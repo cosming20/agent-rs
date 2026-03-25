@@ -20,7 +20,7 @@ class Base(DeclarativeBase):
     """SQLAlchemy declarative base for all Agentic RAG models."""
 
 
-class MessageRole(str, enum.Enum):
+class MessageRole(enum.StrEnum):
     """Valid roles for chat messages."""
 
     USER = "user"
