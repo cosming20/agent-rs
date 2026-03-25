@@ -4,7 +4,10 @@ version = "0.1.0"
 description = "Near-perfect agentic RAG system built on Haystack + Hayhooks"
 requires-python = ">=3.12"
 dependencies = [
+    "alembic>=1.15",
+    "asyncpg>=0.30",
     "pydantic-settings>=2.9",
+    "sqlalchemy[asyncio]>=2.0",
 ]
 
 [build-system]
