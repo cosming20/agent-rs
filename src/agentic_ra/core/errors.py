@@ -50,3 +50,11 @@ class QdrantError(StoreError):
 
 class OpenSearchError(StoreError):
     """OpenSearch keyword search failure."""
+
+
+class RetrievalError(AgenticRAError):
+    """Base for all retrieval pipeline failures."""
+
+
+class EmbeddingError(RetrievalError):
+    """Embedding generation failure."""

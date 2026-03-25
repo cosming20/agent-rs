@@ -6,9 +6,11 @@ requires-python = ">=3.12"
 dependencies = [
     "alembic>=1.15",
     "asyncpg>=0.30",
-    "pydantic-settings>=2.9",
+    "haystack-ai>=2.13",
     "opensearch-py[async]>=2.8",
+    "pydantic-settings>=2.9",
     "qdrant-client>=1.13",
+    "sentence-transformers>=4.1",
     "sqlalchemy[asyncio]>=2.0",
 ]
 
