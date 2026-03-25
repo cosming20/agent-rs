@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any  # opensearchpy index body is untyped dict
 
 from opensearchpy import AsyncOpenSearch
 from pydantic import SecretStr
@@ -63,6 +63,7 @@ class OpenSearchStore:
                 "Failed to ensure index",
                 index=name,
                 operation="ensure_index",
+                original_error=str(e),
             ) from e
 
     async def close(self) -> None:
@@ -70,4 +71,8 @@ class OpenSearchStore:
         try:
             await self._client.close()
         except Exception as e:
-            raise OpenSearchError("Failed to close client", operation="close") from e
+            raise OpenSearchError(
+                "Failed to close client",
+                operation="close",
+                original_error=str(e),
+            ) from e
