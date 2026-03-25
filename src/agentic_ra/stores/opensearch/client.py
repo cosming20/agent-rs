@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
-from typing import Any  # opensearchpy index body is untyped dict
+from typing import Any  # opensearchpy accepts untyped dict for index body and search body
 
+from haystack import Document
 from opensearchpy import AsyncOpenSearch
 from pydantic import SecretStr
 
@@ -63,6 +64,50 @@ class OpenSearchStore:
                 "Failed to ensure index",
                 index=name,
                 operation="ensure_index",
+                original_error=str(e),
+            ) from e
+
+    async def search(
+        self,
+        index: str,
+        query: str,
+        limit: int = 10,
+    ) -> list[Document]:
+        """BM25 keyword search returning Haystack Documents.
+
+        Args:
+            index: OpenSearch index name.
+            query: Search query text.
+            limit: Maximum results to return.
+
+        Returns:
+            Documents with score and source in metadata.
+        """
+        try:
+            response: dict[str, Any] = await self._client.search(
+                index=index,
+                body={
+                    "query": {"match": {"content": query}},
+                    "size": limit,
+                },
+            )
+            hits: list[dict[str, Any]] = response["hits"]["hits"]
+            return [
+                Document(
+                    content=hit["_source"].get("content", ""),
+                    meta={
+                        "score": hit["_score"],
+                        "source": "opensearch",
+                        **{k: v for k, v in hit["_source"].items() if k != "content"},
+                    },
+                )
+                for hit in hits
+            ]
+        except Exception as e:
+            raise OpenSearchError(
+                "Keyword search failed",
+                index=index,
+                operation="search",
                 original_error=str(e),
             ) from e
 

@@ -58,3 +58,7 @@ class RetrievalError(AgenticRAError):
 
 class EmbeddingError(RetrievalError):
     """Embedding generation failure."""
+
+
+class RoutingError(RetrievalError):
+    """Retrieval routing or dispatch failure."""

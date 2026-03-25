@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from haystack import Document
 from pydantic import SecretStr
 from qdrant_client import AsyncQdrantClient, models
 
@@ -47,6 +48,47 @@ class QdrantStore:
                 "Failed to ensure collection",
                 collection=name,
                 operation="ensure_collection",
+            ) from e
+
+    async def search(
+        self,
+        collection: str,
+        query_vector: list[float],
+        limit: int = 10,
+    ) -> list[Document]:
+        """Vector similarity search returning Haystack Documents.
+
+        Args:
+            collection: Qdrant collection name.
+            query_vector: Query embedding vector.
+            limit: Maximum results to return.
+
+        Returns:
+            Documents with score and source in metadata.
+        """
+        try:
+            results = await self._client.query_points(
+                collection_name=collection,
+                query=query_vector,
+                limit=limit,
+            )
+            return [
+                Document(
+                    content=point.payload.get("content", "") if point.payload else "",
+                    meta={
+                        "score": point.score,
+                        "source": "qdrant",
+                        **(point.payload or {}),
+                    },
+                )
+                for point in results.points
+            ]
+        except Exception as e:
+            raise QdrantError(
+                "Vector search failed",
+                collection=collection,
+                operation="search",
+                original_error=str(e),
             ) from e
 
     async def close(self) -> None:
