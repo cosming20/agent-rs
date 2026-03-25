@@ -28,6 +28,7 @@ class Settings(BaseSettings):
     # --- Qdrant ---
     qdrant_grpc_port: int = 1050
     qdrant_http_port: int = 1051
+    qdrant_host: str = "localhost"
     qdrant_api_key: SecretStr
 
     # --- OpenSearch ---
@@ -63,7 +64,7 @@ class Settings(BaseSettings):
     @property
     def qdrant_url(self) -> str:
         """Qdrant HTTP/REST URL for qdrant-client."""
-        return f"http://localhost:{self.qdrant_http_port}"
+        return f"http://{self.qdrant_host}:{self.qdrant_http_port}"
 
     @computed_field  # type: ignore[prop-decorator]
     @property
