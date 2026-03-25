@@ -36,6 +36,7 @@ class Settings(BaseSettings):
     opensearch_initial_admin_password: SecretStr
     opensearch_port: int = 1052
     opensearch_perf_port: int = 1053
+    opensearch_host: str = "localhost"
     opensearch_java_opts: str = (
         "-Xms512m -Xmx512m"  # Infra-only; override in .env for production
     )
@@ -70,7 +71,7 @@ class Settings(BaseSettings):
     @property
     def opensearch_url(self) -> str:
         """OpenSearch HTTPS URL (self-signed cert in dev)."""
-        return f"https://localhost:{self.opensearch_port}"
+        return f"https://{self.opensearch_host}:{self.opensearch_port}"
 
     @computed_field  # type: ignore[prop-decorator]
     @property
