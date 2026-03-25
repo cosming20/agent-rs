@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from pydantic import SecretStr
 from qdrant_client import AsyncQdrantClient, models
 
 from agentic_ra.core.errors import QdrantError
@@ -12,11 +13,11 @@ class QdrantStore:
 
     Args:
         url: Qdrant HTTP/REST URL (e.g., ``http://localhost:1051``).
-        api_key: Qdrant API key for authentication.
+        api_key: Qdrant API key as ``SecretStr`` for safe handling.
     """
 
-    def __init__(self, url: str, api_key: str) -> None:
-        self._client = AsyncQdrantClient(url=url, api_key=api_key)
+    def __init__(self, url: str, api_key: SecretStr) -> None:
+        self._client = AsyncQdrantClient(url=url, api_key=api_key.get_secret_value())
 
     async def ensure_collection(
         self,
@@ -50,4 +51,7 @@ class QdrantStore:
 
     async def close(self) -> None:
         """Close the underlying client connection."""
-        await self._client.close()
+        try:
+            await self._client.close()
+        except Exception as e:
+            raise QdrantError("Failed to close client", operation="close") from e
