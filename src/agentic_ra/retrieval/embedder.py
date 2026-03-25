@@ -51,6 +51,7 @@ class EmbeddingPipeline:
                 "Failed to warm up embedding model",
                 model=self._model_name,
                 operation="warm_up",
+                document_count=0,
                 original_error=str(e),
             ) from e
 
