@@ -42,6 +42,7 @@ class Settings(BaseSettings):
     postgres_password: SecretStr
     postgres_db: str = "agentic_ra"
     postgres_port: int = 1054
+    postgres_host: str = "localhost"
 
     # --- OPA ---
     opa_port: int = 1055
@@ -75,7 +76,17 @@ class Settings(BaseSettings):
         return SecretStr(
             f"postgresql://{self.postgres_user}"
             f":{self.postgres_password.get_secret_value()}"
-            f"@localhost:{self.postgres_port}/{self.postgres_db}"
+            f"@{self.postgres_host}:{self.postgres_port}/{self.postgres_db}"
+        )
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def postgres_dsn_async(self) -> SecretStr:
+        """Async PostgreSQL DSN for asyncpg driver. Use .get_secret_value() to access."""
+        return SecretStr(
+            f"postgresql+asyncpg://{self.postgres_user}"
+            f":{self.postgres_password.get_secret_value()}"
+            f"@{self.postgres_host}:{self.postgres_port}/{self.postgres_db}"
         )
 
     @computed_field  # type: ignore[prop-decorator]
