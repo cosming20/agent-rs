@@ -1,0 +1,201 @@
+# ============================================================
+# Agentic RAG — Infrastructure Services
+# ============================================================
+# All host ports are configurable via .env (see .env.example).
+# WARNING: Jaeger uses in-memory storage — trace data is lost
+# on container restart. Acceptable for dev/staging only.
+# ============================================================
+
+networks:
+  agentic-ra-net:
+    driver: bridge
+
+volumes:
+  qdrant_storage:
+  opensearch_data:
+  postgres_data:
+
+services:
+  # ----------------------------------------------------------
+  # Qdrant — Vector similarity search
+  # ----------------------------------------------------------
+  qdrant:
+    image: qdrant/qdrant:latest
+    container_name: agentic-ra-qdrant
+    restart: "on-failure:5"
+    ports:
+      - "${QDRANT_GRPC_PORT}:6334"
+      - "${QDRANT_HTTP_PORT}:6333"
+    volumes:
+      - qdrant_storage:/qdrant/storage
+      - ./qdrant/config.yaml:/qdrant/config/production.yaml:ro
+    environment:
+      - QDRANT__SERVICE__API_KEY=${QDRANT_API_KEY}
+    networks:
+      - agentic-ra-net
+    mem_limit: 2g
+    mem_reservation: 1g
+    cpus: 1.5
+    healthcheck:
+      test: ["CMD-SHELL", "bash -c 'echo > /dev/tcp/localhost/6333'"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  # ----------------------------------------------------------
+  # OpenSearch — Keyword/BM25 search
+  # ----------------------------------------------------------
+  opensearch:
+    image: opensearchproject/opensearch:latest
+    container_name: agentic-ra-opensearch
+    restart: "on-failure:5"
+    ports:
+      - "${OPENSEARCH_PORT}:9200"
+      - "${OPENSEARCH_PERF_PORT}:9600"
+    volumes:
+      - opensearch_data:/usr/share/opensearch/data
+    environment:
+      - discovery.type=single-node
+      - OPENSEARCH_USER=${OPENSEARCH_USER}
+      - OPENSEARCH_INITIAL_ADMIN_PASSWORD=${OPENSEARCH_INITIAL_ADMIN_PASSWORD}
+      - OPENSEARCH_JAVA_OPTS=${OPENSEARCH_JAVA_OPTS}
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+      nofile:
+        soft: 65536
+        hard: 65536
+    networks:
+      - agentic-ra-net
+    mem_limit: 3g
+    mem_reservation: 1g
+    cpus: 1.5
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "curl -sf --insecure -u $$OPENSEARCH_USER:$$OPENSEARCH_INITIAL_ADMIN_PASSWORD https://localhost:9200/_cluster/health | grep -qv '\"status\":\"red\"'",
+        ]
+      interval: 10s
+      timeout: 10s
+      retries: 10
+      start_period: 60s
+
+  # ----------------------------------------------------------
+  # PostgreSQL — State store, chat history, memory, evidence
+  # ----------------------------------------------------------
+  postgres:
+    image: postgres:latest
+    container_name: agentic-ra-postgres
+    restart: "on-failure:5"
+    ports:
+      - "${POSTGRES_PORT}:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql
+      - ./postgres/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    environment:
+      - POSTGRES_USER=${POSTGRES_USER}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
+      - POSTGRES_DB=${POSTGRES_DB}
+    networks:
+      - agentic-ra-net
+    mem_limit: 1g
+    mem_reservation: 512m
+    cpus: 1.0
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB && psql -U $$POSTGRES_USER -d $$POSTGRES_DB -c 'SELECT 1'",
+        ]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 15s
+
+  # ----------------------------------------------------------
+  # OPA — Policy decision point
+  # ----------------------------------------------------------
+  opa:
+    image: openpolicyagent/opa:latest-debug
+    container_name: agentic-ra-opa
+    restart: unless-stopped
+    ports:
+      - "${OPA_PORT}:8181"
+    volumes:
+      - ./opa/policies:/policies:ro
+    command:
+      - "run"
+      - "--server"
+      - "--addr=0.0.0.0:8181"
+      - "--log-level=${OPA_LOG_LEVEL}"
+      - "--log-format=json"
+      - "--set=decision_logs.console=true"
+      - "/policies"
+    networks:
+      - agentic-ra-net
+    mem_limit: 256m
+    mem_reservation: 128m
+    cpus: 0.5
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "wget -qO- http://localhost:8181/v1/policies | grep -q '\"id\"'",
+        ]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  # ----------------------------------------------------------
+  # Jaeger — Trace storage + UI (in-memory, ephemeral)
+  # ----------------------------------------------------------
+  jaeger:
+    image: jaegertracing/all-in-one:latest
+    container_name: agentic-ra-jaeger
+    restart: unless-stopped
+    ports:
+      - "${JAEGER_UI_PORT}:16686"
+    environment:
+      - COLLECTOR_OTLP_ENABLED=true
+    networks:
+      - agentic-ra-net
+    mem_limit: 1g
+    mem_reservation: 512m
+    cpus: 0.5
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "wget --spider http://localhost:14269/ && nc -z localhost 4317",
+        ]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  # ----------------------------------------------------------
+  # OTel Collector — Telemetry pipeline
+  # ----------------------------------------------------------
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:latest
+    container_name: agentic-ra-otel-collector
+    restart: unless-stopped
+    ports:
+      - "${OTEL_COLLECTOR_PORT}:4317"
+    volumes:
+      - ./otel/collector.yaml:/etc/otelcol-contrib/config.yaml:ro
+    networks:
+      - agentic-ra-net
+    depends_on:
+      jaeger:
+        condition: service_healthy
+    mem_limit: 512m
+    mem_reservation: 256m
+    cpus: 0.5
+    # No CMD-SHELL health check: scratch-based image has no shell.
+    # The collector is stateless with unless-stopped restart policy.
+    # It depends on jaeger:service_healthy and logs errors clearly.
