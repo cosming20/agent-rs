@@ -35,7 +35,9 @@ class Settings(BaseSettings):
     opensearch_initial_admin_password: SecretStr
     opensearch_port: int = 1052
     opensearch_perf_port: int = 1053
-    opensearch_java_opts: str = "-Xms512m -Xmx512m"  # Infra-only; override in .env for production
+    opensearch_java_opts: str = (
+        "-Xms512m -Xmx512m"  # Infra-only; override in .env for production
+    )
 
     # --- PostgreSQL ---
     postgres_user: str = "agentic_ra"
