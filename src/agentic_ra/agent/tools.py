@@ -10,6 +10,7 @@ so internal async operations (Cognee, Postgres) are bridged via
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import logging
 import threading
 from typing import Any, TypedDict
@@ -41,17 +42,19 @@ class ToolConfig(TypedDict):
 # Module-level evidence accumulator — reset per agent run
 # ---------------------------------------------------------------------------
 
-_evidence_buffer: list[Document] = []
+_evidence_buffer: contextvars.ContextVar[list[Document]] = contextvars.ContextVar(
+    "_evidence_buffer", default=[]
+)
 
 
 def reset_evidence_buffer() -> None:
-    """Clear evidence buffer. Call before each agent run."""
-    _evidence_buffer.clear()
+    """Reset evidence buffer for this request context."""
+    _evidence_buffer.set([])
 
 
 def get_evidence_buffer() -> list[Document]:
-    """Get accumulated evidence documents from search_knowledge tool calls."""
-    return list(_evidence_buffer)
+    """Get evidence documents accumulated in this request context."""
+    return list(_evidence_buffer.get())
 
 
 # ---------------------------------------------------------------------------
@@ -63,15 +66,25 @@ _MAX_EVIDENCE_CHARS = 4000
 
 _TOOL_LOOP: asyncio.AbstractEventLoop | None = None
 _TOOL_THREAD: threading.Thread | None = None
+_TOOL_LOOP_LOCK = threading.Lock()
 
 
 def _get_tool_loop() -> asyncio.AbstractEventLoop:
     """Get or create a dedicated event loop for tool async operations."""
     global _TOOL_LOOP, _TOOL_THREAD  # noqa: PLW0603
-    if _TOOL_LOOP is None or _TOOL_LOOP.is_closed():
-        _TOOL_LOOP = asyncio.new_event_loop()
-        _TOOL_THREAD = threading.Thread(target=_TOOL_LOOP.run_forever, daemon=True)
-        _TOOL_THREAD.start()
+    with _TOOL_LOOP_LOCK:
+        if (
+            _TOOL_LOOP is None
+            or _TOOL_LOOP.is_closed()
+            or (_TOOL_THREAD is not None and not _TOOL_THREAD.is_alive())
+        ):
+            if _TOOL_THREAD is not None and not _TOOL_THREAD.is_alive():
+                logger.warning("Tool event loop thread died — recreating")
+            _TOOL_LOOP = asyncio.new_event_loop()
+            _TOOL_THREAD = threading.Thread(
+                target=_TOOL_LOOP.run_forever, daemon=True, name="tool-event-loop"
+            )
+            _TOOL_THREAD.start()
     return _TOOL_LOOP
 
 
@@ -176,7 +189,9 @@ def make_search_knowledge_tool(
                 strategy=retrieval_strategy.value,
             )
             formatted = _format_evidence(evidence_pack.documents)
-            _evidence_buffer.extend(evidence_pack.documents)
+            buf = _evidence_buffer.get()
+            buf.extend(evidence_pack.documents)
+            _evidence_buffer.set(buf)
 
             logger.info(
                 "search_knowledge returned %d documents (strategy=%s)",

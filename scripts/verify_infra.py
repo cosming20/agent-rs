@@ -29,6 +29,8 @@ async def verify_infrastructure():
             settings.jaeger_ui_url.split("//")[1].split(":")[0],
             settings.jaeger_ui_port,
         ),
+        "Neo4j (Bolt)": (settings.neo4j_host, settings.neo4j_bolt_port),
+        "Neo4j (HTTP)": (settings.neo4j_host, settings.neo4j_http_port),
     }
 
     print("--- Infrastructure Health Check ---")

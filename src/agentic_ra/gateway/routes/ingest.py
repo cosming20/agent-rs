@@ -26,7 +26,9 @@ router = APIRouter(prefix="/api/v1", tags=["ingest"])
 class DocumentInput(BaseModel):
     """A document to ingest."""
 
-    content: str = Field(..., min_length=1, description="Document text content")
+    content: str = Field(
+        ..., min_length=1, max_length=500_000, description="Document text content"
+    )
     metadata: dict[str, str] = Field(
         default_factory=dict, description="Document metadata"
     )

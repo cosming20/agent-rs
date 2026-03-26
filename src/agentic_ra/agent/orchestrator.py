@@ -105,8 +105,10 @@ class AgentOrchestrator:
             if self._metrics:
                 self._metrics.record_retrieval(elapsed_ms, len(evidence), strategy)
 
-            # 5. Verify grounding
-            verification = self._verifier.verify(answer=answer, evidence=evidence)
+            # 5. Verify grounding (offloaded — verify() calls LLM synchronously)
+            verification = await asyncio.to_thread(
+                self._verifier.verify, answer=answer, evidence=evidence
+            )
             if self._metrics:
                 self._metrics.record_verification(
                     verification.confidence, verification.is_grounded
@@ -142,7 +144,9 @@ class AgentOrchestrator:
                 )
                 answer = self._extract_answer(agent_result)
                 evidence = get_evidence_buffer()
-                verification = self._verifier.verify(answer=answer, evidence=evidence)
+                verification = await asyncio.to_thread(
+                    self._verifier.verify, answer=answer, evidence=evidence
+                )
 
             # 7. Synthesize citations
             response = self._synthesizer.synthesize(

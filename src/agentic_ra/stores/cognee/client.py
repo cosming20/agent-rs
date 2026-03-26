@@ -258,7 +258,7 @@ class CogneeStore:
                         Document(
                             content=content,
                             meta={
-                                "source": "cognee_graph",
+                                "source": f"cognee_{search_type.lower()}",
                                 "search_type": search_type,
                                 "score": 1.0 / (i + 1),
                                 "dataset": ds,

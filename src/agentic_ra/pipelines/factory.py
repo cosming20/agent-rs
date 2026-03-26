@@ -143,7 +143,10 @@ def build_pipeline(settings: Settings) -> RAGPipeline:
         make_search_knowledge_tool(router, ranker),
         make_search_web_tool(),
         make_ingest_tool(cognee_store),
-        make_remember_tool(memory, "default"),
+        # TODO: user_id should be injected per-request for multi-user isolation.
+        # Currently all users share a single memory namespace. This is acceptable
+        # for single-user deployments but must be fixed for multi-tenant use.
+        make_remember_tool(memory, "shared"),
     ]
 
     # Build Haystack Agent
