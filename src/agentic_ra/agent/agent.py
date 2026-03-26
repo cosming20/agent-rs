@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+from typing import Any
 
 from haystack.components.agents import Agent
 from haystack.components.generators.chat import OpenAIChatGenerator
@@ -78,3 +79,46 @@ def build_agent(
     )
 
     return agent
+
+
+def build_agent_with_tools(
+    base_agent: Agent,
+    tools_config: list[ToolConfig],
+) -> Agent:
+    """Rebuild an agent with new tools for per-request user scoping.
+
+    Reuses the base agent's chat_generator and system_prompt but injects
+    user-scoped tools.
+
+    Args:
+        base_agent: Template agent whose LLM and prompt config are reused.
+        tools_config: Tool descriptor dicts (name, description, function, parameters).
+
+    Returns:
+        A new Agent instance with the given tools.
+    """
+    haystack_tools: list[Tool] = []
+    for tc in tools_config:
+        tool = Tool(
+            name=tc["name"],
+            description=tc["description"],
+            function=tc["function"],
+            parameters=tc["parameters"],
+        )
+        haystack_tools.append(tool)
+
+    new_agent = Agent(
+        chat_generator=base_agent.chat_generator,
+        tools=haystack_tools,
+        system_prompt=base_agent.system_prompt,
+        exit_conditions=["text"],
+        max_agent_steps=base_agent.max_agent_steps,
+        raise_on_tool_invocation_failure=False,
+    )
+
+    logger.info(
+        "Per-request agent built: tools=%s",
+        [t.name for t in haystack_tools],
+    )
+
+    return new_agent

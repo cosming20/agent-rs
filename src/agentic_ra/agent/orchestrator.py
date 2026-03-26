@@ -12,9 +12,17 @@ from haystack import Document
 from haystack.components.agents import Agent
 from haystack.dataclasses import ChatMessage
 
+from agentic_ra.agent.agent import build_agent_with_tools
 from agentic_ra.agent.memory import MemoryStore
 from agentic_ra.agent.synthesis import ResponseSynthesizer, SynthesizedResponse
-from agentic_ra.agent.tools import get_evidence_buffer, reset_evidence_buffer
+from agentic_ra.agent.tools import (
+    get_evidence_buffer,
+    make_ingest_tool,
+    make_remember_tool,
+    make_search_knowledge_tool,
+    make_search_web_tool,
+    reset_evidence_buffer,
+)
 from agentic_ra.agent.verifier import GroundingVerifier
 from agentic_ra.core.errors import OrchestratorError
 from agentic_ra.observability.metrics import RAGMetrics
@@ -39,21 +47,29 @@ class AgentOrchestrator:
 
     def __init__(
         self,
-        agent: Agent,
+        base_agent: Agent,
         memory: MemoryStore,
         verifier: GroundingVerifier,
         synthesizer: ResponseSynthesizer,
         metrics: RAGMetrics | None = None,
         run_store: RunStore | None = None,
         max_retries: int = 1,
+        router: Any = None,
+        ranker: Any = None,
+        cognee_store: Any = None,
+        document_store: Any = None,
     ) -> None:
-        self._agent = agent
+        self._base_agent = base_agent
         self._memory = memory
         self._verifier = verifier
         self._synthesizer = synthesizer
         self._metrics = metrics
         self._run_store = run_store
         self._max_retries = max_retries
+        self._router = router
+        self._ranker = ranker
+        self._cognee_store = cognee_store
+        self._document_store = document_store
 
     async def process_query(
         self,
@@ -62,6 +78,7 @@ class AgentOrchestrator:
         user_id: str,
         strategy: str = "hybrid",
         limit: int = 10,
+        role: str = "user",
     ) -> SynthesizedResponse:
         """Process a user query through the agent + quality gate pipeline."""
         try:
@@ -91,13 +108,32 @@ class AgentOrchestrator:
             )
             chat_messages.append(ChatMessage.from_user(query + hint))
 
-            # 3. Run Haystack Agent (offloaded to thread — Agent.run is sync)
-            reset_evidence_buffer()
-            agent_result = await asyncio.to_thread(
-                self._agent.run, messages=chat_messages
-            )
+            # 3. Build per-request tools scoped to this user's dataset
+            dataset = f"user_{user_id}"
+            tools_config = [
+                make_search_knowledge_tool(
+                    self._router,
+                    self._ranker,
+                    cognee_store=self._cognee_store,
+                    document_store=self._document_store,
+                    dataset=dataset,
+                    role=role,
+                ),
+                make_search_web_tool(),
+                make_remember_tool(self._memory, user_id),
+            ]
+            if self._cognee_store is not None:
+                tools_config.append(
+                    make_ingest_tool(self._cognee_store, dataset=dataset)
+                )
 
-            # 4. Extract answer and evidence
+            agent = build_agent_with_tools(self._base_agent, tools_config)
+
+            # 4. Run Haystack Agent (offloaded to thread — Agent.run is sync)
+            reset_evidence_buffer()
+            agent_result = await asyncio.to_thread(agent.run, messages=chat_messages)
+
+            # 5. Extract answer and evidence
             answer = self._extract_answer(agent_result)
             evidence: list[Document] = get_evidence_buffer()
             elapsed_ms = (time.monotonic() - start) * 1000
@@ -105,7 +141,7 @@ class AgentOrchestrator:
             if self._metrics:
                 self._metrics.record_retrieval(elapsed_ms, len(evidence), strategy)
 
-            # 5. Verify grounding (offloaded — verify() calls LLM synchronously)
+            # 6. Verify grounding (offloaded — verify() calls LLM synchronously)
             verification = await asyncio.to_thread(
                 self._verifier.verify, answer=answer, evidence=evidence
             )
@@ -114,7 +150,7 @@ class AgentOrchestrator:
                     verification.confidence, verification.is_grounded
                 )
 
-            # 6. Retry if not grounded
+            # 7. Retry if not grounded
             retries = 0
             while (
                 self._verifier.needs_retry(verification) and retries < self._max_retries
@@ -140,7 +176,7 @@ class AgentOrchestrator:
                 ]
                 reset_evidence_buffer()
                 agent_result = await asyncio.to_thread(
-                    self._agent.run, messages=retry_messages
+                    agent.run, messages=retry_messages
                 )
                 answer = self._extract_answer(agent_result)
                 evidence = get_evidence_buffer()
@@ -148,7 +184,7 @@ class AgentOrchestrator:
                     self._verifier.verify, answer=answer, evidence=evidence
                 )
 
-            # 7. Synthesize citations
+            # 8. Synthesize citations
             response = self._synthesizer.synthesize(
                 answer=answer,
                 evidence=evidence,
@@ -157,7 +193,7 @@ class AgentOrchestrator:
                 strategy=strategy,
             )
 
-            # 8. Persist pipeline run
+            # 9. Persist pipeline run
             if self._run_store:
                 await self._run_store.save(
                     session_id=session_id,
@@ -174,7 +210,7 @@ class AgentOrchestrator:
                     retries=retries,
                 )
 
-            # 9. Store assistant response
+            # 10. Store assistant response
             await self._memory.add_message(
                 session_id=session_id,
                 role=MessageRole.ASSISTANT,

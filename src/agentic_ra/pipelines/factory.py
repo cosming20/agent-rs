@@ -9,12 +9,6 @@ from agentic_ra.agent.agent import build_agent
 from agentic_ra.agent.memory import MemoryStore
 from agentic_ra.agent.orchestrator import AgentOrchestrator
 from agentic_ra.agent.synthesis import ResponseSynthesizer
-from agentic_ra.agent.tools import (
-    make_ingest_tool,
-    make_remember_tool,
-    make_search_knowledge_tool,
-    make_search_web_tool,
-)
 from agentic_ra.agent.verifier import GroundingVerifier
 from agentic_ra.core.config import Settings
 from agentic_ra.observability.metrics import RAGMetrics
@@ -138,34 +132,28 @@ def build_pipeline(settings: Settings) -> RAGPipeline:
     synthesizer = ResponseSynthesizer()
     metrics = RAGMetrics()
 
-    # Build agent tools
-    tools_config = [
-        make_search_knowledge_tool(router, ranker),
-        make_search_web_tool(),
-        make_ingest_tool(cognee_store),
-        # TODO: user_id should be injected per-request for multi-user isolation.
-        # Currently all users share a single memory namespace. This is acceptable
-        # for single-user deployments but must be fixed for multi-tenant use.
-        make_remember_tool(memory, "shared"),
-    ]
-
-    # Build Haystack Agent
-    agent = build_agent(
+    # Build base agent with no tools — tools are injected per-request
+    # in the orchestrator for RBAC dataset scoping.
+    base_agent = build_agent(
         model=settings.agent_model,
         api_key=api_key,
-        tools_config=tools_config,
+        tools_config=[],
         max_steps=settings.agent_max_steps,
     )
-    agent.warm_up()
+    base_agent.warm_up()
 
     orchestrator = AgentOrchestrator(
-        agent=agent,
+        base_agent=base_agent,
         memory=memory,
         verifier=verifier,
         synthesizer=synthesizer,
         metrics=metrics,
         run_store=run_store,
         max_retries=settings.agent_max_retries,
+        router=router,
+        ranker=ranker,
+        cognee_store=cognee_store,
+        document_store=document_store,
     )
 
     logger.info("RAG pipeline assembled successfully")
