@@ -5,10 +5,15 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass
 
-from agentic_ra.agent.generator import LLMGenerator
+from agentic_ra.agent.agent import build_agent
 from agentic_ra.agent.memory import MemoryStore
 from agentic_ra.agent.orchestrator import AgentOrchestrator
 from agentic_ra.agent.synthesis import ResponseSynthesizer
+from agentic_ra.agent.tools import (
+    make_ingest_tool,
+    make_search_knowledge_tool,
+    make_search_web_tool,
+)
 from agentic_ra.agent.verifier import GroundingVerifier
 from agentic_ra.core.config import Settings
 from agentic_ra.observability.metrics import RAGMetrics
@@ -121,23 +126,35 @@ def build_pipeline(settings: Settings) -> RAGPipeline:
 
     # --- Agent core ---
     memory = MemoryStore(pg_client=postgres)
-    generator = LLMGenerator(
-        model=settings.llm_model,
-        api_key=api_key,
-    )
     verifier = GroundingVerifier(api_key=api_key, model=settings.llm_model)
     synthesizer = ResponseSynthesizer()
     metrics = RAGMetrics()
 
+    # Build agent tools
+    tools_config = [
+        make_search_knowledge_tool(router, ranker),
+        make_search_web_tool(),
+    ]
+    if cognee_store is not None:
+        tools_config.append(make_ingest_tool(cognee_store))
+
+    # Build Haystack Agent
+    agent = build_agent(
+        model=settings.agent_model,
+        api_key=api_key,
+        tools_config=tools_config,
+        max_steps=settings.agent_max_steps,
+    )
+    agent.warm_up()
+
     orchestrator = AgentOrchestrator(
+        agent=agent,
         memory=memory,
-        router=router,
-        ranker=ranker,
-        generator=generator,
         verifier=verifier,
         synthesizer=synthesizer,
         metrics=metrics,
         run_store=run_store,
+        max_retries=settings.agent_max_retries,
     )
 
     logger.info("RAG pipeline assembled successfully")
