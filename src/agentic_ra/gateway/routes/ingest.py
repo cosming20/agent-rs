@@ -1,17 +1,24 @@
-"""Document ingestion endpoint — chunk, embed, store, and persist parsed docs."""
+"""Document ingestion endpoint — Docling parse → Cognee ingest.
+
+Flow:
+  1. Docling parses documents (structure-aware chunking, DoclingDocument JSON)
+  2. Cognee add + cognify (chunking, embedding → Qdrant, entity extraction → Neo4j)
+  3. Postgres persists DoclingDocument JSON for provenance
+"""
 
 from __future__ import annotations
 
 import asyncio
+import logging
 import uuid as uuid_mod
 
 from fastapi import APIRouter, Request
 from haystack import Document
 from pydantic import BaseModel, Field
-from qdrant_client import models as qdrant_models
 
-from agentic_ra.core.config import get_settings
 from agentic_ra.pipelines.factory import RAGPipeline
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/v1", tags=["ingest"])
 
@@ -20,14 +27,18 @@ class DocumentInput(BaseModel):
     """A document to ingest."""
 
     content: str = Field(..., min_length=1, description="Document text content")
-    metadata: dict[str, str] = Field(default_factory=dict, description="Document metadata")
+    metadata: dict[str, str] = Field(
+        default_factory=dict, description="Document metadata"
+    )
 
 
 class IngestRequest(BaseModel):
     """Batch document ingestion request."""
 
     documents: list[DocumentInput] = Field(..., min_length=1, max_length=100)
-    source_path: str = Field(default="api_input", description="Source identifier for provenance")
+    source_path: str = Field(
+        default="api_input", description="Source identifier for provenance"
+    )
 
 
 class IngestResponse(BaseModel):
@@ -36,8 +47,7 @@ class IngestResponse(BaseModel):
     ingested_count: int
     chunk_count: int
     parsed_document_id: uuid_mod.UUID
-    collection: str
-    index: str
+    cognee_ingested: bool
 
 
 def _get_pipeline(request: Request) -> RAGPipeline:
@@ -47,23 +57,15 @@ def _get_pipeline(request: Request) -> RAGPipeline:
 
 @router.post("/ingest", response_model=IngestResponse)
 async def ingest_endpoint(request: Request, body: IngestRequest) -> IngestResponse:
-    """Chunk, embed, and store documents. Persists parsed DoclingDocument JSON."""
+    """Ingest documents: Docling parse → Cognee graph+vector."""
     pipeline = _get_pipeline(request)
-    settings = get_settings()
-    collection = settings.qdrant_collection
-    index = settings.opensearch_index
 
-    docs = [
-        Document(content=d.content, meta=d.metadata)
-        for d in body.documents
-    ]
+    docs = [Document(content=d.content, meta=d.metadata) for d in body.documents]
 
-    # Chunk with Docling HybridChunker
-    chunk_result = await asyncio.to_thread(
-        pipeline.embedding_pipeline.chunk_text, docs
-    )
+    # 1. Parse with Docling HybridChunker (structure-aware chunking)
+    chunk_result = await asyncio.to_thread(pipeline.embedding_pipeline.chunk_text, docs)
 
-    # Persist parsed DoclingDocument JSON
+    # 2. Persist DoclingDocument JSON in Postgres (provenance)
     docling_json = (
         chunk_result.docling_doc.export_to_dict()
         if chunk_result.docling_doc is not None
@@ -76,52 +78,25 @@ async def ingest_endpoint(request: Request, body: IngestRequest) -> IngestRespon
         metadata={"ingested_doc_count": len(body.documents)},
     )
 
-    # Inject parsed_document_id into chunk metadata
-    for doc in chunk_result.documents:
-        doc.meta["parsed_document_id"] = str(parsed_doc.id)
-
-    # Embed with OpenAI
-    embedded = await asyncio.to_thread(
-        pipeline.embedding_pipeline.embed, chunk_result.documents
-    )
-
-    # Store in Qdrant via public API
-    points = [
-        qdrant_models.PointStruct(
-            id=str(uuid_mod.uuid4()),
-            vector=doc.embedding,
-            payload={
-                "content": doc.content,
-                "chunk_text": doc.meta.get("chunk_text", doc.content),
-                "parsed_document_id": doc.meta.get("parsed_document_id", ""),
-                "headings": doc.meta.get("headings", []),
-                "source_path": body.source_path,
-            },
-        )
-        for doc in embedded
-        if doc.embedding is not None
-    ]
-
-    if points:
-        await pipeline.qdrant.upsert(collection=collection, points=points)
-
-    # Store in OpenSearch via public API
-    for doc in embedded:
-        await pipeline.opensearch.index_document(
-            index=index,
-            doc_id=str(uuid_mod.uuid4()),
-            body={
-                "content": doc.meta.get("chunk_text", doc.content),
-                "parsed_document_id": doc.meta.get("parsed_document_id", ""),
-                "headings": doc.meta.get("headings", []),
-                "source_path": body.source_path,
-            },
-        )
+    # 3. Cognee: add + cognify (chunking, embedding → Qdrant, entities → Neo4j)
+    cognee_ok = False
+    if pipeline.cognee_store is not None:
+        try:
+            full_text = "\n\n".join(d.content for d in body.documents)
+            await pipeline.cognee_store.add_and_cognify(text=full_text)
+            cognee_ok = True
+            logger.info(
+                "Cognee ingestion complete: %d docs → graph + vector",
+                len(body.documents),
+            )
+        except Exception:
+            logger.exception("Cognee add+cognify failed")
+    else:
+        logger.warning("CogneeStore not configured — skipping graph+vector ingestion")
 
     return IngestResponse(
         ingested_count=len(body.documents),
-        chunk_count=len(embedded),
+        chunk_count=chunk_result.chunk_count,
         parsed_document_id=parsed_doc.id,
-        collection=collection,
-        index=index,
+        cognee_ingested=cognee_ok,
     )

@@ -38,15 +38,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
 
     logger.info("Warming up embedding models...")
     pipeline.embedding_pipeline.warm_up()
-    pipeline.query_embedder.warm_up()
     logger.info("Embedding models ready")
-
-    await pipeline.qdrant.ensure_collection(
-        settings.qdrant_collection,
-        vector_size=settings.embedding_dimension,
-    )
-    await pipeline.opensearch.ensure_index(settings.opensearch_index)
-    logger.info("Qdrant collection and OpenSearch index ready")
 
     yield
 

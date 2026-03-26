@@ -14,12 +14,11 @@ from agentic_ra.core.config import Settings
 from agentic_ra.observability.metrics import RAGMetrics
 from agentic_ra.retrieval.embedder import EmbeddingPipeline
 from agentic_ra.retrieval.ranker import ResultRanker
-from agentic_ra.retrieval.router import QueryEmbedder, RetrievalRouter
-from agentic_ra.stores.opensearch.client import OpenSearchStore
+from agentic_ra.retrieval.router import RetrievalRouter
+from agentic_ra.stores.cognee.client import CogneeStore
 from agentic_ra.stores.postgres.client import PostgresClient
 from agentic_ra.stores.postgres.documents import DocumentStore
 from agentic_ra.stores.postgres.runs import RunStore
-from agentic_ra.stores.qdrant.client import QdrantStore
 
 logger = logging.getLogger(__name__)
 
@@ -28,31 +27,25 @@ logger = logging.getLogger(__name__)
 class RAGPipeline:
     """Assembled RAG pipeline with all components.
 
-    Holds references to all components for lifecycle management.
-
     Attributes:
         orchestrator: Main query processing entry point.
         postgres: PostgreSQL client (for shutdown).
-        qdrant: Qdrant store (for shutdown).
-        opensearch: OpenSearch store (for shutdown).
-        embedding_pipeline: Document embedding pipeline.
-        query_embedder: Query-time embedder.
+        embedding_pipeline: Docling chunking pipeline (parsing only).
+        document_store: Postgres document persistence.
+        run_store: Postgres pipeline run tracking.
+        cognee_store: Cognee knowledge graph + vector store.
     """
 
     orchestrator: AgentOrchestrator
     postgres: PostgresClient
-    qdrant: QdrantStore
-    opensearch: OpenSearchStore
     embedding_pipeline: EmbeddingPipeline
-    query_embedder: QueryEmbedder
     document_store: DocumentStore
     run_store: RunStore
+    cognee_store: CogneeStore | None = None
 
     async def close(self) -> None:
         """Gracefully shut down all components, tolerating individual failures."""
         for name, close_fn in [
-            ("QdrantStore", self.qdrant.close),
-            ("OpenSearchStore", self.opensearch.close),
             ("PostgresClient", self.postgres.close),
         ]:
             try:
@@ -64,11 +57,10 @@ class RAGPipeline:
 def build_pipeline(settings: Settings) -> RAGPipeline:
     """Assemble a complete RAG pipeline from settings.
 
-    Creates and wires all components: stores, retrieval engine,
-    agent core, and returns a ready-to-use pipeline.
-
-    Note: Call ``warm_up()`` on embedding_pipeline and query_embedder
-    after construction to load models.
+    Architecture:
+    - Cognee owns vector storage (Qdrant) + knowledge graph (Neo4j)
+    - Docling provides document parsing/chunking
+    - Postgres stores DoclingDocument JSON, chat history, pipeline runs
 
     Args:
         settings: Application settings.
@@ -81,19 +73,7 @@ def build_pipeline(settings: Settings) -> RAGPipeline:
         dsn=settings.postgres_dsn_async.get_secret_value(),
     )
 
-    qdrant = QdrantStore(
-        url=settings.qdrant_url,
-        api_key=settings.qdrant_api_key,
-    )
-
-    opensearch = OpenSearchStore(
-        host=settings.opensearch_host,
-        port=settings.opensearch_port,
-        user=settings.opensearch_user,
-        password=settings.opensearch_initial_admin_password,
-    )
-
-    # --- Retrieval engine ---
+    # --- Docling chunking pipeline (parsing only, Cognee handles embedding) ---
     api_key = settings.openai_api_key.get_secret_value()
 
     embedding_pipeline = EmbeddingPipeline(
@@ -105,19 +85,33 @@ def build_pipeline(settings: Settings) -> RAGPipeline:
         merge_peers=settings.chunk_merge_peers,
     )
 
-    query_embedder = QueryEmbedder(
-        model=settings.embedding_model,
-        api_key=api_key,
-        dimension=settings.embedding_dimension,
-    )
+    # --- Cognee (knowledge graph + vector: Qdrant + Neo4j) ---
+    cognee_store: CogneeStore | None = None
+    if settings.cognee_enabled:
+        cognee_store = CogneeStore(dataset=settings.cognee_dataset)
+        cognee_store.configure(
+            llm_api_key=api_key,
+            llm_model=f"openai/{settings.llm_model}",
+            graph_db_provider=settings.cognee_graph_db_provider,
+            vector_db_provider=settings.cognee_vector_db_provider,
+            data_root=settings.cognee_data_root,
+            system_root=settings.cognee_system_root,
+            qdrant_url=settings.qdrant_url,
+            qdrant_api_key=settings.qdrant_api_key.get_secret_value(),
+            neo4j_bolt_url=settings.neo4j_bolt_url,
+            neo4j_user=settings.neo4j_user,
+            neo4j_password=settings.neo4j_password.get_secret_value(),
+            neo4j_db=settings.neo4j_db,
+        )
+        logger.info(
+            "CogneeStore configured (dataset=%s, qdrant=%s, neo4j=%s)",
+            settings.cognee_dataset,
+            settings.qdrant_url,
+            settings.neo4j_bolt_url,
+        )
 
-    router = RetrievalRouter(
-        query_embedder=query_embedder,
-        qdrant_store=qdrant,
-        opensearch_store=opensearch,
-        collection=settings.qdrant_collection,
-        index=settings.opensearch_index,
-    )
+    # --- Retrieval router (Cognee-only: graph + vector + lexical) ---
+    router = RetrievalRouter(cognee_store=cognee_store)  # type: ignore[arg-type]
 
     ranker = ResultRanker()
 
@@ -151,10 +145,8 @@ def build_pipeline(settings: Settings) -> RAGPipeline:
     return RAGPipeline(
         orchestrator=orchestrator,
         postgres=postgres,
-        qdrant=qdrant,
-        opensearch=opensearch,
         embedding_pipeline=embedding_pipeline,
-        query_embedder=query_embedder,
         document_store=document_store,
         run_store=run_store,
+        cognee_store=cognee_store,
     )

@@ -6,21 +6,18 @@ Or connect via MCPToolClient with stdio transport.
 
 from __future__ import annotations
 
-import asyncio
-
 from mcp.server.fastmcp import FastMCP
 
 from agentic_ra.core.config import get_settings
-from agentic_ra.retrieval.router import QueryEmbedder
-from agentic_ra.stores.opensearch.client import OpenSearchStore
-from agentic_ra.stores.qdrant.client import QdrantStore
+from agentic_ra.retrieval.router import RetrievalRouter, RetrievalStrategy
+from agentic_ra.stores.cognee.client import CogneeStore
 
 mcp = FastMCP("AgenticRA Search", json_response=True)
 
 
 @mcp.tool()
 async def search_documents(query: str, limit: int = 5) -> str:
-    """Search the document knowledge base using hybrid retrieval.
+    """Search the document knowledge base using hybrid retrieval via Cognee.
 
     Args:
         query: Natural language search query.
@@ -30,25 +27,30 @@ async def search_documents(query: str, limit: int = 5) -> str:
         Search results as formatted text with sources.
     """
     s = get_settings()
-    qdrant = QdrantStore(url=s.qdrant_url, api_key=s.qdrant_api_key)
-    opensearch = OpenSearchStore(
-        host=s.opensearch_host, port=s.opensearch_port,
-        user=s.opensearch_user, password=s.opensearch_initial_admin_password,
+
+    if not s.cognee_enabled:
+        return "Cognee is not enabled — search unavailable."
+
+    cognee_store = CogneeStore(dataset=s.cognee_dataset)
+    cognee_store.configure(
+        llm_api_key=s.openai_api_key.get_secret_value(),
+        llm_model=f"openai/{s.llm_model}",
+        graph_db_provider=s.cognee_graph_db_provider,
+        vector_db_provider=s.cognee_vector_db_provider,
+        qdrant_url=s.qdrant_url,
+        qdrant_api_key=s.qdrant_api_key.get_secret_value(),
+        neo4j_bolt_url=s.neo4j_bolt_url,
+        neo4j_user=s.neo4j_user,
+        neo4j_password=s.neo4j_password.get_secret_value(),
+        neo4j_db=s.neo4j_db,
     )
-    embedder = QueryEmbedder(
-        model=s.embedding_model,
-        api_key=s.openai_api_key.get_secret_value(),
-        dimension=s.embedding_dimension,
-    )
+    router = RetrievalRouter(cognee_store=cognee_store)
 
     try:
-        query_vector = await asyncio.to_thread(embedder.run, query)
-        vector_results, keyword_results = await asyncio.gather(
-            qdrant.search(s.qdrant_collection, query_vector, limit=limit),
-            opensearch.search(s.opensearch_index, query, limit=limit),
+        all_results = await router.retrieve(
+            query=query, strategy=RetrievalStrategy.HYBRID, limit=limit
         )
 
-        all_results = vector_results + keyword_results
         if not all_results:
             return "No documents found."
 
@@ -64,27 +66,16 @@ async def search_documents(query: str, limit: int = 5) -> str:
         return "\n\n".join(lines[:limit])
     except Exception as e:
         return f"Search error: {e}"
-    finally:
-        await qdrant.close()
-        await opensearch.close()
 
 
 @mcp.tool()
 async def get_document_count() -> str:
-    """Get the total number of indexed documents in Qdrant.
+    """Get the total number of indexed documents.
 
     Returns:
-        Document count as text.
+        Document count as text (currently not available via Cognee).
     """
-    s = get_settings()
-    qdrant = QdrantStore(url=s.qdrant_url, api_key=s.qdrant_api_key)
-    try:
-        info = await qdrant._client.get_collection(s.qdrant_collection)
-        return f"Documents indexed: {info.points_count}"
-    except Exception as e:
-        return f"Count error: {e}"
-    finally:
-        await qdrant.close()
+    return "Document count not available via Cognee SDK."
 
 
 if __name__ == "__main__":
