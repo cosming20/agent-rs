@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-import uuid
+import uuid as uuid_mod
 
 from fastapi import APIRouter, Request
 from haystack import Document
@@ -34,7 +34,7 @@ class IngestResponse(BaseModel):
 
     ingested_count: int
     chunk_count: int
-    parsed_document_id: uuid.UUID
+    parsed_document_id: uuid_mod.UUID
     collection: str
     index: str
 
@@ -91,7 +91,7 @@ async def ingest_endpoint(request: Request, body: IngestRequest) -> IngestRespon
     # Store in Qdrant (vector search)
     points = [
         qdrant_models.PointStruct(
-            id=idx,
+            id=str(uuid_mod.uuid4()),
             vector=doc.embedding,
             payload={
                 "content": doc.content,
@@ -111,10 +111,10 @@ async def ingest_endpoint(request: Request, body: IngestRequest) -> IngestRespon
         )
 
     # Store in OpenSearch (keyword/BM25 search)
-    for idx, doc in enumerate(embedded):
+    for doc in embedded:
         await pipeline.opensearch._client.index(
             index="documents",
-            id=str(idx),
+            id=str(uuid_mod.uuid4()),
             body={
                 "content": doc.meta.get("chunk_text", doc.content),
                 "parsed_document_id": doc.meta.get("parsed_document_id", ""),

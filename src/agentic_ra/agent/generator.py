@@ -49,7 +49,7 @@ class LLMGenerator:
 
     def __init__(
         self,
-        model: str = "gpt-5.4-mini",
+        model: str = "gpt-5.4-mini-2026-03-17",
         api_key: str = "",
         temperature: float = 0.1,
         max_tokens: int = 1024,
@@ -60,12 +60,12 @@ class LLMGenerator:
         self._generator = OpenAIChatGenerator(
             model=model,
             api_key=api_secret,
-            generation_kwargs={"temperature": temperature, "max_tokens": max_tokens},
+            generation_kwargs={"temperature": temperature, "max_completion_tokens": max_tokens},
         )
         self._rewriter = OpenAIChatGenerator(
             model=model,
             api_key=api_secret,
-            generation_kwargs={"temperature": 0.0, "max_tokens": 256},
+            generation_kwargs={"temperature": 0.0, "max_completion_tokens": 256},
         )
 
     def generate_answer(

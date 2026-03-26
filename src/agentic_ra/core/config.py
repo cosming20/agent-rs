@@ -61,7 +61,7 @@ class Settings(BaseSettings):
 
     # --- OpenAI ---
     openai_api_key: SecretStr
-    llm_model: str = "gpt-5.4-mini"
+    llm_model: str = "gpt-5.4-mini-2026-03-17"
 
     # --- Embedding + Chunking (Docling) ---
     embedding_model: str = "text-embedding-3-small"
