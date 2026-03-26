@@ -17,7 +17,7 @@ class Citation:
     Attributes:
         index: Citation number (1-based).
         content_snippet: Relevant excerpt from the source document.
-        source: Origin of the evidence (e.g., "qdrant", "opensearch").
+        source: Origin of the evidence (e.g., "cognee_graph", "cognee_chunks").
         score: Relevance score from retrieval.
     """
 
@@ -109,7 +109,7 @@ class ResponseSynthesizer:
         citations: list[Citation] = []
         for idx, doc in enumerate(evidence, start=1):
             content = doc.content or ""
-            snippet = content[:self._max_snippet]
+            snippet = content[: self._max_snippet]
             if len(content) > self._max_snippet:
                 snippet += "..."
 

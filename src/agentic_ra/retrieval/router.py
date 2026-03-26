@@ -67,24 +67,38 @@ class RetrievalRouter:
         try:
             if strategy == RetrievalStrategy.SEMANTIC:
                 return await self._cognee.search(
-                    query=query, search_type="CHUNKS", top_k=limit
+                    query=query, search_type="CHUNKS", top_k=limit, only_context=True
                 )
 
             if strategy == RetrievalStrategy.KEYWORD:
                 return await self._cognee.search(
-                    query=query, search_type="CHUNKS_LEXICAL", top_k=limit
+                    query=query,
+                    search_type="CHUNKS_LEXICAL",
+                    top_k=limit,
+                    only_context=True,
                 )
 
             if strategy == RetrievalStrategy.GRAPH:
                 return await self._cognee.search(
-                    query=query, search_type="GRAPH_COMPLETION", top_k=limit
+                    query=query,
+                    search_type="GRAPH_COMPLETION",
+                    top_k=limit,
+                    only_context=True,
                 )
 
             if strategy == RetrievalStrategy.HYBRID:
                 semantic_results, keyword_results = await asyncio.gather(
-                    self._cognee.search(query=query, search_type="CHUNKS", top_k=limit),
                     self._cognee.search(
-                        query=query, search_type="CHUNKS_LEXICAL", top_k=limit
+                        query=query,
+                        search_type="CHUNKS",
+                        top_k=limit,
+                        only_context=True,
+                    ),
+                    self._cognee.search(
+                        query=query,
+                        search_type="CHUNKS_LEXICAL",
+                        top_k=limit,
+                        only_context=True,
                     ),
                 )
                 return semantic_results + keyword_results
@@ -92,11 +106,22 @@ class RetrievalRouter:
             # GRAPH_HYBRID: triple fusion
             graph_results, semantic_results, keyword_results = await asyncio.gather(
                 self._cognee.search(
-                    query=query, search_type="GRAPH_COMPLETION", top_k=limit
+                    query=query,
+                    search_type="GRAPH_COMPLETION",
+                    top_k=limit,
+                    only_context=True,
                 ),
-                self._cognee.search(query=query, search_type="CHUNKS", top_k=limit),
                 self._cognee.search(
-                    query=query, search_type="CHUNKS_LEXICAL", top_k=limit
+                    query=query,
+                    search_type="CHUNKS",
+                    top_k=limit,
+                    only_context=True,
+                ),
+                self._cognee.search(
+                    query=query,
+                    search_type="CHUNKS_LEXICAL",
+                    top_k=limit,
+                    only_context=True,
                 ),
             )
             return graph_results + semantic_results + keyword_results

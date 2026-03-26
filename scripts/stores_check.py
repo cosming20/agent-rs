@@ -3,10 +3,10 @@
 import asyncio
 
 import sqlalchemy
+from qdrant_client import AsyncQdrantClient
 
 from agentic_ra.core.config import get_settings
 from agentic_ra.stores.postgres.client import PostgresClient
-from agentic_ra.stores.qdrant.client import QdrantStore
 
 
 async def check_neo4j(host: str, port: int) -> None:
@@ -25,10 +25,10 @@ async def main() -> None:
     print("  Postgres OK")
     await pg.close()
 
-    q = QdrantStore(url=s.qdrant_url, api_key=s.qdrant_api_key)
-    await q._client.get_collections()
+    qdrant = AsyncQdrantClient(url=s.qdrant_url, api_key=s.qdrant_api_key or None)
+    await qdrant.get_collections()
+    await qdrant.close()
     print("  Qdrant OK")
-    await q.close()
 
     await check_neo4j(s.neo4j_host, s.neo4j_bolt_port)
     print("  Neo4j OK")

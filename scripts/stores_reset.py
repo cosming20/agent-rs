@@ -2,21 +2,28 @@
 
 import asyncio
 
+from qdrant_client import AsyncQdrantClient
+from qdrant_client.models import Distance, VectorParams
+
 from agentic_ra.core.config import get_settings
 from agentic_ra.stores.cognee.client import CogneeStore
-from agentic_ra.stores.qdrant.client import QdrantStore
 
 
 async def main() -> None:
     s = get_settings()
 
-    q = QdrantStore(url=s.qdrant_url, api_key=s.qdrant_api_key)
+    qdrant = AsyncQdrantClient(url=s.qdrant_url, api_key=s.qdrant_api_key or None)
     try:
-        await q._client.delete_collection("documents")
+        await qdrant.delete_collection("documents")
     except Exception:
         pass
-    await q.ensure_collection("documents", vector_size=s.embedding_dimension)
-    await q.close()
+    await qdrant.create_collection(
+        collection_name="documents",
+        vectors_config=VectorParams(
+            size=s.embedding_dimension, distance=Distance.COSINE
+        ),
+    )
+    await qdrant.close()
     print(f"  Qdrant collection reset ({s.embedding_dimension} dims)")
 
     cognee_store = CogneeStore(dataset=s.cognee_dataset)
