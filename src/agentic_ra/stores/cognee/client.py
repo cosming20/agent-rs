@@ -244,11 +244,13 @@ class CogneeStore:
         search_type: str = "GRAPH_COMPLETION",
         top_k: int = 10,
         dataset: str | None = None,
-        only_context: bool = True,
     ) -> list[Document]:
         """Search the knowledge graph and return Haystack Documents.
 
-        Bridges Cognee search results into our retrieval pipeline format.
+        Uses ``only_context=False`` so Cognee returns individual result
+        objects (dicts with ``text``, ``id``, etc.) instead of a single
+        concatenated string.  This preserves per-result granularity for
+        ranking, evidence attribution, and prevents context-length overflow.
 
         Args:
             query: Search query text.
@@ -256,9 +258,6 @@ class CogneeStore:
                 TRIPLET_COMPLETION, SUMMARIES, etc.).
             top_k: Maximum results.
             dataset: Override dataset name.
-            only_context: When True (default), Cognee returns raw context chunks
-                without calling its own LLM. Must be True so our orchestrator
-                generates the final answer, not Cognee.
 
         Returns:
             List of Haystack Documents with graph search results.
@@ -272,7 +271,7 @@ class CogneeStore:
                 query_type=st,
                 datasets=[ds],
                 top_k=top_k,
-                only_context=only_context,
+                only_context=False,
             )
 
             documents: list[Document] = []
@@ -314,9 +313,14 @@ class CogneeStore:
     def _extract_content(result: object) -> str:
         """Extract text content from a Cognee search result.
 
-        Cognee returns different result shapes depending on SearchType.
-        This normalizes them all to plain text.
+        With ``only_context=False``, Cognee returns dicts for CHUNKS/LEXICAL
+        (with ``text`` key) and structured objects for GRAPH_COMPLETION.
+        This normalizes all shapes to plain text.
         """
+        # Dict results (CHUNKS, CHUNKS_LEXICAL with only_context=False)
+        if isinstance(result, dict):
+            return str(result.get("text", result.get("content", "")))
+
         if isinstance(result, str):
             return result
 
