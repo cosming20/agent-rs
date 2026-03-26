@@ -14,13 +14,16 @@ source = { editable = "." }
 dependencies = [
     { name = "alembic" },
     { name = "asyncpg" },
+    { name = "fastapi" },
     { name = "haystack-ai" },
+    { name = "httpx" },
     { name = "mcp" },
     { name = "opensearch-py", extra = ["async"] },
     { name = "pydantic-settings" },
     { name = "qdrant-client" },
     { name = "sentence-transformers" },
     { name = "sqlalchemy", extra = ["asyncio"] },
+    { name = "uvicorn" },
 ]
 
 [package.dev-dependencies]
@@ -33,13 +36,16 @@ dev = [
 requires-dist = [
     { name = "alembic", specifier = ">=1.15" },
     { name = "asyncpg", specifier = ">=0.30" },
+    { name = "fastapi", specifier = ">=0.115" },
     { name = "haystack-ai", specifier = ">=2.13" },
+    { name = "httpx", specifier = ">=0.28" },
     { name = "mcp", specifier = ">=1.12" },
     { name = "opensearch-py", extras = ["async"], specifier = ">=2.8" },
     { name = "pydantic-settings", specifier = ">=2.9" },
     { name = "qdrant-client", specifier = ">=1.13" },
     { name = "sentence-transformers", specifier = ">=4.1" },
     { name = "sqlalchemy", extras = ["asyncio"], specifier = ">=2.0" },
+    { name = "uvicorn", specifier = ">=0.34" },
 ]
 
 [package.metadata.requires-dev]
@@ -564,6 +570,22 @@ version = "0.5"
 source = { registry = "https://pypi.org/simple" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/25/ed/e47dec0626edd468c84c04d97769e7ab4ea6457b7f54dcb3f72b17fcd876/Events-0.5-py3-none-any.whl", hash = "sha256:a7286af378ba3e46640ac9825156c93bdba7502174dd696090fdfcd4d80a1abd", size = 6758, upload-time = "2023-07-31T08:23:13.645Z" },
+]
+
+[[package]]
+name = "fastapi"
+version = "0.135.2"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "annotated-doc" },
+    { name = "pydantic" },
+    { name = "starlette" },
+    { name = "typing-extensions" },
+    { name = "typing-inspection" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/c4/73/5903c4b13beae98618d64eb9870c3fac4f605523dd0312ca5c80dadbd5b9/fastapi-0.135.2.tar.gz", hash = "sha256:88a832095359755527b7f63bb4c6bc9edb8329a026189eed83d6c1afcf419d56", size = 395833, upload-time = "2026-03-23T14:12:41.697Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/8f/ea/18f6d0457f9efb2fc6fa594857f92810cadb03024975726db6546b3d6fcf/fastapi-0.135.2-py3-none-any.whl", hash = "sha256:0af0447d541867e8db2a6a25c23a8c4bd80e2394ac5529bd87501bbb9e240ca5", size = 117407, upload-time = "2026-03-23T14:12:43.284Z" },
 ]
 
 [[package]]

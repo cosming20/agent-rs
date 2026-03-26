@@ -94,3 +94,15 @@ class ToolError(AgenticRAError):
 
 class MCPClientError(ToolError):
     """MCP client connection or invocation failure."""
+
+
+class AuthError(AgenticRAError):
+    """Base for authentication/authorization failures."""
+
+
+class OPAError(AuthError):
+    """OPA policy evaluation failure."""
+
+
+class GatewayError(AgenticRAError):
+    """API gateway failure."""
