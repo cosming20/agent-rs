@@ -3,12 +3,13 @@
 from __future__ import annotations
 
 import logging
-from typing import Any
 
 from haystack.components.agents import Agent
 from haystack.components.generators.chat import OpenAIChatGenerator
 from haystack.tools import Tool
 from haystack.utils import Secret
+
+from agentic_ra.agent.tools import ToolConfig
 
 logger = logging.getLogger(__name__)
 
@@ -38,7 +39,7 @@ def build_agent(
     *,
     model: str,
     api_key: str,
-    tools_config: list[dict[str, Any]],
+    tools_config: list[ToolConfig],
     max_steps: int = 10,
     system_prompt: str = _SYSTEM_PROMPT,
 ) -> Agent:

@@ -135,13 +135,13 @@ class GroundingVerifier:
 
         messages = [
             ChatMessage.from_system(_VERIFICATION_PROMPT),
-            ChatMessage.from_user(
-                f"EVIDENCE:\n{evidence_text}\n\nANSWER:\n{answer}"
-            ),
+            ChatMessage.from_user(f"EVIDENCE:\n{evidence_text}\n\nANSWER:\n{answer}"),
         ]
 
         if self._llm is None:
-            raise VerificationError("LLM verifier not configured", operation="verify_llm")
+            raise VerificationError(
+                "LLM verifier not configured", operation="verify_llm"
+            )
         try:
             result = self._llm.run(messages=messages)
             replies: list[ChatMessage] = result["replies"]
@@ -179,7 +179,8 @@ class GroundingVerifier:
 
         if not answer_tokens:
             return VerificationResult(
-                is_grounded=False, confidence=0.0,
+                is_grounded=False,
+                confidence=0.0,
                 reasoning="Answer contains no tokens.",
             )
 

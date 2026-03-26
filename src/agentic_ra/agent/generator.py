@@ -55,12 +55,19 @@ class LLMGenerator:
         max_tokens: int = 1024,
     ) -> None:
         self._model = model
-        api_secret = Secret.from_token(api_key) if api_key else Secret.from_env_var("OPENAI_API_KEY")
+        api_secret = (
+            Secret.from_token(api_key)
+            if api_key
+            else Secret.from_env_var("OPENAI_API_KEY")
+        )
 
         self._generator = OpenAIChatGenerator(
             model=model,
             api_key=api_secret,
-            generation_kwargs={"temperature": temperature, "max_completion_tokens": max_tokens},
+            generation_kwargs={
+                "temperature": temperature,
+                "max_completion_tokens": max_tokens,
+            },
         )
         self._rewriter = OpenAIChatGenerator(
             model=model,
@@ -140,14 +147,14 @@ class LLMGenerator:
         context = ""
         if conversation_history:
             recent = conversation_history[-4:]
-            context = "\n".join(
-                f"{m['role']}: {m['content'][:200]}" for m in recent
-            )
+            context = "\n".join(f"{m['role']}: {m['content'][:200]}" for m in recent)
             context = f"Conversation context:\n{context}\n\n"
 
-        messages.append(ChatMessage.from_user(
-            f"{context}Original query: {query}\n\nRewritten query:"
-        ))
+        messages.append(
+            ChatMessage.from_user(
+                f"{context}Original query: {query}\n\nRewritten query:"
+            )
+        )
 
         try:
             result = self._rewriter.run(messages=messages)

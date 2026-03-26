@@ -2,16 +2,19 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import time
 import uuid
 from typing import Any
 
+from haystack import Document
 from haystack.components.agents import Agent
 from haystack.dataclasses import ChatMessage
 
 from agentic_ra.agent.memory import MemoryStore
 from agentic_ra.agent.synthesis import ResponseSynthesizer, SynthesizedResponse
+from agentic_ra.agent.tools import get_evidence_buffer, reset_evidence_buffer
 from agentic_ra.agent.verifier import GroundingVerifier
 from agentic_ra.core.errors import OrchestratorError
 from agentic_ra.observability.metrics import RAGMetrics
@@ -82,14 +85,21 @@ class AgentOrchestrator:
                     chat_messages.append(ChatMessage.from_user(msg.content))
                 elif msg.role == MessageRole.ASSISTANT:
                     chat_messages.append(ChatMessage.from_assistant(msg.content))
-            chat_messages.append(ChatMessage.from_user(query))
+            # Inject strategy hint into the user message
+            hint = (
+                f"\n\n[System hint: prefer '{strategy}' search strategy for this query]"
+            )
+            chat_messages.append(ChatMessage.from_user(query + hint))
 
-            # 3. Run Haystack Agent
-            agent_result = self._agent.run(messages=chat_messages)
+            # 3. Run Haystack Agent (offloaded to thread — Agent.run is sync)
+            reset_evidence_buffer()
+            agent_result = await asyncio.to_thread(
+                self._agent.run, messages=chat_messages
+            )
 
             # 4. Extract answer and evidence
             answer = self._extract_answer(agent_result)
-            evidence = self._extract_evidence(agent_result)
+            evidence: list[Document] = get_evidence_buffer()
             elapsed_ms = (time.monotonic() - start) * 1000
 
             if self._metrics:
@@ -126,9 +136,12 @@ class AgentOrchestrator:
                     ChatMessage.from_assistant(answer),
                     feedback,
                 ]
-                agent_result = self._agent.run(messages=retry_messages)
+                reset_evidence_buffer()
+                agent_result = await asyncio.to_thread(
+                    self._agent.run, messages=retry_messages
+                )
                 answer = self._extract_answer(agent_result)
-                evidence = self._extract_evidence(agent_result)
+                evidence = get_evidence_buffer()
                 verification = self._verifier.verify(answer=answer, evidence=evidence)
 
             # 7. Synthesize citations
@@ -190,20 +203,3 @@ class AgentOrchestrator:
             if msg.role.value == "assistant" and msg.text and not msg.tool_calls:
                 return msg.text
         return "I was unable to generate an answer."
-
-    @staticmethod
-    def _extract_evidence(agent_result: dict[str, Any]) -> list[Any]:
-        """Extract evidence from agent tool call results."""
-        from haystack import Document
-
-        evidence: list[Document] = []
-        messages: list[ChatMessage] = agent_result.get("messages", [])
-        for msg in messages:
-            # Tool results appear as ChatMessage with role "tool"
-            if msg.role.value == "tool" and msg.text:
-                # The tool returned formatted text -- wrap as evidence document
-                if "[1]" in msg.text or "(source=" in msg.text:
-                    evidence.append(
-                        Document(content=msg.text, meta={"source": "agent_tool"})
-                    )
-        return evidence

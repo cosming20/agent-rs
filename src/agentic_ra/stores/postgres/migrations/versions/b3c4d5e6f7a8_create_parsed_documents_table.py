@@ -23,7 +23,9 @@ def upgrade() -> None:
         "parsed_documents",
         sa.Column("id", sa.Uuid(), nullable=False),
         sa.Column("source_path", sa.Text(), nullable=False),
-        sa.Column("docling_json", postgresql.JSONB(astext_type=sa.Text()), nullable=False),
+        sa.Column(
+            "docling_json", postgresql.JSONB(astext_type=sa.Text()), nullable=False
+        ),
         sa.Column("chunk_count", sa.Integer(), nullable=False),
         sa.Column("metadata", postgresql.JSONB(astext_type=sa.Text()), nullable=False),
         sa.Column(
@@ -43,5 +45,7 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
-    op.drop_index(op.f("ix_parsed_documents_source_path"), table_name="parsed_documents")
+    op.drop_index(
+        op.f("ix_parsed_documents_source_path"), table_name="parsed_documents"
+    )
     op.drop_table("parsed_documents")

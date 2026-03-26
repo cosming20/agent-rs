@@ -90,7 +90,11 @@ async def ingest_endpoint(request: Request, body: IngestRequest) -> IngestRespon
                 len(body.documents),
             )
         except Exception:
-            logger.exception("Cognee add+cognify failed")
+            # Intentional partial success: DoclingDocument JSON is saved in Postgres
+            # for provenance. Cognee graph/vector ingestion failed but can be retried
+            # later by re-running ingest. This prevents total ingestion failure when
+            # Cognee/Neo4j/Qdrant is temporarily unavailable.
+            logger.exception("Cognee add+cognify failed (non-fatal -- Postgres saved)")
     else:
         logger.warning("CogneeStore not configured — skipping graph+vector ingestion")
 

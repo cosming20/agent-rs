@@ -11,6 +11,7 @@ from agentic_ra.agent.orchestrator import AgentOrchestrator
 from agentic_ra.agent.synthesis import ResponseSynthesizer
 from agentic_ra.agent.tools import (
     make_ingest_tool,
+    make_remember_tool,
     make_search_knowledge_tool,
     make_search_web_tool,
 )
@@ -116,7 +117,14 @@ def build_pipeline(settings: Settings) -> RAGPipeline:
         )
 
     # --- Retrieval router (Cognee-only: graph + vector + lexical) ---
-    router = RetrievalRouter(cognee_store=cognee_store)  # type: ignore[arg-type]
+    if cognee_store is None:
+        from agentic_ra.core.errors import ConfigError
+
+        raise ConfigError(
+            "Cognee is the sole retrieval backend — cognee_enabled must be True"
+        )
+
+    router = RetrievalRouter(cognee_store=cognee_store)
 
     ranker = ResultRanker()
 
@@ -134,9 +142,9 @@ def build_pipeline(settings: Settings) -> RAGPipeline:
     tools_config = [
         make_search_knowledge_tool(router, ranker),
         make_search_web_tool(),
+        make_ingest_tool(cognee_store),
+        make_remember_tool(memory, "default"),
     ]
-    if cognee_store is not None:
-        tools_config.append(make_ingest_tool(cognee_store))
 
     # Build Haystack Agent
     agent = build_agent(

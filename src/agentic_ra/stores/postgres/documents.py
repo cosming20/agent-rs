@@ -77,9 +77,14 @@ class DocumentStore:
             The ParsedDocument if found, None otherwise.
         """
         try:
-            stmt = select(ParsedDocument).where(
-                ParsedDocument.source_path == source_path,
-            ).order_by(ParsedDocument.created_at.desc()).limit(1)
+            stmt = (
+                select(ParsedDocument)
+                .where(
+                    ParsedDocument.source_path == source_path,
+                )
+                .order_by(ParsedDocument.created_at.desc())
+                .limit(1)
+            )
             async with self._pg.session() as session:
                 result = await session.execute(stmt)
                 entry = result.scalar_one_or_none()

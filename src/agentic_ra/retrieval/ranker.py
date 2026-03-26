@@ -83,9 +83,7 @@ class ResultRanker:
                             "Document missing 'score' in meta, defaulting to 0.0",
                             extra={"source": source, "doc_id": doc.id},
                         )
-                source_docs.sort(
-                    key=lambda d: d.meta.get("score", 0.0), reverse=True
-                )
+                source_docs.sort(key=lambda d: d.meta.get("score", 0.0), reverse=True)
 
             # Compute RRF scores — dedup key uses doc.id for empty content
             rrf_scores: dict[str, float] = defaultdict(float)

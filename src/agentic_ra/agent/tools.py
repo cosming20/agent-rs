@@ -1,17 +1,18 @@
 """High-level tool functions for the Haystack Agent.
 
-Each ``make_*`` factory returns a dict with ``name``, ``description``,
-``function`` (sync callable), and ``parameters`` (JSON Schema).  Haystack's
-``Tool`` class expects synchronous callables, so internal async operations
-(Cognee, Postgres) are bridged via ``_run_async``.
+Each ``make_*`` factory returns a ``ToolConfig`` dict with ``name``,
+``description``, ``function`` (sync callable), and ``parameters``
+(JSON Schema).  Haystack's ``Tool`` class expects synchronous callables,
+so internal async operations (Cognee, Postgres) are bridged via
+``_run_async`` using a dedicated background event loop.
 """
 
 from __future__ import annotations
 
 import asyncio
-import concurrent.futures
 import logging
-from typing import Any
+import threading
+from typing import Any, TypedDict
 
 from haystack import Document
 
@@ -21,6 +22,38 @@ from agentic_ra.retrieval.router import RetrievalRouter, RetrievalStrategy
 
 logger = logging.getLogger(__name__)
 
+
+# ---------------------------------------------------------------------------
+# Tool config type
+# ---------------------------------------------------------------------------
+
+
+class ToolConfig(TypedDict):
+    """Descriptor returned by each ``make_*`` tool factory."""
+
+    name: str
+    description: str
+    function: Any  # Callable — can't be more specific due to varying signatures
+    parameters: dict[str, Any]
+
+
+# ---------------------------------------------------------------------------
+# Module-level evidence accumulator — reset per agent run
+# ---------------------------------------------------------------------------
+
+_evidence_buffer: list[Document] = []
+
+
+def reset_evidence_buffer() -> None:
+    """Clear evidence buffer. Call before each agent run."""
+    _evidence_buffer.clear()
+
+
+def get_evidence_buffer() -> list[Document]:
+    """Get accumulated evidence documents from search_knowledge tool calls."""
+    return list(_evidence_buffer)
+
+
 # ---------------------------------------------------------------------------
 # Internal helpers
 # ---------------------------------------------------------------------------
@@ -28,24 +61,36 @@ logger = logging.getLogger(__name__)
 _MAX_EVIDENCE_CHARS = 4000
 """Soft cap on formatted evidence text sent back to the LLM."""
 
+_TOOL_LOOP: asyncio.AbstractEventLoop | None = None
+_TOOL_THREAD: threading.Thread | None = None
+
+
+def _get_tool_loop() -> asyncio.AbstractEventLoop:
+    """Get or create a dedicated event loop for tool async operations."""
+    global _TOOL_LOOP, _TOOL_THREAD  # noqa: PLW0603
+    if _TOOL_LOOP is None or _TOOL_LOOP.is_closed():
+        _TOOL_LOOP = asyncio.new_event_loop()
+        _TOOL_THREAD = threading.Thread(target=_TOOL_LOOP.run_forever, daemon=True)
+        _TOOL_THREAD.start()
+    return _TOOL_LOOP
+
 
 def _run_async(coro: Any) -> Any:
-    """Bridge an async coroutine into a synchronous context.
+    """Bridge async to sync using a dedicated background event loop.
 
-    Works both outside an event loop (calls ``asyncio.run``) and inside one
-    (e.g. when FastAPI is driving the loop) by offloading to a background
-    thread.
+    When called from inside an existing event loop (e.g. FastAPI/uvicorn),
+    uses a persistent background thread+loop to avoid spawning a new thread
+    per call. When no loop is running, falls back to ``asyncio.run``.
     """
     try:
         asyncio.get_running_loop()
+        # Inside an existing loop (FastAPI) — use dedicated background loop
+        loop = _get_tool_loop()
+        future = asyncio.run_coroutine_threadsafe(coro, loop)
+        return future.result(timeout=120)
     except RuntimeError:
-        # No running loop -- safe to use asyncio.run directly.
+        # No running loop — safe to use asyncio.run
         return asyncio.run(coro)
-
-    # Already inside an event loop (FastAPI/uvicorn).  Run the coroutine
-    # in a fresh loop on a worker thread to avoid blocking.
-    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
-        return pool.submit(asyncio.run, coro).result()
 
 
 def _format_evidence(documents: list[Document] | tuple[Document, ...]) -> str:
@@ -95,7 +140,7 @@ def _format_evidence(documents: list[Document] | tuple[Document, ...]) -> str:
 def make_search_knowledge_tool(
     router: RetrievalRouter,
     ranker: ResultRanker,
-) -> dict[str, Any]:
+) -> ToolConfig:
     """Create the ``search_knowledge`` tool for the Haystack Agent.
 
     Searches the knowledge base using the retrieval router and ranker,
@@ -131,6 +176,7 @@ def make_search_knowledge_tool(
                 strategy=retrieval_strategy.value,
             )
             formatted = _format_evidence(evidence_pack.documents)
+            _evidence_buffer.extend(evidence_pack.documents)
 
             logger.info(
                 "search_knowledge returned %d documents (strategy=%s)",
@@ -181,7 +227,7 @@ def make_search_knowledge_tool(
     }
 
 
-def make_search_web_tool() -> dict[str, Any]:
+def make_search_web_tool() -> ToolConfig:
     """Create the ``search_web`` tool stub.
 
     Web search integration is not yet implemented. The tool returns a
@@ -218,7 +264,7 @@ def make_search_web_tool() -> dict[str, Any]:
 
 def make_ingest_tool(
     cognee_store: Any,  # CogneeStore -- typed as Any to avoid circular import
-) -> dict[str, Any]:
+) -> ToolConfig:
     """Create the ``ingest_document`` tool for the Haystack Agent.
 
     Ingests text into the Cognee knowledge graph via ``add_and_cognify``.
@@ -289,7 +335,7 @@ def make_ingest_tool(
 def make_remember_tool(
     memory_store: Any,  # MemoryStore -- typed as Any to avoid circular import
     user_id: str,
-) -> dict[str, Any]:
+) -> ToolConfig:
     """Create the ``remember`` tool for the Haystack Agent.
 
     Provides save, get, and list operations on long-term user memory.

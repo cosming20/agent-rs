@@ -8,6 +8,7 @@ from fastapi import APIRouter, Request
 from pydantic import BaseModel, Field
 
 from agentic_ra.pipelines.factory import RAGPipeline
+from agentic_ra.retrieval.router import RetrievalStrategy
 
 router = APIRouter(prefix="/api/v1", tags=["query"])
 
@@ -22,9 +23,9 @@ class QueryRequest(BaseModel):
         default=None, description="Session ID for conversation continuity"
     )
     user_id: str = Field(default="anonymous", description="User identifier")
-    strategy: str = Field(
-        default="hybrid",
-        description="Retrieval strategy hint (semantic, keyword, hybrid, graph, graph_hybrid)",
+    strategy: RetrievalStrategy = Field(
+        default=RetrievalStrategy.HYBRID,
+        description="Retrieval strategy (semantic, keyword, hybrid, graph, graph_hybrid)",
     )
     limit: int = Field(default=10, ge=1, le=100, description="Max evidence documents")
 
@@ -65,7 +66,7 @@ async def query_endpoint(request: Request, body: QueryRequest) -> QueryResponse:
         query=body.query,
         session_id=session_id,
         user_id=body.user_id,
-        strategy=body.strategy,
+        strategy=body.strategy.value,
         limit=body.limit,
     )
 

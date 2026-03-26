@@ -33,9 +33,6 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     pipeline = build_pipeline(settings)
     app.state.pipeline = pipeline
 
-    opa_client = OPAClient(base_url=settings.opa_url)
-    app.state.opa_client = opa_client
-
     logger.info("Warming up embedding models...")
     pipeline.embedding_pipeline.warm_up()
     logger.info("Embedding models ready")
@@ -44,7 +41,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
 
     # Shutdown — close all components, tolerating individual failures
     logger.info("Shutting down RAG pipeline...")
-    for close_fn in [opa_client.close, pipeline.close]:
+    for close_fn in [pipeline.close]:
         try:
             await close_fn()
         except Exception:
@@ -70,7 +67,7 @@ def create_app() -> FastAPI:
     app.include_router(query_router)
     app.include_router(ingest_router)
 
-    # OPA middleware uses settings — single client, properly closed in lifespan
+    # OPA middleware — single client, lifecycle managed by middleware
     app.add_middleware(
         OPAAuthMiddleware,
         opa_client=OPAClient(base_url=settings.opa_url),

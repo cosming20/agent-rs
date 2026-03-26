@@ -95,7 +95,9 @@ class RAGMetrics:
         """Record a query with its strategy."""
         self.query_count.add(1, {"strategy": strategy})
 
-    def record_retrieval(self, latency_ms: float, doc_count: int, strategy: str) -> None:
+    def record_retrieval(
+        self, latency_ms: float, doc_count: int, strategy: str
+    ) -> None:
         """Record retrieval performance metrics."""
         self.retrieval_latency.record(latency_ms, {"strategy": strategy})
         self.retrieval_doc_count.record(doc_count, {"strategy": strategy})

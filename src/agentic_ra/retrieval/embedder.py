@@ -83,7 +83,9 @@ class EmbeddingPipeline:
         )
         self._embedder = OpenAIDocumentEmbedder(
             model=model,
-            api_key=Secret.from_token(api_key) if api_key else Secret.from_env_var("OPENAI_API_KEY"),
+            api_key=Secret.from_token(api_key)
+            if api_key
+            else Secret.from_env_var("OPENAI_API_KEY"),
             dimensions=dimension,
             batch_size=batch_size,
         )
@@ -214,7 +216,9 @@ class EmbeddingPipeline:
             meta: dict[str, Any] = {
                 "headings": list(chunk_meta.headings) if chunk_meta.headings else [],
                 "captions": list(chunk_meta.captions) if chunk_meta.captions else [],
-                "doc_items_count": len(chunk_meta.doc_items) if chunk_meta.doc_items else 0,
+                "doc_items_count": len(chunk_meta.doc_items)
+                if chunk_meta.doc_items
+                else 0,
                 "chunk_text": chunk.text,
                 **extra_meta,
             }

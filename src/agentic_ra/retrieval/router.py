@@ -87,7 +87,7 @@ class RetrievalRouter:
                 )
 
             if strategy == RetrievalStrategy.HYBRID:
-                semantic_results, keyword_results = await asyncio.gather(
+                results = await asyncio.gather(
                     self._cognee.search(
                         query=query,
                         search_type="CHUNKS",
@@ -100,11 +100,12 @@ class RetrievalRouter:
                         top_k=limit,
                         only_context=True,
                     ),
+                    return_exceptions=True,
                 )
-                return semantic_results + keyword_results
+                return self._collect_results(list(results), "hybrid")
 
             # GRAPH_HYBRID: triple fusion
-            graph_results, semantic_results, keyword_results = await asyncio.gather(
+            triple_results = await asyncio.gather(
                 self._cognee.search(
                     query=query,
                     search_type="GRAPH_COMPLETION",
@@ -123,8 +124,9 @@ class RetrievalRouter:
                     top_k=limit,
                     only_context=True,
                 ),
+                return_exceptions=True,
             )
-            return graph_results + semantic_results + keyword_results
+            return self._collect_results(list(triple_results), "graph_hybrid")
 
         except (RoutingError, CogneeError):
             raise
@@ -135,3 +137,17 @@ class RetrievalRouter:
                 operation="retrieve",
                 original_error=str(e),
             ) from e
+
+    @staticmethod
+    def _collect_results(
+        results: list[list[Document] | BaseException],
+        strategy_name: str,
+    ) -> list[Document]:
+        """Filter exceptions from ``asyncio.gather(return_exceptions=True)``."""
+        combined: list[Document] = []
+        for r in results:
+            if isinstance(r, BaseException):
+                logger.warning("Search failed in %s strategy: %s", strategy_name, r)
+            else:
+                combined.extend(r)
+        return combined
