@@ -54,6 +54,7 @@ class OPAAuthMiddleware(BaseHTTPMiddleware):
             "path": request.url.path,
             "headers": dict(request.headers),
             "user": request.headers.get("x-user-id", "anonymous"),
+            "role": request.headers.get("X-User-Role", "user"),
         }
 
         try:

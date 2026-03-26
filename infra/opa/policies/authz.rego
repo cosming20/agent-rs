@@ -1,37 +1,44 @@
 # ============================================================
-# Agentic RAG — Authorization Policy
+# Agentic RAG — RBAC Authorization Policy
 # ============================================================
-# OPA evaluates this policy on every request via the auth middleware.
-# Default: allow all (dev mode). Tighten for production.
+# Roles: admin (full access), user (own data only).
+# Data isolation is enforced at the tool/dataset level, not here.
+# OPA enforces endpoint-level access based on role.
 # ============================================================
 
 package authz
 
-# Dev mode: allow everything. Replace with real rules for production.
-default allow := true
+default allow := false
 
-# --- Production rules (uncomment to enforce) ---
+# Health and docs are always public
+allow if {
+    input.method == "GET"
+    input.path == "/health"
+}
+allow if {
+    input.method == "GET"
+    startswith(input.path, "/docs")
+}
+allow if {
+    input.method == "GET"
+    input.path == "/openapi.json"
+}
 
-# # Block anonymous users from API endpoints
-# deny if {
-#     input.user == "anonymous"
-#     startswith(input.path, "/api/")
-# }
+# Admin can do everything
+allow if {
+    input.role == "admin"
+}
 
-# # Always allow health checks
-# allow if {
-#     input.method == "GET"
-#     input.path == "/health"
-# }
+# Users can query (data isolation enforced at tool level)
+allow if {
+    input.role == "user"
+    input.method == "POST"
+    input.path == "/api/v1/query"
+}
 
-# # Allow authenticated users full API access
-# allow if {
-#     input.user != "anonymous"
-#     startswith(input.path, "/api/")
-# }
-
-# # Restrict ingestion to admin users
-# deny if {
-#     input.path == "/api/v1/ingest"
-#     input.user != "admin"
-# }
+# Users can ingest their own documents
+allow if {
+    input.role == "user"
+    input.method == "POST"
+    input.path == "/api/v1/ingest"
+}
