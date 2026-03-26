@@ -5,11 +5,13 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass
 
+from agentic_ra.agent.generator import LLMGenerator
 from agentic_ra.agent.memory import MemoryStore
 from agentic_ra.agent.orchestrator import AgentOrchestrator
 from agentic_ra.agent.synthesis import ResponseSynthesizer
 from agentic_ra.agent.verifier import GroundingVerifier
 from agentic_ra.core.config import Settings
+from agentic_ra.observability.metrics import RAGMetrics
 from agentic_ra.retrieval.embedder import EmbeddingPipeline
 from agentic_ra.retrieval.ranker import ResultRanker
 from agentic_ra.retrieval.router import QueryEmbedder, RetrievalRouter
@@ -116,15 +118,22 @@ def build_pipeline(settings: Settings) -> RAGPipeline:
 
     # --- Agent core ---
     memory = MemoryStore(pg_client=postgres)
+    generator = LLMGenerator(
+        model=settings.llm_model,
+        api_key=api_key,
+    )
     verifier = GroundingVerifier()
     synthesizer = ResponseSynthesizer()
+    metrics = RAGMetrics()
 
     orchestrator = AgentOrchestrator(
         memory=memory,
         router=router,
         ranker=ranker,
+        generator=generator,
         verifier=verifier,
         synthesizer=synthesizer,
+        metrics=metrics,
     )
 
     logger.info("RAG pipeline assembled successfully")

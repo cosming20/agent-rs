@@ -59,8 +59,11 @@ class Settings(BaseSettings):
     otel_collector_port: int = 1057
     jaeger_ui_port: int = 1058
 
-    # --- Embedding (OpenAI) + Chunking (Docling) ---
+    # --- OpenAI ---
     openai_api_key: SecretStr
+    llm_model: str = "gpt-5.4-mini"
+
+    # --- Embedding + Chunking (Docling) ---
     embedding_model: str = "text-embedding-3-small"
     embedding_dimension: int = 1536
     embedding_batch_size: int = 32
