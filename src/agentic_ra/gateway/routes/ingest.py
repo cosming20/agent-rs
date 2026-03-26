@@ -12,7 +12,7 @@ import asyncio
 import logging
 import uuid as uuid_mod
 
-from fastapi import APIRouter, Request
+from fastapi import APIRouter, Header, Request
 from haystack import Document
 from pydantic import BaseModel, Field
 
@@ -58,9 +58,14 @@ def _get_pipeline(request: Request) -> RAGPipeline:
 
 
 @router.post("/ingest", response_model=IngestResponse)
-async def ingest_endpoint(request: Request, body: IngestRequest) -> IngestResponse:
+async def ingest_endpoint(
+    request: Request,
+    body: IngestRequest,
+    x_user_id: str = Header(default="anonymous", alias="X-User-Id"),
+) -> IngestResponse:
     """Ingest documents: Docling parse → Cognee graph+vector."""
     pipeline = _get_pipeline(request)
+    dataset = f"user_{x_user_id}"
 
     docs = [Document(content=d.content, meta=d.metadata) for d in body.documents]
 
@@ -78,6 +83,7 @@ async def ingest_endpoint(request: Request, body: IngestRequest) -> IngestRespon
         docling_json=docling_json,
         chunk_count=chunk_result.chunk_count,
         metadata={"ingested_doc_count": len(body.documents)},
+        user_id=x_user_id,
     )
 
     # 3. Cognee: add + cognify (chunking, embedding → Qdrant, entities → Neo4j)
@@ -85,7 +91,7 @@ async def ingest_endpoint(request: Request, body: IngestRequest) -> IngestRespon
     if pipeline.cognee_store is not None:
         try:
             full_text = "\n\n".join(d.content for d in body.documents)
-            await pipeline.cognee_store.add_and_cognify(text=full_text)
+            await pipeline.cognee_store.add_and_cognify(text=full_text, dataset=dataset)
             cognee_ok = True
             logger.info(
                 "Cognee ingestion complete: %d docs → graph + vector",

@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import logging
-from typing import Any
 
 from haystack.components.agents import Agent
 from haystack.components.generators.chat import OpenAIChatGenerator

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import uuid
 
-from fastapi import APIRouter, Request
+from fastapi import APIRouter, Header, Request
 from pydantic import BaseModel, Field
 
 from agentic_ra.pipelines.factory import RAGPipeline
@@ -22,7 +22,6 @@ class QueryRequest(BaseModel):
     session_id: uuid.UUID | None = Field(
         default=None, description="Session ID for conversation continuity"
     )
-    user_id: str = Field(default="anonymous", description="User identifier")
     strategy: RetrievalStrategy = Field(
         default=RetrievalStrategy.HYBRID,
         description="Retrieval strategy (semantic, keyword, hybrid, graph, graph_hybrid)",
@@ -57,7 +56,12 @@ def _get_pipeline(request: Request) -> RAGPipeline:
 
 
 @router.post("/query", response_model=QueryResponse)
-async def query_endpoint(request: Request, body: QueryRequest) -> QueryResponse:
+async def query_endpoint(
+    request: Request,
+    body: QueryRequest,
+    x_user_id: str = Header(default="anonymous", alias="X-User-Id"),
+    x_user_role: str = Header(default="user", alias="X-User-Role"),
+) -> QueryResponse:
     """Process a RAG query through the full orchestrator pipeline."""
     pipeline = _get_pipeline(request)
     session_id = body.session_id or uuid.uuid4()
@@ -65,7 +69,8 @@ async def query_endpoint(request: Request, body: QueryRequest) -> QueryResponse:
     result = await pipeline.orchestrator.process_query(
         query=body.query,
         session_id=session_id,
-        user_id=body.user_id,
+        user_id=x_user_id,
+        role=x_user_role,
         strategy=body.strategy.value,
         limit=body.limit,
     )
