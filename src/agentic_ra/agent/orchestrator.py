@@ -16,6 +16,8 @@ from agentic_ra.observability.metrics import RAGMetrics
 from agentic_ra.retrieval.ranker import ResultRanker
 from agentic_ra.retrieval.router import RetrievalRouter, RetrievalStrategy
 from agentic_ra.stores.postgres.models import MessageRole
+from agentic_ra.stores.postgres.runs import RunStore
+from agentic_ra.tools.mcp_client import MCPToolClient
 
 logger = logging.getLogger(__name__)
 
@@ -46,6 +48,8 @@ class AgentOrchestrator:
         verifier: GroundingVerifier,
         synthesizer: ResponseSynthesizer,
         metrics: RAGMetrics | None = None,
+        mcp_client: MCPToolClient | None = None,
+        run_store: RunStore | None = None,
         max_retries: int = 1,
     ) -> None:
         self._memory = memory
@@ -55,6 +59,8 @@ class AgentOrchestrator:
         self._verifier = verifier
         self._synthesizer = synthesizer
         self._metrics = metrics
+        self._mcp = mcp_client
+        self._run_store = run_store
         self._max_retries = max_retries
 
     async def process_query(
@@ -120,7 +126,27 @@ class AgentOrchestrator:
                     retrieval_ms, len(evidence_pack.documents), strategy.value
                 )
 
-            # 5. Generate answer with LLM
+            # 5. If insufficient evidence, try MCP tools
+            if len(evidence_pack.documents) == 0 and self._mcp is not None:
+                logger.info("No retrieval results, invoking MCP tools for query: %s", query)
+                tool_result = await self._mcp.call_tool(
+                    "search_documents",
+                    {"query": rewritten_query, "limit": limit},
+                )
+                if tool_result.content and not tool_result.is_error:
+                    from haystack import Document
+                    tool_doc = Document(
+                        content=tool_result.content,
+                        meta={"source": "mcp_tool", "tool": tool_result.tool_name},
+                    )
+                    evidence_pack = self._ranker.rank(
+                        results=[tool_doc],
+                        query=rewritten_query,
+                        strategy="mcp",
+                        limit=limit,
+                    )
+
+            # 6. Generate answer with LLM
             answer = await asyncio.to_thread(
                 self._generator.generate_answer,
                 query,
@@ -187,7 +213,24 @@ class AgentOrchestrator:
                 strategy=strategy.value,
             )
 
-            # 9. Store assistant response in session memory
+            # 9. Persist pipeline run for auditing
+            if self._run_store:
+                await self._run_store.save(
+                    session_id=session_id,
+                    user_id=user_id,
+                    query=query,
+                    rewritten_query=rewritten_query,
+                    strategy=strategy.value,
+                    answer=response.answer,
+                    confidence=response.confidence,
+                    is_grounded=response.is_grounded,
+                    citation_count=len(response.citations),
+                    retrieval_ms=retrieval_ms,
+                    evidence_count=len(evidence_pack.documents),
+                    retries=retries,
+                )
+
+            # 10. Store assistant response in session memory
             await self._memory.add_message(
                 session_id=session_id,
                 role=MessageRole.ASSISTANT,

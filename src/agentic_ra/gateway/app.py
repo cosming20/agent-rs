@@ -8,7 +8,10 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 
+from agentic_ra.auth.opa import OPAClient
 from agentic_ra.core.config import get_settings
+from agentic_ra.core.logging import setup_logging
+from agentic_ra.gateway.middleware.auth import OPAAuthMiddleware
 from agentic_ra.gateway.routes.health import router as health_router
 from agentic_ra.gateway.routes.ingest import router as ingest_router
 from agentic_ra.gateway.routes.query import router as query_router
@@ -23,12 +26,16 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     """Application lifespan: build pipeline on startup, tear down on shutdown."""
     settings = get_settings()
 
+    # Setup structured logging
+    setup_logging(level="INFO")
+
     # Setup tracing
     tracer_provider = setup_tracing(settings)
 
     # Build the RAG pipeline
     pipeline = build_pipeline(settings)
     app.state.pipeline = pipeline
+    app.state.opa_client = OPAClient(base_url=settings.opa_url)
 
     # Warm up embedding models (sync, runs in main thread at startup)
     logger.info("Warming up embedding models...")
@@ -48,6 +55,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
 
     # Shutdown
     logger.info("Shutting down RAG pipeline...")
+    await app.state.opa_client.close()
     await pipeline.close()
     tracer_provider.shutdown()
     logger.info("Shutdown complete")
@@ -71,5 +79,13 @@ def create_app() -> FastAPI:
     app.include_router(health_router)
     app.include_router(query_router)
     app.include_router(ingest_router)
+
+    # OPA auth middleware — disabled by default in dev (OPA may not be running).
+    # Set OPA_AUTH_ENABLED=true in .env to enforce authorization.
+    app.add_middleware(
+        OPAAuthMiddleware,
+        opa_client=OPAClient(base_url="http://localhost:1055"),
+        enabled=False,
+    )
 
     return app

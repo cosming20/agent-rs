@@ -2,42 +2,110 @@
 
 Run standalone: ``python -m agentic_ra.tools.mcp_servers.search_server``
 Or connect via MCPToolClient with stdio transport.
+
+Wired to real retrieval: uses QdrantStore and OpenSearchStore for search.
 """
 
 from __future__ import annotations
 
+import asyncio
+
 from mcp.server.fastmcp import FastMCP
+
+from agentic_ra.core.config import get_settings
+from agentic_ra.retrieval.router import QueryEmbedder
+from agentic_ra.stores.opensearch.client import OpenSearchStore
+from agentic_ra.stores.qdrant.client import QdrantStore
 
 mcp = FastMCP("AgenticRA Search", json_response=True)
 
 
+def _get_stores() -> tuple[QdrantStore, OpenSearchStore, QueryEmbedder]:
+    """Build store clients from settings."""
+    s = get_settings()
+    qdrant = QdrantStore(url=s.qdrant_url, api_key=s.qdrant_api_key)
+    opensearch = OpenSearchStore(
+        host=s.opensearch_host,
+        port=s.opensearch_port,
+        user=s.opensearch_user,
+        password=s.opensearch_initial_admin_password,
+    )
+    embedder = QueryEmbedder(
+        model=s.embedding_model,
+        api_key=s.openai_api_key.get_secret_value(),
+        dimension=s.embedding_dimension,
+    )
+    return qdrant, opensearch, embedder
+
+
 @mcp.tool()
 def search_documents(query: str, limit: int = 5) -> str:
-    """Search the document knowledge base.
+    """Search the document knowledge base using hybrid retrieval.
 
     Args:
         query: Natural language search query.
         limit: Maximum number of results to return.
 
     Returns:
-        Search results as formatted text.
+        Search results as formatted text with sources.
     """
-    # Placeholder — will be wired to RetrievalRouter in Phase 8
-    return (
-        f"[search_documents] Query: {query!r}, limit: {limit}. "
-        "Results: placeholder — wire to retrieval pipeline."
-    )
+    qdrant, opensearch, embedder = _get_stores()
+
+    async def _search() -> str:
+        try:
+            # Embed query
+            query_vector = embedder.run(query)
+
+            # Parallel search
+            vector_results, keyword_results = await asyncio.gather(
+                qdrant.search("documents", query_vector, limit=limit),
+                opensearch.search("documents", query, limit=limit),
+            )
+
+            all_results = vector_results + keyword_results
+
+            if not all_results:
+                return "No documents found."
+
+            # Deduplicate by content
+            seen: set[str] = set()
+            lines: list[str] = []
+            for doc in all_results:
+                text = doc.meta.get("chunk_text", doc.content or "")[:200]
+                if text not in seen:
+                    seen.add(text)
+                    source = doc.meta.get("source", "unknown")
+                    lines.append(f"[{source}] {text}")
+
+            return "\n\n".join(lines[:limit])
+        finally:
+            await qdrant.close()
+            await opensearch.close()
+
+    return asyncio.run(_search())
 
 
 @mcp.tool()
 def get_document_count() -> str:
-    """Get the total number of indexed documents.
+    """Get the total number of indexed documents in Qdrant.
 
     Returns:
         Document count as text.
     """
-    # Placeholder — will be wired to stores in Phase 8
-    return "[get_document_count] Count: placeholder — wire to stores."
+    qdrant, opensearch, _ = _get_stores()
+
+    async def _count() -> str:
+        try:
+            info = await qdrant._client.get_collection("documents")
+            count = info.points_count
+            return f"Documents indexed: {count}"
+        except Exception as e:
+            return f"Error: {e}"
+        finally:
+            await qdrant.close()
+            await opensearch.close()
+
+    return asyncio.run(_count())
 
 
 if __name__ == "__main__":

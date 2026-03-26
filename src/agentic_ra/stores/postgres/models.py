@@ -11,7 +11,7 @@ import uuid
 from datetime import datetime
 from typing import Any
 
-from sqlalchemy import DateTime, Integer, String, Text, func
+from sqlalchemy import DateTime, Float, Integer, String, Text, func
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
@@ -95,6 +95,38 @@ class ParsedDocument(Base):
     source_path: Mapped[str] = mapped_column(Text, index=True)
     docling_json: Mapped[dict[str, Any]] = mapped_column(JSONB)
     chunk_count: Mapped[int] = mapped_column(Integer)
+    metadata_: Mapped[dict[str, Any]] = mapped_column(
+        "metadata",
+        JSONB,
+        default=dict,
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+    )
+
+
+class PipelineRun(Base):
+    """Tracks a single RAG pipeline execution for observability and auditing."""
+
+    __tablename__ = "pipeline_runs"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        primary_key=True,
+        default=uuid.uuid4,
+    )
+    session_id: Mapped[uuid.UUID] = mapped_column(index=True)
+    user_id: Mapped[str] = mapped_column(String(255), index=True)
+    query: Mapped[str] = mapped_column(Text)
+    rewritten_query: Mapped[str] = mapped_column(Text)
+    strategy: Mapped[str] = mapped_column(String(50))
+    answer: Mapped[str] = mapped_column(Text)
+    confidence: Mapped[float] = mapped_column(Float)
+    is_grounded: Mapped[bool]
+    citation_count: Mapped[int] = mapped_column(Integer)
+    retrieval_ms: Mapped[float] = mapped_column(Float)
+    evidence_count: Mapped[int] = mapped_column(Integer)
+    retries: Mapped[int] = mapped_column(Integer, default=0)
     metadata_: Mapped[dict[str, Any]] = mapped_column(
         "metadata",
         JSONB,

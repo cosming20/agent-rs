@@ -18,6 +18,7 @@ from agentic_ra.retrieval.router import QueryEmbedder, RetrievalRouter
 from agentic_ra.stores.opensearch.client import OpenSearchStore
 from agentic_ra.stores.postgres.client import PostgresClient
 from agentic_ra.stores.postgres.documents import DocumentStore
+from agentic_ra.stores.postgres.runs import RunStore
 from agentic_ra.stores.qdrant.client import QdrantStore
 
 logger = logging.getLogger(__name__)
@@ -45,6 +46,7 @@ class RAGPipeline:
     embedding_pipeline: EmbeddingPipeline
     query_embedder: QueryEmbedder
     document_store: DocumentStore
+    run_store: RunStore
 
     async def close(self) -> None:
         """Gracefully shut down all components."""
@@ -113,8 +115,9 @@ def build_pipeline(settings: Settings) -> RAGPipeline:
 
     ranker = ResultRanker()
 
-    # --- Document persistence ---
+    # --- Document persistence + run tracking ---
     document_store = DocumentStore(pg_client=postgres)
+    run_store = RunStore(pg_client=postgres)
 
     # --- Agent core ---
     memory = MemoryStore(pg_client=postgres)
@@ -122,7 +125,7 @@ def build_pipeline(settings: Settings) -> RAGPipeline:
         model=settings.llm_model,
         api_key=api_key,
     )
-    verifier = GroundingVerifier()
+    verifier = GroundingVerifier(api_key=api_key, model=settings.llm_model)
     synthesizer = ResponseSynthesizer()
     metrics = RAGMetrics()
 
@@ -134,6 +137,7 @@ def build_pipeline(settings: Settings) -> RAGPipeline:
         verifier=verifier,
         synthesizer=synthesizer,
         metrics=metrics,
+        run_store=run_store,
     )
 
     logger.info("RAG pipeline assembled successfully")
@@ -146,4 +150,5 @@ def build_pipeline(settings: Settings) -> RAGPipeline:
         embedding_pipeline=embedding_pipeline,
         query_embedder=query_embedder,
         document_store=document_store,
+        run_store=run_store,
     )
