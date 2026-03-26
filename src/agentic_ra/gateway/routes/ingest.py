@@ -1,8 +1,9 @@
-"""Document ingestion endpoint — chunk, embed, and store documents."""
+"""Document ingestion endpoint — chunk, embed, store, and persist parsed docs."""
 
 from __future__ import annotations
 
 import asyncio
+import uuid
 
 from fastapi import APIRouter, Request
 from haystack import Document
@@ -25,6 +26,7 @@ class IngestRequest(BaseModel):
     """Batch document ingestion request."""
 
     documents: list[DocumentInput] = Field(..., min_length=1, max_length=100)
+    source_path: str = Field(default="api_input", description="Source identifier for provenance")
 
 
 class IngestResponse(BaseModel):
@@ -32,6 +34,7 @@ class IngestResponse(BaseModel):
 
     ingested_count: int
     chunk_count: int
+    parsed_document_id: uuid.UUID
     collection: str
     index: str
 
@@ -43,11 +46,11 @@ def _get_pipeline(request: Request) -> RAGPipeline:
 
 @router.post("/ingest", response_model=IngestResponse)
 async def ingest_endpoint(request: Request, body: IngestRequest) -> IngestResponse:
-    """Chunk, embed, and store documents in Qdrant and OpenSearch.
+    """Chunk, embed, and store documents. Persists parsed DoclingDocument JSON.
 
     Documents are chunked with Docling HybridChunker (structure-aware),
-    embedded via OpenAI, and stored in both Qdrant (vector) and
-    OpenSearch (keyword) for hybrid retrieval.
+    embedded via OpenAI, stored in Qdrant + OpenSearch, and the parsed
+    DoclingDocument JSON is persisted in Postgres for reuse.
     """
     pipeline = _get_pipeline(request)
 
@@ -57,8 +60,33 @@ async def ingest_endpoint(request: Request, body: IngestRequest) -> IngestRespon
         for d in body.documents
     ]
 
-    # Chunk with Docling HybridChunker + embed with OpenAI (sync — run in thread)
-    embedded = await asyncio.to_thread(pipeline.embedding_pipeline.run, docs)
+    # Chunk with Docling HybridChunker (sync — run in thread)
+    chunk_result = await asyncio.to_thread(
+        pipeline.embedding_pipeline.chunk_text, docs
+    )
+
+    # Persist the parsed DoclingDocument JSON in Postgres
+    docling_json = (
+        chunk_result.docling_doc.export_to_dict()
+        if chunk_result.docling_doc is not None
+        else {}
+    )
+
+    parsed_doc = await pipeline.document_store.save(
+        source_path=body.source_path,
+        docling_json=docling_json,
+        chunk_count=chunk_result.chunk_count,
+        metadata={"ingested_doc_count": len(body.documents)},
+    )
+
+    # Inject parsed_document_id into chunk metadata for provenance
+    for doc in chunk_result.documents:
+        doc.meta["parsed_document_id"] = str(parsed_doc.id)
+
+    # Embed with OpenAI (sync — run in thread)
+    embedded = await asyncio.to_thread(
+        pipeline.embedding_pipeline.embed, chunk_result.documents
+    )
 
     # Store in Qdrant (vector search)
     points = [
@@ -68,6 +96,7 @@ async def ingest_endpoint(request: Request, body: IngestRequest) -> IngestRespon
             payload={
                 "content": doc.content,
                 "chunk_text": doc.meta.get("chunk_text", doc.content),
+                "parsed_document_id": doc.meta.get("parsed_document_id", ""),
                 **(doc.meta or {}),
             },
         )
@@ -88,6 +117,7 @@ async def ingest_endpoint(request: Request, body: IngestRequest) -> IngestRespon
             id=str(idx),
             body={
                 "content": doc.meta.get("chunk_text", doc.content),
+                "parsed_document_id": doc.meta.get("parsed_document_id", ""),
                 **(doc.meta or {}),
             },
             refresh=True,
@@ -96,6 +126,7 @@ async def ingest_endpoint(request: Request, body: IngestRequest) -> IngestRespon
     return IngestResponse(
         ingested_count=len(body.documents),
         chunk_count=len(embedded),
+        parsed_document_id=parsed_doc.id,
         collection="documents",
         index="documents",
     )

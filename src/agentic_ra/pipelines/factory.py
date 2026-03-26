@@ -15,6 +15,7 @@ from agentic_ra.retrieval.ranker import ResultRanker
 from agentic_ra.retrieval.router import QueryEmbedder, RetrievalRouter
 from agentic_ra.stores.opensearch.client import OpenSearchStore
 from agentic_ra.stores.postgres.client import PostgresClient
+from agentic_ra.stores.postgres.documents import DocumentStore
 from agentic_ra.stores.qdrant.client import QdrantStore
 
 logger = logging.getLogger(__name__)
@@ -41,6 +42,7 @@ class RAGPipeline:
     opensearch: OpenSearchStore
     embedding_pipeline: EmbeddingPipeline
     query_embedder: QueryEmbedder
+    document_store: DocumentStore
 
     async def close(self) -> None:
         """Gracefully shut down all components."""
@@ -109,6 +111,9 @@ def build_pipeline(settings: Settings) -> RAGPipeline:
 
     ranker = ResultRanker()
 
+    # --- Document persistence ---
+    document_store = DocumentStore(pg_client=postgres)
+
     # --- Agent core ---
     memory = MemoryStore(pg_client=postgres)
     verifier = GroundingVerifier()
@@ -131,4 +136,5 @@ def build_pipeline(settings: Settings) -> RAGPipeline:
         opensearch=opensearch,
         embedding_pipeline=embedding_pipeline,
         query_embedder=query_embedder,
+        document_store=document_store,
     )
