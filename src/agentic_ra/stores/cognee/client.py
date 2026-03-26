@@ -81,7 +81,7 @@ class CogneeStore:
                     """Shim: absorb extra kwargs Cognee 0.5.5 passes to adapter v0.1.0.
 
                     - ``__init__``: ignores ``database_name``
-                    - ``search``: ignores ``include_payload``
+                    - ``search``: ignores ``include_payload``, ``node_name``
                     """
 
                     def __init__(  # type: ignore[no-untyped-def]
@@ -90,7 +90,11 @@ class CogneeStore:
                         super().__init__(*args, **kwargs)
 
                     async def search(  # type: ignore[no-untyped-def]
-                        self, *args: Any, include_payload: bool = True, **kwargs: Any
+                        self,
+                        *args: Any,
+                        include_payload: bool = True,
+                        node_name: str | None = None,
+                        **kwargs: Any,
                     ) -> list[Any]:
                         return await super().search(*args, **kwargs)
 
