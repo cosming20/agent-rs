@@ -84,6 +84,11 @@ class Settings(BaseSettings):
     # --- Application ---
     log_level: str = "INFO"
 
+    # --- Agent ---
+    agent_model: str = "gpt-4o"
+    agent_max_steps: int = 10
+    agent_max_retries: int = 1
+
     # --- Computed connection URLs ---
 
     @computed_field  # type: ignore[prop-decorator]
