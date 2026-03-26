@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+import logging
 from collections import defaultdict
 from dataclasses import dataclass, field
 
 from haystack import Document
 
 from agentic_ra.core.errors import RankingError
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -21,7 +24,7 @@ class EvidencePack:
         source_counts: Number of results per source before dedup.
     """
 
-    documents: list[Document]
+    documents: tuple[Document, ...]
     query: str
     strategy: str
     source_counts: dict[str, int] = field(default_factory=dict)
@@ -48,6 +51,7 @@ class ResultRanker:
 
         Args:
             results: Combined results from retrieval router.
+                Each document must have ``meta["score"]`` and ``meta["source"]``.
             query: Original user query.
             strategy: Retrieval strategy used.
             limit: Maximum documents in the evidence pack.
@@ -56,7 +60,7 @@ class ResultRanker:
             Ranked, deduplicated evidence pack.
         """
         if not results:
-            return EvidencePack(documents=[], query=query, strategy=strategy)
+            return EvidencePack(documents=(), query=query, strategy=strategy)
 
         try:
             # Count sources before dedup
@@ -72,20 +76,25 @@ class ResultRanker:
                 by_source[source].append(doc)
 
             # Sort each source's results by their original score (descending)
-            for source_docs in by_source.values():
+            for source, source_docs in by_source.items():
+                for doc in source_docs:
+                    if "score" not in doc.meta:
+                        logger.warning(
+                            "Document missing 'score' in meta, defaulting to 0.0",
+                            extra={"source": source, "doc_id": doc.id},
+                        )
                 source_docs.sort(
                     key=lambda d: d.meta.get("score", 0.0), reverse=True
                 )
 
-            # Compute RRF scores
+            # Compute RRF scores — dedup key uses doc.id for empty content
             rrf_scores: dict[str, float] = defaultdict(float)
             content_to_doc: dict[str, Document] = {}
 
             for source_docs in by_source.values():
                 for rank_idx, doc in enumerate(source_docs):
-                    content_key = doc.content or ""
+                    content_key = doc.content if doc.content else f"__empty_{doc.id}"
                     rrf_scores[content_key] += 1.0 / (self._rrf_k + rank_idx + 1)
-                    # Keep the version with higher accumulated RRF score
                     if content_key not in content_to_doc:
                         content_to_doc[content_key] = doc
 
@@ -109,7 +118,7 @@ class ResultRanker:
                 )
 
             return EvidencePack(
-                documents=ranked_docs,
+                documents=tuple(ranked_docs),
                 query=query,
                 strategy=strategy,
                 source_counts=dict(source_counts),
