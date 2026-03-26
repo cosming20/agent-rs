@@ -78,12 +78,21 @@ class CogneeStore:
                 )
 
                 class _CompatQDrantAdapter(_BaseQDrantAdapter):  # type: ignore[misc]
-                    """Shim: accept and ignore ``database_name`` for Cognee 0.5.5 compat."""
+                    """Shim: absorb extra kwargs Cognee 0.5.5 passes to adapter v0.1.0.
+
+                    - ``__init__``: ignores ``database_name``
+                    - ``search``: ignores ``include_payload``
+                    """
 
                     def __init__(  # type: ignore[no-untyped-def]
                         self, *args: Any, database_name: str = "", **kwargs: Any
                     ) -> None:
                         super().__init__(*args, **kwargs)
+
+                    async def search(  # type: ignore[no-untyped-def]
+                        self, *args: Any, include_payload: bool = True, **kwargs: Any
+                    ) -> list[Any]:
+                        return await super().search(*args, **kwargs)
 
                 use_vector_adapter("qdrant", _CompatQDrantAdapter)
 
