@@ -135,6 +135,15 @@ ingest-sample:
 ingest-file +FILES:
     uv run python scripts/ingest_file.py {{ FILES }}
 
+# Run E2E validation: ingest test.pdf + query via gateway
+# Requires: infra running (just infra-up), server running (just server)
+e2e-test *ARGS:
+    uv run python scripts/e2e_ingest_and_query.py {{ ARGS }}
+
+# Run E2E queries only (skip ingestion)
+e2e-query:
+    uv run python scripts/e2e_ingest_and_query.py --skip-ingest
+
 # ─── Query ───────────────────────────────────────────────────
 
 # Quick query from CLI: just query "What is Python?"

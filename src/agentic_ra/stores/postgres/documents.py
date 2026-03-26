@@ -32,6 +32,7 @@ class DocumentStore:
         docling_json: dict[str, Any],
         chunk_count: int,
         metadata: dict[str, Any] | None = None,
+        user_id: str = "anonymous",
     ) -> ParsedDocument:
         """Store a parsed DoclingDocument as JSON.
 
@@ -40,6 +41,7 @@ class DocumentStore:
             docling_json: Result of ``docling_doc.export_to_dict()``.
             chunk_count: Number of chunks produced from this document.
             metadata: Optional extra metadata.
+            user_id: Owner of the document for per-user data isolation.
 
         Returns:
             The persisted ParsedDocument record.
@@ -50,6 +52,7 @@ class DocumentStore:
                 docling_json=docling_json,
                 chunk_count=chunk_count,
                 metadata_=metadata or {},
+                user_id=user_id,
             )
             async with self._pg.session() as session:
                 session.add(entry)
@@ -96,6 +99,55 @@ class DocumentStore:
                 "Failed to get parsed document",
                 source_path=source_path,
                 operation="get_parsed_document",
+                original_error=str(e),
+            ) from e
+
+    async def get_by_user(self, user_id: str, limit: int = 100) -> list[ParsedDocument]:
+        """Retrieve all parsed documents for a user.
+
+        Args:
+            user_id: The user whose documents to retrieve.
+            limit: Maximum number of results to return (most recent first).
+
+        Returns:
+            List of ParsedDocument records belonging to the user.
+        """
+        try:
+            stmt = (
+                select(ParsedDocument)
+                .where(ParsedDocument.user_id == user_id)
+                .order_by(ParsedDocument.created_at.desc())
+                .limit(limit)
+            )
+            async with self._pg.session() as session:
+                result = await session.execute(stmt)
+                entries = list(result.scalars().all())
+                for entry in entries:
+                    session.expunge(entry)
+                return entries
+        except SQLAlchemyError as e:
+            raise PostgresError(
+                "Failed to get documents by user",
+                user_id=user_id,
+                operation="get_by_user",
+                original_error=str(e),
+            ) from e
+
+    async def list_user_datasets(self) -> list[str]:
+        """List all distinct user_ids that have documents (for admin fan-out).
+
+        Returns:
+            Sorted list of user_id strings present in parsed_documents.
+        """
+        try:
+            stmt = select(ParsedDocument.user_id).distinct()
+            async with self._pg.session() as session:
+                result = await session.execute(stmt)
+                return [row[0] for row in result.all()]
+        except SQLAlchemyError as e:
+            raise PostgresError(
+                "Failed to list user datasets",
+                operation="list_user_datasets",
                 original_error=str(e),
             ) from e
 

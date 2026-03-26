@@ -93,6 +93,7 @@ class ParsedDocument(Base):
         default=uuid.uuid4,
     )
     source_path: Mapped[str] = mapped_column(Text, index=True)
+    user_id: Mapped[str] = mapped_column(String(255), index=True, default="anonymous")
     docling_json: Mapped[dict[str, Any]] = mapped_column(JSONB)
     chunk_count: Mapped[int] = mapped_column(Integer)
     metadata_: Mapped[dict[str, Any]] = mapped_column(
