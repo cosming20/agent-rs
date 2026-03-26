@@ -6,7 +6,8 @@ import asyncio
 import enum
 
 from haystack import Document
-from haystack.components.embedders import SentenceTransformersTextEmbedder
+from haystack.components.embedders import OpenAITextEmbedder
+from haystack.utils import Secret
 
 from agentic_ra.core.errors import EmbeddingError, RoutingError, StoreError
 from agentic_ra.stores.opensearch.client import OpenSearchStore
@@ -24,32 +25,33 @@ class RetrievalStrategy(enum.StrEnum):
 class QueryEmbedder:
     """Query text embedder for retrieval.
 
-    Wraps Haystack ``SentenceTransformersTextEmbedder``.
+    Wraps Haystack ``OpenAITextEmbedder``.
     Synchronous — callers bridge via ``asyncio.to_thread()``.
 
     Args:
-        model: Sentence-transformers model name or path.
+        model: OpenAI embedding model name.
+        api_key: OpenAI API key.
+        dimension: Embedding output dimensionality.
     """
 
-    def __init__(self, model: str = "sentence-transformers/all-MiniLM-L6-v2") -> None:
+    def __init__(
+        self,
+        model: str = "text-embedding-3-small",
+        api_key: str = "",
+        dimension: int = 1536,
+    ) -> None:
         self._model_name = model
-        self._embedder = SentenceTransformersTextEmbedder(
+        self._embedder = OpenAITextEmbedder(
             model=model,
-            normalize_embeddings=True,
+            api_key=Secret.from_token(api_key) if api_key else Secret.from_env_var("OPENAI_API_KEY"),
+            dimensions=dimension,
         )
 
     def warm_up(self) -> None:
-        """Load the embedding model into memory. Call once at startup."""
-        try:
-            self._embedder.warm_up()  # type: ignore[no-untyped-call]  # haystack warm_up() lacks annotations
-        except Exception as e:
-            raise EmbeddingError(
-                "Failed to warm up query embedder",
-                model=self._model_name,
-                operation="warm_up",
-                document_count=0,
-                original_error=str(e),
-            ) from e
+        """No-op for OpenAI embedders (API-based, no local model to load).
+
+        Kept for interface compatibility with the pipeline factory.
+        """
 
     def run(self, text: str) -> list[float]:
         """Embed query text into a vector.

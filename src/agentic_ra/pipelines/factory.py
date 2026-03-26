@@ -82,14 +82,22 @@ def build_pipeline(settings: Settings) -> RAGPipeline:
     )
 
     # --- Retrieval engine ---
+    api_key = settings.openai_api_key.get_secret_value()
+
     embedding_pipeline = EmbeddingPipeline(
         model=settings.embedding_model,
+        api_key=api_key,
+        dimension=settings.embedding_dimension,
         batch_size=settings.embedding_batch_size,
         chunk_size=settings.chunk_size,
         chunk_overlap=settings.chunk_overlap,
     )
 
-    query_embedder = QueryEmbedder(model=settings.embedding_model)
+    query_embedder = QueryEmbedder(
+        model=settings.embedding_model,
+        api_key=api_key,
+        dimension=settings.embedding_dimension,
+    )
 
     router = RetrievalRouter(
         query_embedder=query_embedder,
