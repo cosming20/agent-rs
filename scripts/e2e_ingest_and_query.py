@@ -153,11 +153,14 @@ async def run_ingestion(file_path: str) -> IngestResult:
     print(f"  Persisted DoclingDocument: {parsed_doc.id}")
 
     # 3. Cognee: add + cognify (embedding -> Qdrant, entities -> Neo4j)
-    print("  Cognee add+cognify...")
+    # Ingest into "user_anonymous" dataset to match the query API path.
+    # The orchestrator scopes queries to "user_{user_id}" — default user is "anonymous".
+    query_dataset = "user_anonymous"
+    print(f"  Cognee add+cognify (dataset={query_dataset})...")
     full_text = "\n\n".join(
         doc.meta.get("chunk_text", doc.content) for doc in chunk_result.documents
     )
-    await cognee_store.add_and_cognify(text=full_text)
+    await cognee_store.add_and_cognify(text=full_text, dataset=query_dataset)
     print("  Cognee: graph + vector ingestion complete")
 
     await pg.close()
