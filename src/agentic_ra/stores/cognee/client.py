@@ -69,11 +69,12 @@ class CogneeStore:
         try:
             # Register Qdrant community adapter if using qdrant
             if vector_db_provider == "qdrant":
-                from cognee_community_vector_adapter_qdrant import (
-                    register as register_qdrant,
-                )  # type: ignore[import-untyped]
+                from cognee_community_vector_adapter_qdrant.register import (  # type: ignore[import-untyped]
+                    QDrantAdapter,
+                    use_vector_adapter,
+                )
 
-                register_qdrant()
+                use_vector_adapter("qdrant", QDrantAdapter)
 
             # LLM config
             cognee.config.set_llm_api_key(llm_api_key)
