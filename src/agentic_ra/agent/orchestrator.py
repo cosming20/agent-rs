@@ -131,11 +131,30 @@ class AgentOrchestrator:
             agent = build_agent_with_tools(self._base_agent, tools_config)
 
             # 4. Run Haystack Agent (offloaded to thread — Agent.run is sync)
+            #    Haystack's agent snapshot code tries to serialize tool functions
+            #    on pipeline errors.  Our closure-based tools can't be serialized,
+            #    so we catch SerializationError and fall back to evidence already
+            #    accumulated by the tool closures.
             evidence.clear()
-            agent_result = await asyncio.to_thread(agent.run, messages=chat_messages)
+            agent_result: dict[str, Any] | None = None
+            try:
+                agent_result = await asyncio.to_thread(
+                    agent.run, messages=chat_messages
+                )
+            except Exception as agent_err:
+                err_name = type(agent_err).__name__
+                logger.warning(
+                    "Agent run failed (%s): %s — using accumulated evidence",
+                    err_name,
+                    str(agent_err)[:200],
+                )
 
             # 5. Extract answer and evidence (accumulated via closure)
-            answer = self._extract_answer(agent_result)
+            answer = (
+                self._extract_answer(agent_result)
+                if agent_result is not None
+                else "I was unable to generate an answer due to a processing error."
+            )
             elapsed_ms = (time.monotonic() - start) * 1000
 
             if self._metrics:
