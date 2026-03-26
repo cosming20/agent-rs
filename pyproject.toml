@@ -14,6 +14,10 @@ dependencies = [
     "pydantic-settings>=2.9",
     "qdrant-client>=1.13",
     "sentence-transformers>=4.1",
+    "opentelemetry-api>=1.29",
+    "opentelemetry-exporter-otlp>=1.29",
+    "opentelemetry-instrumentation-fastapi>=0.50b0",
+    "opentelemetry-sdk>=1.29",
     "sqlalchemy[asyncio]>=2.0",
     "uvicorn>=0.34",
 ]
