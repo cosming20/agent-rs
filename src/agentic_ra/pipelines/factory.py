@@ -89,8 +89,8 @@ def build_pipeline(settings: Settings) -> RAGPipeline:
         api_key=api_key,
         dimension=settings.embedding_dimension,
         batch_size=settings.embedding_batch_size,
-        chunk_size=settings.chunk_size,
-        chunk_overlap=settings.chunk_overlap,
+        max_tokens=settings.chunk_max_tokens,
+        merge_peers=settings.chunk_merge_peers,
     )
 
     query_embedder = QueryEmbedder(

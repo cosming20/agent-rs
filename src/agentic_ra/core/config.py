@@ -59,13 +59,13 @@ class Settings(BaseSettings):
     otel_collector_port: int = 1057
     jaeger_ui_port: int = 1058
 
-    # --- Embedding (OpenAI) ---
+    # --- Embedding (OpenAI) + Chunking (Docling) ---
     openai_api_key: SecretStr
     embedding_model: str = "text-embedding-3-small"
     embedding_dimension: int = 1536
     embedding_batch_size: int = 32
-    chunk_size: int = 200
-    chunk_overlap: int = 50
+    chunk_max_tokens: int = 512
+    chunk_merge_peers: bool = True
 
     # --- Computed connection URLs ---
 

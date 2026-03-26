@@ -1,4 +1,4 @@
-"""Document ingestion endpoint — embed and store documents."""
+"""Document ingestion endpoint — chunk, embed, and store documents."""
 
 from __future__ import annotations
 
@@ -43,9 +43,10 @@ def _get_pipeline(request: Request) -> RAGPipeline:
 
 @router.post("/ingest", response_model=IngestResponse)
 async def ingest_endpoint(request: Request, body: IngestRequest) -> IngestResponse:
-    """Embed and store documents in both Qdrant and OpenSearch.
+    """Chunk, embed, and store documents in Qdrant and OpenSearch.
 
-    Documents are chunked, embedded, and stored in Qdrant (vector) and
+    Documents are chunked with Docling HybridChunker (structure-aware),
+    embedded via OpenAI, and stored in both Qdrant (vector) and
     OpenSearch (keyword) for hybrid retrieval.
     """
     pipeline = _get_pipeline(request)
@@ -56,15 +57,19 @@ async def ingest_endpoint(request: Request, body: IngestRequest) -> IngestRespon
         for d in body.documents
     ]
 
-    # Chunk and embed (sync — run in thread)
+    # Chunk with Docling HybridChunker + embed with OpenAI (sync — run in thread)
     embedded = await asyncio.to_thread(pipeline.embedding_pipeline.run, docs)
 
-    # Store in Qdrant (vector)
+    # Store in Qdrant (vector search)
     points = [
         qdrant_models.PointStruct(
             id=idx,
             vector=doc.embedding,
-            payload={"content": doc.content, **(doc.meta or {})},
+            payload={
+                "content": doc.content,
+                "chunk_text": doc.meta.get("chunk_text", doc.content),
+                **(doc.meta or {}),
+            },
         )
         for idx, doc in enumerate(embedded)
         if doc.embedding is not None
@@ -76,12 +81,15 @@ async def ingest_endpoint(request: Request, body: IngestRequest) -> IngestRespon
             points=points,
         )
 
-    # Store in OpenSearch (keyword)
+    # Store in OpenSearch (keyword/BM25 search)
     for idx, doc in enumerate(embedded):
         await pipeline.opensearch._client.index(
             index="documents",
             id=str(idx),
-            body={"content": doc.content, **(doc.meta or {})},
+            body={
+                "content": doc.meta.get("chunk_text", doc.content),
+                **(doc.meta or {}),
+            },
             refresh=True,
         )
 
