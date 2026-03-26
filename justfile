@@ -128,9 +128,12 @@ stores-reset:
 ingest-sample:
     uv run python scripts/ingest_sample.py
 
-# Ingest a file (PDF, DOCX, etc.) via Docling parser (local, no server needed)
-ingest-file FILE:
-    uv run python -c "from agentic_ra.core.config import get_settings; from agentic_ra.retrieval.embedder import EmbeddingPipeline; s=get_settings(); p=EmbeddingPipeline(model=s.embedding_model, api_key=s.openai_api_key.get_secret_value(), dimension=s.embedding_dimension); r=p.chunk_file('{{ FILE }}'); print(f'Parsed: {r.chunk_count} chunks'); e=p.embed(r.documents); print(f'Embedded: {len(e)} chunks ({s.embedding_dimension}d)')"
+# Ingest file(s) — full pipeline: parse → chunk → embed → store → persist
+# Usage: just ingest-file report.pdf          (single file)
+#        just ingest-file a.pdf b.docx c.html (multiple files)
+#        just ingest-file https://arxiv.org/pdf/2408.09869 (URL)
+ingest-file +FILES:
+    uv run python scripts/ingest_file.py {{ FILES }}
 
 # ─── Query ───────────────────────────────────────────────────
 
@@ -157,6 +160,20 @@ jaeger:
 # Check OTel collector logs
 otel-status:
     @docker logs agentic-ra-otel-collector --tail 10 2>&1 || echo "OTel collector not running"
+
+# ─── Data Inspection ─────────────────────────────────────────
+
+# Show ingested document stats from Postgres
+data-stats:
+    uv run python scripts/data_stats.py
+
+# List all parsed documents stored in Postgres
+data-list:
+    uv run python scripts/data_list.py
+
+# Preview chunks stored in Qdrant
+data-chunks LIMIT="5":
+    uv run python scripts/data_chunks.py {{ LIMIT }}
 
 # ─── Clean ───────────────────────────────────────────────────
 
