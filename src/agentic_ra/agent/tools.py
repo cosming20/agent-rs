@@ -93,19 +93,14 @@ def _get_tool_loop() -> asyncio.AbstractEventLoop:
 def _run_async(coro: Any) -> Any:
     """Bridge async to sync using a dedicated background event loop.
 
-    When called from inside an existing event loop (e.g. FastAPI/uvicorn),
-    uses a persistent background thread+loop to avoid spawning a new thread
-    per call. When no loop is running, falls back to ``asyncio.run``.
+    Always uses the persistent ``_TOOL_LOOP`` thread so that all async
+    operations (Cognee search, Neo4j graph queries, Qdrant vector search)
+    share a single event loop.  This prevents "Future attached to a
+    different loop" errors from Neo4j/asyncio drivers.
     """
-    try:
-        asyncio.get_running_loop()
-        # Inside an existing loop (FastAPI) — use dedicated background loop
-        loop = _get_tool_loop()
-        future = asyncio.run_coroutine_threadsafe(coro, loop)
-        return future.result(timeout=120)
-    except RuntimeError:
-        # No running loop — safe to use asyncio.run
-        return asyncio.run(coro)
+    loop = _get_tool_loop()
+    future = asyncio.run_coroutine_threadsafe(coro, loop)
+    return future.result(timeout=120)
 
 
 def _sanitize_user_id(user_id: str) -> str:
