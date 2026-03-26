@@ -116,18 +116,26 @@ class AgentOrchestrator:
                     extra={"confidence": verification.confidence, "query": query},
                 )
 
-                # Broaden search with higher limit
+                # Stage-2: broaden to HYBRID with higher limit
+                retry_strategy = RetrievalStrategy.HYBRID
+                logger.info(
+                    "Stage-2 broadening: switching strategy from %s to %s",
+                    strategy.value,
+                    retry_strategy.value,
+                )
                 raw_results = await self._router.retrieve(
                     query=query,
-                    strategy=RetrievalStrategy.HYBRID,
+                    strategy=retry_strategy,
                     limit=limit * 2,
                 )
                 evidence_pack = self._ranker.rank(
                     results=raw_results,
                     query=query,
-                    strategy="hybrid",
+                    strategy=retry_strategy.value,
                     limit=limit * 2,
                 )
+                # Track actual strategy used for provenance
+                strategy = retry_strategy
 
                 answer = self._generate_answer(query, evidence_pack.documents)
                 verification = self._verifier.verify(

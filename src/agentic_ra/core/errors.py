@@ -72,7 +72,7 @@ class AgentError(AgenticRAError):
     """Base for all agent core failures."""
 
 
-class MemoryError(AgentError):
+class MemoryStoreError(AgentError):
     """Memory store read/write failure."""
 
 

@@ -8,7 +8,7 @@ from typing import Any
 from sqlalchemy import select
 from sqlalchemy.exc import SQLAlchemyError
 
-from agentic_ra.core.errors import MemoryError
+from agentic_ra.core.errors import MemoryStoreError
 from agentic_ra.stores.postgres.client import PostgresClient
 from agentic_ra.stores.postgres.models import ChatMessage, MemoryEntry, MessageRole
 
@@ -59,7 +59,7 @@ class MemoryStore:
                 await session.refresh(msg)
             return msg
         except SQLAlchemyError as e:
-            raise MemoryError(
+            raise MemoryStoreError(
                 "Failed to add message",
                 session_id=str(session_id),
                 operation="add_message",
@@ -89,9 +89,12 @@ class MemoryStore:
             )
             async with self._pg.session() as session:
                 result = await session.execute(stmt)
-                return list(result.scalars().all())
+                messages = list(result.scalars().all())
+                for msg in messages:
+                    session.expunge(msg)
+                return messages
         except SQLAlchemyError as e:
-            raise MemoryError(
+            raise MemoryStoreError(
                 "Failed to get messages",
                 session_id=str(session_id),
                 operation="get_messages",
@@ -146,7 +149,7 @@ class MemoryStore:
                 await session.refresh(entry)
                 return entry
         except SQLAlchemyError as e:
-            raise MemoryError(
+            raise MemoryStoreError(
                 "Failed to save memory",
                 user_id=user_id,
                 key=key,
@@ -175,9 +178,12 @@ class MemoryStore:
             )
             async with self._pg.session() as session:
                 result = await session.execute(stmt)
-                return result.scalar_one_or_none()
+                entry = result.scalar_one_or_none()
+                if entry is not None:
+                    session.expunge(entry)
+                return entry
         except SQLAlchemyError as e:
-            raise MemoryError(
+            raise MemoryStoreError(
                 "Failed to get memory",
                 user_id=user_id,
                 key=key,
@@ -208,9 +214,12 @@ class MemoryStore:
             )
             async with self._pg.session() as session:
                 result = await session.execute(stmt)
-                return list(result.scalars().all())
+                entries = list(result.scalars().all())
+                for entry in entries:
+                    session.expunge(entry)
+                return entries
         except SQLAlchemyError as e:
-            raise MemoryError(
+            raise MemoryStoreError(
                 "Failed to get memories",
                 user_id=user_id,
                 operation="get_memories",
@@ -245,7 +254,7 @@ class MemoryStore:
                 await session.commit()
                 return True
         except SQLAlchemyError as e:
-            raise MemoryError(
+            raise MemoryStoreError(
                 "Failed to delete memory",
                 user_id=user_id,
                 key=key,

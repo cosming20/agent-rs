@@ -2,14 +2,9 @@
 
 from __future__ import annotations
 
-import logging
 from dataclasses import dataclass
 
 from haystack import Document
-
-from agentic_ra.core.errors import VerificationError
-
-logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -27,6 +22,13 @@ class VerificationResult:
     confidence: float
     reasoning: str
     ungrounded_claims: tuple[str, ...] = ()
+
+
+_STOP_WORDS = frozenset({
+    "the", "a", "an", "is", "are", "was", "were", "in", "on",
+    "at", "to", "for", "of", "and", "or", "but", "not", "with",
+    "that", "this", "it", "be", "as", "by", "from", "has", "have",
+})
 
 
 class GroundingVerifier:
@@ -70,50 +72,37 @@ class GroundingVerifier:
                 reasoning="No evidence provided for grounding check.",
             )
 
-        try:
-            # Heuristic: compute token overlap between answer and evidence
-            answer_tokens = set(answer.lower().split())
-            evidence_tokens: set[str] = set()
-            for doc in evidence:
-                if doc.content:
-                    evidence_tokens.update(doc.content.lower().split())
+        # Heuristic: compute token overlap between answer and evidence
+        answer_tokens = set(answer.lower().split())
+        evidence_tokens: set[str] = set()
+        for doc in evidence:
+            if doc.content:
+                evidence_tokens.update(doc.content.lower().split())
 
-            if not answer_tokens:
-                return VerificationResult(
-                    is_grounded=False,
-                    confidence=0.0,
-                    reasoning="Answer contains no tokens.",
-                )
-
-            overlap = answer_tokens & evidence_tokens
-            confidence = len(overlap) / len(answer_tokens)
-
-            is_grounded = confidence >= self._threshold
-
-            # Identify ungrounded tokens (simplified: tokens not in evidence)
-            ungrounded = answer_tokens - evidence_tokens
-            # Filter out common stop words for cleaner reporting
-            stop_words = {"the", "a", "an", "is", "are", "was", "were", "in", "on",
-                          "at", "to", "for", "of", "and", "or", "but", "not", "with",
-                          "that", "this", "it", "be", "as", "by", "from", "has", "have"}
-            meaningful_ungrounded = ungrounded - stop_words
-
+        if not answer_tokens:
             return VerificationResult(
-                is_grounded=is_grounded,
-                confidence=round(confidence, 3),
-                reasoning=(
-                    f"Token overlap: {len(overlap)}/{len(answer_tokens)} "
-                    f"({confidence:.1%}). Threshold: {self._threshold:.1%}."
-                ),
-                ungrounded_claims=tuple(sorted(meaningful_ungrounded)[:10]),
+                is_grounded=False,
+                confidence=0.0,
+                reasoning="Answer contains no tokens.",
             )
 
-        except Exception as e:
-            raise VerificationError(
-                "Grounding verification failed",
-                operation="verify",
-                original_error=str(e),
-            ) from e
+        overlap = answer_tokens & evidence_tokens
+        confidence = len(overlap) / len(answer_tokens)
+        is_grounded = confidence >= self._threshold
+
+        # Identify ungrounded tokens (simplified: tokens not in evidence)
+        ungrounded = answer_tokens - evidence_tokens
+        meaningful_ungrounded = ungrounded - _STOP_WORDS
+
+        return VerificationResult(
+            is_grounded=is_grounded,
+            confidence=round(confidence, 3),
+            reasoning=(
+                f"Token overlap: {len(overlap)}/{len(answer_tokens)} "
+                f"({confidence:.1%}). Threshold: {self._threshold:.1%}."
+            ),
+            ungrounded_claims=tuple(sorted(meaningful_ungrounded)[:10]),
+        )
 
     def needs_retry(self, result: VerificationResult) -> bool:
         """Determine if the answer should trigger a Stage-2 retrieval retry.

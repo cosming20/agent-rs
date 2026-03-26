@@ -108,8 +108,9 @@ class ResponseSynthesizer:
         """Extract citations from evidence documents."""
         citations: list[Citation] = []
         for idx, doc in enumerate(evidence, start=1):
-            snippet = (doc.content or "")[:self._max_snippet]
-            if len(doc.content or "") > self._max_snippet:
+            content = doc.content or ""
+            snippet = content[:self._max_snippet]
+            if len(content) > self._max_snippet:
                 snippet += "..."
 
             citations.append(
