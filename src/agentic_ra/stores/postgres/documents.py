@@ -10,7 +10,7 @@ from sqlalchemy.exc import SQLAlchemyError
 
 from agentic_ra.core.errors import PostgresError
 from agentic_ra.stores.postgres.client import PostgresClient
-from agentic_ra.stores.postgres.models import ParsedDocument
+from agentic_ra.stores.postgres.models import ANONYMOUS_USER_ID, ParsedDocument
 
 
 class DocumentStore:
@@ -32,7 +32,7 @@ class DocumentStore:
         docling_json: dict[str, Any],
         chunk_count: int,
         metadata: dict[str, Any] | None = None,
-        user_id: str = "anonymous",
+        user_id: str = ANONYMOUS_USER_ID,
     ) -> ParsedDocument:
         """Store a parsed DoclingDocument as JSON.
 
@@ -68,13 +68,16 @@ class DocumentStore:
                 original_error=str(e),
             ) from e
 
-    async def get_by_source(self, source_path: str) -> ParsedDocument | None:
-        """Retrieve a parsed document by its source path.
+    async def get_by_source(
+        self, source_path: str, user_id: str
+    ) -> ParsedDocument | None:
+        """Retrieve a parsed document by its source path, scoped to a user.
 
         Enables cache-hit on re-ingest: if already parsed, skip parsing.
 
         Args:
             source_path: Original file path or URL.
+            user_id: Owner of the document (prevents cross-user leakage).
 
         Returns:
             The ParsedDocument if found, None otherwise.
@@ -84,6 +87,7 @@ class DocumentStore:
                 select(ParsedDocument)
                 .where(
                     ParsedDocument.source_path == source_path,
+                    ParsedDocument.user_id == user_id,
                 )
                 .order_by(ParsedDocument.created_at.desc())
                 .limit(1)
@@ -151,19 +155,23 @@ class DocumentStore:
                 original_error=str(e),
             ) from e
 
-    async def get_by_id(self, doc_id: uuid.UUID) -> ParsedDocument | None:
-        """Retrieve a parsed document by ID.
+    async def get_by_id(self, doc_id: uuid.UUID, user_id: str) -> ParsedDocument | None:
+        """Retrieve a parsed document by ID, scoped to a user.
 
         Used for context expansion: chunk metadata references parent doc ID.
 
         Args:
             doc_id: ParsedDocument UUID.
+            user_id: Owner of the document (prevents cross-user access).
 
         Returns:
             The ParsedDocument if found, None otherwise.
         """
         try:
-            stmt = select(ParsedDocument).where(ParsedDocument.id == doc_id)
+            stmt = select(ParsedDocument).where(
+                ParsedDocument.id == doc_id,
+                ParsedDocument.user_id == user_id,
+            )
             async with self._pg.session() as session:
                 result = await session.execute(stmt)
                 entry = result.scalar_one_or_none()

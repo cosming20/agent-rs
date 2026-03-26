@@ -67,14 +67,25 @@ class CogneeStore:
             neo4j_db: Neo4j database name.
         """
         try:
-            # Register Qdrant community adapter if using qdrant
+            # Register Qdrant community adapter if using qdrant.
+            # Cognee 0.5.5 passes `database_name` to adapter __init__, but the
+            # community adapter v0.1.0 doesn't accept it. We wrap the adapter
+            # to absorb the extra kwarg until upstream fixes the mismatch.
             if vector_db_provider == "qdrant":
                 from cognee_community_vector_adapter_qdrant.register import (  # type: ignore[import-untyped]
-                    QDrantAdapter,
+                    QDrantAdapter as _BaseQDrantAdapter,
                     use_vector_adapter,
                 )
 
-                use_vector_adapter("qdrant", QDrantAdapter)
+                class _CompatQDrantAdapter(_BaseQDrantAdapter):  # type: ignore[misc]
+                    """Shim: accept and ignore ``database_name`` for Cognee 0.5.5 compat."""
+
+                    def __init__(  # type: ignore[no-untyped-def]
+                        self, *args: Any, database_name: str = "", **kwargs: Any
+                    ) -> None:
+                        super().__init__(*args, **kwargs)
+
+                use_vector_adapter("qdrant", _CompatQDrantAdapter)
 
             # LLM config
             cognee.config.set_llm_api_key(llm_api_key)

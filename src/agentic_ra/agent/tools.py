@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 import contextvars
 import logging
+import re
 import threading
 from typing import Any, TypedDict
 
@@ -104,6 +105,22 @@ def _run_async(coro: Any) -> Any:
     except RuntimeError:
         # No running loop — safe to use asyncio.run
         return asyncio.run(coro)
+
+
+def _sanitize_user_id(user_id: str) -> str:
+    """Sanitize user_id for use in Cognee dataset names.
+
+    Strips any characters that are not alphanumeric, underscore, or hyphen
+    to prevent injection into dataset names.
+
+    Args:
+        user_id: Raw user identifier.
+
+    Returns:
+        Sanitized string safe for dataset name construction.
+    """
+    sanitized = re.sub(r"[^a-zA-Z0-9_-]", "", user_id)
+    return sanitized or "anonymous"
 
 
 def _format_evidence(documents: list[Document] | tuple[Document, ...]) -> str:
@@ -241,13 +258,28 @@ def make_search_knowledge_tool(
                     user_ids: list[str] = _run_async(
                         document_store.list_user_datasets()
                     )
+                    # Cap to prevent DoS on large deployments
+                    MAX_FAN_OUT = 50
+                    if len(user_ids) > MAX_FAN_OUT:
+                        logger.warning(
+                            "Admin fan-out capped at %d users (total: %d)",
+                            MAX_FAN_OUT,
+                            len(user_ids),
+                        )
+                        user_ids = user_ids[:MAX_FAN_OUT]
+
                     all_results: list[Document] = []
                     for uid in user_ids:
-                        ds = f"user_{uid}"
-                        results = _search_dataset(
-                            cognee_store, ds, query, retrieval_strategy, limit=10
-                        )
-                        all_results.extend(results)
+                        ds = f"user_{_sanitize_user_id(uid)}"
+                        try:
+                            results = _search_dataset(
+                                cognee_store, ds, query, retrieval_strategy, limit=10
+                            )
+                            all_results.extend(results)
+                        except Exception:
+                            logger.warning(
+                                "Admin fan-out: search failed for dataset %s", ds
+                            )
                     raw_docs = all_results
                 else:
                     # User: search only their dataset

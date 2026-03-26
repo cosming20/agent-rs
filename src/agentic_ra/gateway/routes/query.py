@@ -12,6 +12,8 @@ from agentic_ra.retrieval.router import RetrievalStrategy
 
 router = APIRouter(prefix="/api/v1", tags=["query"])
 
+VALID_ROLES = frozenset({"user", "admin"})
+
 
 class QueryRequest(BaseModel):
     """Incoming RAG query request."""
@@ -63,6 +65,9 @@ async def query_endpoint(
     x_user_role: str = Header(default="user", alias="X-User-Role"),
 ) -> QueryResponse:
     """Process a RAG query through the full orchestrator pipeline."""
+    if x_user_role not in VALID_ROLES:
+        x_user_role = "user"  # Default to least-privileged
+
     pipeline = _get_pipeline(request)
     session_id = body.session_id or uuid.uuid4()
 

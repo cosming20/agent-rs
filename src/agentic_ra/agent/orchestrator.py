@@ -16,6 +16,7 @@ from agentic_ra.agent.agent import build_agent_with_tools
 from agentic_ra.agent.memory import MemoryStore
 from agentic_ra.agent.synthesis import ResponseSynthesizer, SynthesizedResponse
 from agentic_ra.agent.tools import (
+    _sanitize_user_id,
     get_evidence_buffer,
     make_ingest_tool,
     make_remember_tool,
@@ -109,7 +110,7 @@ class AgentOrchestrator:
             chat_messages.append(ChatMessage.from_user(query + hint))
 
             # 3. Build per-request tools scoped to this user's dataset
-            dataset = f"user_{user_id}"
+            dataset = f"user_{_sanitize_user_id(user_id)}"
             tools_config = [
                 make_search_knowledge_tool(
                     self._router,

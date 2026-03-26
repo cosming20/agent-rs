@@ -16,6 +16,7 @@ from fastapi import APIRouter, Header, Request
 from haystack import Document
 from pydantic import BaseModel, Field
 
+from agentic_ra.agent.tools import _sanitize_user_id
 from agentic_ra.pipelines.factory import RAGPipeline
 
 logger = logging.getLogger(__name__)
@@ -65,7 +66,7 @@ async def ingest_endpoint(
 ) -> IngestResponse:
     """Ingest documents: Docling parse → Cognee graph+vector."""
     pipeline = _get_pipeline(request)
-    dataset = f"user_{x_user_id}"
+    dataset = f"user_{_sanitize_user_id(x_user_id)}"
 
     docs = [Document(content=d.content, meta=d.metadata) for d in body.documents]
 
