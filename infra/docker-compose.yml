@@ -12,8 +12,8 @@ networks:
 
 volumes:
   qdrant_storage:
-  opensearch_data:
   postgres_data:
+  neo4j_data:
 
 services:
   # ----------------------------------------------------------
@@ -42,46 +42,6 @@ services:
       timeout: 5s
       retries: 5
       start_period: 10s
-
-  # ----------------------------------------------------------
-  # OpenSearch — Keyword/BM25 search
-  # ----------------------------------------------------------
-  opensearch:
-    image: opensearchproject/opensearch:latest
-    container_name: agentic-ra-opensearch
-    restart: "on-failure:5"
-    ports:
-      - "${OPENSEARCH_PORT}:9200"
-      - "${OPENSEARCH_PERF_PORT}:9600"
-    volumes:
-      - opensearch_data:/usr/share/opensearch/data
-    environment:
-      - discovery.type=single-node
-      - OPENSEARCH_USER=${OPENSEARCH_USER}
-      - OPENSEARCH_INITIAL_ADMIN_PASSWORD=${OPENSEARCH_INITIAL_ADMIN_PASSWORD}
-      - OPENSEARCH_JAVA_OPTS=${OPENSEARCH_JAVA_OPTS}
-    ulimits:
-      memlock:
-        soft: -1
-        hard: -1
-      nofile:
-        soft: 65536
-        hard: 65536
-    networks:
-      - agentic-ra-net
-    mem_limit: 3g
-    mem_reservation: 1g
-    cpus: 1.5
-    healthcheck:
-      test:
-        [
-          "CMD-SHELL",
-          "curl -sf --insecure -u $$OPENSEARCH_USER:$$OPENSEARCH_INITIAL_ADMIN_PASSWORD https://localhost:9200/_cluster/health | grep -qv '\"status\":\"red\"'",
-        ]
-      interval: 10s
-      timeout: 10s
-      retries: 10
-      start_period: 60s
 
   # ----------------------------------------------------------
   # PostgreSQL — State store, chat history, memory, evidence
@@ -114,6 +74,33 @@ services:
       timeout: 5s
       retries: 10
       start_period: 15s
+
+  # ----------------------------------------------------------
+  # Neo4j — Knowledge graph (Cognee graph backend)
+  # ----------------------------------------------------------
+  neo4j:
+    image: neo4j:5-community
+    container_name: agentic-ra-neo4j
+    restart: "on-failure:5"
+    ports:
+      - "${NEO4J_BOLT_PORT}:7687"
+      - "${NEO4J_HTTP_PORT}:7474"
+    volumes:
+      - neo4j_data:/data
+    environment:
+      - NEO4J_AUTH=${NEO4J_USER}/${NEO4J_PASSWORD}
+      - NEO4J_PLUGINS=["apoc"]
+    networks:
+      - agentic-ra-net
+    mem_limit: 2g
+    mem_reservation: 1g
+    cpus: 1.0
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:7474 || exit 1"]
+      interval: 10s
+      timeout: 10s
+      retries: 10
+      start_period: 30s
 
   # ----------------------------------------------------------
   # OPA — Policy decision point

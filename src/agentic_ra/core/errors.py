@@ -5,8 +5,8 @@ structured context for observability integration.
 
 Usage::
 
-    raise QdrantError("Collection not found", collection="docs", operation="search")
-    # str: "Collection not found [collection='docs', operation='search']"
+    raise CogneeError("Graph query failed", dataset="agentic_rag", operation="search")
+    # str: "Graph query failed [dataset='agentic_rag', operation='search']"
 """
 
 from __future__ import annotations
@@ -42,14 +42,6 @@ class StoreError(AgenticRAError):
 
 class PostgresError(StoreError):
     """PostgreSQL connection or query failure."""
-
-
-class QdrantError(StoreError):
-    """Qdrant vector store failure."""
-
-
-class OpenSearchError(StoreError):
-    """OpenSearch keyword search failure."""
 
 
 class RetrievalError(AgenticRAError):
@@ -102,6 +94,10 @@ class AuthError(AgenticRAError):
 
 class OPAError(AuthError):
     """OPA policy evaluation failure."""
+
+
+class CogneeError(StoreError):
+    """Cognee knowledge graph operation failure."""
 
 
 class GatewayError(AgenticRAError):

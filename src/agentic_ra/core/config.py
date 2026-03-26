@@ -32,17 +32,6 @@ class Settings(BaseSettings):
     qdrant_api_key: SecretStr
     qdrant_collection: str = "documents"
 
-    # --- OpenSearch ---
-    opensearch_user: str = "admin"
-    opensearch_initial_admin_password: SecretStr
-    opensearch_port: int = 1052
-    opensearch_perf_port: int = 1053
-    opensearch_host: str = "localhost"
-    opensearch_index: str = "documents"
-    opensearch_java_opts: str = (
-        "-Xms512m -Xmx512m"  # Infra-only; override in .env for production
-    )
-
     # --- PostgreSQL ---
     postgres_user: str = "agentic_ra"
     postgres_password: SecretStr
@@ -76,6 +65,22 @@ class Settings(BaseSettings):
     chunk_max_tokens: int = 512
     chunk_merge_peers: bool = True
 
+    # --- Cognee (Knowledge Graph) ---
+    cognee_dataset: str = "agentic_rag"
+    cognee_graph_db_provider: str = "neo4j"
+    cognee_vector_db_provider: str = "qdrant"
+    cognee_data_root: str = str(_PROJECT_ROOT / ".cognee_data")
+    cognee_system_root: str = str(_PROJECT_ROOT / ".cognee_system")
+    cognee_enabled: bool = True
+
+    # --- Neo4j (Cognee graph backend) ---
+    neo4j_host: str = "localhost"
+    neo4j_bolt_port: int = 1061
+    neo4j_http_port: int = 1062
+    neo4j_user: str = "neo4j"
+    neo4j_password: SecretStr = SecretStr("changeme-neo4j")
+    neo4j_db: str = "neo4j"
+
     # --- Application ---
     log_level: str = "INFO"
 
@@ -86,12 +91,6 @@ class Settings(BaseSettings):
     def qdrant_url(self) -> str:
         """Qdrant HTTP/REST URL for qdrant-client."""
         return f"http://{self.qdrant_host}:{self.qdrant_http_port}"
-
-    @computed_field  # type: ignore[prop-decorator]
-    @property
-    def opensearch_url(self) -> str:
-        """OpenSearch HTTPS URL (self-signed cert in dev)."""
-        return f"https://{self.opensearch_host}:{self.opensearch_port}"
 
     @computed_field  # type: ignore[prop-decorator]
     @property
@@ -130,6 +129,12 @@ class Settings(BaseSettings):
     def jaeger_ui_url(self) -> str:
         """Jaeger trace UI URL."""
         return f"http://{self.jaeger_host}:{self.jaeger_ui_port}"
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def neo4j_bolt_url(self) -> str:
+        """Neo4j Bolt protocol URL for Cognee graph backend."""
+        return f"bolt://{self.neo4j_host}:{self.neo4j_bolt_port}"
 
 
 @lru_cache(maxsize=1)

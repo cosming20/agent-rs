@@ -6,14 +6,15 @@ requires-python = ">=3.12"
 dependencies = [
     "alembic>=1.15",
     "asyncpg>=0.30",
+    "cognee[neo4j]>=0.3",
+    "cognee-community-vector-adapter-qdrant>=0.1",
     "docling>=2.31",
     "docling-core>=2.31",
     "fastapi>=0.115",
     "haystack-ai>=2.13",
     "httpx>=0.28",
     "mcp>=1.12",
-    "opensearch-py[async]>=2.8",
-    "pydantic-settings>=2.9",
+"pydantic-settings>=2.9",
     "qdrant-client>=1.13",
     "opentelemetry-api>=1.29",
     "opentelemetry-exporter-otlp>=1.29",
@@ -29,6 +30,27 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/agentic_ra"]
+
+[tool.uv]
+# Cognee pins deps that lack Python 3.14 wheels.
+# onnxruntime<=1.22.1 has no cp314 wheels; v1.24+ does.
+# kuzu 0.11.3 can't build from source on 3.14; we use Neo4j so kuzu is unused at runtime.
+# See: https://github.com/microsoft/onnxruntime/issues/26309
+override-dependencies = [
+    "onnxruntime>=1.24",
+    "kuzu; python_version < '3.14'",
+]
+
+[tool.mypy]
+# Cognee has no py.typed marker — suppress all type errors in our wrapper
+[[tool.mypy.overrides]]
+module = ["cognee.*", "cognee_community_vector_adapter_qdrant.*"]
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = ["agentic_ra.stores.cognee.*"]
+disallow_untyped_defs = false
+disable_error_code = ["attr-defined", "import-untyped", "unused-ignore"]
 
 [dependency-groups]
 dev = [

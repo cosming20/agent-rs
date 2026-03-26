@@ -6,7 +6,7 @@ from haystack import Document
 from pydantic import SecretStr
 from qdrant_client import AsyncQdrantClient, models
 
-from agentic_ra.core.errors import QdrantError
+from agentic_ra.core.errors import StoreError
 
 
 class QdrantStore:
@@ -44,7 +44,7 @@ class QdrantStore:
                 ),
             )
         except Exception as e:
-            raise QdrantError(
+            raise StoreError(
                 "Failed to ensure collection",
                 collection=name,
                 operation="ensure_collection",
@@ -84,7 +84,7 @@ class QdrantStore:
                 for point in results.points
             ]
         except Exception as e:
-            raise QdrantError(
+            raise StoreError(
                 "Vector search failed",
                 collection=collection,
                 operation="search",
@@ -108,7 +108,7 @@ class QdrantStore:
                 points=points,
             )
         except Exception as e:
-            raise QdrantError(
+            raise StoreError(
                 "Upsert failed",
                 collection=collection,
                 operation="upsert",
@@ -121,4 +121,4 @@ class QdrantStore:
         try:
             await self._client.close()
         except Exception as e:
-            raise QdrantError("Failed to close client", operation="close") from e
+            raise StoreError("Failed to close client", operation="close") from e
