@@ -114,11 +114,11 @@ lint-fix:
 
 # ─── Store Management ────────────────────────────────────────
 
-# Verify all store connections (Postgres, Qdrant, OpenSearch)
+# Verify all store connections (Postgres, Qdrant, Neo4j)
 stores-check:
     uv run python scripts/stores_check.py
 
-# Reset Qdrant collection + OpenSearch index
+# Reset Qdrant collection + Cognee knowledge graph
 stores-reset:
     uv run python scripts/stores_reset.py
 
@@ -138,8 +138,23 @@ ingest-file +FILES:
 # ─── Query ───────────────────────────────────────────────────
 
 # Quick query from CLI: just query "What is Python?"
+# Strategy values: semantic, keyword, hybrid, graph, graph_hybrid
 query QUERY STRATEGY="hybrid":
     @uv run python -c "import httpx,json; r=httpx.post('http://127.0.0.1:1059/api/v1/query',json={'query':'{{ QUERY }}','strategy':'{{ STRATEGY }}'},timeout=60); d=r.json(); print(json.dumps(d,indent=2))"
+
+# ─── Cognee (Knowledge Graph) ───────────────────────────────
+
+# Search Cognee knowledge graph directly
+cognee-search QUERY SEARCH_TYPE="GRAPH_COMPLETION" TOP_K="5":
+    @uv run python -c "import asyncio,json; from agentic_ra.core.config import get_settings; from agentic_ra.stores.cognee.client import CogneeStore; s=get_settings(); cs=CogneeStore(dataset=s.cognee_dataset); cs.configure(llm_api_key=s.openai_api_key.get_secret_value(), llm_model='openai/'+s.llm_model, graph_db_provider=s.cognee_graph_db_provider, vector_db_provider=s.cognee_vector_db_provider, data_root=s.cognee_data_root, system_root=s.cognee_system_root, qdrant_url=s.qdrant_url, qdrant_api_key=s.qdrant_api_key.get_secret_value(), neo4j_bolt_url=s.neo4j_bolt_url, neo4j_user=s.neo4j_user, neo4j_password=s.neo4j_password.get_secret_value(), neo4j_db=s.neo4j_db); docs=asyncio.run(cs.search('{{ QUERY }}','{{ SEARCH_TYPE }}',int('{{ TOP_K }}'))); print(json.dumps([{'content':d.content[:200],'meta':d.meta} for d in docs],indent=2,default=str))"
+
+# Query with graph_hybrid strategy (vector + keyword + graph fusion)
+query-graph QUERY:
+    @uv run python -c "import httpx,json; r=httpx.post('http://127.0.0.1:1059/api/v1/query',json={'query':'{{ QUERY }}','strategy':'graph_hybrid'},timeout=120); d=r.json(); print(json.dumps(d,indent=2))"
+
+# Reset Cognee knowledge base (prune graph + vectors)
+cognee-prune:
+    @uv run python -c "import asyncio; from agentic_ra.core.config import get_settings; from agentic_ra.stores.cognee.client import CogneeStore; s=get_settings(); cs=CogneeStore(dataset=s.cognee_dataset); cs.configure(llm_api_key=s.openai_api_key.get_secret_value(), llm_model='openai/'+s.llm_model, graph_db_provider=s.cognee_graph_db_provider, vector_db_provider=s.cognee_vector_db_provider, data_root=s.cognee_data_root, system_root=s.cognee_system_root, qdrant_url=s.qdrant_url, qdrant_api_key=s.qdrant_api_key.get_secret_value(), neo4j_bolt_url=s.neo4j_bolt_url, neo4j_user=s.neo4j_user, neo4j_password=s.neo4j_password.get_secret_value(), neo4j_db=s.neo4j_db); asyncio.run(cs.prune()); print('Cognee knowledge base pruned')"
 
 # ─── MCP ─────────────────────────────────────────────────────
 

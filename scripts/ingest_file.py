@@ -1,7 +1,7 @@
-"""Ingest a file (PDF, DOCX, PPTX, HTML, etc.) into the full RAG pipeline.
+"""Ingest a file (PDF, DOCX, PPTX, HTML, etc.) into the RAG pipeline.
 
-Parse with Docling → chunk with HybridChunker → embed with OpenAI →
-store in Qdrant + OpenSearch → persist DoclingDocument JSON in Postgres.
+Flow: Docling parse → Postgres DoclingDocument JSON persistence
+      → Cognee add+cognify (vector+graph via Qdrant + Neo4j)
 
 Usage: uv run python scripts/ingest_file.py <file_or_url> [file2] [file3] ...
 """
@@ -12,14 +12,11 @@ import asyncio
 import sys
 import time
 
-from qdrant_client import models as qdrant_models
-
 from agentic_ra.core.config import get_settings
 from agentic_ra.retrieval.embedder import EmbeddingPipeline
-from agentic_ra.stores.opensearch.client import OpenSearchStore
+from agentic_ra.stores.cognee.client import CogneeStore
 from agentic_ra.stores.postgres.client import PostgresClient
 from agentic_ra.stores.postgres.documents import DocumentStore
-from agentic_ra.stores.qdrant.client import QdrantStore
 
 
 async def ingest_file(source: str) -> None:
@@ -29,13 +26,6 @@ async def ingest_file(source: str) -> None:
     # Build components
     pg = PostgresClient(dsn=s.postgres_dsn_async.get_secret_value())
     doc_store = DocumentStore(pg_client=pg)
-    qdrant = QdrantStore(url=s.qdrant_url, api_key=s.qdrant_api_key)
-    opensearch = OpenSearchStore(
-        host=s.opensearch_host,
-        port=s.opensearch_port,
-        user=s.opensearch_user,
-        password=s.opensearch_initial_admin_password,
-    )
     pipeline = EmbeddingPipeline(
         model=s.embedding_model,
         api_key=s.openai_api_key.get_secret_value(),
@@ -44,23 +34,34 @@ async def ingest_file(source: str) -> None:
         merge_peers=s.chunk_merge_peers,
     )
 
-    # Ensure stores exist
-    await qdrant.ensure_collection("documents", vector_size=s.embedding_dimension)
-    await opensearch.ensure_index("documents")
+    # Cognee store — always required (Cognee is now the sole retrieval backend)
+    cognee_store = CogneeStore(dataset=s.cognee_dataset)
+    cognee_store.configure(
+        llm_api_key=s.openai_api_key.get_secret_value(),
+        llm_model=f"openai/{s.llm_model}",
+        graph_db_provider=s.cognee_graph_db_provider,
+        vector_db_provider=s.cognee_vector_db_provider,
+        data_root=s.cognee_data_root,
+        system_root=s.cognee_system_root,
+        qdrant_url=s.qdrant_url,
+        qdrant_api_key=s.qdrant_api_key.get_secret_value(),
+        neo4j_bolt_url=s.neo4j_bolt_url,
+        neo4j_user=s.neo4j_user,
+        neo4j_password=s.neo4j_password.get_secret_value(),
+        neo4j_db=s.neo4j_db,
+    )
 
-    # 1. Parse + chunk
+    # 1. Parse + chunk with Docling
     print(f"Parsing: {source}")
     chunk_result = pipeline.chunk_file(source)
     print(f"  Chunks: {chunk_result.chunk_count}")
 
     if chunk_result.chunk_count == 0:
         print("  No chunks produced — skipping.")
-        await qdrant.close()
-        await opensearch.close()
         await pg.close()
         return
 
-    # 2. Persist DoclingDocument JSON
+    # 2. Persist DoclingDocument JSON in Postgres
     docling_json = (
         chunk_result.docling_doc.export_to_dict()
         if chunk_result.docling_doc is not None
@@ -74,57 +75,14 @@ async def ingest_file(source: str) -> None:
     )
     print(f"  Persisted DoclingDocument: {parsed_doc.id}")
 
-    # Inject parsed_document_id into chunk metadata
-    for doc in chunk_result.documents:
-        doc.meta["parsed_document_id"] = str(parsed_doc.id)
+    # 3. Cognee: add + cognify (embedding → Qdrant, entities → Neo4j)
+    print("  Cognee add+cognify...")
+    full_text = "\n\n".join(
+        doc.meta.get("chunk_text", doc.content) for doc in chunk_result.documents
+    )
+    await cognee_store.add_and_cognify(text=full_text)
+    print("  Cognee: graph + vector ingestion complete")
 
-    # 3. Embed
-    print(f"  Embedding {len(chunk_result.documents)} chunks...")
-    embedded = pipeline.embed(chunk_result.documents)
-    print(f"  Embedded: {len(embedded)} chunks ({s.embedding_dimension}d)")
-
-    # 4. Store in Qdrant
-    # Use UUID-based IDs to avoid collisions across ingestions
-    import uuid
-
-    points = [
-        qdrant_models.PointStruct(
-            id=str(uuid.uuid4()),
-            vector=doc.embedding,
-            payload={
-                "content": doc.content,
-                "chunk_text": doc.meta.get("chunk_text", doc.content),
-                "parsed_document_id": doc.meta.get("parsed_document_id", ""),
-                "headings": doc.meta.get("headings", []),
-                "source_path": source,
-            },
-        )
-        for doc in embedded
-        if doc.embedding is not None
-    ]
-
-    if points:
-        await qdrant._client.upsert(collection_name="documents", points=points)
-        print(f"  Qdrant: {len(points)} vectors stored")
-
-    # 5. Store in OpenSearch
-    for doc in embedded:
-        await opensearch._client.index(
-            index="documents",
-            id=str(uuid.uuid4()),
-            body={
-                "content": doc.meta.get("chunk_text", doc.content),
-                "parsed_document_id": doc.meta.get("parsed_document_id", ""),
-                "headings": doc.meta.get("headings", []),
-                "source_path": source,
-            },
-            refresh=True,
-        )
-    print(f"  OpenSearch: {len(embedded)} documents indexed")
-
-    # Cleanup
-    await qdrant.close()
-    await opensearch.close()
     await pg.close()
 
     elapsed = time.time() - start

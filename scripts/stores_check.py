@@ -1,13 +1,19 @@
-"""Verify connectivity to all stores (Postgres, Qdrant, OpenSearch)."""
+"""Verify connectivity to all stores (Postgres, Qdrant, Neo4j)."""
 
 import asyncio
 
 import sqlalchemy
 
 from agentic_ra.core.config import get_settings
-from agentic_ra.stores.opensearch.client import OpenSearchStore
 from agentic_ra.stores.postgres.client import PostgresClient
 from agentic_ra.stores.qdrant.client import QdrantStore
+
+
+async def check_neo4j(host: str, port: int) -> None:
+    """Verify Neo4j is reachable via a TCP connection to bolt port."""
+    reader, writer = await asyncio.open_connection(host, port)
+    writer.close()
+    await writer.wait_closed()
 
 
 async def main() -> None:
@@ -24,15 +30,8 @@ async def main() -> None:
     print("  Qdrant OK")
     await q.close()
 
-    o = OpenSearchStore(
-        host=s.opensearch_host,
-        port=s.opensearch_port,
-        user=s.opensearch_user,
-        password=s.opensearch_initial_admin_password,
-    )
-    await o._client.info()
-    print("  OpenSearch OK")
-    await o.close()
+    await check_neo4j(s.neo4j_host, s.neo4j_bolt_port)
+    print("  Neo4j OK")
 
     print("All stores connected")
 
