@@ -16,6 +16,7 @@ from typing import Any
 
 from docling.document_converter import DocumentConverter
 from docling_core.transforms.chunker import HybridChunker  # type: ignore[attr-defined]  # re-exported at runtime
+from docling_core.transforms.chunker.tokenizer.huggingface import HuggingFaceTokenizer
 from docling_core.types.doc import DocItemLabel, DoclingDocument  # type: ignore[attr-defined]  # re-exported at runtime
 from haystack import Document
 from haystack.components.embedders import OpenAIDocumentEmbedder
@@ -67,7 +68,16 @@ class EmbeddingPipeline:
     ) -> None:
         self._model_name = model
         self._converter = DocumentConverter()
+
+        # Use a tokenizer with max_tokens matching the embedding model's context window
+        # (8191 for OpenAI text-embedding-3-*) to avoid false truncation warnings.
+        # The chunk max_tokens is set separately and controls actual chunk size.
+        tokenizer = HuggingFaceTokenizer.from_pretrained(
+            model_name="bert-base-uncased",
+            max_tokens=max_tokens,
+        )
         self._chunker = HybridChunker(  # type: ignore[call-arg]  # pydantic model accepts kwargs at runtime
+            tokenizer=tokenizer,
             max_tokens=max_tokens,
             merge_peers=merge_peers,
         )
