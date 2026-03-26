@@ -30,6 +30,7 @@ class Settings(BaseSettings):
     qdrant_http_port: int = 1051
     qdrant_host: str = "localhost"
     qdrant_api_key: SecretStr
+    qdrant_collection: str = "documents"
 
     # --- OpenSearch ---
     opensearch_user: str = "admin"
@@ -37,6 +38,7 @@ class Settings(BaseSettings):
     opensearch_port: int = 1052
     opensearch_perf_port: int = 1053
     opensearch_host: str = "localhost"
+    opensearch_index: str = "documents"
     opensearch_java_opts: str = (
         "-Xms512m -Xmx512m"  # Infra-only; override in .env for production
     )
@@ -50,14 +52,18 @@ class Settings(BaseSettings):
 
     # --- OPA ---
     opa_port: int = 1055
+    opa_host: str = "localhost"
     opa_log_level: str = "info"
+    opa_auth_enabled: bool = False
 
-    # --- Hayhooks (reserved for Phase 8) ---
+    # --- Hayhooks (reserved) ---
     hayhooks_port: int = 1056
 
     # --- OTel / Jaeger ---
     otel_collector_port: int = 1057
+    otel_host: str = "localhost"
     jaeger_ui_port: int = 1058
+    jaeger_host: str = "localhost"
 
     # --- OpenAI ---
     openai_api_key: SecretStr
@@ -69,6 +75,9 @@ class Settings(BaseSettings):
     embedding_batch_size: int = 32
     chunk_max_tokens: int = 512
     chunk_merge_peers: bool = True
+
+    # --- Application ---
+    log_level: str = "INFO"
 
     # --- Computed connection URLs ---
 
@@ -97,7 +106,7 @@ class Settings(BaseSettings):
     @computed_field  # type: ignore[prop-decorator]
     @property
     def postgres_dsn_async(self) -> SecretStr:
-        """Async PostgreSQL DSN for asyncpg driver. Use .get_secret_value() to access."""
+        """Async PostgreSQL DSN for asyncpg driver."""
         return SecretStr(
             f"postgresql+asyncpg://{self.postgres_user}"
             f":{self.postgres_password.get_secret_value()}"
@@ -108,19 +117,19 @@ class Settings(BaseSettings):
     @property
     def opa_url(self) -> str:
         """OPA policy decision endpoint."""
-        return f"http://localhost:{self.opa_port}"
+        return f"http://{self.opa_host}:{self.opa_port}"
 
     @computed_field  # type: ignore[prop-decorator]
     @property
     def otel_endpoint(self) -> str:
         """OTel Collector OTLP gRPC endpoint."""
-        return f"http://localhost:{self.otel_collector_port}"
+        return f"http://{self.otel_host}:{self.otel_collector_port}"
 
     @computed_field  # type: ignore[prop-decorator]
     @property
     def jaeger_ui_url(self) -> str:
         """Jaeger trace UI URL."""
-        return f"http://localhost:{self.jaeger_ui_port}"
+        return f"http://{self.jaeger_host}:{self.jaeger_ui_port}"
 
 
 @lru_cache(maxsize=1)

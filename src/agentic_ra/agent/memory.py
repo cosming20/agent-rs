@@ -57,6 +57,7 @@ class MemoryStore:
                 session.add(msg)
                 await session.commit()
                 await session.refresh(msg)
+                session.expunge(msg)
             return msg
         except SQLAlchemyError as e:
             raise MemoryStoreError(
@@ -147,6 +148,7 @@ class MemoryStore:
 
                 await session.commit()
                 await session.refresh(entry)
+                session.expunge(entry)
                 return entry
         except SQLAlchemyError as e:
             raise MemoryStoreError(

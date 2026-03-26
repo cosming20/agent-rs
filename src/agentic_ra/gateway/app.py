@@ -26,47 +26,45 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     """Application lifespan: build pipeline on startup, tear down on shutdown."""
     settings = get_settings()
 
-    # Setup structured logging
-    setup_logging(level="INFO")
+    setup_logging(level=settings.log_level)
 
-    # Setup tracing
     tracer_provider = setup_tracing(settings)
 
-    # Build the RAG pipeline
     pipeline = build_pipeline(settings)
     app.state.pipeline = pipeline
-    app.state.opa_client = OPAClient(base_url=settings.opa_url)
 
-    # Warm up embedding models (sync, runs in main thread at startup)
+    opa_client = OPAClient(base_url=settings.opa_url)
+    app.state.opa_client = opa_client
+
     logger.info("Warming up embedding models...")
     pipeline.embedding_pipeline.warm_up()
     pipeline.query_embedder.warm_up()
     logger.info("Embedding models ready")
 
-    # Ensure collections and indices exist
     await pipeline.qdrant.ensure_collection(
-        "documents",
+        settings.qdrant_collection,
         vector_size=settings.embedding_dimension,
     )
-    await pipeline.opensearch.ensure_index("documents")
+    await pipeline.opensearch.ensure_index(settings.opensearch_index)
     logger.info("Qdrant collection and OpenSearch index ready")
 
     yield
 
-    # Shutdown
+    # Shutdown — close all components, tolerating individual failures
     logger.info("Shutting down RAG pipeline...")
-    await app.state.opa_client.close()
-    await pipeline.close()
+    for close_fn in [opa_client.close, pipeline.close]:
+        try:
+            await close_fn()
+        except Exception:
+            logger.exception("Error during shutdown")
     tracer_provider.shutdown()
     logger.info("Shutdown complete")
 
 
 def create_app() -> FastAPI:
-    """Create and configure the FastAPI application.
+    """Create and configure the FastAPI application."""
+    settings = get_settings()
 
-    Returns:
-        Configured FastAPI instance with all routes mounted.
-    """
     app = FastAPI(
         title="Agentic RAG",
         description="Near-perfect agentic RAG system API",
@@ -80,12 +78,11 @@ def create_app() -> FastAPI:
     app.include_router(query_router)
     app.include_router(ingest_router)
 
-    # OPA auth middleware — disabled by default in dev (OPA may not be running).
-    # Set OPA_AUTH_ENABLED=true in .env to enforce authorization.
+    # OPA middleware uses settings — single client, properly closed in lifespan
     app.add_middleware(
         OPAAuthMiddleware,
-        opa_client=OPAClient(base_url="http://localhost:1055"),
-        enabled=False,
+        opa_client=OPAClient(base_url=settings.opa_url),
+        enabled=settings.opa_auth_enabled,
     )
 
     return app

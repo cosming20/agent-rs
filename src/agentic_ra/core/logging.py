@@ -6,6 +6,7 @@ and human-readable output for development.
 
 from __future__ import annotations
 
+import json
 import logging
 import sys
 from typing import Literal
@@ -52,8 +53,6 @@ class _JsonFormatter(logging.Formatter):
     """JSON log formatter for structured logging in production."""
 
     def format(self, record: logging.LogRecord) -> str:
-        import json
-
         log_entry: dict[str, object] = {
             "timestamp": self.formatTime(record),
             "level": record.levelname,

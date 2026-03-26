@@ -91,6 +91,31 @@ class QdrantStore:
                 original_error=str(e),
             ) from e
 
+    async def upsert(
+        self,
+        collection: str,
+        points: list[models.PointStruct],
+    ) -> None:
+        """Upsert points into a collection.
+
+        Args:
+            collection: Qdrant collection name.
+            points: Points with id, vector, and payload.
+        """
+        try:
+            await self._client.upsert(
+                collection_name=collection,
+                points=points,
+            )
+        except Exception as e:
+            raise QdrantError(
+                "Upsert failed",
+                collection=collection,
+                operation="upsert",
+                point_count=len(points),
+                original_error=str(e),
+            ) from e
+
     async def close(self) -> None:
         """Close the underlying client connection."""
         try:

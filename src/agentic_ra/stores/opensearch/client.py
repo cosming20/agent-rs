@@ -111,6 +111,37 @@ class OpenSearchStore:
                 original_error=str(e),
             ) from e
 
+    async def index_document(
+        self,
+        index: str,
+        doc_id: str,
+        body: dict[str, Any],
+        refresh: bool = True,
+    ) -> None:
+        """Index a single document.
+
+        Args:
+            index: OpenSearch index name.
+            doc_id: Document ID.
+            body: Document body to index.
+            refresh: Whether to refresh the index after indexing.
+        """
+        try:
+            await self._client.index(
+                index=index,
+                id=doc_id,
+                body=body,
+                refresh=refresh,
+            )
+        except Exception as e:
+            raise OpenSearchError(
+                "Document indexing failed",
+                index=index,
+                doc_id=doc_id,
+                operation="index_document",
+                original_error=str(e),
+            ) from e
+
     async def close(self) -> None:
         """Close the underlying client connection."""
         try:

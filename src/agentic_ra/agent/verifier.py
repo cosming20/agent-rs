@@ -115,8 +115,12 @@ class GroundingVerifier:
         return self._verify_heuristic(answer, evidence)
 
     def needs_retry(self, result: VerificationResult) -> bool:
-        """Determine if the answer should trigger a Stage-2 retrieval retry."""
-        return not result.is_grounded
+        """Determine if the answer should trigger a Stage-2 retrieval retry.
+
+        Only retries when grounding failed despite having evidence.
+        Zero-evidence case (confidence=0.0) is not retried.
+        """
+        return not result.is_grounded and result.confidence > 0.0
 
     def _verify_with_llm(
         self,
@@ -136,7 +140,8 @@ class GroundingVerifier:
             ),
         ]
 
-        assert self._llm is not None  # guaranteed by caller check
+        if self._llm is None:
+            raise VerificationError("LLM verifier not configured", operation="verify_llm")
         try:
             result = self._llm.run(messages=messages)
             replies: list[ChatMessage] = result["replies"]

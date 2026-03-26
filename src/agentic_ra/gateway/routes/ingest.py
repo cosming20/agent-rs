@@ -10,6 +10,7 @@ from haystack import Document
 from pydantic import BaseModel, Field
 from qdrant_client import models as qdrant_models
 
+from agentic_ra.core.config import get_settings
 from agentic_ra.pipelines.factory import RAGPipeline
 
 router = APIRouter(prefix="/api/v1", tags=["ingest"])
@@ -46,32 +47,28 @@ def _get_pipeline(request: Request) -> RAGPipeline:
 
 @router.post("/ingest", response_model=IngestResponse)
 async def ingest_endpoint(request: Request, body: IngestRequest) -> IngestResponse:
-    """Chunk, embed, and store documents. Persists parsed DoclingDocument JSON.
-
-    Documents are chunked with Docling HybridChunker (structure-aware),
-    embedded via OpenAI, stored in Qdrant + OpenSearch, and the parsed
-    DoclingDocument JSON is persisted in Postgres for reuse.
-    """
+    """Chunk, embed, and store documents. Persists parsed DoclingDocument JSON."""
     pipeline = _get_pipeline(request)
+    settings = get_settings()
+    collection = settings.qdrant_collection
+    index = settings.opensearch_index
 
-    # Convert to Haystack Documents
     docs = [
         Document(content=d.content, meta=d.metadata)
         for d in body.documents
     ]
 
-    # Chunk with Docling HybridChunker (sync — run in thread)
+    # Chunk with Docling HybridChunker
     chunk_result = await asyncio.to_thread(
         pipeline.embedding_pipeline.chunk_text, docs
     )
 
-    # Persist the parsed DoclingDocument JSON in Postgres
+    # Persist parsed DoclingDocument JSON
     docling_json = (
         chunk_result.docling_doc.export_to_dict()
         if chunk_result.docling_doc is not None
         else {}
     )
-
     parsed_doc = await pipeline.document_store.save(
         source_path=body.source_path,
         docling_json=docling_json,
@@ -79,16 +76,16 @@ async def ingest_endpoint(request: Request, body: IngestRequest) -> IngestRespon
         metadata={"ingested_doc_count": len(body.documents)},
     )
 
-    # Inject parsed_document_id into chunk metadata for provenance
+    # Inject parsed_document_id into chunk metadata
     for doc in chunk_result.documents:
         doc.meta["parsed_document_id"] = str(parsed_doc.id)
 
-    # Embed with OpenAI (sync — run in thread)
+    # Embed with OpenAI
     embedded = await asyncio.to_thread(
         pipeline.embedding_pipeline.embed, chunk_result.documents
     )
 
-    # Store in Qdrant (vector search)
+    # Store in Qdrant via public API
     points = [
         qdrant_models.PointStruct(
             id=str(uuid_mod.uuid4()),
@@ -97,36 +94,34 @@ async def ingest_endpoint(request: Request, body: IngestRequest) -> IngestRespon
                 "content": doc.content,
                 "chunk_text": doc.meta.get("chunk_text", doc.content),
                 "parsed_document_id": doc.meta.get("parsed_document_id", ""),
-                **(doc.meta or {}),
+                "headings": doc.meta.get("headings", []),
+                "source_path": body.source_path,
             },
         )
-        for idx, doc in enumerate(embedded)
+        for doc in embedded
         if doc.embedding is not None
     ]
 
     if points:
-        await pipeline.qdrant._client.upsert(
-            collection_name="documents",
-            points=points,
-        )
+        await pipeline.qdrant.upsert(collection=collection, points=points)
 
-    # Store in OpenSearch (keyword/BM25 search)
+    # Store in OpenSearch via public API
     for doc in embedded:
-        await pipeline.opensearch._client.index(
-            index="documents",
-            id=str(uuid_mod.uuid4()),
+        await pipeline.opensearch.index_document(
+            index=index,
+            doc_id=str(uuid_mod.uuid4()),
             body={
                 "content": doc.meta.get("chunk_text", doc.content),
                 "parsed_document_id": doc.meta.get("parsed_document_id", ""),
-                **(doc.meta or {}),
+                "headings": doc.meta.get("headings", []),
+                "source_path": body.source_path,
             },
-            refresh=True,
         )
 
     return IngestResponse(
         ingested_count=len(body.documents),
         chunk_count=len(embedded),
         parsed_document_id=parsed_doc.id,
-        collection="documents",
-        index="documents",
+        collection=collection,
+        index=index,
     )

@@ -21,7 +21,7 @@ class QueryRequest(BaseModel):
         default=None, description="Session ID for conversation continuity"
     )
     user_id: str = Field(default="anonymous", description="User identifier")
-    strategy: str = Field(default="hybrid", description="Retrieval strategy: vector, keyword, hybrid")
+    strategy: RetrievalStrategy = Field(default=RetrievalStrategy.HYBRID, description="Retrieval strategy")
     limit: int = Field(default=10, ge=1, le=100, description="Max evidence documents")
 
 
@@ -57,13 +57,11 @@ async def query_endpoint(request: Request, body: QueryRequest) -> QueryResponse:
     pipeline = _get_pipeline(request)
     session_id = body.session_id or uuid.uuid4()
 
-    strategy = RetrievalStrategy(body.strategy)
-
     result = await pipeline.orchestrator.process_query(
         query=body.query,
         session_id=session_id,
         user_id=body.user_id,
-        strategy=strategy,
+        strategy=body.strategy,
         limit=body.limit,
     )
 

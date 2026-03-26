@@ -49,10 +49,16 @@ class RAGPipeline:
     run_store: RunStore
 
     async def close(self) -> None:
-        """Gracefully shut down all components."""
-        await self.qdrant.close()
-        await self.opensearch.close()
-        await self.postgres.close()
+        """Gracefully shut down all components, tolerating individual failures."""
+        for name, close_fn in [
+            ("QdrantStore", self.qdrant.close),
+            ("OpenSearchStore", self.opensearch.close),
+            ("PostgresClient", self.postgres.close),
+        ]:
+            try:
+                await close_fn()
+            except Exception:
+                logging.getLogger(__name__).exception("Error closing %s", name)
 
 
 def build_pipeline(settings: Settings) -> RAGPipeline:
@@ -109,8 +115,8 @@ def build_pipeline(settings: Settings) -> RAGPipeline:
         query_embedder=query_embedder,
         qdrant_store=qdrant,
         opensearch_store=opensearch,
-        collection="documents",
-        index="documents",
+        collection=settings.qdrant_collection,
+        index=settings.opensearch_index,
     )
 
     ranker = ResultRanker()
