@@ -66,3 +66,23 @@ class RoutingError(RetrievalError):
 
 class RankingError(RetrievalError):
     """Ranking or evidence assembly failure."""
+
+
+class AgentError(AgenticRAError):
+    """Base for all agent core failures."""
+
+
+class MemoryError(AgentError):
+    """Memory store read/write failure."""
+
+
+class OrchestratorError(AgentError):
+    """Agent orchestration failure."""
+
+
+class VerificationError(AgentError):
+    """Faithfulness/grounding verification failure."""
+
+
+class SynthesisError(AgentError):
+    """Response synthesis failure."""
