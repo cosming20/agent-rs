@@ -7,6 +7,7 @@ dependencies = [
     "alembic>=1.15",
     "asyncpg>=0.30",
     "haystack-ai>=2.13",
+    "mcp>=1.12",
     "opensearch-py[async]>=2.8",
     "pydantic-settings>=2.9",
     "qdrant-client>=1.13",

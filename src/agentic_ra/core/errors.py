@@ -86,3 +86,11 @@ class VerificationError(AgentError):
 
 class SynthesisError(AgentError):
     """Response synthesis failure."""
+
+
+class ToolError(AgenticRAError):
+    """Base for all tool integration failures."""
+
+
+class MCPClientError(ToolError):
+    """MCP client connection or invocation failure."""
