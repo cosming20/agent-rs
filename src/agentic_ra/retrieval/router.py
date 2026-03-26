@@ -8,7 +8,7 @@ import enum
 from haystack import Document
 from haystack.components.embedders import SentenceTransformersTextEmbedder
 
-from agentic_ra.core.errors import EmbeddingError, RoutingError
+from agentic_ra.core.errors import EmbeddingError, RoutingError, StoreError
 from agentic_ra.stores.opensearch.client import OpenSearchStore
 from agentic_ra.stores.qdrant.client import QdrantStore
 
@@ -131,7 +131,7 @@ class RetrievalRouter:
             )
             return vector_results + keyword_results
 
-        except (EmbeddingError, RoutingError):
+        except (EmbeddingError, RoutingError, StoreError):
             raise
         except Exception as e:
             raise RoutingError(
