@@ -145,6 +145,52 @@ def _format_evidence(documents: list[Document] | tuple[Document, ...]) -> str:
     return "\n\n".join(parts)
 
 
+def _search_dataset(
+    cognee_store: Any,
+    dataset: str,
+    query: str,
+    strategy: RetrievalStrategy,
+    limit: int = 10,
+) -> list[Document]:
+    """Search a specific Cognee dataset using the given strategy.
+
+    Maps each :class:`RetrievalStrategy` to one or more Cognee search types,
+    then runs them sequentially against *dataset* and merges the results.
+
+    Args:
+        cognee_store: CogneeStore instance (typed ``Any`` to avoid circular import).
+        dataset: Cognee dataset name (e.g. ``"user_42"``).
+        query: The search query text.
+        strategy: Which retrieval strategy to use.
+        limit: Maximum results per search type.
+
+    Returns:
+        A flat list of :class:`Document` results across all search types.
+    """
+    search_types: dict[RetrievalStrategy, list[str]] = {
+        RetrievalStrategy.SEMANTIC: ["CHUNKS"],
+        RetrievalStrategy.KEYWORD: ["CHUNKS_LEXICAL"],
+        RetrievalStrategy.GRAPH: ["GRAPH_COMPLETION"],
+        RetrievalStrategy.HYBRID: ["CHUNKS", "CHUNKS_LEXICAL"],
+        RetrievalStrategy.GRAPH_HYBRID: [
+            "GRAPH_COMPLETION",
+            "CHUNKS",
+            "CHUNKS_LEXICAL",
+        ],
+    }
+    types = search_types.get(strategy, ["CHUNKS", "CHUNKS_LEXICAL"])
+
+    all_results: list[Document] = []
+    for st in types:
+        results: list[Document] = _run_async(
+            cognee_store.search(
+                query=query, search_type=st, top_k=limit, dataset=dataset
+            )
+        )
+        all_results.extend(results)
+    return all_results
+
+
 # ---------------------------------------------------------------------------
 # Tool factories
 # ---------------------------------------------------------------------------
@@ -153,15 +199,24 @@ def _format_evidence(documents: list[Document] | tuple[Document, ...]) -> str:
 def make_search_knowledge_tool(
     router: RetrievalRouter,
     ranker: ResultRanker,
+    cognee_store: Any = None,
+    document_store: Any = None,
+    dataset: str = "user_anonymous",
+    role: str = "user",
 ) -> ToolConfig:
     """Create the ``search_knowledge`` tool for the Haystack Agent.
 
-    Searches the knowledge base using the retrieval router and ranker,
-    returning formatted evidence text plus raw documents.
+    Searches the knowledge base using per-user dataset scoping.  Regular
+    users search only their own dataset; admins fan-out across **all**
+    user datasets.
 
     Args:
-        router: Retrieval router for dispatching searches.
+        router: Retrieval router (kept for backward compatibility).
         ranker: Result ranker for dedup and RRF fusion.
+        cognee_store: CogneeStore instance for direct dataset-scoped search.
+        document_store: Document store with ``list_user_datasets()`` (admin fan-out).
+        dataset: Cognee dataset name for the current user (e.g. ``"user_42"``).
+        role: ``"user"`` or ``"admin"``.
 
     Returns:
         Tool descriptor dict with name, description, function, parameters.
@@ -180,9 +235,31 @@ def make_search_knowledge_tool(
             )
 
         try:
-            raw_docs = _run_async(
-                router.retrieve(query=query, strategy=retrieval_strategy)
-            )
+            if cognee_store is not None:
+                if role == "admin" and document_store is not None:
+                    # Admin fan-out: search all user datasets
+                    user_ids: list[str] = _run_async(
+                        document_store.list_user_datasets()
+                    )
+                    all_results: list[Document] = []
+                    for uid in user_ids:
+                        ds = f"user_{uid}"
+                        results = _search_dataset(
+                            cognee_store, ds, query, retrieval_strategy, limit=10
+                        )
+                        all_results.extend(results)
+                    raw_docs = all_results
+                else:
+                    # User: search only their dataset
+                    raw_docs = _search_dataset(
+                        cognee_store, dataset, query, retrieval_strategy, limit=10
+                    )
+            else:
+                # Fallback: use router (no dataset scoping)
+                raw_docs = _run_async(
+                    router.retrieve(query=query, strategy=retrieval_strategy)
+                )
+
             evidence_pack = ranker.rank(
                 results=raw_docs,
                 query=query,
@@ -279,19 +356,22 @@ def make_search_web_tool() -> ToolConfig:
 
 def make_ingest_tool(
     cognee_store: Any,  # CogneeStore -- typed as Any to avoid circular import
+    dataset: str = "user_anonymous",
 ) -> ToolConfig:
     """Create the ``ingest_document`` tool for the Haystack Agent.
 
-    Ingests text into the Cognee knowledge graph via ``add_and_cognify``.
+    Ingests text into the Cognee knowledge graph via ``add_and_cognify``,
+    scoped to the given *dataset* (typically ``"user_{user_id}"``).
 
     Args:
         cognee_store: CogneeStore instance for knowledge graph operations.
+        dataset: Cognee dataset name for the current user.
 
     Returns:
         Tool descriptor dict with name, description, function, parameters.
     """
 
-    def ingest_document(text: str, dataset: str = "") -> dict[str, str]:
+    def ingest_document(text: str) -> dict[str, str]:
         """Ingest text into the knowledge graph."""
         if not text.strip():
             raise ToolError(
@@ -300,16 +380,12 @@ def make_ingest_tool(
             )
 
         try:
-            kwargs: dict[str, str] = {}
-            if dataset:
-                kwargs["dataset"] = dataset
-
-            _run_async(cognee_store.add_and_cognify(text, **kwargs))
+            _run_async(cognee_store.add_and_cognify(text=text, dataset=dataset))
 
             logger.info(
                 "ingest_document ingested %d characters (dataset=%s)",
                 len(text),
-                dataset or "default",
+                dataset,
             )
             return {"text": f"Successfully ingested {len(text)} characters."}
         except ToolError:
@@ -335,11 +411,6 @@ def make_ingest_tool(
                 "text": {
                     "type": "string",
                     "description": "The raw text content to ingest.",
-                },
-                "dataset": {
-                    "type": "string",
-                    "description": "Optional dataset name override.",
-                    "default": "",
                 },
             },
             "required": ["text"],
