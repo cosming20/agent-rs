@@ -20,7 +20,7 @@ services:
   # Qdrant — Vector similarity search
   # ----------------------------------------------------------
   qdrant:
-    image: qdrant/qdrant:latest
+    image: qdrant/qdrant:v1.14.0
     container_name: agentic-ra-qdrant
     restart: "on-failure:5"
     ports:
@@ -47,13 +47,13 @@ services:
   # PostgreSQL — State store, chat history, memory, evidence
   # ----------------------------------------------------------
   postgres:
-    image: postgres:latest
+    image: postgres:17.4
     container_name: agentic-ra-postgres
     restart: "on-failure:5"
     ports:
       - "${POSTGRES_PORT}:5432"
     volumes:
-      - postgres_data:/var/lib/postgresql
+      - postgres_data:/var/lib/postgresql/data
       - ./postgres/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
     environment:
       - POSTGRES_USER=${POSTGRES_USER}
@@ -79,7 +79,7 @@ services:
   # Neo4j — Knowledge graph (Cognee graph backend)
   # ----------------------------------------------------------
   neo4j:
-    image: neo4j:5-community
+    image: neo4j:5.26-community
     container_name: agentic-ra-neo4j
     restart: "on-failure:5"
     ports:
@@ -106,7 +106,7 @@ services:
   # OPA — Policy decision point
   # ----------------------------------------------------------
   opa:
-    image: openpolicyagent/opa:latest-debug
+    image: openpolicyagent/opa:1.4.2-debug
     container_name: agentic-ra-opa
     restart: unless-stopped
     ports:
@@ -141,7 +141,7 @@ services:
   # Jaeger — Trace storage + UI (in-memory, ephemeral)
   # ----------------------------------------------------------
   jaeger:
-    image: jaegertracing/all-in-one:latest
+    image: jaegertracing/all-in-one:1.67
     container_name: agentic-ra-jaeger
     restart: unless-stopped
     ports:
@@ -168,7 +168,7 @@ services:
   # OTel Collector — Telemetry pipeline
   # ----------------------------------------------------------
   otel-collector:
-    image: otel/opentelemetry-collector-contrib:latest
+    image: otel/opentelemetry-collector-contrib:0.121.0
     container_name: agentic-ra-otel-collector
     restart: unless-stopped
     ports:

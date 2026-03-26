@@ -157,48 +157,6 @@ class EmbeddingPipeline:
                 original_error=str(e),
             ) from e
 
-    def embed(self, documents: list[Document]) -> list[Document]:
-        """Generate embeddings for pre-chunked documents.
-
-        Args:
-            documents: Haystack Documents (typically from chunk_text/chunk_file).
-
-        Returns:
-            Documents with populated ``embedding`` field.
-        """
-        if not documents:
-            return []
-
-        try:
-            result = self._embedder.run(documents=documents)
-            embedded: list[Document] = result["documents"]
-            return embedded
-        except Exception as e:
-            raise EmbeddingError(
-                "Embedding generation failed",
-                model=self._model_name,
-                operation="embed",
-                document_count=len(documents),
-                original_error=str(e),
-            ) from e
-
-    def run(self, documents: list[Document]) -> list[Document]:
-        """Chunk and embed text documents in one step.
-
-        Convenience method that chains chunk_text → embed.
-
-        Args:
-            documents: Haystack Documents with text content.
-
-        Returns:
-            Embedded documents with chunk metadata.
-        """
-        if not documents:
-            return []
-
-        chunk_result = self.chunk_text(documents)
-        return self.embed(chunk_result.documents)
-
     def _chunk_docling_doc(
         self,
         docling_doc: DoclingDocument,

@@ -143,11 +143,26 @@ class RetrievalRouter:
         results: list[list[Document] | BaseException],
         strategy_name: str,
     ) -> list[Document]:
-        """Filter exceptions from ``asyncio.gather(return_exceptions=True)``."""
+        """Filter exceptions from ``asyncio.gather(return_exceptions=True)``.
+
+        Raises:
+            RoutingError: If all retrieval branches failed.
+        """
         combined: list[Document] = []
+        failure_count = 0
         for r in results:
             if isinstance(r, BaseException):
                 logger.warning("Search failed in %s strategy: %s", strategy_name, r)
+                failure_count += 1
             else:
                 combined.extend(r)
+
+        if len(combined) == 0 and failure_count > 0:
+            raise RoutingError(
+                "All retrieval branches failed",
+                operation="retrieve",
+                strategy=strategy_name,
+                failure_count=failure_count,
+            )
+
         return combined

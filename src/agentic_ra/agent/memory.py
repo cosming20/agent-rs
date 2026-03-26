@@ -127,9 +127,13 @@ class MemoryStore:
         """
         try:
             async with self._pg.session() as session:
-                stmt = select(MemoryEntry).where(
-                    MemoryEntry.user_id == user_id,
-                    MemoryEntry.key == key,
+                stmt = (
+                    select(MemoryEntry)
+                    .where(
+                        MemoryEntry.user_id == user_id,
+                        MemoryEntry.key == key,
+                    )
+                    .with_for_update()
                 )
                 result = await session.execute(stmt)
                 entry = result.scalar_one_or_none()

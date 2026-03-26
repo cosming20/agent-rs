@@ -108,7 +108,7 @@ class ResponseSynthesizer:
         """Extract citations from evidence documents."""
         citations: list[Citation] = []
         for idx, doc in enumerate(evidence, start=1):
-            content = doc.content or ""
+            content = doc.meta.get("chunk_text", doc.content or "")
             snippet = content[: self._max_snippet]
             if len(content) > self._max_snippet:
                 snippet += "..."

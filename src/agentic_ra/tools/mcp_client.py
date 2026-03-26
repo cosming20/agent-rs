@@ -37,6 +37,12 @@ class MCPToolClient:
     Connects to an MCP server via stdio transport, discovers available tools,
     and invokes them with structured arguments.
 
+    .. note::
+        Currently spawns a new subprocess per call (list_tools / call_tool).
+        For production use, extract the stdio_client + ClientSession lifecycle
+        into a shared async context manager so the subprocess is reused across
+        calls within one request.
+
     Args:
         command: Command to launch the MCP server process.
         args: Arguments for the server command.

@@ -17,12 +17,10 @@ from agentic_ra.agent.memory import MemoryStore
 from agentic_ra.agent.synthesis import ResponseSynthesizer, SynthesizedResponse
 from agentic_ra.agent.tools import (
     _sanitize_user_id,
-    get_evidence_buffer,
     make_ingest_tool,
     make_remember_tool,
     make_search_knowledge_tool,
     make_search_web_tool,
-    reset_evidence_buffer,
 )
 from agentic_ra.agent.verifier import GroundingVerifier
 from agentic_ra.core.errors import OrchestratorError
@@ -111,6 +109,7 @@ class AgentOrchestrator:
 
             # 3. Build per-request tools scoped to this user's dataset
             dataset = f"user_{_sanitize_user_id(user_id)}"
+            evidence: list[Document] = []
             tools_config = [
                 make_search_knowledge_tool(
                     self._router,
@@ -119,6 +118,7 @@ class AgentOrchestrator:
                     document_store=self._document_store,
                     dataset=dataset,
                     role=role,
+                    evidence_accumulator=evidence,
                 ),
                 make_search_web_tool(),
                 make_remember_tool(self._memory, user_id),
@@ -131,12 +131,11 @@ class AgentOrchestrator:
             agent = build_agent_with_tools(self._base_agent, tools_config)
 
             # 4. Run Haystack Agent (offloaded to thread — Agent.run is sync)
-            reset_evidence_buffer()
+            evidence.clear()
             agent_result = await asyncio.to_thread(agent.run, messages=chat_messages)
 
-            # 5. Extract answer and evidence
+            # 5. Extract answer and evidence (accumulated via closure)
             answer = self._extract_answer(agent_result)
-            evidence: list[Document] = get_evidence_buffer()
             elapsed_ms = (time.monotonic() - start) * 1000
 
             if self._metrics:
@@ -175,12 +174,11 @@ class AgentOrchestrator:
                     ChatMessage.from_assistant(answer),
                     feedback,
                 ]
-                reset_evidence_buffer()
+                evidence.clear()
                 agent_result = await asyncio.to_thread(
                     agent.run, messages=retry_messages
                 )
                 answer = self._extract_answer(agent_result)
-                evidence = get_evidence_buffer()
                 verification = await asyncio.to_thread(
                     self._verifier.verify, answer=answer, evidence=evidence
                 )

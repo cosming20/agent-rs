@@ -9,6 +9,7 @@ from starlette.middleware.base import BaseHTTPMiddleware, RequestResponseEndpoin
 from starlette.responses import JSONResponse
 
 from agentic_ra.auth.opa import OPAClient
+from agentic_ra.core.errors import OPAError
 
 logger = logging.getLogger(__name__)
 
@@ -59,7 +60,7 @@ class OPAAuthMiddleware(BaseHTTPMiddleware):
 
         try:
             decision = await self._opa.check(input_data)
-        except Exception:
+        except OPAError:
             logger.exception("OPA check failed, denying request")
             return JSONResponse(
                 status_code=503,

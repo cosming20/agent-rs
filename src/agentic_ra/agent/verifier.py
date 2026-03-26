@@ -19,7 +19,10 @@ _VERIFICATION_PROMPT = """\
 You are a faithfulness evaluator. Given an ANSWER and EVIDENCE, determine \
 if the answer is fully grounded in the evidence.
 
-Respond with a JSON object only, no other text:
+Respond with a JSON object only, no other text.
+The EVIDENCE is delimited by <evidence> tags.
+The ANSWER is delimited by <answer> tags.
+
 {
   "is_grounded": true/false,
   "confidence": 0.0-1.0,
@@ -68,7 +71,7 @@ class GroundingVerifier:
         self,
         confidence_threshold: float = 0.5,
         api_key: str = "",
-        model: str = "gpt-5.4-mini-2026-03-17",
+        model: str = "gpt-4o-mini",
     ) -> None:
         self._threshold = confidence_threshold
         self._llm: OpenAIChatGenerator | None = None
@@ -135,7 +138,9 @@ class GroundingVerifier:
 
         messages = [
             ChatMessage.from_system(_VERIFICATION_PROMPT),
-            ChatMessage.from_user(f"EVIDENCE:\n{evidence_text}\n\nANSWER:\n{answer}"),
+            ChatMessage.from_user(
+                f"<evidence>\n{evidence_text}\n</evidence>\n\n<answer>\n{answer}\n</answer>"
+            ),
         ]
 
         if self._llm is None:
@@ -149,9 +154,10 @@ class GroundingVerifier:
                 return self._verify_heuristic(answer, evidence)
 
             parsed = json.loads(replies[0].text)
+            confidence = max(0.0, min(1.0, float(parsed.get("confidence", 0.0))))
             return VerificationResult(
                 is_grounded=bool(parsed.get("is_grounded", False)),
-                confidence=float(parsed.get("confidence", 0.0)),
+                confidence=confidence,
                 reasoning=str(parsed.get("reasoning", "")),
                 ungrounded_claims=tuple(parsed.get("ungrounded_claims", [])),
             )
@@ -165,17 +171,132 @@ class GroundingVerifier:
                 original_error=str(e),
             ) from e
 
+    _STOP_WORDS: frozenset[str] = frozenset(
+        {
+            "the",
+            "a",
+            "an",
+            "is",
+            "are",
+            "was",
+            "were",
+            "be",
+            "been",
+            "being",
+            "have",
+            "has",
+            "had",
+            "do",
+            "does",
+            "did",
+            "will",
+            "would",
+            "could",
+            "should",
+            "may",
+            "might",
+            "shall",
+            "can",
+            "to",
+            "of",
+            "in",
+            "for",
+            "on",
+            "with",
+            "at",
+            "by",
+            "from",
+            "as",
+            "into",
+            "through",
+            "during",
+            "before",
+            "after",
+            "above",
+            "below",
+            "between",
+            "out",
+            "off",
+            "over",
+            "under",
+            "again",
+            "further",
+            "then",
+            "once",
+            "here",
+            "there",
+            "when",
+            "where",
+            "why",
+            "how",
+            "all",
+            "each",
+            "every",
+            "both",
+            "few",
+            "more",
+            "most",
+            "other",
+            "some",
+            "such",
+            "no",
+            "nor",
+            "not",
+            "only",
+            "own",
+            "same",
+            "so",
+            "than",
+            "too",
+            "very",
+            "just",
+            "because",
+            "but",
+            "and",
+            "or",
+            "if",
+            "while",
+            "about",
+            "up",
+            "its",
+            "it",
+            "this",
+            "that",
+            "these",
+            "those",
+            "i",
+            "me",
+            "my",
+            "we",
+            "our",
+            "you",
+            "your",
+            "he",
+            "him",
+            "his",
+            "she",
+            "her",
+            "they",
+            "them",
+            "their",
+            "what",
+            "which",
+            "who",
+            "whom",
+        }
+    )
+
     def _verify_heuristic(
         self,
         answer: str,
         evidence: tuple[Document, ...] | list[Document],
     ) -> VerificationResult:
         """Heuristic token overlap verification (fallback)."""
-        answer_tokens = set(answer.lower().split())
+        answer_tokens = set(answer.lower().split()) - self._STOP_WORDS
         evidence_tokens: set[str] = set()
         for doc in evidence:
             text = doc.meta.get("chunk_text", doc.content or "")
-            evidence_tokens.update(text.lower().split())
+            evidence_tokens.update(set(text.lower().split()) - self._STOP_WORDS)
 
         if not answer_tokens:
             return VerificationResult(

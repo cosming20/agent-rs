@@ -115,6 +115,8 @@ def build_agent_with_tools(
         raise_on_tool_invocation_failure=False,
     )
 
+    new_agent.warm_up()
+
     logger.info(
         "Per-request agent built: tools=%s",
         [t.name for t in haystack_tools],

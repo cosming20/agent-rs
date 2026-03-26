@@ -77,7 +77,13 @@ class OPAClient:
 
             # OPA returns {"result": true/false} for data queries
             result = body.get("result", False)
-            allowed = bool(result) if isinstance(result, bool) else bool(result)
+            if not isinstance(result, bool):
+                raise OPAError(
+                    "Unexpected OPA result type",
+                    result_type=type(result).__name__,
+                    operation="check",
+                )
+            allowed = result
 
             return AuthzDecision(
                 allowed=allowed,

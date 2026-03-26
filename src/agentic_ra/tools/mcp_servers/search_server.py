@@ -16,11 +16,14 @@ mcp = FastMCP("AgenticRA Search", json_response=True)
 
 
 @mcp.tool()
-async def search_documents(query: str, limit: int = 5) -> str:
+async def search_documents(
+    query: str, user_id: str = "anonymous", limit: int = 5
+) -> str:
     """Search the document knowledge base using hybrid retrieval via Cognee.
 
     Args:
         query: Natural language search query.
+        user_id: User identifier for dataset scoping.
         limit: Maximum number of results to return.
 
     Returns:
@@ -31,7 +34,7 @@ async def search_documents(query: str, limit: int = 5) -> str:
     if not s.cognee_enabled:
         return "Cognee is not enabled — search unavailable."
 
-    cognee_store = CogneeStore(dataset=s.cognee_dataset)
+    cognee_store = CogneeStore(dataset=f"user_{user_id}")
     cognee_store.configure(
         llm_api_key=s.openai_api_key.get_secret_value(),
         llm_model=f"openai/{s.llm_model}",

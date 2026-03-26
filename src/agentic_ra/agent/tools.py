@@ -10,7 +10,6 @@ so internal async operations (Cognee, Postgres) are bridged via
 from __future__ import annotations
 
 import asyncio
-import contextvars
 import logging
 import re
 import threading
@@ -40,22 +39,21 @@ class ToolConfig(TypedDict):
 
 
 # ---------------------------------------------------------------------------
-# Module-level evidence accumulator — reset per agent run
+# Evidence accumulator — backward-compat stubs
 # ---------------------------------------------------------------------------
-
-_evidence_buffer: contextvars.ContextVar[list[Document]] = contextvars.ContextVar(
-    "_evidence_buffer", default=[]
-)
-
-
-def reset_evidence_buffer() -> None:
-    """Reset evidence buffer for this request context."""
-    _evidence_buffer.set([])
+# The ContextVar approach was broken across thread boundaries (tools run in
+# the _TOOL_LOOP thread, not the request thread).  Evidence is now passed via
+# an explicit ``evidence_accumulator`` list through the tool closure.
+# These functions remain as no-ops for any call sites that still reference them.
 
 
-def get_evidence_buffer() -> list[Document]:
-    """Get evidence documents accumulated in this request context."""
-    return list(_evidence_buffer.get())
+def reset_evidence_buffer() -> None:  # noqa: D401
+    """No-op (kept for backward compatibility)."""
+
+
+def get_evidence_buffer() -> list[Document]:  # noqa: D401
+    """No-op — returns empty list (kept for backward compatibility)."""
+    return []
 
 
 # ---------------------------------------------------------------------------
@@ -64,6 +62,9 @@ def get_evidence_buffer() -> list[Document]:
 
 _MAX_EVIDENCE_CHARS = 4000
 """Soft cap on formatted evidence text sent back to the LLM."""
+
+_MAX_USER_ID_LEN = 128
+"""Maximum length for sanitized user IDs in dataset names."""
 
 _TOOL_LOOP: asyncio.AbstractEventLoop | None = None
 _TOOL_THREAD: threading.Thread | None = None
@@ -120,6 +121,7 @@ def _sanitize_user_id(user_id: str) -> str:
         Sanitized string safe for dataset name construction.
     """
     sanitized = re.sub(r"[^a-zA-Z0-9_-]", "", user_id)
+    sanitized = sanitized[:_MAX_USER_ID_LEN]
     return sanitized or "anonymous"
 
 
@@ -220,6 +222,7 @@ def make_search_knowledge_tool(
     document_store: Any = None,
     dataset: str = "user_anonymous",
     role: str = "user",
+    evidence_accumulator: list[Document] | None = None,
 ) -> ToolConfig:
     """Create the ``search_knowledge`` tool for the Haystack Agent.
 
@@ -298,9 +301,8 @@ def make_search_knowledge_tool(
                 strategy=retrieval_strategy.value,
             )
             formatted = _format_evidence(evidence_pack.documents)
-            buf = _evidence_buffer.get()
-            buf.extend(evidence_pack.documents)
-            _evidence_buffer.set(buf)
+            if evidence_accumulator is not None:
+                evidence_accumulator.extend(evidence_pack.documents)
 
             logger.info(
                 "search_knowledge returned %d documents (strategy=%s)",

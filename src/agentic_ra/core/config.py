@@ -56,7 +56,7 @@ class Settings(BaseSettings):
 
     # --- OpenAI ---
     openai_api_key: SecretStr
-    llm_model: str = "gpt-5.4-mini-2026-03-17"
+    llm_model: str = "gpt-4o-mini"
 
     # --- Embedding + Chunking (Docling) ---
     embedding_model: str = "text-embedding-3-small"
@@ -78,7 +78,7 @@ class Settings(BaseSettings):
     neo4j_bolt_port: int = 1061
     neo4j_http_port: int = 1062
     neo4j_user: str = "neo4j"
-    neo4j_password: SecretStr = SecretStr("changeme-neo4j")
+    neo4j_password: SecretStr
     neo4j_db: str = "neo4j"
 
     # --- Application ---
