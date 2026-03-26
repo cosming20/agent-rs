@@ -1,0 +1,390 @@
+"""High-level tool functions for the Haystack Agent.
+
+Each ``make_*`` factory returns a dict with ``name``, ``description``,
+``function`` (sync callable), and ``parameters`` (JSON Schema).  Haystack's
+``Tool`` class expects synchronous callables, so internal async operations
+(Cognee, Postgres) are bridged via ``_run_async``.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import concurrent.futures
+import logging
+from typing import Any
+
+from haystack import Document
+
+from agentic_ra.core.errors import ToolError
+from agentic_ra.retrieval.ranker import ResultRanker
+from agentic_ra.retrieval.router import RetrievalRouter, RetrievalStrategy
+
+logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Internal helpers
+# ---------------------------------------------------------------------------
+
+_MAX_EVIDENCE_CHARS = 4000
+"""Soft cap on formatted evidence text sent back to the LLM."""
+
+
+def _run_async(coro: Any) -> Any:
+    """Bridge an async coroutine into a synchronous context.
+
+    Works both outside an event loop (calls ``asyncio.run``) and inside one
+    (e.g. when FastAPI is driving the loop) by offloading to a background
+    thread.
+    """
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        # No running loop -- safe to use asyncio.run directly.
+        return asyncio.run(coro)
+
+    # Already inside an event loop (FastAPI/uvicorn).  Run the coroutine
+    # in a fresh loop on a worker thread to avoid blocking.
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+        return pool.submit(asyncio.run, coro).result()
+
+
+def _format_evidence(documents: list[Document] | tuple[Document, ...]) -> str:
+    """Format a list of Documents as numbered, readable text for the LLM.
+
+    Each entry includes the source metadata (if present) and the content,
+    truncated to ``_MAX_EVIDENCE_CHARS`` total to stay within token budgets.
+    """
+    if not documents:
+        return "No documents found."
+
+    parts: list[str] = []
+    total_chars = 0
+
+    for idx, doc in enumerate(documents, start=1):
+        source = doc.meta.get("source", "unknown")
+        score = doc.meta.get("rrf_score", doc.meta.get("score", ""))
+        header = f"[{idx}] (source={source}"
+        if score:
+            header += (
+                f", score={score:.4f}"
+                if isinstance(score, float)
+                else f", score={score}"
+            )
+        header += ")"
+
+        content = doc.content or "(empty)"
+        entry = f"{header}\n{content}"
+
+        if total_chars + len(entry) > _MAX_EVIDENCE_CHARS:
+            remaining = _MAX_EVIDENCE_CHARS - total_chars
+            if remaining > 80:
+                parts.append(entry[:remaining] + "\n... (truncated)")
+            break
+
+        parts.append(entry)
+        total_chars += len(entry)
+
+    return "\n\n".join(parts)
+
+
+# ---------------------------------------------------------------------------
+# Tool factories
+# ---------------------------------------------------------------------------
+
+
+def make_search_knowledge_tool(
+    router: RetrievalRouter,
+    ranker: ResultRanker,
+) -> dict[str, Any]:
+    """Create the ``search_knowledge`` tool for the Haystack Agent.
+
+    Searches the knowledge base using the retrieval router and ranker,
+    returning formatted evidence text plus raw documents.
+
+    Args:
+        router: Retrieval router for dispatching searches.
+        ranker: Result ranker for dedup and RRF fusion.
+
+    Returns:
+        Tool descriptor dict with name, description, function, parameters.
+    """
+
+    def search_knowledge(query: str, strategy: str = "hybrid") -> dict[str, Any]:
+        """Search the knowledge base and return ranked evidence."""
+        try:
+            retrieval_strategy = RetrievalStrategy(strategy.lower())
+        except ValueError:
+            valid = ", ".join(s.value for s in RetrievalStrategy)
+            raise ToolError(
+                f"Invalid retrieval strategy: {strategy!r}",
+                valid_strategies=valid,
+                operation="search_knowledge",
+            )
+
+        try:
+            raw_docs = _run_async(
+                router.retrieve(query=query, strategy=retrieval_strategy)
+            )
+            evidence_pack = ranker.rank(
+                results=raw_docs,
+                query=query,
+                strategy=retrieval_strategy.value,
+            )
+            formatted = _format_evidence(evidence_pack.documents)
+
+            logger.info(
+                "search_knowledge returned %d documents (strategy=%s)",
+                len(evidence_pack.documents),
+                strategy,
+            )
+            return {
+                "text": formatted,
+                "documents": list(evidence_pack.documents),
+            }
+        except ToolError:
+            raise
+        except Exception as e:
+            raise ToolError(
+                "Knowledge search failed",
+                query=query,
+                strategy=strategy,
+                operation="search_knowledge",
+                original_error=str(e),
+            ) from e
+
+    return {
+        "name": "search_knowledge",
+        "description": (
+            "Search the internal knowledge base using semantic, keyword, hybrid, "
+            "graph, or graph_hybrid retrieval. Returns ranked evidence documents."
+        ),
+        "function": search_knowledge,
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "The search query text.",
+                },
+                "strategy": {
+                    "type": "string",
+                    "description": (
+                        "Retrieval strategy: semantic, keyword, hybrid, graph, "
+                        "or graph_hybrid."
+                    ),
+                    "enum": [s.value for s in RetrievalStrategy],
+                    "default": "hybrid",
+                },
+            },
+            "required": ["query"],
+        },
+    }
+
+
+def make_search_web_tool() -> dict[str, Any]:
+    """Create the ``search_web`` tool stub.
+
+    Web search integration is not yet implemented. The tool returns a
+    placeholder response indicating the capability is unavailable.
+
+    Returns:
+        Tool descriptor dict with name, description, function, parameters.
+    """
+
+    def search_web(query: str) -> dict[str, str]:
+        """Search the web for information (not yet implemented)."""
+        logger.warning("search_web called but not yet configured (query=%s)", query)
+        return {"text": "Web search not yet configured."}
+
+    return {
+        "name": "search_web",
+        "description": (
+            "Search the web for information not available in the knowledge base. "
+            "(Not yet configured -- returns a placeholder.)"
+        ),
+        "function": search_web,
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "The web search query text.",
+                },
+            },
+            "required": ["query"],
+        },
+    }
+
+
+def make_ingest_tool(
+    cognee_store: Any,  # CogneeStore -- typed as Any to avoid circular import
+) -> dict[str, Any]:
+    """Create the ``ingest_document`` tool for the Haystack Agent.
+
+    Ingests text into the Cognee knowledge graph via ``add_and_cognify``.
+
+    Args:
+        cognee_store: CogneeStore instance for knowledge graph operations.
+
+    Returns:
+        Tool descriptor dict with name, description, function, parameters.
+    """
+
+    def ingest_document(text: str, dataset: str = "") -> dict[str, str]:
+        """Ingest text into the knowledge graph."""
+        if not text.strip():
+            raise ToolError(
+                "Cannot ingest empty text",
+                operation="ingest_document",
+            )
+
+        try:
+            kwargs: dict[str, str] = {}
+            if dataset:
+                kwargs["dataset"] = dataset
+
+            _run_async(cognee_store.add_and_cognify(text, **kwargs))
+
+            logger.info(
+                "ingest_document ingested %d characters (dataset=%s)",
+                len(text),
+                dataset or "default",
+            )
+            return {"text": f"Successfully ingested {len(text)} characters."}
+        except ToolError:
+            raise
+        except Exception as e:
+            raise ToolError(
+                "Document ingestion failed",
+                text_length=len(text),
+                operation="ingest_document",
+                original_error=str(e),
+            ) from e
+
+    return {
+        "name": "ingest_document",
+        "description": (
+            "Ingest text into the knowledge graph. The text is chunked, "
+            "entities and relations are extracted, and the graph is updated."
+        ),
+        "function": ingest_document,
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "text": {
+                    "type": "string",
+                    "description": "The raw text content to ingest.",
+                },
+                "dataset": {
+                    "type": "string",
+                    "description": "Optional dataset name override.",
+                    "default": "",
+                },
+            },
+            "required": ["text"],
+        },
+    }
+
+
+def make_remember_tool(
+    memory_store: Any,  # MemoryStore -- typed as Any to avoid circular import
+    user_id: str,
+) -> dict[str, Any]:
+    """Create the ``remember`` tool for the Haystack Agent.
+
+    Provides save, get, and list operations on long-term user memory.
+    The ``user_id`` is captured via closure so the LLM cannot impersonate
+    other users.
+
+    Args:
+        memory_store: MemoryStore instance for persistent memory.
+        user_id: User identifier bound into the closure.
+
+    Returns:
+        Tool descriptor dict with name, description, function, parameters.
+    """
+
+    def remember(action: str, key: str = "", value: str = "") -> dict[str, str]:
+        """Save, retrieve, or list long-term memories."""
+        action_lower = action.lower()
+
+        try:
+            if action_lower == "save":
+                if not key:
+                    raise ToolError(
+                        "Memory 'save' requires a key",
+                        operation="remember",
+                    )
+                _run_async(
+                    memory_store.save_memory(user_id=user_id, key=key, value=value)
+                )
+                logger.info("remember: saved key=%s for user=%s", key, user_id)
+                return {"text": f"Saved memory '{key}'."}
+
+            if action_lower == "get":
+                if not key:
+                    raise ToolError(
+                        "Memory 'get' requires a key",
+                        operation="remember",
+                    )
+                entry = _run_async(memory_store.get_memory(user_id=user_id, key=key))
+                if entry is None:
+                    return {"text": f"No memory found for key '{key}'."}
+                return {"text": f"{entry.key}: {entry.value}"}
+
+            if action_lower == "list":
+                entries = _run_async(memory_store.get_memories(user_id=user_id))
+                if not entries:
+                    return {"text": "No memories stored."}
+                lines = [f"- {e.key}: {e.value}" for e in entries]
+                return {"text": "\n".join(lines)}
+
+            valid_actions = "save, get, list"
+            raise ToolError(
+                f"Invalid memory action: {action!r}",
+                valid_actions=valid_actions,
+                operation="remember",
+            )
+
+        except ToolError:
+            raise
+        except Exception as e:
+            raise ToolError(
+                "Memory operation failed",
+                action=action,
+                key=key,
+                user_id=user_id,
+                operation="remember",
+                original_error=str(e),
+            ) from e
+
+    return {
+        "name": "remember",
+        "description": (
+            "Save, retrieve, or list long-term memories for the current user. "
+            "Use action='save' to store a fact, 'get' to retrieve by key, "
+            "or 'list' to show all stored memories."
+        ),
+        "function": remember,
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "action": {
+                    "type": "string",
+                    "description": "Memory operation: save, get, or list.",
+                    "enum": ["save", "get", "list"],
+                },
+                "key": {
+                    "type": "string",
+                    "description": "Memory key (required for save and get).",
+                    "default": "",
+                },
+                "value": {
+                    "type": "string",
+                    "description": "Value to store (required for save).",
+                    "default": "",
+                },
+            },
+            "required": ["action"],
+        },
+    }
