@@ -4,8 +4,11 @@ from __future__ import annotations
 
 import uuid
 
-from fastapi import APIRouter
+from fastapi import APIRouter, Request
 from pydantic import BaseModel, Field
+
+from agentic_ra.pipelines.factory import RAGPipeline
+from agentic_ra.retrieval.router import RetrievalStrategy
 
 router = APIRouter(prefix="/api/v1", tags=["query"])
 
@@ -43,21 +46,41 @@ class QueryResponse(BaseModel):
     session_id: uuid.UUID
 
 
+def _get_pipeline(request: Request) -> RAGPipeline:
+    """Extract the RAG pipeline from app state."""
+    return request.app.state.pipeline  # type: ignore[no-any-return]
+
+
 @router.post("/query", response_model=QueryResponse)
-async def query_endpoint(request: QueryRequest) -> QueryResponse:
-    """Process a RAG query and return an answer with citations.
+async def query_endpoint(request: Request, body: QueryRequest) -> QueryResponse:
+    """Process a RAG query through the full orchestrator pipeline."""
+    pipeline = _get_pipeline(request)
+    session_id = body.session_id or uuid.uuid4()
 
-    This is a placeholder — the orchestrator will be wired in Phase 8.
-    """
-    session_id = request.session_id or uuid.uuid4()
+    strategy = RetrievalStrategy(body.strategy)
 
-    # Placeholder response — will be wired to AgentOrchestrator
+    result = await pipeline.orchestrator.process_query(
+        query=body.query,
+        session_id=session_id,
+        user_id=body.user_id,
+        strategy=strategy,
+        limit=body.limit,
+    )
+
     return QueryResponse(
-        answer=f"Placeholder response for: {request.query}",
-        citations=[],
-        query=request.query,
-        confidence=0.0,
-        is_grounded=False,
-        strategy=request.strategy,
+        answer=result.answer,
+        citations=[
+            CitationResponse(
+                index=c.index,
+                content_snippet=c.content_snippet,
+                source=c.source,
+                score=c.score,
+            )
+            for c in result.citations
+        ],
+        query=result.query,
+        confidence=result.confidence,
+        is_grounded=result.is_grounded,
+        strategy=result.strategy,
         session_id=session_id,
     )
