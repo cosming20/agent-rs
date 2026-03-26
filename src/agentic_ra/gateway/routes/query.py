@@ -8,7 +8,6 @@ from fastapi import APIRouter, Request
 from pydantic import BaseModel, Field
 
 from agentic_ra.pipelines.factory import RAGPipeline
-from agentic_ra.retrieval.router import RetrievalStrategy
 
 router = APIRouter(prefix="/api/v1", tags=["query"])
 
@@ -16,12 +15,17 @@ router = APIRouter(prefix="/api/v1", tags=["query"])
 class QueryRequest(BaseModel):
     """Incoming RAG query request."""
 
-    query: str = Field(..., min_length=1, max_length=10000, description="User query text")
+    query: str = Field(
+        ..., min_length=1, max_length=10000, description="User query text"
+    )
     session_id: uuid.UUID | None = Field(
         default=None, description="Session ID for conversation continuity"
     )
     user_id: str = Field(default="anonymous", description="User identifier")
-    strategy: RetrievalStrategy = Field(default=RetrievalStrategy.HYBRID, description="Retrieval strategy")
+    strategy: str = Field(
+        default="hybrid",
+        description="Retrieval strategy hint (semantic, keyword, hybrid, graph, graph_hybrid)",
+    )
     limit: int = Field(default=10, ge=1, le=100, description="Max evidence documents")
 
 
