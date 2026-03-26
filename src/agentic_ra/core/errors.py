@@ -62,3 +62,7 @@ class EmbeddingError(RetrievalError):
 
 class RoutingError(RetrievalError):
     """Retrieval routing or dispatch failure."""
+
+
+class RankingError(RetrievalError):
+    """Ranking or evidence assembly failure."""
