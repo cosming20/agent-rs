@@ -13,13 +13,14 @@ import logging
 from typing import Any
 
 import litellm
-from haystack.components.agents import Agent
+from haystack import component
 from haystack.dataclasses import ChatMessage, ChatRole, ToolCall
 from haystack.tools import Tool
 
 logger = logging.getLogger(__name__)
 
 
+@component
 class LiteLLMChatGenerator:
     """Haystack-compatible ChatGenerator backed by LiteLLM.
 
@@ -48,6 +49,29 @@ class LiteLLMChatGenerator:
     def warm_up(self) -> None:
         """No-op for API-based generators."""
 
+    def to_dict(self) -> dict[str, Any]:
+        """Serialize for Haystack pipeline snapshots."""
+        return {
+            "type": "agentic_ra.core.llm.LiteLLMChatGenerator",
+            "init_parameters": {
+                "model": self.model,
+                "generation_kwargs": self.generation_kwargs,
+                "purpose": self.purpose,
+            },
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "LiteLLMChatGenerator":
+        """Deserialize from Haystack pipeline snapshot."""
+        params = data.get("init_parameters", {})
+        return cls(
+            model=params.get("model", ""),
+            api_key=params.get("api_key", ""),
+            generation_kwargs=params.get("generation_kwargs", {}),
+            purpose=params.get("purpose", "unknown"),
+        )
+
+    @component.output_types(replies=list[ChatMessage])
     def run(
         self,
         messages: list[ChatMessage],
