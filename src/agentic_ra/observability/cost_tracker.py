@@ -117,16 +117,11 @@ class CostTracker(CustomLogger):
         # Structured log (always, sync)
         log_fn = logger.info if success else logger.error
         log_fn(
-            "llm_call",
-            model=model,
-            purpose=purpose,
-            prompt_tokens=usage.get("prompt_tokens", 0),
-            completion_tokens=usage.get("completion_tokens", 0),
-            total_tokens=usage.get("total_tokens", 0),
-            cost_usd=cost,
-            latency_ms=latency_ms,
-            success=success,
-            error=error,
+            "llm_call model=%s purpose=%s tokens=%d/%d cost=$%.6f latency=%dms%s",
+            model, purpose,
+            usage.get("prompt_tokens", 0), usage.get("completion_tokens", 0),
+            cost, latency_ms,
+            f" error={error}" if error else "",
         )
 
         # Postgres insert (async, fire-and-forget)
@@ -167,6 +162,82 @@ class CostTracker(CustomLogger):
             logger.exception("Failed to insert llm_call row")
 
 
+    def record_call(
+        self,
+        model: str,
+        purpose: str,
+        usage: dict[str, int],
+        latency_ms: int = 0,
+        session_id: str | None = None,
+        success: bool = True,
+        error: str | None = None,
+    ) -> None:
+        """Manually record an LLM call (for non-LiteLLM generators like Haystack).
+
+        Use this when the LLM call goes through OpenAI SDK directly
+        (not LiteLLM) and the callback doesn't fire.
+
+        Args:
+            model: Model name (e.g. "gpt-4o").
+            purpose: Cost label ("agent", "verifier", etc.).
+            usage: Token usage dict with prompt_tokens, completion_tokens, total_tokens.
+            latency_ms: Call latency in milliseconds.
+            session_id: Optional session UUID string.
+            success: Whether the call succeeded.
+            error: Error message if failed.
+        """
+        prompt_tokens = usage.get("prompt_tokens", 0)
+        completion_tokens = usage.get("completion_tokens", 0)
+        total_tokens = usage.get("total_tokens", 0)
+
+        # Estimate cost using LiteLLM's pricing database
+        cost = 0.0
+        try:
+            # Strip date suffix (gpt-4o-2024-08-06 → gpt-4o) for pricing lookup
+            base_model = model.rsplit("-202", 1)[0] if "-202" in model else model
+            pt_cost, ct_cost = litellm.cost_per_token(
+                model=base_model,
+                prompt_tokens=prompt_tokens,
+                completion_tokens=completion_tokens,
+            )
+            cost = pt_cost + ct_cost
+        except Exception:
+            pass  # Unknown model — record 0 cost
+
+        log_fn = logger.info if success else logger.error
+        log_fn(
+            "llm_call model=%s purpose=%s tokens=%d/%d cost=$%.6f latency=%dms%s",
+            model, purpose, prompt_tokens, completion_tokens,
+            cost, latency_ms,
+            f" error={error}" if error else "",
+        )
+
+        row = {
+            "id": uuid.uuid4(),
+            "model": model,
+            "purpose": purpose,
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": completion_tokens,
+            "total_tokens": total_tokens,
+            "cost_usd": cost,
+            "latency_ms": latency_ms,
+            "session_id": uuid.UUID(session_id) if session_id else None,
+            "success": success,
+            "error": error,
+        }
+        loop = _get_db_loop()
+        asyncio.run_coroutine_threadsafe(self._insert_row(row), loop)
+
+
+# Module-level tracker instance (set by setup_cost_tracking)
+_tracker: CostTracker | None = None
+
+
+def get_tracker() -> CostTracker | None:
+    """Get the global CostTracker instance, or None if not initialized."""
+    return _tracker
+
+
 def setup_cost_tracking(pg_dsn: str) -> CostTracker:
     """Initialize cost tracking and register with LiteLLM.
 
@@ -178,7 +249,9 @@ def setup_cost_tracking(pg_dsn: str) -> CostTracker:
     Returns:
         The CostTracker instance (for testing/inspection).
     """
+    global _tracker  # noqa: PLW0603
     tracker = CostTracker(pg_dsn=pg_dsn)
     litellm.callbacks = [tracker]
+    _tracker = tracker
     logger.info("LiteLLM cost tracking initialized (Postgres + structured logs)")
     return tracker

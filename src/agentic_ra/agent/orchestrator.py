@@ -30,6 +30,7 @@ from agentic_ra.core.errors import OrchestratorError
 from agentic_ra.tools.budgets import WebToolBudget
 from agentic_ra.tools.mcp_http_client import MCPHttpClient
 from agentic_ra.tools.url_safety import URLValidator
+from agentic_ra.observability.cost_tracker import get_tracker
 from agentic_ra.observability.metrics import RAGMetrics
 from agentic_ra.stores.postgres.models import MessageRole
 from agentic_ra.stores.postgres.runs import RunStore
@@ -189,6 +190,9 @@ class AgentOrchestrator:
                     str(agent_err)[:200],
                 )
 
+            # 4b. Record agent LLM costs from response metadata
+            self._record_agent_costs(agent_result, session_id, "agent")
+
             # 5. Extract answer and evidence (accumulated via closure)
             answer = (
                 self._extract_answer(agent_result)
@@ -317,3 +321,31 @@ class AgentOrchestrator:
             if msg.role.value == "assistant" and msg.text and not msg.tool_calls:
                 return msg.text
         return "I was unable to generate an answer."
+
+    @staticmethod
+    def _record_agent_costs(
+        agent_result: dict[str, Any] | None,
+        session_id: uuid.UUID,
+        purpose: str,
+    ) -> None:
+        """Extract token usage from Haystack agent result and record to cost tracker."""
+        tracker = get_tracker()
+        if tracker is None or agent_result is None:
+            return
+
+        messages: list[ChatMessage] = agent_result.get("messages", [])
+        for msg in messages:
+            meta = msg._meta if hasattr(msg, "_meta") else {}
+            usage = meta.get("usage")
+            model = meta.get("model", "")
+            if usage and model:
+                tracker.record_call(
+                    model=model,
+                    purpose=purpose,
+                    usage={
+                        "prompt_tokens": usage.get("prompt_tokens", 0),
+                        "completion_tokens": usage.get("completion_tokens", 0),
+                        "total_tokens": usage.get("total_tokens", 0),
+                    },
+                    session_id=str(session_id),
+                )

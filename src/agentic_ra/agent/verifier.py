@@ -12,6 +12,7 @@ from haystack.dataclasses import ChatMessage
 from haystack.utils import Secret
 
 from agentic_ra.core.errors import VerificationError
+from agentic_ra.observability.cost_tracker import get_tracker
 
 logger = logging.getLogger(__name__)
 
@@ -152,6 +153,18 @@ class GroundingVerifier:
         try:
             result = self._llm.run(messages=messages)
             replies: list[ChatMessage] = result["replies"]
+
+            # Record verifier LLM cost
+            if replies:
+                meta = replies[0]._meta if hasattr(replies[0], "_meta") else {}
+                usage = meta.get("usage")
+                model = meta.get("model", "")
+                tracker = get_tracker()
+                if tracker and usage and model:
+                    tracker.record_call(
+                        model=model, purpose="verifier", usage=usage,
+                    )
+
             if not replies or not replies[0].text:
                 return self._verify_heuristic(answer, evidence)
 
