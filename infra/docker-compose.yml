@@ -171,7 +171,9 @@ services:
     image: node:22-slim
     container_name: agentic-ra-brave-search
     restart: "on-failure:5"
-    command: npx -y @brave/brave-search-mcp-server@2.1.4 --transport http --port 1063
+    command: npx -y @brave/brave-search-mcp-server@2.0.75 --transport http --port 1063 --enabled-tools brave_web_search brave_news_search
+    ports:
+      - "${BRAVE_MCP_PORT:-1063}:1063"
     environment:
       - BRAVE_API_KEY=${BRAVE_API_KEY}
       - BRAVE_MCP_TRANSPORT=http

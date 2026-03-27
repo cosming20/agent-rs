@@ -19,6 +19,8 @@ from agentic_ra.stores.cognee.client import CogneeStore
 from agentic_ra.stores.postgres.client import PostgresClient
 from agentic_ra.stores.postgres.documents import DocumentStore
 from agentic_ra.stores.postgres.runs import RunStore
+from agentic_ra.tools.mcp_http_client import MCPHttpClient
+from agentic_ra.tools.url_safety import URLValidator
 
 logger = logging.getLogger(__name__)
 
@@ -142,6 +144,12 @@ def build_pipeline(settings: Settings) -> RAGPipeline:
     )
     base_agent.warm_up()
 
+    # --- Brave Search MCP client (optional) ---
+    brave_client: MCPHttpClient | None = None
+    if settings.brave_search_enabled:
+        brave_client = MCPHttpClient(base_url=settings.brave_mcp_url)
+        logger.info("Brave Search MCP client configured: %s", settings.brave_mcp_url)
+
     orchestrator = AgentOrchestrator(
         base_agent=base_agent,
         memory=memory,
@@ -154,6 +162,8 @@ def build_pipeline(settings: Settings) -> RAGPipeline:
         ranker=ranker,
         cognee_store=cognee_store,
         document_store=document_store,
+        brave_client=brave_client,
+        url_validator=URLValidator(),
     )
 
     logger.info("RAG pipeline assembled successfully")
