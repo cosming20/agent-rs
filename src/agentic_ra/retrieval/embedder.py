@@ -157,6 +157,37 @@ class EmbeddingPipeline:
                 original_error=str(e),
             ) from e
 
+    @staticmethod
+    def build_breadcrumb_chunks(chunk_result: ChunkResult) -> list[str]:
+        """Build chunk texts with heading breadcrumbs prepended.
+
+        Each chunk gets its section path (e.g. "Titlul III > Capitolul II >
+        Articolul 170") prepended so that heading context is embedded alongside
+        the content.  This matches the lawren-docling approach and makes
+        individual articles searchable by their heading text.
+
+        Args:
+            chunk_result: Result from chunk_file() or chunk_text().
+
+        Returns:
+            List of breadcrumb-prefixed chunk texts.
+        """
+        breadcrumb_chunks: list[str] = []
+        for doc in chunk_result.documents:
+            headings: list[str] = doc.meta.get("headings", [])
+            chunk_text: str = doc.meta.get("chunk_text", doc.content or "")
+
+            if headings:
+                breadcrumb = " > ".join(headings)
+                text = f"{breadcrumb}\n\n{chunk_text}"
+            else:
+                text = chunk_text
+
+            if text.strip():
+                breadcrumb_chunks.append(text)
+
+        return breadcrumb_chunks
+
     def _chunk_docling_doc(
         self,
         docling_doc: DoclingDocument,
