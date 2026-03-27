@@ -165,6 +165,33 @@ services:
       start_period: 10s
 
   # ----------------------------------------------------------
+  # Brave Search MCP — Web search (internal-only)
+  # ----------------------------------------------------------
+  brave-search-mcp:
+    image: node:22-slim
+    container_name: agentic-ra-brave-search
+    restart: "on-failure:5"
+    command: npx -y @brave/brave-search-mcp-server --transport http --port 1063
+    environment:
+      - BRAVE_API_KEY=${BRAVE_API_KEY}
+      - BRAVE_MCP_TRANSPORT=http
+      - BRAVE_MCP_PORT=1063
+      - BRAVE_MCP_HOST=0.0.0.0
+      - BRAVE_MCP_STATELESS=true
+      - BRAVE_MCP_ENABLED_TOOLS=brave_web_search,brave_news_search
+    networks:
+      - agentic-ra-net
+    mem_limit: 256m
+    mem_reservation: 128m
+    cpus: 0.5
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:1063/mcp || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+
+  # ----------------------------------------------------------
   # OTel Collector — Telemetry pipeline
   # ----------------------------------------------------------
   otel-collector:
