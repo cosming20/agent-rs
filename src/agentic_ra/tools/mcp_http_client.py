@@ -1,6 +1,7 @@
 """MCP client for Streamable HTTP transport with connection pooling.
 
-Maintains a reusable HTTP session for low-latency tool invocations.
+Creates a Streamable HTTP connection per tool invocation. The MCP SDK manages
+underlying HTTP connection reuse internally.
 One MCPHttpClient instance per remote MCP server per app instance.
 
 See: https://modelcontextprotocol.io/specification/2025-06-18/basic/transports#streamable-http
@@ -23,9 +24,9 @@ logger = logging.getLogger(__name__)
 class MCPHttpClient:
     """Async MCP client for Streamable HTTP transport.
 
-    Uses the MCP Python SDK's ``streamablehttp_client`` for persistent
-    HTTP connection pooling. Created once at app startup and shared
-    across all requests.
+    Connects to an MCP server via Streamable HTTP transport. Each tool call
+    creates a new MCP session. One MCPHttpClient instance per remote MCP
+    server per app instance.
 
     Args:
         base_url: Full URL to the MCP server endpoint (e.g. ``http://brave-search-mcp:1063``).
