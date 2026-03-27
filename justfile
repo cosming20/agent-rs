@@ -155,7 +155,7 @@ query QUERY STRATEGY="hybrid":
 
 # Search Cognee knowledge graph directly
 cognee-search QUERY SEARCH_TYPE="GRAPH_COMPLETION" TOP_K="5":
-    @uv run python -c "import asyncio,json; from agentic_ra.core.config import get_settings; from agentic_ra.stores.cognee.client import CogneeStore; s=get_settings(); cs=CogneeStore(dataset=s.cognee_dataset); cs.configure(llm_api_key=s.openai_api_key.get_secret_value(), llm_model='openai/'+s.llm_model, graph_db_provider=s.cognee_graph_db_provider, vector_db_provider=s.cognee_vector_db_provider, data_root=s.cognee_data_root, system_root=s.cognee_system_root, qdrant_url=s.qdrant_url, qdrant_api_key=s.qdrant_api_key.get_secret_value(), neo4j_bolt_url=s.neo4j_bolt_url, neo4j_user=s.neo4j_user, neo4j_password=s.neo4j_password.get_secret_value(), neo4j_db=s.neo4j_db); docs=asyncio.run(cs.search('{{ QUERY }}','{{ SEARCH_TYPE }}',int('{{ TOP_K }}'))); print(json.dumps([{'content':d.content[:200],'meta':d.meta} for d in docs],indent=2,default=str))"
+    @uv run python -c "import asyncio,json; from agentic_ra.core.config import get_settings; from agentic_ra.stores.cognee.client import CogneeStore; s=get_settings(); cs=CogneeStore(dataset=s.cognee_dataset); cs.configure(llm_api_key=s.llm_api_key.get_secret_value(), llm_model=s.llm_enrichment_model, graph_db_provider=s.cognee_graph_db_provider, vector_db_provider=s.cognee_vector_db_provider, data_root=s.cognee_data_root, system_root=s.cognee_system_root, qdrant_url=s.qdrant_url, qdrant_api_key=s.qdrant_api_key.get_secret_value(), neo4j_bolt_url=s.neo4j_bolt_url, neo4j_user=s.neo4j_user, neo4j_password=s.neo4j_password.get_secret_value(), neo4j_db=s.neo4j_db); docs=asyncio.run(cs.search('{{ QUERY }}','{{ SEARCH_TYPE }}',int('{{ TOP_K }}'))); print(json.dumps([{'content':d.content[:200],'meta':d.meta} for d in docs],indent=2,default=str))"
 
 # Query with graph_hybrid strategy (vector + keyword + graph fusion)
 query-graph QUERY:
@@ -163,7 +163,7 @@ query-graph QUERY:
 
 # Reset Cognee knowledge base (prune graph + vectors)
 cognee-prune:
-    @uv run python -c "import asyncio; from agentic_ra.core.config import get_settings; from agentic_ra.stores.cognee.client import CogneeStore; s=get_settings(); cs=CogneeStore(dataset=s.cognee_dataset); cs.configure(llm_api_key=s.openai_api_key.get_secret_value(), llm_model='openai/'+s.llm_model, graph_db_provider=s.cognee_graph_db_provider, vector_db_provider=s.cognee_vector_db_provider, data_root=s.cognee_data_root, system_root=s.cognee_system_root, qdrant_url=s.qdrant_url, qdrant_api_key=s.qdrant_api_key.get_secret_value(), neo4j_bolt_url=s.neo4j_bolt_url, neo4j_user=s.neo4j_user, neo4j_password=s.neo4j_password.get_secret_value(), neo4j_db=s.neo4j_db); asyncio.run(cs.prune()); print('Cognee knowledge base pruned')"
+    @uv run python -c "import asyncio; from agentic_ra.core.config import get_settings; from agentic_ra.stores.cognee.client import CogneeStore; s=get_settings(); cs=CogneeStore(dataset=s.cognee_dataset); cs.configure(llm_api_key=s.llm_api_key.get_secret_value(), llm_model=s.llm_enrichment_model, graph_db_provider=s.cognee_graph_db_provider, vector_db_provider=s.cognee_vector_db_provider, data_root=s.cognee_data_root, system_root=s.cognee_system_root, qdrant_url=s.qdrant_url, qdrant_api_key=s.qdrant_api_key.get_secret_value(), neo4j_bolt_url=s.neo4j_bolt_url, neo4j_user=s.neo4j_user, neo4j_password=s.neo4j_password.get_secret_value(), neo4j_db=s.neo4j_db); asyncio.run(cs.prune()); print('Cognee knowledge base pruned')"
 
 # ─── MCP ─────────────────────────────────────────────────────
 

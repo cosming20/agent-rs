@@ -28,8 +28,8 @@ async def main() -> None:
 
     cognee_store = CogneeStore(dataset=s.cognee_dataset)
     cognee_store.configure(
-        llm_api_key=s.openai_api_key.get_secret_value(),
-        llm_model=f"openai/{s.llm_model}",
+        llm_api_key=s.llm_api_key.get_secret_value(),
+        llm_model=s.llm_enrichment_model,
         graph_db_provider=s.cognee_graph_db_provider,
         vector_db_provider=s.cognee_vector_db_provider,
         data_root=s.cognee_data_root,

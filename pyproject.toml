@@ -13,6 +13,7 @@ dependencies = [
     "fastapi>=0.115",
     "haystack-ai>=2.13",
     "httpx>=0.28",
+    "litellm>=1.80",
     "mcp>=1.12",
 "pydantic-settings>=2.9",
     "qdrant-client>=1.13",

@@ -54,9 +54,12 @@ class Settings(BaseSettings):
     jaeger_ui_port: int = 1058
     jaeger_host: str = "localhost"
 
-    # --- OpenAI ---
-    openai_api_key: SecretStr
-    llm_model: str = "gpt-4o-mini"
+    # --- LLM Provider (LiteLLM format: provider/model) ---
+    llm_api_key: SecretStr
+    llm_provider_model: str = "openai/gpt-4o"
+    llm_verifier_model: str = "openai/gpt-4o-mini"
+    llm_enrichment_model: str = "openai/gpt-4o-mini"
+    llm_temperature: float = 0.1
 
     # --- Embedding + Chunking (Docling) ---
     embedding_model: str = "text-embedding-3-small"
@@ -85,7 +88,6 @@ class Settings(BaseSettings):
     log_level: str = "INFO"
 
     # --- Agent ---
-    agent_model: str = "gpt-4o"
     agent_max_steps: int = 10
     agent_max_retries: int = 1
 

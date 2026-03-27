@@ -17,6 +17,7 @@ from agentic_ra.gateway.middleware.auth import OPAAuthMiddleware
 from agentic_ra.gateway.routes.health import router as health_router
 from agentic_ra.gateway.routes.ingest import router as ingest_router
 from agentic_ra.gateway.routes.query import router as query_router
+from agentic_ra.observability.cost_tracker import setup_cost_tracking
 from agentic_ra.observability.metrics import setup_metrics
 from agentic_ra.observability.tracing import instrument_fastapi, setup_tracing
 from agentic_ra.pipelines.factory import build_pipeline
@@ -35,6 +36,9 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     meter_provider = setup_metrics(settings)
 
     instrument_fastapi(app)
+
+    # Initialize LLM cost tracking (Postgres + structured logs)
+    setup_cost_tracking(pg_dsn=settings.postgres_dsn_async.get_secret_value())
 
     pipeline = build_pipeline(settings)
     app.state.pipeline = pipeline

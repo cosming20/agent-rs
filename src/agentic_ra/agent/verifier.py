@@ -7,11 +7,10 @@ import logging
 from dataclasses import dataclass
 
 from haystack import Document
-from haystack.components.generators.chat import OpenAIChatGenerator
 from haystack.dataclasses import ChatMessage
-from haystack.utils import Secret
 
 from agentic_ra.core.errors import VerificationError
+from agentic_ra.core.llm import LiteLLMChatGenerator, create_generator
 
 logger = logging.getLogger(__name__)
 
@@ -74,13 +73,15 @@ class GroundingVerifier:
         model: str = "gpt-4o-mini",
     ) -> None:
         self._threshold = confidence_threshold
-        self._llm: OpenAIChatGenerator | None = None
+        self._llm: LiteLLMChatGenerator | None = None
 
         if api_key:
-            self._llm = OpenAIChatGenerator(
+            self._llm = create_generator(
                 model=model,
-                api_key=Secret.from_token(api_key),
-                generation_kwargs={"temperature": 0.0, "max_completion_tokens": 512},
+                api_key=api_key,
+                purpose="verifier",
+                temperature=0.0,
+                max_tokens=512,
             )
 
     def verify(

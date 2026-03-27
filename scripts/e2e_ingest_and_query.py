@@ -107,7 +107,7 @@ async def run_ingestion(file_path: str) -> IngestResult:
     doc_store = DocumentStore(pg_client=pg)
     pipeline = EmbeddingPipeline(
         model=s.embedding_model,
-        api_key=s.openai_api_key.get_secret_value(),
+        api_key=s.llm_api_key.get_secret_value(),
         dimension=s.embedding_dimension,
         max_tokens=s.chunk_max_tokens,
         merge_peers=s.chunk_merge_peers,
@@ -115,8 +115,8 @@ async def run_ingestion(file_path: str) -> IngestResult:
 
     cognee_store = CogneeStore(dataset=s.cognee_dataset)
     cognee_store.configure(
-        llm_api_key=s.openai_api_key.get_secret_value(),
-        llm_model=f"openai/{s.llm_model}",
+        llm_api_key=s.llm_api_key.get_secret_value(),
+        llm_model=s.llm_enrichment_model,
         graph_db_provider=s.cognee_graph_db_provider,
         vector_db_provider=s.cognee_vector_db_provider,
         data_root=s.cognee_data_root,

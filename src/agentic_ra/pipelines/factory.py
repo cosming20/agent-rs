@@ -74,7 +74,7 @@ def build_pipeline(settings: Settings) -> RAGPipeline:
     )
 
     # --- Docling chunking pipeline (parsing only, Cognee handles embedding) ---
-    api_key = settings.openai_api_key.get_secret_value()
+    api_key = settings.llm_api_key.get_secret_value()
 
     embedding_pipeline = EmbeddingPipeline(
         model=settings.embedding_model,
@@ -91,7 +91,7 @@ def build_pipeline(settings: Settings) -> RAGPipeline:
         cognee_store = CogneeStore(dataset=settings.cognee_dataset)
         cognee_store.configure(
             llm_api_key=api_key,
-            llm_model=f"openai/{settings.llm_model}",
+            llm_model=settings.llm_enrichment_model,
             graph_db_provider=settings.cognee_graph_db_provider,
             vector_db_provider=settings.cognee_vector_db_provider,
             data_root=settings.cognee_data_root,
@@ -128,14 +128,14 @@ def build_pipeline(settings: Settings) -> RAGPipeline:
 
     # --- Agent core ---
     memory = MemoryStore(pg_client=postgres)
-    verifier = GroundingVerifier(api_key=api_key, model=settings.llm_model)
+    verifier = GroundingVerifier(api_key=api_key, model=settings.llm_verifier_model)
     synthesizer = ResponseSynthesizer()
     metrics = RAGMetrics()
 
     # Build base agent with no tools — tools are injected per-request
     # in the orchestrator for RBAC dataset scoping.
     base_agent = build_agent(
-        model=settings.agent_model,
+        model=settings.llm_provider_model,
         api_key=api_key,
         tools_config=[],
         max_steps=settings.agent_max_steps,

@@ -36,8 +36,8 @@ async def search_documents(
 
     cognee_store = CogneeStore(dataset=f"user_{user_id}")
     cognee_store.configure(
-        llm_api_key=s.openai_api_key.get_secret_value(),
-        llm_model=f"openai/{s.llm_model}",
+        llm_api_key=s.llm_api_key.get_secret_value(),
+        llm_model=s.llm_enrichment_model,
         graph_db_provider=s.cognee_graph_db_provider,
         vector_db_provider=s.cognee_vector_db_provider,
         qdrant_url=s.qdrant_url,

@@ -5,11 +5,10 @@ from __future__ import annotations
 import logging
 
 from haystack.components.agents import Agent
-from haystack.components.generators.chat import OpenAIChatGenerator
 from haystack.tools import Tool
-from haystack.utils import Secret
 
 from agentic_ra.agent.tools import ToolConfig
+from agentic_ra.core.llm import LiteLLMChatGenerator, create_generator
 
 logger = logging.getLogger(__name__)
 
@@ -55,10 +54,11 @@ def build_agent(
         )
         haystack_tools.append(tool)
 
-    chat_generator = OpenAIChatGenerator(
+    chat_generator = create_generator(
         model=model,
-        api_key=Secret.from_token(api_key),
-        generation_kwargs={"temperature": 0.1},
+        api_key=api_key,
+        purpose="agent",
+        temperature=0.1,
     )
 
     agent = Agent(
