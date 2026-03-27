@@ -75,12 +75,13 @@ async def ingest_file(source: str) -> None:
     )
     print(f"  Persisted DoclingDocument: {parsed_doc.id}")
 
-    # 3. Cognee: add + cognify (embedding → Qdrant, entities → Neo4j)
-    print("  Cognee add+cognify...")
-    full_text = "\n\n".join(
-        doc.meta.get("chunk_text", doc.content) for doc in chunk_result.documents
-    )
-    await cognee_store.add_and_cognify(text=full_text)
+    # 3. Cognee: add individual chunks + cognify (embedding → Qdrant, entities → Neo4j)
+    print("  Building breadcrumb chunks...")
+    breadcrumb_chunks = pipeline.build_breadcrumb_chunks(chunk_result)
+    print(f"  Breadcrumb chunks: {len(breadcrumb_chunks)}")
+
+    print("  Cognee add (per-chunk) + cognify...")
+    await cognee_store.add_chunks(chunks=breadcrumb_chunks)
     print("  Cognee: graph + vector ingestion complete")
 
     await pg.close()
