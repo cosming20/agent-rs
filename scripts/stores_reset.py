@@ -12,7 +12,7 @@ from agentic_ra.stores.cognee.client import CogneeStore
 async def main() -> None:
     s = get_settings()
 
-    qdrant = AsyncQdrantClient(url=s.qdrant_url, api_key=s.qdrant_api_key or None)
+    qdrant = AsyncQdrantClient(url=s.qdrant_url, api_key=s.qdrant_api_key.get_secret_value())
     try:
         await qdrant.delete_collection("documents")
     except Exception:

@@ -292,7 +292,10 @@ class CogneeStore:
         is irreversible and affects all datasets managed by this Cognee instance.
         """
         try:
-            await cognee.prune()
+            # Cognee 0.5.5: prune() is a class, not a coroutine
+            result = cognee.prune()
+            if hasattr(result, "__await__"):
+                await result
             logger.info("Cognee knowledge base pruned")
         except Exception as e:
             raise CogneeError(
