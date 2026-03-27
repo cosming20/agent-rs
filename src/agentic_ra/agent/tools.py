@@ -20,6 +20,11 @@ from haystack import Document
 from agentic_ra.core.errors import ToolError
 from agentic_ra.retrieval.ranker import ResultRanker
 from agentic_ra.retrieval.router import RetrievalRouter, RetrievalStrategy
+from agentic_ra.tools.budgets import WebToolBudget
+from agentic_ra.tools.mcp_client import ToolResult
+from agentic_ra.tools.mcp_http_client import MCPHttpClient
+from agentic_ra.tools.url_safety import URLValidator
+from agentic_ra.tools.web import fetch_url
 
 logger = logging.getLogger(__name__)
 
@@ -205,6 +210,48 @@ def _search_dataset(
     return all_results
 
 
+def _parse_brave_results(raw_content: str, provider: str) -> list[Document]:
+    """Parse Brave Search MCP text results into Documents.
+
+    Brave MCP returns results as text content. Each result typically
+    includes title, URL, and description. We parse these into Documents
+    with structured metadata.
+
+    Args:
+        raw_content: Raw text content from Brave MCP tool result.
+        provider: Provider tag for metadata (``"brave_web"`` or ``"brave_news"``).
+
+    Returns:
+        List of Documents with source and provider metadata.
+    """
+    if not raw_content.strip():
+        return []
+
+    documents: list[Document] = []
+    blocks = [b.strip() for b in raw_content.split("\n\n") if b.strip()]
+
+    for idx, block in enumerate(blocks):
+        url = ""
+        for line in block.split("\n"):
+            line_stripped = line.strip()
+            if line_stripped.startswith(("http://", "https://")):
+                url = line_stripped
+                break
+
+        documents.append(
+            Document(
+                content=block,
+                meta={
+                    "source": url or f"{provider}_result_{idx}",
+                    "provider": provider,
+                    "score": 1.0 / (idx + 1),
+                },
+            )
+        )
+
+    return documents
+
+
 # ---------------------------------------------------------------------------
 # Tool factories
 # ---------------------------------------------------------------------------
@@ -348,26 +395,84 @@ def make_search_knowledge_tool(
     }
 
 
-def make_search_web_tool() -> ToolConfig:
-    """Create the ``search_web`` tool stub.
+def make_search_web_tool(
+    brave_client: MCPHttpClient | None = None,
+    evidence_accumulator: list[Document] | None = None,
+    budget: WebToolBudget | None = None,
+) -> ToolConfig:
+    """Create the ``search_web`` tool for the Haystack Agent.
 
-    Web search integration is not yet implemented. The tool returns a
-    placeholder response indicating the capability is unavailable.
+    Searches the web using Brave Search via MCP Streamable HTTP.
+    If Brave is not configured (brave_client is None), returns a
+    graceful degradation message.
+
+    Args:
+        brave_client: MCPHttpClient connected to Brave Search MCP server.
+        evidence_accumulator: Shared list to collect web evidence documents.
+        budget: Per-query web tool budget.
 
     Returns:
-        Tool descriptor dict with name, description, function, parameters.
+        Tool descriptor dict.
     """
 
-    def search_web(query: str) -> dict[str, str]:
-        """Search the web for information (not yet implemented)."""
-        logger.warning("search_web called but not yet configured (query=%s)", query)
-        return {"text": "Web search not yet configured."}
+    def search_web(
+        query: str, country: str = "US", freshness: str = ""
+    ) -> dict[str, Any]:
+        """Search the web for information using Brave Search."""
+        if brave_client is None:
+            logger.warning("search_web called but Brave Search is not configured")
+            return {"text": "Web search is not configured."}
+
+        if budget is not None:
+            try:
+                budget.check_web_search()
+            except Exception as e:
+                return {"text": str(e)}
+
+        try:
+            args: dict[str, Any] = {"query": query, "count": 5, "country": country}
+            if freshness:
+                args["freshness"] = freshness
+
+            result: ToolResult = _run_async(
+                brave_client.call_tool("brave_web_search", args)
+            )
+
+            if result.is_error:
+                raise ToolError(
+                    "Brave web search returned error",
+                    query=query,
+                    content=result.content[:200],
+                )
+
+            if budget is not None:
+                budget.record_web_search()
+
+            documents = _parse_brave_results(result.content, provider="brave_web")
+            if evidence_accumulator is not None:
+                evidence_accumulator.extend(documents)
+
+            formatted = _format_evidence(documents)
+            logger.info(
+                "search_web returned %d results (query=%s)", len(documents), query
+            )
+            return {"text": formatted, "documents": documents}
+
+        except ToolError:
+            raise
+        except Exception as e:
+            raise ToolError(
+                "Web search failed",
+                query=query,
+                operation="search_web",
+                original_error=str(e),
+            ) from e
 
     return {
         "name": "search_web",
         "description": (
             "Search the web for information not available in the knowledge base. "
-            "(Not yet configured -- returns a placeholder.)"
+            "Use for evergreen topics and general queries."
         ),
         "function": search_web,
         "parameters": {
@@ -377,8 +482,212 @@ def make_search_web_tool() -> ToolConfig:
                     "type": "string",
                     "description": "The web search query text.",
                 },
+                "country": {
+                    "type": "string",
+                    "description": "Country code for search results (default US).",
+                    "default": "US",
+                },
+                "freshness": {
+                    "type": "string",
+                    "description": (
+                        "Time filter: 'pd' (past day), 'pw' (past week), "
+                        "'pm' (past month), 'py' (past year), or empty for all time."
+                    ),
+                    "default": "",
+                },
             },
             "required": ["query"],
+        },
+    }
+
+
+def make_search_news_tool(
+    brave_client: MCPHttpClient | None = None,
+    evidence_accumulator: list[Document] | None = None,
+    budget: WebToolBudget | None = None,
+) -> ToolConfig:
+    """Create the ``search_news`` tool for the Haystack Agent.
+
+    Searches recent news using Brave News Search via MCP.
+    Better fit for recency-sensitive queries than search_web.
+
+    Args:
+        brave_client: MCPHttpClient connected to Brave Search MCP server.
+        evidence_accumulator: Shared list to collect web evidence documents.
+        budget: Per-query web tool budget.
+
+    Returns:
+        Tool descriptor dict.
+    """
+
+    def search_news(query: str, freshness: str = "pw") -> dict[str, Any]:
+        """Search recent news articles using Brave News Search."""
+        if brave_client is None:
+            logger.warning("search_news called but Brave Search is not configured")
+            return {"text": "News search is not configured."}
+
+        if budget is not None:
+            try:
+                budget.check_news_search()
+            except Exception as e:
+                return {"text": str(e)}
+
+        try:
+            args: dict[str, Any] = {"query": query, "count": 5, "freshness": freshness}
+
+            result: ToolResult = _run_async(
+                brave_client.call_tool("brave_news_search", args)
+            )
+
+            if result.is_error:
+                raise ToolError(
+                    "Brave news search returned error",
+                    query=query,
+                    content=result.content[:200],
+                )
+
+            if budget is not None:
+                budget.record_news_search()
+
+            documents = _parse_brave_results(result.content, provider="brave_news")
+            if evidence_accumulator is not None:
+                evidence_accumulator.extend(documents)
+
+            formatted = _format_evidence(documents)
+            logger.info(
+                "search_news returned %d results (query=%s)", len(documents), query
+            )
+            return {"text": formatted, "documents": documents}
+
+        except ToolError:
+            raise
+        except Exception as e:
+            raise ToolError(
+                "News search failed",
+                query=query,
+                operation="search_news",
+                original_error=str(e),
+            ) from e
+
+    return {
+        "name": "search_news",
+        "description": (
+            "Search recent news articles. Use for queries about recent events, "
+            "releases, changes, or time-sensitive topics."
+        ),
+        "function": search_news,
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "The news search query text.",
+                },
+                "freshness": {
+                    "type": "string",
+                    "description": (
+                        "Time filter: 'pd' (past day), 'pw' (past week), "
+                        "'pm' (past month). Default is 'pw' (past week)."
+                    ),
+                    "default": "pw",
+                },
+            },
+            "required": ["query"],
+        },
+    }
+
+
+def make_fetch_url_tool(
+    url_validator: URLValidator,
+    evidence_accumulator: list[Document] | None = None,
+    budget: WebToolBudget | None = None,
+    max_length: int = 5000,
+    max_bytes: int = 2_000_000,
+    timeout: int = 30,
+    user_agent: str = "AgenticRA/1.0",
+) -> ToolConfig:
+    """Create the ``fetch_url`` tool for the Haystack Agent.
+
+    Fetches a URL, extracts main content via trafilatura, and returns
+    clean text. All URLs are SSRF-validated before any network I/O.
+
+    Args:
+        url_validator: URLValidator for SSRF protection.
+        evidence_accumulator: Shared list to collect web evidence documents.
+        budget: Per-query web tool budget.
+        max_length: Maximum characters in returned content.
+        max_bytes: Maximum bytes to download.
+        timeout: HTTP request timeout in seconds.
+        user_agent: User-Agent header value.
+
+    Returns:
+        Tool descriptor dict.
+    """
+
+    def fetch(url: str) -> dict[str, Any]:
+        """Fetch a URL and extract its main content."""
+        if budget is not None:
+            try:
+                budget.check_fetch()
+            except Exception as e:
+                return {"text": str(e)}
+
+        try:
+            content, bytes_downloaded = _run_async(
+                fetch_url(
+                    url=url,
+                    validator=url_validator,
+                    max_length=max_length,
+                    max_bytes=max_bytes,
+                    timeout=timeout,
+                    user_agent=user_agent,
+                )
+            )
+
+            if budget is not None:
+                budget.record_fetch(bytes_downloaded)
+
+            doc = Document(
+                content=content,
+                meta={"source": url, "provider": "fetch"},
+            )
+            if evidence_accumulator is not None:
+                evidence_accumulator.append(doc)
+
+            logger.info(
+                "fetch_url downloaded %d bytes, extracted %d chars (url=%s)",
+                bytes_downloaded,
+                len(content),
+                url,
+            )
+            return {"text": content}
+
+        except ToolError:
+            raise
+        except Exception as e:
+            raise ToolError(
+                "URL fetch failed",
+                url=url,
+                operation="fetch_url",
+                original_error=str(e),
+            ) from e
+
+    return {
+        "name": "fetch_url",
+        "description": (
+            "Fetch a URL and extract its main content as clean text. "
+            "Use to get full page content from URLs found in search results."
+        ),
+        "function": fetch,
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "url": {
+                    "type": "string",
+                    "description": "The URL to fetch and extract content from.",
+                },
+            },
+            "required": ["url"],
         },
     }
 
