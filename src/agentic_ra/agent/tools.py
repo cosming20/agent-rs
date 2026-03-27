@@ -17,7 +17,7 @@ from typing import Any, TypedDict
 
 from haystack import Document
 
-from agentic_ra.core.errors import ToolError
+from agentic_ra.core.errors import ToolError, WebBudgetExhaustedError
 from agentic_ra.retrieval.ranker import ResultRanker
 from agentic_ra.retrieval.router import RetrievalRouter, RetrievalStrategy
 from agentic_ra.tools.budgets import WebToolBudget
@@ -426,7 +426,7 @@ def make_search_web_tool(
         if budget is not None:
             try:
                 budget.check_web_search()
-            except Exception as e:
+            except WebBudgetExhaustedError as e:
                 return {"text": str(e)}
 
         try:
@@ -438,15 +438,16 @@ def make_search_web_tool(
                 brave_client.call_tool("brave_web_search", args)
             )
 
+            # Record budget FIRST — the call was made regardless of result
+            if budget is not None:
+                budget.record_web_search()
+
             if result.is_error:
                 raise ToolError(
                     "Brave web search returned error",
                     query=query,
                     content=result.content[:200],
                 )
-
-            if budget is not None:
-                budget.record_web_search()
 
             documents = _parse_brave_results(result.content, provider="brave_web")
             if evidence_accumulator is not None:
@@ -529,7 +530,7 @@ def make_search_news_tool(
         if budget is not None:
             try:
                 budget.check_news_search()
-            except Exception as e:
+            except WebBudgetExhaustedError as e:
                 return {"text": str(e)}
 
         try:
@@ -539,15 +540,16 @@ def make_search_news_tool(
                 brave_client.call_tool("brave_news_search", args)
             )
 
+            # Record budget FIRST — the call was made regardless of result
+            if budget is not None:
+                budget.record_news_search()
+
             if result.is_error:
                 raise ToolError(
                     "Brave news search returned error",
                     query=query,
                     content=result.content[:200],
                 )
-
-            if budget is not None:
-                budget.record_news_search()
 
             documents = _parse_brave_results(result.content, provider="brave_news")
             if evidence_accumulator is not None:
@@ -629,7 +631,7 @@ def make_fetch_url_tool(
         if budget is not None:
             try:
                 budget.check_fetch()
-            except Exception as e:
+            except WebBudgetExhaustedError as e:
                 return {"text": str(e)}
 
         try:
