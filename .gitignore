@@ -38,5 +38,12 @@ htmlcov/
 # Infrastructure
 infra/data/
 
+# Cognee local data
+.cognee_data/
+.cognee_system/
+
 # Logs
 *.log
+
+# Worktrees
+.worktrees/
