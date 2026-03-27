@@ -129,3 +129,118 @@ class ResultRanker:
                 document_count=len(results),
                 original_error=str(e),
             ) from e
+
+    def fuse_evidence(
+        self,
+        kb_documents: list[Document],
+        web_documents: list[Document],
+        query: str,
+        kb_weight: float = 1.5,
+        limit: int = 15,
+    ) -> EvidencePack:
+        """Fuse KB and web evidence into a single ranked evidence pack.
+
+        Deduplicates across sources, applies cross-source RRF with a
+        weight boost for KB results (trusted source), and preserves
+        provenance metadata.
+
+        Args:
+            kb_documents: Evidence from knowledge base retrieval.
+            web_documents: Evidence from web search and URL fetch.
+            query: Original user query.
+            kb_weight: Multiplier for KB document RRF scores. Default 1.5.
+            limit: Maximum documents in the fused evidence pack.
+
+        Returns:
+            Fused, ranked evidence pack with provenance tags.
+        """
+        if not kb_documents and not web_documents:
+            return EvidencePack(documents=(), query=query, strategy="fused")
+
+        try:
+            # Tag provenance if not already tagged
+            for doc in kb_documents:
+                if "provider" not in doc.meta:
+                    doc.meta["provider"] = "cognee"
+            for doc in web_documents:
+                if "provider" not in doc.meta:
+                    doc.meta["provider"] = "web"
+
+            # Dedup by content prefix (first 200 chars)
+            seen_content: set[str] = set()
+            unique_kb: list[Document] = []
+            for doc in kb_documents:
+                key = (doc.content or "")[:200]
+                if key not in seen_content:
+                    seen_content.add(key)
+                    unique_kb.append(doc)
+
+            unique_web: list[Document] = []
+            for doc in web_documents:
+                key = (doc.content or "")[:200]
+                if key not in seen_content:
+                    seen_content.add(key)
+                    unique_web.append(doc)
+
+            # RRF scoring with source weighting
+            rrf_scores: dict[str, float] = {}
+            content_to_doc: dict[str, Document] = {}
+
+            # Score KB documents (with weight boost)
+            for rank_idx, doc in enumerate(unique_kb):
+                content_key = doc.content if doc.content else f"__empty_{doc.id}"
+                rrf_scores[content_key] = kb_weight / (self._rrf_k + rank_idx + 1)
+                if content_key not in content_to_doc:
+                    content_to_doc[content_key] = doc
+
+            # Score web documents (standard weight)
+            for rank_idx, doc in enumerate(unique_web):
+                content_key = doc.content if doc.content else f"__empty_{doc.id}"
+                rrf_scores[content_key] = 1.0 / (self._rrf_k + rank_idx + 1)
+                if content_key not in content_to_doc:
+                    content_to_doc[content_key] = doc
+
+            # Sort by fused score descending
+            ranked_keys = sorted(
+                rrf_scores.keys(), key=lambda k: rrf_scores[k], reverse=True
+            )[:limit]
+
+            ranked_docs = []
+            for content_key in ranked_keys:
+                doc = content_to_doc[content_key]
+                ranked_docs.append(
+                    Document(
+                        content=doc.content,
+                        meta={
+                            **doc.meta,
+                            "rrf_score": rrf_scores[content_key],
+                        },
+                    )
+                )
+
+            source_counts: dict[str, int] = {}
+            source_counts["kb"] = len(unique_kb)
+            source_counts["web"] = len(unique_web)
+
+            logger.info(
+                "Evidence fusion: %d KB + %d web -> %d fused documents",
+                len(unique_kb),
+                len(unique_web),
+                len(ranked_docs),
+            )
+
+            return EvidencePack(
+                documents=tuple(ranked_docs),
+                query=query,
+                strategy="fused",
+                source_counts=source_counts,
+            )
+
+        except Exception as e:
+            raise RankingError(
+                "Evidence fusion failed",
+                operation="fuse_evidence",
+                kb_count=len(kb_documents),
+                web_count=len(web_documents),
+                original_error=str(e),
+            ) from e

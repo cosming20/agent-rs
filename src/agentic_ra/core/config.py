@@ -91,6 +91,28 @@ class Settings(BaseSettings):
     agent_max_steps: int = 10
     agent_max_retries: int = 1
 
+    # --- Brave Search MCP ---
+    brave_api_key: SecretStr = SecretStr("")
+    brave_mcp_host: str = "localhost"
+    brave_mcp_port: int = 1063
+    brave_search_enabled: bool = False
+
+    # --- Fetch ---
+    fetch_max_length: int = 5000
+    fetch_max_bytes: int = 2_000_000
+    fetch_timeout: int = 30
+    fetch_user_agent: str = "AgenticRA/1.0"
+    fetch_max_redirects: int = 3
+    fetch_domain_denylist: str = ""
+    fetch_domain_allowlist: str = ""
+
+    # --- Web Tool Budgets ---
+    web_budget_max_searches: int = 3
+    web_budget_max_news: int = 2
+    web_budget_max_fetches: int = 3
+    web_budget_timeout_s: float = 45.0
+    web_budget_max_bytes: int = 6_000_000
+
     # --- Computed connection URLs ---
 
     @computed_field  # type: ignore[prop-decorator]
@@ -142,6 +164,12 @@ class Settings(BaseSettings):
     def neo4j_bolt_url(self) -> str:
         """Neo4j Bolt protocol URL for Cognee graph backend."""
         return f"bolt://{self.neo4j_host}:{self.neo4j_bolt_port}"
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def brave_mcp_url(self) -> str:
+        """Brave Search MCP server Streamable HTTP URL."""
+        return f"http://{self.brave_mcp_host}:{self.brave_mcp_port}"
 
 
 @lru_cache(maxsize=1)

@@ -88,6 +88,18 @@ class MCPClientError(ToolError):
     """MCP client connection or invocation failure."""
 
 
+class WebSearchError(ToolError):
+    """Brave Search or URL fetch failure."""
+
+
+class SSRFError(WebSearchError):
+    """URL failed SSRF validation (blocked scheme, private IP, etc.)."""
+
+
+class WebBudgetExhaustedError(WebSearchError):
+    """Web tool budget exceeded for this query."""
+
+
 class AuthError(AgenticRAError):
     """Base for authentication/authorization failures."""
 

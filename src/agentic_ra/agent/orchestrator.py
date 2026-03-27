@@ -17,13 +17,19 @@ from agentic_ra.agent.memory import MemoryStore
 from agentic_ra.agent.synthesis import ResponseSynthesizer, SynthesizedResponse
 from agentic_ra.agent.tools import (
     _sanitize_user_id,
+    make_fetch_url_tool,
     make_ingest_tool,
     make_remember_tool,
     make_search_knowledge_tool,
+    make_search_news_tool,
     make_search_web_tool,
 )
 from agentic_ra.agent.verifier import GroundingVerifier
+from agentic_ra.core.config import get_settings
 from agentic_ra.core.errors import OrchestratorError
+from agentic_ra.tools.budgets import WebToolBudget
+from agentic_ra.tools.mcp_http_client import MCPHttpClient
+from agentic_ra.tools.url_safety import URLValidator
 from agentic_ra.observability.metrics import RAGMetrics
 from agentic_ra.stores.postgres.models import MessageRole
 from agentic_ra.stores.postgres.runs import RunStore
@@ -57,6 +63,8 @@ class AgentOrchestrator:
         ranker: Any = None,
         cognee_store: Any = None,
         document_store: Any = None,
+        brave_client: MCPHttpClient | None = None,
+        url_validator: URLValidator | None = None,
     ) -> None:
         self._base_agent = base_agent
         self._memory = memory
@@ -69,6 +77,8 @@ class AgentOrchestrator:
         self._ranker = ranker
         self._cognee_store = cognee_store
         self._document_store = document_store
+        self._brave_client = brave_client
+        self._url_validator = url_validator or URLValidator()
 
     async def process_query(
         self,
@@ -109,7 +119,18 @@ class AgentOrchestrator:
 
             # 3. Build per-request tools scoped to this user's dataset
             dataset = f"user_{_sanitize_user_id(user_id)}"
-            evidence: list[Document] = []
+            kb_evidence: list[Document] = []
+            web_evidence: list[Document] = []
+
+            settings = get_settings()
+            budget = WebToolBudget(
+                max_web_searches=settings.web_budget_max_searches,
+                max_news_searches=settings.web_budget_max_news,
+                max_fetch_calls=settings.web_budget_max_fetches,
+                total_web_timeout_s=settings.web_budget_timeout_s,
+                total_fetch_bytes=settings.web_budget_max_bytes,
+            )
+
             tools_config = [
                 make_search_knowledge_tool(
                     self._router,
@@ -118,9 +139,27 @@ class AgentOrchestrator:
                     document_store=self._document_store,
                     dataset=dataset,
                     role=role,
-                    evidence_accumulator=evidence,
+                    evidence_accumulator=kb_evidence,
                 ),
-                make_search_web_tool(),
+                make_search_web_tool(
+                    brave_client=self._brave_client,
+                    evidence_accumulator=web_evidence,
+                    budget=budget,
+                ),
+                make_search_news_tool(
+                    brave_client=self._brave_client,
+                    evidence_accumulator=web_evidence,
+                    budget=budget,
+                ),
+                make_fetch_url_tool(
+                    url_validator=self._url_validator,
+                    evidence_accumulator=web_evidence,
+                    budget=budget,
+                    max_length=settings.fetch_max_length,
+                    max_bytes=settings.fetch_max_bytes,
+                    timeout=settings.fetch_timeout,
+                    user_agent=settings.fetch_user_agent,
+                ),
                 make_remember_tool(self._memory, user_id),
             ]
             if self._cognee_store is not None:
@@ -135,7 +174,8 @@ class AgentOrchestrator:
             #    on pipeline errors.  Our closure-based tools can't be serialized,
             #    so we catch SerializationError and fall back to evidence already
             #    accumulated by the tool closures.
-            evidence.clear()
+            kb_evidence.clear()
+            web_evidence.clear()
             agent_result: dict[str, Any] | None = None
             try:
                 agent_result = await asyncio.to_thread(
@@ -155,6 +195,15 @@ class AgentOrchestrator:
                 if agent_result is not None
                 else "I was unable to generate an answer due to a processing error."
             )
+
+            # 5b. Fuse KB + web evidence
+            fused_pack = self._ranker.fuse_evidence(
+                kb_documents=kb_evidence,
+                web_documents=web_evidence,
+                query=query,
+            )
+            evidence = list(fused_pack.documents)
+
             elapsed_ms = (time.monotonic() - start) * 1000
 
             if self._metrics:
@@ -193,11 +242,18 @@ class AgentOrchestrator:
                     ChatMessage.from_assistant(answer),
                     feedback,
                 ]
-                evidence.clear()
+                kb_evidence.clear()
+                web_evidence.clear()
                 agent_result = await asyncio.to_thread(
                     agent.run, messages=retry_messages
                 )
                 answer = self._extract_answer(agent_result)
+                fused_pack = self._ranker.fuse_evidence(
+                    kb_documents=kb_evidence,
+                    web_documents=web_evidence,
+                    query=query,
+                )
+                evidence = list(fused_pack.documents)
                 verification = await asyncio.to_thread(
                     self._verifier.verify, answer=answer, evidence=evidence
                 )
