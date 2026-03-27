@@ -13,13 +13,14 @@ from __future__ import annotations
 import json
 import logging
 import re
+from urllib.parse import urljoin
 
 import httpx
 import trafilatura
 from markdownify import markdownify
 
 from agentic_ra.core.errors import SSRFError, WebSearchError
-from agentic_ra.tools.url_safety import URLValidator
+from agentic_ra.tools.url_safety import URLValidator, ValidatedURL
 
 logger = logging.getLogger(__name__)
 
@@ -33,6 +34,15 @@ async def fetch_url(
     user_agent: str = "AgenticRA/1.0",
 ) -> tuple[str, int]:
     """Fetch a URL, extract main content, return as clean text.
+
+    Uses IP-pinned URLs to prevent DNS rebinding TOCTOU attacks:
+    the validator resolves DNS and returns a ``ValidatedURL`` whose
+    ``safe_url`` has the hostname replaced by the resolved IP. The
+    original hostname is sent via the ``Host`` header.
+
+    Redirects are followed manually (up to ``validator.max_redirects``)
+    so that every redirect target is re-validated against the SSRF
+    policy.
 
     Args:
         url: The URL to fetch.
@@ -49,37 +59,17 @@ async def fetch_url(
         SSRFError: If URL fails SSRF validation.
         WebSearchError: If fetch or extraction fails.
     """
-    # SSRF validation — must pass before any network I/O
-    validated_url = validator.validate(url)
+    # SSRF validation — returns a pinned ValidatedURL (IP-substituted)
+    validated = validator.validate(url)
 
     try:
-        async with httpx.AsyncClient(
-            timeout=httpx.Timeout(timeout),
-            follow_redirects=True,
-            max_redirects=validator.max_redirects,
-            headers={"User-Agent": user_agent},
-        ) as client:
-            # Streaming download with size cap
-            async with client.stream("GET", validated_url) as response:
-                response.raise_for_status()
-
-                content_type = response.headers.get("content-type", "")
-                chunks: list[bytes] = []
-                total_bytes = 0
-
-                async for chunk in response.aiter_bytes(chunk_size=8192):
-                    total_bytes += len(chunk)
-                    if total_bytes > max_bytes:
-                        logger.warning(
-                            "Fetch aborted: response exceeds %d bytes (url=%s)",
-                            max_bytes,
-                            url,
-                        )
-                        break
-                    chunks.append(chunk)
-
-                raw_bytes = b"".join(chunks)
-
+        raw_bytes, content_type = await _fetch_with_redirect_validation(
+            validated=validated,
+            validator=validator,
+            max_bytes=max_bytes,
+            timeout=timeout,
+            user_agent=user_agent,
+        )
     except SSRFError:
         raise
     except httpx.HTTPStatusError as e:
@@ -101,11 +91,8 @@ async def fetch_url(
             original_error=str(e),
         ) from e
 
-    # Decode content
-    try:
-        text = raw_bytes.decode("utf-8", errors="replace")
-    except Exception:
-        text = raw_bytes.decode("latin-1", errors="replace")
+    # Decode content — errors="replace" never raises (Issue 4: dead code removed)
+    text = raw_bytes.decode("utf-8", errors="replace")
 
     # Content extraction based on content-type
     extracted = _extract_content(text, content_type, url)
@@ -114,7 +101,93 @@ async def fetch_url(
     if len(extracted) > max_length:
         extracted = extracted[:max_length] + "\n\n... (truncated)"
 
-    return extracted, total_bytes
+    return extracted, len(raw_bytes)
+
+
+async def _fetch_with_redirect_validation(
+    validated: ValidatedURL,
+    validator: URLValidator,
+    max_bytes: int,
+    timeout: int,
+    user_agent: str,
+) -> tuple[bytes, str]:
+    """Fetch URL with manual redirect following and SSRF re-validation.
+
+    Each redirect ``Location`` header is validated through the
+    ``URLValidator`` before following, preventing open-redirect SSRF.
+
+    Args:
+        validated: The SSRF-validated URL to fetch.
+        validator: URLValidator for re-validating redirect targets.
+        max_bytes: Maximum bytes to download before aborting.
+        timeout: HTTP request timeout in seconds.
+        user_agent: User-Agent header value.
+
+    Returns:
+        Tuple of (raw_bytes, content_type_header).
+
+    Raises:
+        SSRFError: If a redirect target fails SSRF validation.
+        WebSearchError: If too many redirects occur.
+        httpx.HTTPStatusError: On non-redirect HTTP errors.
+        httpx.TimeoutException: On request timeout.
+        httpx.RequestError: On other request failures.
+    """
+    current = validated
+    redirects_remaining = validator.max_redirects
+
+    async with httpx.AsyncClient(
+        timeout=httpx.Timeout(timeout),
+        follow_redirects=False,  # Manual redirect handling for re-validation
+        headers={"User-Agent": user_agent},
+    ) as client:
+        while True:
+            request_headers = {"Host": current.hostname}
+            async with client.stream(
+                "GET", current.safe_url, headers=request_headers
+            ) as response:
+                # Handle redirects manually
+                if response.is_redirect:
+                    if redirects_remaining <= 0:
+                        raise WebSearchError(
+                            "Too many redirects",
+                            url=current.original_url,
+                            max_redirects=validator.max_redirects,
+                        )
+                    redirects_remaining -= 1
+
+                    location = response.headers.get("location")
+                    if not location:
+                        raise WebSearchError(
+                            "Redirect with no Location header",
+                            url=current.original_url,
+                        )
+
+                    # Resolve relative redirects against the original URL
+                    absolute_location = urljoin(current.original_url, location)
+
+                    # Re-validate redirect target against SSRF policy
+                    current = validator.validate(absolute_location)
+                    continue
+
+                response.raise_for_status()
+
+                content_type = response.headers.get("content-type", "")
+                chunks: list[bytes] = []
+                total_bytes = 0
+
+                async for chunk in response.aiter_bytes(chunk_size=8192):
+                    total_bytes += len(chunk)
+                    if total_bytes > max_bytes:
+                        logger.warning(
+                            "Fetch aborted: response exceeds %d bytes (url=%s)",
+                            max_bytes,
+                            current.original_url,
+                        )
+                        break
+                    chunks.append(chunk)
+
+                return b"".join(chunks), content_type
 
 
 def _extract_content(text: str, content_type: str, url: str) -> str:
@@ -168,7 +241,9 @@ def _extract_html(html: str, url: str) -> str:
         return _normalize_whitespace(extracted)
 
     # Fallback: markdownify (raw HTML -> markdown, less clean)
-    logger.debug("trafilatura returned empty for %s, falling back to markdownify", url)
+    logger.warning(
+        "trafilatura returned empty for %s, falling back to markdownify", url
+    )
     md = markdownify(html, heading_style="ATX", strip=["script", "style", "nav"])
     return _normalize_whitespace(md)
 
