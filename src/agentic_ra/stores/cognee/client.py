@@ -179,6 +179,69 @@ class CogneeStore:
                 original_error=str(e),
             ) from e
 
+    async def add_chunks(
+        self,
+        chunks: list[str],
+        dataset: str | None = None,
+    ) -> dict[str, Any]:
+        """Ingest individual chunks and build knowledge graph.
+
+        Each chunk is added as a separate document to preserve structure
+        (e.g. article boundaries in legal documents). Cognify runs once
+        after all chunks are added.
+
+        Args:
+            chunks: List of chunk texts (each should have heading breadcrumbs).
+            dataset: Override dataset name (defaults to instance default).
+
+        Returns:
+            Dict with keys ``add_count`` and ``cognify_result``.
+        """
+        ds = dataset or self._dataset
+        if not chunks:
+            raise CogneeError(
+                "No chunks to ingest",
+                dataset=ds,
+                operation="add_chunks",
+                original_error="Empty chunk list",
+            )
+
+        try:
+            for i, chunk_text in enumerate(chunks):
+                if not chunk_text.strip():
+                    continue
+                await cognee.add(data=chunk_text, dataset_name=ds)
+
+                if (i + 1) % 50 == 0:
+                    logger.info(
+                        "Cognee add progress: %d/%d chunks (dataset=%s)",
+                        i + 1,
+                        len(chunks),
+                        ds,
+                    )
+
+            logger.info(
+                "Cognee add complete: %d chunks (dataset=%s), starting cognify...",
+                len(chunks),
+                ds,
+            )
+
+            cognify_result = await cognee.cognify(datasets=[ds])
+
+            logger.info("Cognee cognify complete for dataset=%s", ds)
+            return {"add_count": len(chunks), "cognify_result": cognify_result}
+
+        except CogneeError:
+            raise
+        except Exception as e:
+            raise CogneeError(
+                "Cognee chunk ingestion failed",
+                dataset=ds,
+                chunk_count=len(chunks),
+                operation="add_chunks",
+                original_error=str(e),
+            ) from e
+
     async def add(self, text: str, dataset: str | None = None) -> object:
         """Ingest text into Cognee without building the graph.
 
