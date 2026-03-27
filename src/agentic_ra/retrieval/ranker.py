@@ -155,9 +155,7 @@ class ResultRanker:
             Fused, ranked evidence pack with provenance tags.
         """
         if not kb_documents and not web_documents:
-            return EvidencePack(
-                documents=(), query=query, strategy="fused"
-            )
+            return EvidencePack(documents=(), query=query, strategy="fused")
 
         try:
             # Tag provenance if not already tagged
