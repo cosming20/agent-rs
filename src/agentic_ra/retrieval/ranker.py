@@ -183,35 +183,37 @@ class ResultRanker:
                     unique_web.append(doc)
 
             # RRF scoring with source weighting
-            rrf_scores: dict[int, float] = {}
-            doc_map: dict[int, Document] = {}
+            rrf_scores: dict[str, float] = {}
+            content_to_doc: dict[str, Document] = {}
 
             # Score KB documents (with weight boost)
             for rank_idx, doc in enumerate(unique_kb):
-                doc_id = id(doc)
-                rrf_scores[doc_id] = kb_weight / (self._rrf_k + rank_idx + 1)
-                doc_map[doc_id] = doc
+                content_key = doc.content if doc.content else f"__empty_{doc.id}"
+                rrf_scores[content_key] = kb_weight / (self._rrf_k + rank_idx + 1)
+                if content_key not in content_to_doc:
+                    content_to_doc[content_key] = doc
 
             # Score web documents (standard weight)
             for rank_idx, doc in enumerate(unique_web):
-                doc_id = id(doc)
-                rrf_scores[doc_id] = 1.0 / (self._rrf_k + rank_idx + 1)
-                doc_map[doc_id] = doc
+                content_key = doc.content if doc.content else f"__empty_{doc.id}"
+                rrf_scores[content_key] = 1.0 / (self._rrf_k + rank_idx + 1)
+                if content_key not in content_to_doc:
+                    content_to_doc[content_key] = doc
 
             # Sort by fused score descending
-            ranked_ids = sorted(
+            ranked_keys = sorted(
                 rrf_scores.keys(), key=lambda k: rrf_scores[k], reverse=True
             )[:limit]
 
             ranked_docs = []
-            for doc_id in ranked_ids:
-                doc = doc_map[doc_id]
+            for content_key in ranked_keys:
+                doc = content_to_doc[content_key]
                 ranked_docs.append(
                     Document(
                         content=doc.content,
                         meta={
                             **doc.meta,
-                            "rrf_score": rrf_scores[doc_id],
+                            "rrf_score": rrf_scores[content_key],
                         },
                     )
                 )
