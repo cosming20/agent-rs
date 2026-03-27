@@ -65,7 +65,7 @@ class Settings(BaseSettings):
     embedding_model: str = "text-embedding-3-small"
     embedding_dimension: int = 1536
     embedding_batch_size: int = 32
-    chunk_max_tokens: int = 512
+    chunk_max_tokens: int = 2048
     chunk_merge_peers: bool = True
 
     # --- Cognee (Knowledge Graph) ---

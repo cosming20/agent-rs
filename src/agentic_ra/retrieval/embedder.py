@@ -14,7 +14,9 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from docling.document_converter import DocumentConverter
+from docling.datamodel.base_models import InputFormat
+from docling.datamodel.pipeline_options import PdfPipelineOptions, TableStructureOptions
+from docling.document_converter import DocumentConverter, PdfFormatOption
 from docling_core.transforms.chunker import HybridChunker  # type: ignore[attr-defined]  # re-exported at runtime
 from docling_core.transforms.chunker.tokenizer.huggingface import HuggingFaceTokenizer
 from docling_core.types.doc import DocItemLabel, DoclingDocument  # type: ignore[attr-defined]  # re-exported at runtime
@@ -63,11 +65,29 @@ class EmbeddingPipeline:
         api_key: str = "",
         dimension: int = 1536,
         batch_size: int = 32,
-        max_tokens: int = 512,
+        max_tokens: int = 2048,
         merge_peers: bool = True,
     ) -> None:
         self._model_name = model
-        self._converter = DocumentConverter()
+
+        # Match lawren-docling settings for better heading detection:
+        # - force_backend_text=True: use PDF's native text, skip ML detection
+        # - do_ocr=False: no OCR (faster, cleaner for digital PDFs)
+        # - table_structure mode="accurate": better table parsing
+        pdf_opts = PdfPipelineOptions()
+        pdf_opts.do_ocr = False
+        pdf_opts.force_backend_text = True
+        pdf_opts.do_table_structure = True
+        try:
+            pdf_opts.table_structure_options = TableStructureOptions(mode="accurate")
+        except Exception:
+            pass
+
+        self._converter = DocumentConverter(
+            format_options={
+                InputFormat.PDF: PdfFormatOption(pipeline_options=pdf_opts),
+            },
+        )
 
         # Use a tokenizer with max_tokens matching the embedding model's context window
         # (8191 for OpenAI text-embedding-3-*) to avoid false truncation warnings.
