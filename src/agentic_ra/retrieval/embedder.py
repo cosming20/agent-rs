@@ -10,6 +10,7 @@ Architecture:
 from __future__ import annotations
 
 import logging
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -25,6 +26,7 @@ from haystack.components.embedders import OpenAIDocumentEmbedder
 from haystack.utils import Secret
 
 from agentic_ra.core.errors import EmbeddingError
+from agentic_ra.retrieval.html_preprocessor import is_legi_html, preprocess_legi_html
 
 logger = logging.getLogger(__name__)
 
@@ -49,6 +51,10 @@ class _CharApproxTokenizer(BaseTokenizer):  # type: ignore[misc]
 
     Uses len(text)/4 as the standard English approximation (~4 chars per token).
     Good enough for chunk size budgeting where ±10% doesn't matter.
+
+    Implements ``__call__`` so that ``semchunk.chunkerify()`` can wrap it with
+    ``functools.lru_cache`` — required on Python 3.14+ where ``lru_cache``
+    validates that the first argument is callable.
     """
 
     _max_tokens: int = 2048
@@ -61,10 +67,23 @@ class _CharApproxTokenizer(BaseTokenizer):  # type: ignore[misc]
         return self._max_tokens
 
     def get_tokenizer(self) -> Any:
-        return self  # self implements count_tokens
+        return self  # self implements count_tokens + __call__
 
     def count_tokens(self, text: str) -> int:
         return max(1, len(text) // 4)
+
+    def __call__(self, text: str) -> int:
+        """Make instance callable for semchunk/lru_cache compatibility."""
+        return self.count_tokens(text)
+
+    def __hash__(self) -> int:
+        """Make hashable for semchunk's memoization dict."""
+        return hash(("_CharApproxTokenizer", self._max_tokens))
+
+    def __eq__(self, other: object) -> bool:
+        if isinstance(other, _CharApproxTokenizer):
+            return self._max_tokens == other._max_tokens
+        return NotImplemented
 
 
 class EmbeddingPipeline:
@@ -168,6 +187,9 @@ class EmbeddingPipeline:
         """Parse a file/URL with Docling and chunk with HybridChunker.
 
         Supports PDF, DOCX, PPTX, HTML, Markdown, images, and more.
+        HTML files from legislatie.just.ro are automatically detected and
+        pre-processed to convert ``<span class="S_*">`` elements into
+        semantic HTML before Docling parses them.
 
         Args:
             source: File path or URL to parse.
@@ -176,7 +198,8 @@ class EmbeddingPipeline:
             ChunkResult with contextualized documents and the DoclingDocument.
         """
         try:
-            result = self._converter.convert(source)
+            actual_source = self._maybe_preprocess_html(source)
+            result = self._converter.convert(actual_source)
             docling_doc: DoclingDocument = result.document
 
             return self._chunk_docling_doc(
@@ -184,6 +207,8 @@ class EmbeddingPipeline:
                 extra_meta={"source_path": str(source)},
             )
 
+        except EmbeddingError:
+            raise
         except Exception as e:
             raise EmbeddingError(
                 "File parsing/chunking failed",
@@ -192,6 +217,74 @@ class EmbeddingPipeline:
                 source=str(source),
                 original_error=str(e),
             ) from e
+
+    def chunk_html(self, html: str, source_path: str = "html_input") -> ChunkResult:
+        """Parse an HTML string through the pipeline.
+
+        Automatically detects legislatie.just.ro format and pre-processes
+        the ``<span class="S_*">`` DOM into semantic HTML before Docling
+        conversion.
+
+        Args:
+            html: Raw HTML string.
+            source_path: Provenance label for the document origin.
+
+        Returns:
+            ChunkResult with contextualized documents and the DoclingDocument.
+        """
+        if is_legi_html(html):
+            logger.info("Detected legislatie.just.ro HTML — preprocessing")
+            html = preprocess_legi_html(html)
+
+        with tempfile.NamedTemporaryFile(
+            suffix=".html", delete=False, mode="w", encoding="utf-8",
+        ) as f:
+            f.write(html)
+            tmp_path = f.name
+
+        try:
+            result = self._converter.convert(tmp_path)
+            docling_doc: DoclingDocument = result.document
+            return self._chunk_docling_doc(
+                docling_doc,
+                extra_meta={"source_path": source_path},
+            )
+        except Exception as e:
+            raise EmbeddingError(
+                "HTML parsing/chunking failed",
+                model=self._model_name,
+                operation="chunk_html",
+                source=source_path,
+                original_error=str(e),
+            ) from e
+        finally:
+            Path(tmp_path).unlink(missing_ok=True)
+
+    @staticmethod
+    def _maybe_preprocess_html(source: str | Path) -> str | Path:
+        """If *source* is an HTML file with legislatie.just.ro content, preprocess it.
+
+        Returns the original path for non-HTML or non-legi files, or a new
+        temp file path with semantic HTML for legi files.
+        """
+        path = Path(source) if not isinstance(source, Path) else source
+        if not path.suffix.lower() in (".html", ".htm"):
+            return source
+
+        raw = path.read_text(encoding="utf-8", errors="replace")
+        if not is_legi_html(raw):
+            return source
+
+        logger.info("Detected legislatie.just.ro HTML in %s — preprocessing", path.name)
+        cleaned = preprocess_legi_html(raw)
+
+        # Write to a sibling temp file so Docling can read it
+        tmp = tempfile.NamedTemporaryFile(
+            suffix=".html", delete=False, mode="w", encoding="utf-8",
+        )
+        tmp.write(cleaned)
+        tmp.close()
+        return Path(tmp.name)
 
     @staticmethod
     def build_breadcrumb_chunks(chunk_result: ChunkResult) -> list[str]:
