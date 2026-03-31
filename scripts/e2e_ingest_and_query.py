@@ -21,6 +21,7 @@ from dataclasses import dataclass
 import httpx
 
 from agentic_ra.core.config import get_settings
+from agentic_ra.observability.cost_tracker import setup_cost_tracking
 from agentic_ra.retrieval.embedder import EmbeddingPipeline
 from agentic_ra.stores.cognee.client import CogneeStore
 from agentic_ra.stores.postgres.client import PostgresClient
@@ -102,6 +103,9 @@ async def run_ingestion(file_path: str) -> IngestResult:
     """
     s = get_settings()
     start = time.time()
+
+    # Initialize cost tracking so Cognee's LiteLLM calls are captured
+    setup_cost_tracking(pg_dsn=s.postgres_dsn_async.get_secret_value())
 
     pg = PostgresClient(dsn=s.postgres_dsn_async.get_secret_value())
     doc_store = DocumentStore(pg_client=pg)

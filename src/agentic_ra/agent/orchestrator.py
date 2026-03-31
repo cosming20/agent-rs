@@ -178,6 +178,7 @@ class AgentOrchestrator:
             kb_evidence.clear()
             web_evidence.clear()
             agent_result: dict[str, Any] | None = None
+            agent_start = time.monotonic()
             try:
                 agent_result = await asyncio.to_thread(
                     agent.run, messages=chat_messages
@@ -189,9 +190,12 @@ class AgentOrchestrator:
                     err_name,
                     str(agent_err)[:200],
                 )
+            agent_latency_ms = int((time.monotonic() - agent_start) * 1000)
 
             # 4b. Record agent LLM costs from response metadata
-            self._record_agent_costs(agent_result, session_id, "agent")
+            self._record_agent_costs(
+                agent_result, session_id, "agent", agent_latency_ms
+            )
 
             # 5. Extract answer and evidence (accumulated via closure)
             answer = (
@@ -327,6 +331,7 @@ class AgentOrchestrator:
         agent_result: dict[str, Any] | None,
         session_id: uuid.UUID,
         purpose: str,
+        total_latency_ms: int = 0,
     ) -> None:
         """Extract token usage from Haystack agent result and record to cost tracker."""
         tracker = get_tracker()
@@ -334,18 +339,25 @@ class AgentOrchestrator:
             return
 
         messages: list[ChatMessage] = agent_result.get("messages", [])
-        for msg in messages:
-            meta = msg._meta if hasattr(msg, "_meta") else {}
-            usage = meta.get("usage")
-            model = meta.get("model", "")
-            if usage and model:
-                tracker.record_call(
-                    model=model,
-                    purpose=purpose,
-                    usage={
-                        "prompt_tokens": usage.get("prompt_tokens", 0),
-                        "completion_tokens": usage.get("completion_tokens", 0),
-                        "total_tokens": usage.get("total_tokens", 0),
-                    },
-                    session_id=str(session_id),
-                )
+        llm_msgs = [
+            m for m in messages
+            if hasattr(m, "_meta") and m._meta.get("usage") and m._meta.get("model")
+        ]
+        n = len(llm_msgs)
+
+        for i, msg in enumerate(llm_msgs):
+            meta = msg._meta
+            usage = meta["usage"]
+            # Split total latency proportionally across LLM calls
+            latency = total_latency_ms // n if n > 0 else 0
+            tracker.record_call(
+                model=meta["model"],
+                purpose=purpose,
+                usage={
+                    "prompt_tokens": usage.get("prompt_tokens", 0),
+                    "completion_tokens": usage.get("completion_tokens", 0),
+                    "total_tokens": usage.get("total_tokens", 0),
+                },
+                latency_ms=latency,
+                session_id=str(session_id),
+            )

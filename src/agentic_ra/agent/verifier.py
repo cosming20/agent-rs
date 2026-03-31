@@ -151,7 +151,11 @@ class GroundingVerifier:
                 "LLM verifier not configured", operation="verify_llm"
             )
         try:
+            import time as _time
+
+            _v_start = _time.monotonic()
             result = self._llm.run(messages=messages)
+            _v_latency = int((_time.monotonic() - _v_start) * 1000)
             replies: list[ChatMessage] = result["replies"]
 
             # Record verifier LLM cost
@@ -163,6 +167,7 @@ class GroundingVerifier:
                 if tracker and usage and model:
                     tracker.record_call(
                         model=model, purpose="verifier", usage=usage,
+                        latency_ms=_v_latency,
                     )
 
             if not replies or not replies[0].text:
