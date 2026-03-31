@@ -297,7 +297,7 @@
           "editorMode": "code",
           "format": "table",
           "rawQuery": true,
-          "rawSql": "SELECT SUM(cost) AS \"value\" FROM llm_calls",
+          "rawSql": "SELECT SUM(cost_usd) AS \"value\" FROM llm_calls",
           "refId": "A"
         }
       ],
@@ -640,7 +640,7 @@
           "editorMode": "code",
           "format": "table",
           "rawQuery": true,
-          "rawSql": "SELECT model, SUM(cost) AS total_cost FROM llm_calls WHERE created_at > NOW() - INTERVAL '7 days' GROUP BY model ORDER BY total_cost DESC",
+          "rawSql": "SELECT model, SUM(cost_usd) AS total_cost FROM llm_calls WHERE created_at > NOW() - INTERVAL '7 days' GROUP BY model ORDER BY total_cost DESC",
           "refId": "A"
         }
       ],
@@ -716,7 +716,7 @@
           "editorMode": "code",
           "format": "time_series",
           "rawQuery": true,
-          "rawSql": "SELECT DATE_TRUNC('hour', p.created_at) AS \"time\", AVG(l.cost) AS avg_cost FROM pipeline_runs p LEFT JOIN llm_calls l ON DATE_TRUNC('minute', p.created_at) = DATE_TRUNC('minute', l.created_at) WHERE p.created_at > NOW() - INTERVAL '7 days' GROUP BY 1 ORDER BY 1",
+          "rawSql": "SELECT DATE_TRUNC('hour', p.created_at) AS \"time\", AVG(l.cost_usd) AS avg_cost FROM pipeline_runs p LEFT JOIN llm_calls l ON DATE_TRUNC('minute', p.created_at) = DATE_TRUNC('minute', l.created_at) WHERE p.created_at > NOW() - INTERVAL '7 days' GROUP BY 1 ORDER BY 1",
           "refId": "A"
         }
       ],
@@ -797,7 +797,7 @@
           "editorMode": "code",
           "format": "table",
           "rawQuery": true,
-          "rawSql": "SELECT model, SUM(input_tokens) AS input_tok, SUM(output_tokens) AS output_tok FROM llm_calls WHERE created_at > NOW() - INTERVAL '7 days' GROUP BY model ORDER BY (SUM(input_tokens) + SUM(output_tokens)) DESC",
+          "rawSql": "SELECT model, SUM(prompt_tokens) AS input_tok, SUM(completion_tokens) AS output_tok FROM llm_calls WHERE created_at > NOW() - INTERVAL '7 days' GROUP BY model ORDER BY (SUM(prompt_tokens) + SUM(completion_tokens)) DESC",
           "refId": "A"
         }
       ],

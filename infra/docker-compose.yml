@@ -258,6 +258,9 @@ services:
       - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_ADMIN_PASSWORD:-admin}
       - GF_AUTH_ANONYMOUS_ENABLED=true
       - GF_AUTH_ANONYMOUS_ORG_ROLE=Viewer
+      - POSTGRES_USER=${POSTGRES_USER:-agentic_ra}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-changeme-postgres}
+      - POSTGRES_DB=${POSTGRES_DB:-agentic_ra}
     networks:
       - agentic-ra-net
     depends_on:

@@ -1,7 +1,12 @@
 apiVersion: 1
 
+deleteDatasources:
+  - name: PostgreSQL
+  - name: Prometheus
+
 datasources:
   - name: Prometheus
+    uid: Prometheus
     type: prometheus
     access: proxy
     url: http://prometheus:9090
@@ -9,13 +14,14 @@ datasources:
     editable: true
 
   - name: PostgreSQL
+    uid: PostgreSQL
     type: postgres
     access: proxy
-    url: postgres:5432
-    database: agentic_rag
-    user: ${POSTGRES_USER:-agentic_rag}
+    url: agentic-ra-postgres:5432
+    database: $POSTGRES_DB
+    user: $POSTGRES_USER
     secureJsonData:
-      password: ${POSTGRES_PASSWORD:-agentic_rag}
+      password: $POSTGRES_PASSWORD
     jsonData:
       sslmode: disable
       maxOpenConns: 5
