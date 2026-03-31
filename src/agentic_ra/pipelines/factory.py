@@ -16,10 +16,12 @@ from agentic_ra.observability.metrics import RAGMetrics
 from agentic_ra.retrieval.embedder import EmbeddingPipeline
 from agentic_ra.retrieval.ranker import ResultRanker
 from agentic_ra.retrieval.router import RetrievalRouter
+from agentic_ra.retrieval.strategy_learner import QueryEmbedder, StrategyLearner
 from agentic_ra.stores.cognee.client import CogneeStore
 from agentic_ra.stores.postgres.client import PostgresClient
 from agentic_ra.stores.postgres.documents import DocumentStore
 from agentic_ra.stores.postgres.runs import RunStore
+from agentic_ra.stores.qdrant.client import QdrantStore
 from agentic_ra.tools.mcp_http_client import MCPHttpClient
 from agentic_ra.tools.url_safety import URLValidator
 
@@ -158,6 +160,32 @@ def build_pipeline(settings: Settings) -> RAGPipeline:
             "FeedbackAdapter enabled (dry_run=%s)", settings.feedback_dry_run
         )
 
+    # --- Strategy learner (Loop 2: predict strategy from past query performance) ---
+    strategy_learner: StrategyLearner | None = None
+    if settings.strategy_learning_enabled:
+        qdrant_store = QdrantStore(
+            url=settings.qdrant_url,
+            api_key=settings.qdrant_api_key,
+        )
+        query_embedder = QueryEmbedder(
+            model=settings.embedding_model,
+            api_key=api_key,
+            dimension=settings.embedding_dimension,
+        )
+        strategy_learner = StrategyLearner(
+            qdrant=qdrant_store,
+            embedder=query_embedder,
+            collection=settings.strategy_collection,
+            min_neighbors=settings.strategy_min_neighbors,
+            confidence_threshold=settings.strategy_confidence_threshold,
+            max_age_days=settings.strategy_max_age_days,
+        )
+        logger.info(
+            "StrategyLearner enabled (collection=%s, min_neighbors=%d)",
+            settings.strategy_collection,
+            settings.strategy_min_neighbors,
+        )
+
     orchestrator = AgentOrchestrator(
         base_agent=base_agent,
         memory=memory,
@@ -173,6 +201,7 @@ def build_pipeline(settings: Settings) -> RAGPipeline:
         brave_client=brave_client,
         url_validator=URLValidator(),
         feedback=feedback,
+        strategy_learner=strategy_learner,
     )
 
     logger.info("RAG pipeline assembled successfully")

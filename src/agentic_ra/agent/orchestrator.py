@@ -28,6 +28,7 @@ from agentic_ra.agent.feedback import FeedbackAdapter, confidence_to_score
 from agentic_ra.agent.verifier import GroundingVerifier
 from agentic_ra.core.config import get_settings
 from agentic_ra.core.errors import OrchestratorError
+from agentic_ra.retrieval.strategy_learner import StrategyLearner
 from agentic_ra.tools.budgets import WebToolBudget
 from agentic_ra.tools.mcp_http_client import MCPHttpClient
 from agentic_ra.tools.url_safety import URLValidator
@@ -68,6 +69,7 @@ class AgentOrchestrator:
         brave_client: MCPHttpClient | None = None,
         url_validator: URLValidator | None = None,
         feedback: FeedbackAdapter | None = None,
+        strategy_learner: StrategyLearner | None = None,
     ) -> None:
         self._base_agent = base_agent
         self._memory = memory
@@ -83,6 +85,7 @@ class AgentOrchestrator:
         self._brave_client = brave_client
         self._url_validator = url_validator or URLValidator()
         self._feedback = feedback
+        self._strategy_learner = strategy_learner
 
     async def process_query(
         self,
@@ -115,6 +118,19 @@ class AgentOrchestrator:
                     chat_messages.append(ChatMessage.from_user(msg.content))
                 elif msg.role == MessageRole.ASSISTANT:
                     chat_messages.append(ChatMessage.from_assistant(msg.content))
+            # Strategy prediction (Loop 2)
+            if self._strategy_learner and strategy == "hybrid":
+                predicted = await self._strategy_learner.predict(query)
+                if predicted != strategy:
+                    logger.info(
+                        "Strategy learner: %s → %s", strategy, predicted
+                    )
+                    if self._metrics:
+                        self._metrics.record_strategy_prediction(
+                            predicted, strategy, was_override=True
+                        )
+                    strategy = predicted
+
             # Inject strategy hint into the user message
             hint = (
                 f"\n\n[System hint: prefer '{strategy}' search strategy for this query]"
@@ -295,6 +311,21 @@ class AgentOrchestrator:
                     evidence_count=len(evidence),
                     retries=retries,
                 )
+
+            # 9a. Record strategy outcome (Loop 2)
+            if self._strategy_learner:
+                try:
+                    query_embedding = self._strategy_learner.embed_query(query)
+                    await self._strategy_learner.record(
+                        query_embedding=query_embedding,
+                        strategy=strategy,
+                        confidence=verification.confidence,
+                        is_grounded=verification.is_grounded,
+                        retrieval_ms=elapsed_ms,
+                        evidence_count=len(evidence),
+                    )
+                except Exception:
+                    logger.exception("Failed to record strategy outcome")
 
             # 9b. Submit feedback to Cognee (async, non-blocking)
             if self._feedback:

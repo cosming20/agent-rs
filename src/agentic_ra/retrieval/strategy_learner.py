@@ -111,6 +111,20 @@ class StrategyLearner:
         self._confidence_threshold = confidence_threshold
         self._max_age_days = max_age_days
 
+    def embed_query(self, query: str) -> list[float]:
+        """Embed a query string using the underlying QueryEmbedder.
+
+        Convenience method so callers can obtain embeddings for ``record()``
+        without reaching into private attributes.
+
+        Args:
+            query: The query text to embed.
+
+        Returns:
+            Float vector of the configured dimensionality.
+        """
+        return self._embedder.embed_query(query)
+
     async def predict(self, query: str) -> str:
         """Predict the best strategy for a query.
 
