@@ -16,6 +16,7 @@ volumes:
   neo4j_data:
   prometheus_data:
   grafana_data:
+  ruvector_data:
 
 services:
   # ----------------------------------------------------------
@@ -265,3 +266,23 @@ services:
     mem_limit: 512m
     mem_reservation: 256m
     cpus: 0.5
+
+  # ----------------------------------------------------------
+  # RuVector — Self-learning vector database (optional)
+  # ----------------------------------------------------------
+  ruvector:
+    image: ghcr.io/ruvnet/ruvector:latest
+    container_name: agentic-ra-ruvector
+    restart: "on-failure:5"
+    ports:
+      - "${RUVECTOR_HTTP_PORT:-1064}:6333"
+      - "${RUVECTOR_GRPC_PORT:-1065}:6334"
+    volumes:
+      - ruvector_data:/data
+    networks:
+      - agentic-ra-net
+    mem_limit: 2g
+    mem_reservation: 1g
+    cpus: 1.5
+    profiles:
+      - ruvector

@@ -100,6 +100,16 @@ class CogneeStore:
 
                 use_vector_adapter("qdrant", _CompatQDrantAdapter)
 
+            if vector_db_provider == "ruvector":
+                from agentic_ra.stores.ruvector.cognee_vector_adapter import (
+                    RuVectorVectorAdapter,
+                )
+                from cognee.infrastructure.databases.vector.use_vector_adapter import (
+                    use_vector_adapter,
+                )
+
+                use_vector_adapter("ruvector", RuVectorVectorAdapter)
+
             # LLM config
             cognee.config.set_llm_api_key(llm_api_key)
             cognee.config.set_llm_model(llm_model)
