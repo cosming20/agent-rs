@@ -112,5 +112,9 @@ class CogneeError(StoreError):
     """Cognee knowledge graph operation failure."""
 
 
+class QdrantError(StoreError):
+    """Qdrant vector store operation failure."""
+
+
 class GatewayError(AgenticRAError):
     """API gateway failure."""
