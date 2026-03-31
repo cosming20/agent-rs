@@ -20,7 +20,6 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-import inspect
 import os
 import sys
 import time
@@ -28,8 +27,6 @@ import uuid
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any
-
-from pydantic import SecretStr
 
 # ── Test Constants (NO MAGIC NUMBERS) ─────────────────────────
 
@@ -146,12 +143,6 @@ def _make_fake_embedding(dimension: int = EMBEDDING_DIMENSION) -> list[float]:
     return [0.01 * (i % 100) for i in range(dimension)]
 
 
-def _make_seeded_embedding(seed: int, dimension: int = EMBEDDING_DIMENSION) -> list[float]:
-    """Create a deterministic embedding vector seeded by an integer.
-
-    Different seeds produce different but reproducible vectors.
-    """
-    return [0.01 * ((i + seed) % 100) for i in range(dimension)]
 
 
 # ── Category 1: Configuration Tests ───────────────────────────
@@ -656,7 +647,6 @@ async def test_session_id_passed_to_cognee_search() -> TestResult:
             query="test query for session tracking",
             search_type="CHUNKS",
             top_k=1,
-            only_context=True,
             session_id=test_session_id,
         )
 
