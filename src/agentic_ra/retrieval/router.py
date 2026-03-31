@@ -9,6 +9,12 @@ Strategies:
 - HYBRID: CHUNKS + CHUNKS_LEXICAL in parallel
 - GRAPH: Cognee GRAPH_COMPLETION (graph traversal + LLM reasoning)
 - GRAPH_HYBRID: GRAPH_COMPLETION + CHUNKS + CHUNKS_LEXICAL (triple fusion)
+- RAG_COMPLETION: Cognee RAG_COMPLETION (retrieval-augmented generation)
+- SUMMARIES: Cognee SUMMARIES (document-level summary search)
+- TEMPORAL: Cognee TEMPORAL (time-aware retrieval)
+- GRAPH_COT: Cognee GRAPH_COMPLETION_COT (chain-of-thought graph reasoning)
+- GRAPH_CONSTRAINED: GRAPH_COMPLETION + CHUNKS (entity-neighbourhood filtering;
+  full Neo4j entity extraction forthcoming)
 """
 
 from __future__ import annotations
@@ -33,6 +39,12 @@ class RetrievalStrategy(enum.StrEnum):
     HYBRID = "hybrid"
     GRAPH = "graph"
     GRAPH_HYBRID = "graph_hybrid"
+    # Extended Cognee search types
+    RAG_COMPLETION = "rag_completion"
+    SUMMARIES = "summaries"
+    TEMPORAL = "temporal"
+    GRAPH_COT = "graph_cot"
+    GRAPH_CONSTRAINED = "graph_constrained"
 
 
 class RetrievalRouter:
@@ -117,31 +129,100 @@ class RetrievalRouter:
                 return self._collect_results(list(results), "hybrid")
 
             # GRAPH_HYBRID: triple fusion
-            triple_results = await asyncio.gather(
-                self._cognee.search(
+            if strategy == RetrievalStrategy.GRAPH_HYBRID:
+                triple_results = await asyncio.gather(
+                    self._cognee.search(
+                        query=query,
+                        search_type="GRAPH_COMPLETION",
+                        top_k=limit,
+                        only_context=True,
+                        session_id=session_id,
+                    ),
+                    self._cognee.search(
+                        query=query,
+                        search_type="CHUNKS",
+                        top_k=limit,
+                        only_context=True,
+                        session_id=session_id,
+                    ),
+                    self._cognee.search(
+                        query=query,
+                        search_type="CHUNKS_LEXICAL",
+                        top_k=limit,
+                        only_context=True,
+                        session_id=session_id,
+                    ),
+                    return_exceptions=True,
+                )
+                return self._collect_results(list(triple_results), "graph_hybrid")
+
+            elif strategy == RetrievalStrategy.RAG_COMPLETION:
+                return await self._cognee.search(
                     query=query,
-                    search_type="GRAPH_COMPLETION",
+                    search_type="RAG_COMPLETION",
                     top_k=limit,
                     only_context=True,
                     session_id=session_id,
-                ),
-                self._cognee.search(
+                )
+
+            elif strategy == RetrievalStrategy.SUMMARIES:
+                return await self._cognee.search(
                     query=query,
-                    search_type="CHUNKS",
+                    search_type="SUMMARIES",
                     top_k=limit,
                     only_context=True,
                     session_id=session_id,
-                ),
-                self._cognee.search(
+                )
+
+            elif strategy == RetrievalStrategy.TEMPORAL:
+                return await self._cognee.search(
                     query=query,
-                    search_type="CHUNKS_LEXICAL",
+                    search_type="TEMPORAL",
                     top_k=limit,
                     only_context=True,
                     session_id=session_id,
-                ),
-                return_exceptions=True,
-            )
-            return self._collect_results(list(triple_results), "graph_hybrid")
+                )
+
+            elif strategy == RetrievalStrategy.GRAPH_COT:
+                return await self._cognee.search(
+                    query=query,
+                    search_type="GRAPH_COMPLETION_COT",
+                    top_k=limit,
+                    only_context=True,
+                    session_id=session_id,
+                )
+
+            elif strategy == RetrievalStrategy.GRAPH_CONSTRAINED:
+                # Graph-constrained: use GRAPH_COMPLETION to find entity neighbourhood,
+                # then CHUNKS filtered to that neighbourhood.
+                # Full Neo4j entity extraction + Qdrant filtering is pending;
+                # this combines both sources as an interim approach similar to
+                # GRAPH_HYBRID but without lexical fusion.
+                constrained_results = await asyncio.gather(
+                    self._cognee.search(
+                        query=query,
+                        search_type="GRAPH_COMPLETION",
+                        top_k=limit,
+                        only_context=True,
+                        session_id=session_id,
+                    ),
+                    self._cognee.search(
+                        query=query,
+                        search_type="CHUNKS",
+                        top_k=limit,
+                        only_context=True,
+                        session_id=session_id,
+                    ),
+                    return_exceptions=True,
+                )
+                return self._collect_results(list(constrained_results), "graph_constrained")
+
+            else:
+                raise RoutingError(
+                    f"Unknown retrieval strategy: {strategy!r}",
+                    strategy=str(strategy),
+                    operation="retrieve",
+                )
 
         except (RoutingError, CogneeError):
             raise
