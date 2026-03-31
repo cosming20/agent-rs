@@ -50,3 +50,5 @@ infra/data/
 
 # E2E test artifacts (screenshots, reports)
 artifacts/
+node-compile-cache/
+lawren_crawler_dump.sql.zst
