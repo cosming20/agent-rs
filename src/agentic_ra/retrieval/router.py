@@ -53,6 +53,7 @@ class RetrievalRouter:
         query: str,
         strategy: RetrievalStrategy = RetrievalStrategy.HYBRID,
         limit: int = 10,
+        session_id: str | None = None,
     ) -> list[Document]:
         """Retrieve documents using the specified strategy.
 
@@ -60,6 +61,9 @@ class RetrievalRouter:
             query: User query text.
             strategy: Retrieval strategy to use.
             limit: Maximum results per source.
+            session_id: Optional session identifier forwarded to Cognee for
+                feedback tracking.  When provided, Cognee records which graph
+                elements were consulted, enabling reinforcement of relevant nodes.
 
         Returns:
             Retrieved documents (unranked, may contain duplicates for hybrid).
@@ -67,7 +71,11 @@ class RetrievalRouter:
         try:
             if strategy == RetrievalStrategy.SEMANTIC:
                 return await self._cognee.search(
-                    query=query, search_type="CHUNKS", top_k=limit, only_context=True
+                    query=query,
+                    search_type="CHUNKS",
+                    top_k=limit,
+                    only_context=True,
+                    session_id=session_id,
                 )
 
             if strategy == RetrievalStrategy.KEYWORD:
@@ -76,6 +84,7 @@ class RetrievalRouter:
                     search_type="CHUNKS_LEXICAL",
                     top_k=limit,
                     only_context=True,
+                    session_id=session_id,
                 )
 
             if strategy == RetrievalStrategy.GRAPH:
@@ -84,6 +93,7 @@ class RetrievalRouter:
                     search_type="GRAPH_COMPLETION",
                     top_k=limit,
                     only_context=True,
+                    session_id=session_id,
                 )
 
             if strategy == RetrievalStrategy.HYBRID:
@@ -93,12 +103,14 @@ class RetrievalRouter:
                         search_type="CHUNKS",
                         top_k=limit,
                         only_context=True,
+                        session_id=session_id,
                     ),
                     self._cognee.search(
                         query=query,
                         search_type="CHUNKS_LEXICAL",
                         top_k=limit,
                         only_context=True,
+                        session_id=session_id,
                     ),
                     return_exceptions=True,
                 )
@@ -111,18 +123,21 @@ class RetrievalRouter:
                     search_type="GRAPH_COMPLETION",
                     top_k=limit,
                     only_context=True,
+                    session_id=session_id,
                 ),
                 self._cognee.search(
                     query=query,
                     search_type="CHUNKS",
                     top_k=limit,
                     only_context=True,
+                    session_id=session_id,
                 ),
                 self._cognee.search(
                     query=query,
                     search_type="CHUNKS_LEXICAL",
                     top_k=limit,
                     only_context=True,
+                    session_id=session_id,
                 ),
                 return_exceptions=True,
             )

@@ -310,6 +310,7 @@ class CogneeStore:
         search_type: str = "GRAPH_COMPLETION",
         top_k: int = 10,
         dataset: str | None = None,
+        session_id: str | None = None,
     ) -> list[Document]:
         """Search the knowledge graph and return Haystack Documents.
 
@@ -324,6 +325,9 @@ class CogneeStore:
                 TRIPLET_COMPLETION, SUMMARIES, etc.).
             top_k: Maximum results.
             dataset: Override dataset name.
+            session_id: Optional session identifier for Cognee feedback tracking.
+                When provided, Cognee records which graph elements were used,
+                enabling downstream feedback loops to reinforce relevant nodes.
 
         Returns:
             List of Haystack Documents with graph search results.
@@ -332,13 +336,17 @@ class CogneeStore:
         try:
             st = SearchType(search_type)
 
-            results = await cognee.search(
-                query_text=query,
-                query_type=st,
-                datasets=[ds],
-                top_k=top_k,
-                only_context=False,
-            )
+            search_kwargs: dict[str, object] = {
+                "query_text": query,
+                "query_type": st,
+                "datasets": [ds],
+                "top_k": top_k,
+                "only_context": False,
+            }
+            if session_id:
+                search_kwargs["session_id"] = session_id
+
+            results = await cognee.search(**search_kwargs)
 
             documents: list[Document] = []
             for i, result in enumerate(results or []):
