@@ -202,6 +202,7 @@ services:
     restart: unless-stopped
     ports:
       - "${OTEL_COLLECTOR_PORT}:4317"
+      - "8889:8889"
     volumes:
       - ./otel/collector.yaml:/etc/otelcol-contrib/config.yaml:ro
     networks:
