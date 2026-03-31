@@ -120,6 +120,13 @@ class Settings(BaseSettings):
     feedback_weight_floor: float = 0.1
     feedback_weight_ceiling: float = 0.9
 
+    # --- Strategy Learning (Loop 2) ---
+    strategy_learning_enabled: bool = False
+    strategy_collection: str = "query_strategies"
+    strategy_min_neighbors: int = 5
+    strategy_confidence_threshold: float = 0.1
+    strategy_max_age_days: int = 30
+
     # --- Computed connection URLs ---
 
     @computed_field  # type: ignore[prop-decorator]
