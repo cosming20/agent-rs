@@ -91,6 +91,51 @@ class RAGMetrics:
             unit="1",
         )
 
+        # --- Feedback (Loop 1) metrics ---
+        self.feedback_applied = meter.create_counter(
+            name="rag.feedback.applied",
+            description="Graph weight updates applied via memify",
+            unit="1",
+        )
+
+        self.feedback_score = meter.create_histogram(
+            name="rag.feedback.score",
+            description="Feedback scores sent to Cognee (1-5)",
+            unit="1",
+        )
+
+        self.confidence_rolling = meter.create_histogram(
+            name="rag.confidence.rolling",
+            description="Confidence scores for rolling average tracking",
+            unit="1",
+        )
+
+        # --- Strategy (Loop 2) metrics ---
+        self.strategy_prediction = meter.create_counter(
+            name="rag.strategy.prediction",
+            description="Strategy predictions made by learner",
+            unit="1",
+        )
+
+        self.strategy_override = meter.create_counter(
+            name="rag.strategy.override",
+            description="Times learned strategy overrode default",
+            unit="1",
+        )
+
+        self.failure_evaluation = meter.create_counter(
+            name="rag.strategy.failure_evaluation",
+            description="PIKE-RAG failure evaluations triggered",
+            unit="1",
+        )
+
+        # --- Cost metrics ---
+        self.query_cost = meter.create_histogram(
+            name="rag.cost.per_query",
+            description="LLM cost per query in USD",
+            unit="USD",
+        )
+
     def record_query(self, strategy: str) -> None:
         """Record a query with its strategy."""
         self.query_count.add(1, {"strategy": strategy})
@@ -113,3 +158,22 @@ class RAGMetrics:
     def record_stage2_retry(self) -> None:
         """Record a Stage-2 retrieval retry."""
         self.stage2_retry_count.add(1)
+
+    def record_feedback(self, score: int) -> None:
+        """Record a feedback score submission."""
+        self.feedback_applied.add(1, {"score": str(score)})
+        self.feedback_score.record(score)
+
+    def record_strategy_prediction(
+        self, predicted: str, original: str, was_override: bool
+    ) -> None:
+        """Record a strategy prediction event."""
+        self.strategy_prediction.add(1, {"strategy": predicted})
+        if was_override:
+            self.strategy_override.add(
+                1, {"from": original, "to": predicted}
+            )
+
+    def record_query_cost(self, cost_usd: float, model: str) -> None:
+        """Record per-query LLM cost."""
+        self.query_cost.record(cost_usd, {"model": model})
