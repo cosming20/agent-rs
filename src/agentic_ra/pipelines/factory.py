@@ -3,9 +3,9 @@
 from __future__ import annotations
 
 import logging
-from collections.abc import Coroutine
+from collections.abc import Callable, Coroutine
 from dataclasses import dataclass
-from typing import Any, Callable
+from typing import Any
 
 from agentic_ra.agent.agent import build_agent
 from agentic_ra.agent.feedback import FeedbackAdapter
@@ -54,8 +54,7 @@ class RAGPipeline:
 
     async def close(self) -> None:
         """Gracefully shut down all components, tolerating individual failures."""
-        _CloseFn = Callable[[], Coroutine[Any, Any, None]]
-        closeable: list[tuple[str, _CloseFn]] = [
+        closeable: list[tuple[str, Callable[[], Coroutine[Any, Any, None]]]] = [
             ("PostgresClient", self.postgres.close),
         ]
         if self.strategy_qdrant is not None:
