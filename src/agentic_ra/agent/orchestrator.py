@@ -86,6 +86,7 @@ class AgentOrchestrator:
         self._url_validator = url_validator or URLValidator()
         self._feedback = feedback
         self._strategy_learner = strategy_learner
+        self._background_tasks: set[asyncio.Task[Any]] = set()
 
     async def process_query(
         self,
@@ -119,8 +120,13 @@ class AgentOrchestrator:
                 elif msg.role == MessageRole.ASSISTANT:
                     chat_messages.append(ChatMessage.from_assistant(msg.content))
             # Strategy prediction (Loop 2)
+            # Compute embedding once and reuse for both predict() and record()
+            query_embedding: list[float] | None = None
             if self._strategy_learner and strategy == "hybrid":
-                predicted = await self._strategy_learner.predict(query)
+                query_embedding = self._strategy_learner.embed_query(query)
+                predicted = await self._strategy_learner.predict(
+                    query, query_embedding=query_embedding
+                )
                 if predicted != strategy:
                     logger.info(
                         "Strategy learner: %s → %s", strategy, predicted
@@ -315,7 +321,8 @@ class AgentOrchestrator:
             # 9a. Record strategy outcome (Loop 2)
             if self._strategy_learner:
                 try:
-                    query_embedding = self._strategy_learner.embed_query(query)
+                    if query_embedding is None:
+                        query_embedding = self._strategy_learner.embed_query(query)
                     await self._strategy_learner.record(
                         query_embedding=query_embedding,
                         strategy=strategy,
@@ -329,13 +336,15 @@ class AgentOrchestrator:
 
             # 9b. Submit feedback to Cognee (async, non-blocking)
             if self._feedback:
-                asyncio.create_task(
+                task = asyncio.create_task(
                     self._feedback.submit(
                         session_id=str(session_id),
                         confidence=verification.confidence,
                         is_grounded=verification.is_grounded,
                     )
                 )
+                self._background_tasks.add(task)
+                task.add_done_callback(self._background_tasks.discard)
                 if self._metrics:
                     self._metrics.record_feedback(
                         confidence_to_score(verification.confidence)

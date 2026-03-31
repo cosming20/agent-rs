@@ -125,7 +125,9 @@ class StrategyLearner:
         """
         return self._embedder.embed_query(query)
 
-    async def predict(self, query: str) -> str:
+    async def predict(
+        self, query: str, query_embedding: list[float] | None = None
+    ) -> str:
         """Predict the best strategy for a query.
 
         Returns the default strategy when there is insufficient historical data
@@ -133,12 +135,14 @@ class StrategyLearner:
 
         Args:
             query: The query text for which to predict a strategy.
+            query_embedding: Optional pre-computed embedding to avoid
+                recomputing when the caller already has one.
 
         Returns:
             Strategy name string (e.g. ``"hybrid"``, ``"graph_hybrid"``).
         """
         try:
-            embedding = self._embedder.embed_query(query)
+            embedding = query_embedding or self._embedder.embed_query(query)
 
             results = await self._qdrant.search(
                 collection=self._collection,

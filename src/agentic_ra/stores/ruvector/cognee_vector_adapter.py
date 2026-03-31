@@ -13,6 +13,8 @@ from cognee.infrastructure.databases.vector.exceptions import CollectionNotFound
 from cognee.infrastructure.databases.vector.models.ScoredResult import ScoredResult
 from cognee.infrastructure.engine import DataPoint
 
+from pydantic import Field
+
 from agentic_ra.stores.ruvector.client import RuVectorClient
 
 logger = logging.getLogger(__name__)
@@ -22,7 +24,7 @@ class _IndexSchema(DataPoint):
     """Minimal DataPoint subclass for index_data_points text embedding."""
 
     text: str
-    metadata: dict = {"index_fields": ["text"]}  # type: ignore[assignment]
+    metadata: dict = Field(default_factory=lambda: {"index_fields": ["text"]})  # type: ignore[assignment]  # DataPoint.metadata expects ClassVar but we override per-instance for embedding config
 
 
 class RuVectorVectorAdapter:
@@ -215,14 +217,15 @@ class RuVectorVectorAdapter:
                 scored.append(
                     ScoredResult(
                         id=UUID(str(result_id)) if result_id else UUID(int=0),
-                        score=1 - score if score else 1.0,
+                        # RuVector returns cosine distance (0=identical, 1=orthogonal); invert to similarity
+                        score=1.0 - score,
                         payload={**payload, "id": str(result_id)},
                     )
                 )
             return scored
         except Exception as exc:
             logger.error("RuVector search error: %s", exc, exc_info=True)
-            return []
+            raise  # Let Cognee handle the failure — don't hide a dead backend
         finally:
             await client.close()
 
@@ -257,7 +260,8 @@ class RuVectorVectorAdapter:
                     scored.append(
                         ScoredResult(
                             id=UUID(str(result_id)) if result_id else UUID(int=0),
-                            score=1 - score if score else 1.0,
+                            # RuVector returns cosine distance (0=identical, 1=orthogonal); invert to similarity
+                            score=1.0 - score,
                             payload={**payload, "id": str(result_id)},
                         )
                     )
@@ -265,7 +269,7 @@ class RuVectorVectorAdapter:
             return all_scored
         except Exception as exc:
             logger.error("RuVector batch_search error: %s", exc, exc_info=True)
-            return []
+            raise  # Let Cognee handle the failure — don't hide a dead backend
         finally:
             await client.close()
 

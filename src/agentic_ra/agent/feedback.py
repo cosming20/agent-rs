@@ -123,6 +123,9 @@ class FeedbackAdapter:
             return bool(ok)
 
         except Exception:
+            # Broad catch is intentional — feedback submission must never crash
+            # the request pipeline. Errors are logged and surfaced via the
+            # asyncio task's done_callback (see orchestrator._background_tasks).
             logger.exception(
                 "Failed to submit feedback: session=%s", session_id
             )

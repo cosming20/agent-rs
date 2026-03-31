@@ -116,5 +116,9 @@ class QdrantError(StoreError):
     """Qdrant vector store operation failure."""
 
 
+class RuVectorError(StoreError):
+    """RuVector vector database operation failure."""
+
+
 class GatewayError(AgenticRAError):
     """API gateway failure."""
