@@ -113,6 +113,13 @@ class Settings(BaseSettings):
     web_budget_timeout_s: float = 45.0
     web_budget_max_bytes: int = 6_000_000
 
+    # --- Feedback (Loop 1) ---
+    feedback_enabled: bool = True
+    feedback_alpha: float = 0.1
+    feedback_dry_run: bool = False
+    feedback_weight_floor: float = 0.1
+    feedback_weight_ceiling: float = 0.9
+
     # --- Computed connection URLs ---
 
     @computed_field  # type: ignore[prop-decorator]
