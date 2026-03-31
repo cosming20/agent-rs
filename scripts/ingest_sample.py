@@ -25,7 +25,7 @@ SAMPLE_DOCS = [
         "metadata": {"source": "blog"},
     },
     {
-        "content": "OpenSearch provides full-text search, log analytics, and observability capabilities. It uses BM25 scoring for keyword relevance ranking.",
+        "content": "Cognee provides knowledge graph construction with automatic entity extraction, relationship mapping, and hybrid retrieval across vector, keyword, and graph modalities.",
         "metadata": {"source": "docs"},
     },
 ]
