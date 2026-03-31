@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import logging
-from typing import Any, Optional
+from typing import Any
 from uuid import UUID
 
 from cognee.infrastructure.databases.vector.embeddings.EmbeddingEngine import (
@@ -24,7 +24,7 @@ class _IndexSchema(DataPoint):
     """Minimal DataPoint subclass for index_data_points text embedding."""
 
     text: str
-    metadata: dict = Field(default_factory=lambda: {"index_fields": ["text"]})  # type: ignore[assignment]  # DataPoint.metadata expects ClassVar but we override per-instance for embedding config
+    metadata: dict = Field(default_factory=lambda: {"index_fields": ["text"]})  # type: ignore[assignment]  # DataPoint.metadata is ClassVar; override as instance field for embedding config
 
 
 class RuVectorVectorAdapter:
@@ -46,7 +46,7 @@ class RuVectorVectorAdapter:
         embedding_engine: EmbeddingEngine | None = None,
         *,
         database_name: str = "",
-        **kwargs: Any,
+        **kwargs: Any,  # absorb extra kwargs from Cognee's factory
     ) -> None:
         if embedding_engine is None:
             from cognee.infrastructure.databases.vector.embeddings.get_embedding_engine import (
@@ -86,7 +86,7 @@ class RuVectorVectorAdapter:
     async def create_collection(
         self,
         collection_name: str,
-        payload_schema: Optional[Any] = None,
+        payload_schema: Any | None = None,
     ) -> None:
         client = self._client()
         try:
@@ -144,8 +144,8 @@ class RuVectorVectorAdapter:
         pipeline primarily relies on ``search`` and ``create_data_points``; the
         ``retrieve`` path is used only by optional introspection features.
         """
-        logger.debug(
-            "RuVector retrieve stub called for %d IDs in %s",
+        logger.warning(
+            "RuVector retrieve stub called for %d IDs in %s — no retrieve-by-ID endpoint available",
             len(data_point_ids),
             collection_name,
         )
@@ -168,12 +168,12 @@ class RuVectorVectorAdapter:
     async def search(
         self,
         collection_name: str,
-        query_text: Optional[str] = None,
-        query_vector: Optional[list[float]] = None,
-        limit: Optional[int] = 15,
+        query_text: str | None = None,
+        query_vector: list[float] | None = None,
+        limit: int | None = 15,
         with_vector: bool = False,
         include_payload: bool = False,
-        node_name: Optional[list[str]] = None,
+        node_name: list[str] | None = None,
     ) -> list[ScoredResult]:
         if query_text is None and query_vector is None:
             from cognee.infrastructure.databases.exceptions import (
@@ -233,10 +233,10 @@ class RuVectorVectorAdapter:
         self,
         collection_name: str,
         query_texts: list[str],
-        limit: Optional[int] = None,
+        limit: int | None = None,
         with_vectors: bool = False,
         include_payload: bool = False,
-        node_name: Optional[list[str]] = None,
+        node_name: list[str] | None = None,
     ) -> list[list[ScoredResult]]:
         embedded = await self.embed_data(query_texts)
 

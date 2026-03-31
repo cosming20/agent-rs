@@ -9,7 +9,11 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import logging
 import sys
+
+logging.basicConfig(level=logging.INFO, format="%(message)s")
+logger = logging.getLogger(__name__)
 
 from cognee.memify_pipelines.apply_feedback_weights import (  # type: ignore[import-untyped]
     apply_feedback_weights_pipeline,
@@ -28,7 +32,7 @@ async def main() -> None:
     settings = get_settings()
     alpha = args.alpha or settings.feedback_alpha
 
-    print(f"Applying feedback weights: sessions={args.session}, alpha={alpha}")
+    logger.info("Applying feedback weights: sessions=%s, alpha=%s", args.session, alpha)
 
     system_user = User(id="system", email="system@agentic-rag.local")
 
@@ -37,7 +41,7 @@ async def main() -> None:
         session_ids=args.session,
         alpha=alpha,
     )
-    print(f"Result: {result}")
+    logger.info("Result: %s", result)
 
 
 if __name__ == "__main__":

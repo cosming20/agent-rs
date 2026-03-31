@@ -18,6 +18,22 @@ logger = logging.getLogger(__name__)
 _DEFAULT_STRATEGY = "hybrid"
 
 
+def _parse_dt(val: object) -> datetime | None:
+    """Parse an ISO timestamp string to a timezone-aware datetime.
+
+    Args:
+        val: Value to parse — expected to be an ISO 8601 string.
+
+    Returns:
+        Timezone-aware datetime if parsing succeeds, ``None`` otherwise.
+    """
+    try:
+        dt = datetime.fromisoformat(str(val))
+        return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+    except (ValueError, TypeError):
+        return None
+
+
 class QueryEmbedder:
     """Thin wrapper around Haystack's OpenAITextEmbedder for query-side embedding.
 
@@ -159,8 +175,10 @@ class StrategyLearner:
                 return _DEFAULT_STRATEGY
 
             cutoff = datetime.now(timezone.utc) - timedelta(days=self._max_age_days)
-            cutoff_iso = cutoff.isoformat()
-            recent = [r for r in results if str(r.get("created_at", "")) >= cutoff_iso]
+            recent = [
+                r for r in results
+                if (dt := _parse_dt(r.get("created_at"))) is not None and dt >= cutoff
+            ]
 
             if len(recent) < self._min_neighbors:
                 logger.debug(

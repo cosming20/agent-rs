@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import logging
+from collections.abc import Coroutine
 from dataclasses import dataclass
+from typing import Any, Callable
 
 from agentic_ra.agent.agent import build_agent
 from agentic_ra.agent.feedback import FeedbackAdapter
@@ -39,6 +41,7 @@ class RAGPipeline:
         document_store: Postgres document persistence.
         run_store: Postgres pipeline run tracking.
         cognee_store: Cognee knowledge graph + vector store.
+        strategy_qdrant: QdrantStore used by StrategyLearner (for shutdown).
     """
 
     orchestrator: AgentOrchestrator
@@ -47,12 +50,17 @@ class RAGPipeline:
     document_store: DocumentStore
     run_store: RunStore
     cognee_store: CogneeStore | None = None
+    strategy_qdrant: QdrantStore | None = None
 
     async def close(self) -> None:
         """Gracefully shut down all components, tolerating individual failures."""
-        for name, close_fn in [
+        _CloseFn = Callable[[], Coroutine[Any, Any, None]]
+        closeable: list[tuple[str, _CloseFn]] = [
             ("PostgresClient", self.postgres.close),
-        ]:
+        ]
+        if self.strategy_qdrant is not None:
+            closeable.append(("StrategyLearner QdrantStore", self.strategy_qdrant.close))
+        for name, close_fn in closeable:
             try:
                 await close_fn()
             except Exception:
@@ -162,8 +170,9 @@ def build_pipeline(settings: Settings) -> RAGPipeline:
 
     # --- Strategy learner (Loop 2: predict strategy from past query performance) ---
     strategy_learner: StrategyLearner | None = None
+    strategy_qdrant: QdrantStore | None = None
     if settings.strategy_learning_enabled:
-        qdrant_store = QdrantStore(
+        strategy_qdrant = QdrantStore(
             url=settings.qdrant_url,
             api_key=settings.qdrant_api_key,
         )
@@ -173,7 +182,7 @@ def build_pipeline(settings: Settings) -> RAGPipeline:
             dimension=settings.embedding_dimension,
         )
         strategy_learner = StrategyLearner(
-            qdrant=qdrant_store,
+            qdrant=strategy_qdrant,
             embedder=query_embedder,
             collection=settings.strategy_collection,
             min_neighbors=settings.strategy_min_neighbors,
@@ -213,4 +222,5 @@ def build_pipeline(settings: Settings) -> RAGPipeline:
         document_store=document_store,
         run_store=run_store,
         cognee_store=cognee_store,
+        strategy_qdrant=strategy_qdrant,
     )

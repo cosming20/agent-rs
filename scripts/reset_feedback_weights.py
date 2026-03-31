@@ -9,7 +9,11 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import logging
 import os
+
+logging.basicConfig(level=logging.INFO, format="%(message)s")
+logger = logging.getLogger(__name__)
 
 os.environ.setdefault("LLM_API_KEY", os.environ.get("OPENAI_API_KEY", ""))
 
@@ -24,7 +28,7 @@ async def main() -> None:
     if not args.confirm:
         resp = input("This will reset ALL feedback_weight values to 0.5. Continue? [y/N] ")
         if resp.lower() != "y":
-            print("Aborted.")
+            logger.info("Aborted.")
             return
 
     s = get_settings()
@@ -54,7 +58,7 @@ async def main() -> None:
         edge_count = record["reset_count"] if record else 0
 
     await driver.close()
-    print(f"Reset complete: {node_count} nodes, {edge_count} edges → 0.5")
+    logger.info("Reset complete: %d nodes, %d edges → 0.5", node_count, edge_count)
 
 
 if __name__ == "__main__":

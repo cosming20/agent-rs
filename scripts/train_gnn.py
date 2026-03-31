@@ -8,7 +8,11 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import logging
 import os
+
+logging.basicConfig(level=logging.INFO, format="%(message)s")
+logger = logging.getLogger(__name__)
 
 os.environ.setdefault("LLM_API_KEY", os.environ.get("OPENAI_API_KEY", ""))
 
@@ -27,7 +31,7 @@ async def main() -> None:
     s = get_settings()
 
     if not s.ruvector_enabled:
-        print("Error: ruvector_enabled is False. Set RUVECTOR_ENABLED=true.")
+        logger.error("ruvector_enabled is False. Set RUVECTOR_ENABLED=true.")
         return
 
     pg = PostgresClient(dsn=s.postgres_dsn_async.get_secret_value())
@@ -44,7 +48,7 @@ async def main() -> None:
     )
 
     result = await trainer.train(since_hours=args.hours)
-    print(f"GNN training result: {result}")
+    logger.info("GNN training result: %s", result)
 
     await ruvector.close()
     await pg.close()

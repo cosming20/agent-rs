@@ -11,7 +11,11 @@ Usage:
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
+
+logging.basicConfig(level=logging.INFO, format="%(message)s")
+logger = logging.getLogger(__name__)
 
 # Ensure LLM_API_KEY is set so pydantic-settings doesn't fail on startup
 # when this script is run outside the full application context.
@@ -31,9 +35,11 @@ async def main() -> None:
             name=s.strategy_collection,
             vector_size=s.embedding_dimension,
         )
-        print(
-            f"Collection '{s.strategy_collection}' ready "
-            f"(dim={s.embedding_dimension}, url={s.qdrant_url})"
+        logger.info(
+            "Collection '%s' ready (dim=%d, url=%s)",
+            s.strategy_collection,
+            s.embedding_dimension,
+            s.qdrant_url,
         )
     finally:
         await qdrant.close()
