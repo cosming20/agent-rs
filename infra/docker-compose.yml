@@ -15,6 +15,7 @@ volumes:
   postgres_data:
   neo4j_data:
   prometheus_data:
+  grafana_data:
 
 services:
   # ----------------------------------------------------------
@@ -234,6 +235,32 @@ services:
       - agentic-ra-net
     depends_on:
       otel-collector:
+        condition: service_started
+    mem_limit: 512m
+    mem_reservation: 256m
+    cpus: 0.5
+
+  # ----------------------------------------------------------
+  # Grafana — Observability dashboard
+  # ----------------------------------------------------------
+  grafana:
+    image: grafana/grafana-oss:12.1.0
+    container_name: agentic-ra-grafana
+    restart: unless-stopped
+    ports:
+      - "${GRAFANA_PORT:-1067}:3000"
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_ADMIN_PASSWORD:-admin}
+      - GF_AUTH_ANONYMOUS_ENABLED=true
+      - GF_AUTH_ANONYMOUS_ORG_ROLE=Viewer
+    networks:
+      - agentic-ra-net
+    depends_on:
+      prometheus:
         condition: service_started
     mem_limit: 512m
     mem_reservation: 256m
