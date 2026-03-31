@@ -127,6 +127,14 @@ class Settings(BaseSettings):
     strategy_confidence_threshold: float = 0.1
     strategy_max_age_days: int = 30
 
+    # --- RuVector (Loop 3) ---
+    ruvector_enabled: bool = False
+    ruvector_url: str = "http://localhost:1064"
+    ruvector_api_key: SecretStr = SecretStr("")
+    gnn_training_enabled: bool = False
+    gnn_training_interval_hours: int = 24
+    gnn_training_min_samples: int = 50
+
     # --- Computed connection URLs ---
 
     @computed_field  # type: ignore[prop-decorator]
