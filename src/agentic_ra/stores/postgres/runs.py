@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import uuid
+from datetime import datetime
 from typing import Any
 
 from sqlalchemy import select
@@ -112,5 +113,32 @@ class RunStore:
                 "Failed to get pipeline runs",
                 session_id=str(session_id),
                 operation="get_pipeline_runs",
+                original_error=str(e),
+            ) from e
+
+    async def get_since(self, since: datetime) -> list[PipelineRun]:
+        """Get all pipeline runs since a timestamp.
+
+        Args:
+            since: Cutoff timestamp (inclusive).
+
+        Returns:
+            List of PipelineRun records ordered by created_at.
+        """
+        try:
+            async with self._pg.session() as session:
+                result = await session.execute(
+                    select(PipelineRun)
+                    .where(PipelineRun.created_at >= since)
+                    .order_by(PipelineRun.created_at)
+                )
+                runs = list(result.scalars().all())
+                for run in runs:
+                    session.expunge(run)
+                return runs
+        except SQLAlchemyError as e:
+            raise PostgresError(
+                "Failed to query pipeline runs",
+                operation="get_since",
                 original_error=str(e),
             ) from e
