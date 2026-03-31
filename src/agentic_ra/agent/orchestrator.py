@@ -24,6 +24,7 @@ from agentic_ra.agent.tools import (
     make_search_news_tool,
     make_search_web_tool,
 )
+from agentic_ra.agent.feedback import FeedbackAdapter, confidence_to_score
 from agentic_ra.agent.verifier import GroundingVerifier
 from agentic_ra.core.config import get_settings
 from agentic_ra.core.errors import OrchestratorError
@@ -66,6 +67,7 @@ class AgentOrchestrator:
         document_store: Any = None,
         brave_client: MCPHttpClient | None = None,
         url_validator: URLValidator | None = None,
+        feedback: FeedbackAdapter | None = None,
     ) -> None:
         self._base_agent = base_agent
         self._memory = memory
@@ -80,6 +82,7 @@ class AgentOrchestrator:
         self._document_store = document_store
         self._brave_client = brave_client
         self._url_validator = url_validator or URLValidator()
+        self._feedback = feedback
 
     async def process_query(
         self,
@@ -141,6 +144,7 @@ class AgentOrchestrator:
                     dataset=dataset,
                     role=role,
                     evidence_accumulator=kb_evidence,
+                    session_id=str(session_id),
                 ),
                 make_search_web_tool(
                     brave_client=self._brave_client,
@@ -291,6 +295,20 @@ class AgentOrchestrator:
                     evidence_count=len(evidence),
                     retries=retries,
                 )
+
+            # 9b. Submit feedback to Cognee (async, non-blocking)
+            if self._feedback:
+                asyncio.create_task(
+                    self._feedback.submit(
+                        session_id=str(session_id),
+                        confidence=verification.confidence,
+                        is_grounded=verification.is_grounded,
+                    )
+                )
+                if self._metrics:
+                    self._metrics.record_feedback(
+                        confidence_to_score(verification.confidence)
+                    )
 
             # 10. Store assistant response
             await self._memory.add_message(

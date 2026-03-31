@@ -6,6 +6,7 @@ import logging
 from dataclasses import dataclass
 
 from agentic_ra.agent.agent import build_agent
+from agentic_ra.agent.feedback import FeedbackAdapter
 from agentic_ra.agent.memory import MemoryStore
 from agentic_ra.agent.orchestrator import AgentOrchestrator
 from agentic_ra.agent.synthesis import ResponseSynthesizer
@@ -150,6 +151,13 @@ def build_pipeline(settings: Settings) -> RAGPipeline:
         brave_client = MCPHttpClient(base_url=settings.brave_mcp_url)
         logger.info("Brave Search MCP client configured: %s", settings.brave_mcp_url)
 
+    # --- Feedback adapter (Loop 1: confidence → Cognee session feedback) ---
+    feedback = FeedbackAdapter(settings=settings) if settings.feedback_enabled else None
+    if feedback is not None:
+        logger.info(
+            "FeedbackAdapter enabled (dry_run=%s)", settings.feedback_dry_run
+        )
+
     orchestrator = AgentOrchestrator(
         base_agent=base_agent,
         memory=memory,
@@ -164,6 +172,7 @@ def build_pipeline(settings: Settings) -> RAGPipeline:
         document_store=document_store,
         brave_client=brave_client,
         url_validator=URLValidator(),
+        feedback=feedback,
     )
 
     logger.info("RAG pipeline assembled successfully")

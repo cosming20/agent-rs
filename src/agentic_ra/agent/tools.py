@@ -170,6 +170,7 @@ def _search_dataset(
     query: str,
     strategy: RetrievalStrategy,
     limit: int = 10,
+    session_id: str | None = None,
 ) -> list[Document]:
     """Search a specific Cognee dataset using the given strategy.
 
@@ -182,6 +183,7 @@ def _search_dataset(
         query: The search query text.
         strategy: Which retrieval strategy to use.
         limit: Maximum results per search type.
+        session_id: Cognee session ID for feedback tracking.
 
     Returns:
         A flat list of :class:`Document` results across all search types.
@@ -203,7 +205,8 @@ def _search_dataset(
     for st in types:
         results: list[Document] = _run_async(
             cognee_store.search(
-                query=query, search_type=st, top_k=limit, dataset=dataset
+                query=query, search_type=st, top_k=limit, dataset=dataset,
+                session_id=session_id,
             )
         )
         all_results.extend(results)
@@ -265,6 +268,7 @@ def make_search_knowledge_tool(
     dataset: str = "user_anonymous",
     role: str = "user",
     evidence_accumulator: list[Document] | None = None,
+    session_id: str | None = None,
 ) -> ToolConfig:
     """Create the ``search_knowledge`` tool for the Haystack Agent.
 
@@ -279,6 +283,8 @@ def make_search_knowledge_tool(
         document_store: Document store with ``list_user_datasets()`` (admin fan-out).
         dataset: Cognee dataset name for the current user (e.g. ``"user_42"``).
         role: ``"user"`` or ``"admin"``.
+        evidence_accumulator: Shared list to collect KB evidence documents.
+        session_id: Cognee session ID for feedback tracking.
 
     Returns:
         Tool descriptor dict with name, description, function, parameters.
@@ -318,7 +324,8 @@ def make_search_knowledge_tool(
                         ds = f"user_{_sanitize_user_id(uid)}"
                         try:
                             results = _search_dataset(
-                                cognee_store, ds, query, retrieval_strategy, limit=10
+                                cognee_store, ds, query, retrieval_strategy,
+                                limit=10, session_id=session_id,
                             )
                             all_results.extend(results)
                         except Exception:
@@ -329,12 +336,16 @@ def make_search_knowledge_tool(
                 else:
                     # User: search only their dataset
                     raw_docs = _search_dataset(
-                        cognee_store, dataset, query, retrieval_strategy, limit=10
+                        cognee_store, dataset, query, retrieval_strategy,
+                        limit=10, session_id=session_id,
                     )
             else:
                 # Fallback: use router (no dataset scoping)
                 raw_docs = _run_async(
-                    router.retrieve(query=query, strategy=retrieval_strategy)
+                    router.retrieve(
+                        query=query, strategy=retrieval_strategy,
+                        session_id=session_id,
+                    )
                 )
 
             evidence_pack = ranker.rank(
