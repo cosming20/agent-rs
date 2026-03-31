@@ -86,7 +86,7 @@ class RetrievalRouter:
                     query=query,
                     search_type="CHUNKS",
                     top_k=limit,
-                    only_context=True,
+
                     session_id=session_id,
                 )
 
@@ -95,7 +95,7 @@ class RetrievalRouter:
                     query=query,
                     search_type="CHUNKS_LEXICAL",
                     top_k=limit,
-                    only_context=True,
+
                     session_id=session_id,
                 )
 
@@ -104,7 +104,7 @@ class RetrievalRouter:
                     query=query,
                     search_type="GRAPH_COMPLETION",
                     top_k=limit,
-                    only_context=True,
+
                     session_id=session_id,
                 )
 
@@ -114,14 +114,14 @@ class RetrievalRouter:
                         query=query,
                         search_type="CHUNKS",
                         top_k=limit,
-                        only_context=True,
+    
                         session_id=session_id,
                     ),
                     self._cognee.search(
                         query=query,
                         search_type="CHUNKS_LEXICAL",
                         top_k=limit,
-                        only_context=True,
+    
                         session_id=session_id,
                     ),
                     return_exceptions=True,
@@ -135,21 +135,21 @@ class RetrievalRouter:
                         query=query,
                         search_type="GRAPH_COMPLETION",
                         top_k=limit,
-                        only_context=True,
+    
                         session_id=session_id,
                     ),
                     self._cognee.search(
                         query=query,
                         search_type="CHUNKS",
                         top_k=limit,
-                        only_context=True,
+    
                         session_id=session_id,
                     ),
                     self._cognee.search(
                         query=query,
                         search_type="CHUNKS_LEXICAL",
                         top_k=limit,
-                        only_context=True,
+    
                         session_id=session_id,
                     ),
                     return_exceptions=True,
@@ -161,7 +161,7 @@ class RetrievalRouter:
                     query=query,
                     search_type="RAG_COMPLETION",
                     top_k=limit,
-                    only_context=True,
+
                     session_id=session_id,
                 )
 
@@ -170,7 +170,7 @@ class RetrievalRouter:
                     query=query,
                     search_type="SUMMARIES",
                     top_k=limit,
-                    only_context=True,
+
                     session_id=session_id,
                 )
 
@@ -179,7 +179,7 @@ class RetrievalRouter:
                     query=query,
                     search_type="TEMPORAL",
                     top_k=limit,
-                    only_context=True,
+
                     session_id=session_id,
                 )
 
@@ -188,7 +188,7 @@ class RetrievalRouter:
                     query=query,
                     search_type="GRAPH_COMPLETION_COT",
                     top_k=limit,
-                    only_context=True,
+
                     session_id=session_id,
                 )
 
@@ -203,14 +203,14 @@ class RetrievalRouter:
                         query=query,
                         search_type="GRAPH_COMPLETION",
                         top_k=limit,
-                        only_context=True,
+    
                         session_id=session_id,
                     ),
                     self._cognee.search(
                         query=query,
                         search_type="CHUNKS",
                         top_k=limit,
-                        only_context=True,
+    
                         session_id=session_id,
                     ),
                     return_exceptions=True,
