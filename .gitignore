@@ -47,3 +47,6 @@ infra/data/
 
 # Worktrees
 .worktrees/
+
+# E2E test artifacts (screenshots, reports)
+artifacts/
