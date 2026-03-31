@@ -144,7 +144,7 @@ services:
   # Jaeger — Trace storage + UI (in-memory, ephemeral)
   # ----------------------------------------------------------
   jaeger:
-    image: jaegertracing/all-in-one:1.67
+    image: jaegertracing/all-in-one:latest
     container_name: agentic-ra-jaeger
     restart: unless-stopped
     ports:

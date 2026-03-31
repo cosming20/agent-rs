@@ -22,7 +22,7 @@ processors:
     send_batch_size: 512
 
 exporters:
-  otlp_grpc/jaeger:
+  otlp/jaeger:
     endpoint: jaeger:4317
     tls:
       insecure: true
@@ -40,7 +40,7 @@ service:
     traces:
       receivers: [otlp]
       processors: [batch]
-      exporters: [otlp_grpc/jaeger]
+      exporters: [otlp/jaeger]
     metrics:
       receivers: [otlp]
       processors: [batch]
