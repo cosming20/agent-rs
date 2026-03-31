@@ -14,6 +14,7 @@ volumes:
   qdrant_storage:
   postgres_data:
   neo4j_data:
+  prometheus_data:
 
 services:
   # ----------------------------------------------------------
@@ -216,3 +217,24 @@ services:
     # No CMD-SHELL health check: scratch-based image has no shell.
     # The collector is stateless with unless-stopped restart policy.
     # It depends on jaeger:service_healthy and logs errors clearly.
+
+  # ----------------------------------------------------------
+  # Prometheus — Metrics storage
+  # ----------------------------------------------------------
+  prometheus:
+    image: prom/prometheus:v3.4.0
+    container_name: agentic-ra-prometheus
+    restart: unless-stopped
+    ports:
+      - "${PROMETHEUS_PORT:-1066}:9090"
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+    networks:
+      - agentic-ra-net
+    depends_on:
+      otel-collector:
+        condition: service_started
+    mem_limit: 512m
+    mem_reservation: 256m
+    cpus: 0.5
