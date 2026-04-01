@@ -101,7 +101,8 @@ class ResultRanker:
                 rrf_scores.keys(), key=lambda k: rrf_scores[k], reverse=True
             )[:limit]
 
-            # Build final documents with fused score in metadata
+            # Build final documents — RRF score used for ordering only,
+            # original retrieval score preserved for display
             ranked_docs = []
             for key in ranked_keys:
                 doc = content_to_doc[key]

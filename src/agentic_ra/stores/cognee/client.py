@@ -30,6 +30,12 @@ class CogneeStore:
 
     def __init__(self, dataset: str = "agentic_rag") -> None:
         self._dataset = dataset
+        # Use PassthroughChunker to prevent Cognee from re-chunking our
+        # pre-chunked text.  Cognee's default TextChunker always runs
+        # sentence-level tokenization which can split at boundaries.
+        from agentic_ra.stores.cognee.passthrough_chunker import PassthroughChunker
+
+        self._chunker = PassthroughChunker
 
     def configure(
         self,
@@ -82,12 +88,31 @@ class CogneeStore:
 
                     - ``__init__``: ignores ``database_name``
                     - ``search``: ignores ``include_payload``, ``node_name``
+                    - ``get_qdrant_client``: removes hardcoded port=6333 that
+                      triggers "insecure connection" and version mismatch warnings
                     """
 
                     def __init__(  # type: ignore[no-untyped-def]
                         self, *args: Any, database_name: str = "", **kwargs: Any
                     ) -> None:
                         super().__init__(*args, **kwargs)
+
+                    def get_qdrant_client(self):  # type: ignore[no-untyped-def]
+                        import warnings
+
+                        from qdrant_client import AsyncQdrantClient
+
+                        with warnings.catch_warnings():
+                            warnings.simplefilter("ignore", UserWarning)
+                            if self.qdrant_path is not None:
+                                return AsyncQdrantClient(path=self.qdrant_path)
+                            elif self.url is not None:
+                                return AsyncQdrantClient(
+                                    url=self.url,
+                                    api_key=self.api_key,
+                                    check_compatibility=False,
+                                )
+                            return AsyncQdrantClient(location=":memory:")
 
                     async def search(  # type: ignore[no-untyped-def]
                         self,
@@ -135,6 +160,13 @@ class CogneeStore:
                 graph_config["graph_database_name"] = neo4j_db
             cognee.config.set_graph_db_config(graph_config)
 
+            # Chunking — smaller chunks improve retrieval precision for
+            # structured documents (legal codes, technical specs, articles).
+            # Default Cognee chunk size is too large, merging unrelated
+            # sections into one embedding.
+            cognee.config.set_chunk_size(16000)
+            cognee.config.set_chunk_overlap(0)
+
             # Storage directories
             if data_root:
                 cognee.config.data_root_directory(data_root)
@@ -173,7 +205,11 @@ class CogneeStore:
         ds = dataset or self._dataset
         try:
             add_result = await cognee.add(data=text, dataset_name=ds)
-            cognify_result = await cognee.cognify(datasets=[ds])
+            cognify_result = await cognee.cognify(
+                datasets=[ds],
+                chunker=self._chunker,
+                chunk_size=16000,
+            )
 
             logger.info(
                 "Cognee add+cognify complete for dataset=%s",
@@ -217,29 +253,35 @@ class CogneeStore:
             )
 
         try:
+            # Suppress Cognee's verbose per-chunk logging
+            import logging as _logging
+            _cognee_logger = _logging.getLogger("cognee")
+            _prev_level = _cognee_logger.level
+            _cognee_logger.setLevel(_logging.WARNING)
+
+            total = len(chunks)
             for i, chunk_text in enumerate(chunks):
                 if not chunk_text.strip():
                     continue
                 await cognee.add(data=chunk_text, dataset_name=ds)
+                pct = (i + 1) * 100 // total
+                bar = f"[{'█' * (pct // 2)}{'░' * (50 - pct // 2)}]"
+                print(f"\r  Cognee add {bar} {i + 1}/{total}", end="", flush=True)
 
-                if (i + 1) % 50 == 0:
-                    logger.info(
-                        "Cognee add progress: %d/%d chunks (dataset=%s)",
-                        i + 1,
-                        len(chunks),
-                        ds,
-                    )
+            print()  # newline after progress bar
+            print("  Starting cognify (graph + vector)...")
 
-            logger.info(
-                "Cognee add complete: %d chunks (dataset=%s), starting cognify...",
-                len(chunks),
-                ds,
+            cognify_result = await cognee.cognify(
+                datasets=[ds],
+                chunker=self._chunker,
+                chunk_size=16000,
             )
 
-            cognify_result = await cognee.cognify(datasets=[ds])
+            # Restore logging
+            _cognee_logger.setLevel(_prev_level)
 
             logger.info("Cognee cognify complete for dataset=%s", ds)
-            return {"add_count": len(chunks), "cognify_result": cognify_result}
+            return {"add_count": total, "cognify_result": cognify_result}
 
         except CogneeError:
             raise
@@ -286,7 +328,9 @@ class CogneeStore:
         """
         ds = dataset or self._dataset
         try:
-            return await cognee.cognify(datasets=[ds])
+            return await cognee.cognify(
+                datasets=[ds], chunker=self._chunker, chunk_size=16000
+            )
         except Exception as e:
             raise CogneeError(
                 "Cognee cognify failed",
@@ -298,14 +342,29 @@ class CogneeStore:
     async def prune(self) -> None:
         """Reset Cognee knowledge base.
 
-        Removes all data from graph and vector stores. Use with caution — this
-        is irreversible and affects all datasets managed by this Cognee instance.
+        Removes all data from graph and vector stores AND cleans the data
+        directory on disk.  Without the disk cleanup, ``cognify()`` would
+        reprocess stale files from previous ingestion runs.
         """
         try:
             # Cognee 0.5.5: prune() is a class, not a coroutine
             result = cognee.prune()
             if hasattr(result, "__await__"):
                 await result
+
+            # Also wipe the data directory — cognee.prune() only clears
+            # Qdrant/Neo4j/relational DB but leaves data files on disk.
+            import shutil
+            from pathlib import Path
+
+            from agentic_ra.core.config import get_settings
+
+            data_root = Path(get_settings().cognee_data_root)
+            if data_root.exists():
+                shutil.rmtree(data_root)
+                data_root.mkdir(parents=True, exist_ok=True)
+                logger.info("Cleaned Cognee data directory: %s", data_root)
+
             logger.info("Cognee knowledge base pruned")
         except Exception as e:
             raise CogneeError(
@@ -362,13 +421,14 @@ class CogneeStore:
             for i, result in enumerate(results or []):
                 content = self._extract_content(result)
                 if content:
+                    score = self._extract_score(result, rank=i)
                     documents.append(
                         Document(
                             content=content,
                             meta={
                                 "source": f"cognee_{search_type.lower()}",
                                 "search_type": search_type,
-                                "score": 1.0 / (i + 1),
+                                "score": score,
                                 "dataset": ds,
                                 "rank": i,
                             },
@@ -392,6 +452,37 @@ class CogneeStore:
                 operation="search",
                 original_error=str(e),
             ) from e
+
+    @staticmethod
+    def _extract_score(result: object, *, rank: int) -> float:
+        """Extract relevance score from a Cognee search result.
+
+        Cognee vector search returns cosine similarity (0-1) in 'score' or
+        '_distance' fields.  Falls back to rank-based scoring for result
+        shapes that don't carry a numeric score (e.g. GRAPH_COMPLETION
+        strings).
+        """
+        # Dict results: CHUNKS / CHUNKS_LEXICAL
+        if isinstance(result, dict):
+            for key in ("score", "_distance", "similarity"):
+                val = result.get(key)
+                if val is not None:
+                    try:
+                        return float(val)
+                    except (TypeError, ValueError):
+                        continue
+
+        # Object results with score attribute
+        for attr in ("score", "_distance", "similarity"):
+            val = getattr(result, attr, None)
+            if val is not None:
+                try:
+                    return float(val)
+                except (TypeError, ValueError):
+                    continue
+
+        # Fallback: rank-based score (GRAPH_COMPLETION, strings, etc.)
+        return 1.0 / (rank + 1)
 
     @staticmethod
     def _extract_content(result: object) -> str:

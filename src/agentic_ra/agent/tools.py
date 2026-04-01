@@ -139,15 +139,7 @@ def _format_evidence(documents: list[Document] | tuple[Document, ...]) -> str:
 
     for idx, doc in enumerate(documents, start=1):
         source = doc.meta.get("source", "unknown")
-        score = doc.meta.get("rrf_score", doc.meta.get("score", ""))
-        header = f"[{idx}] (source={source}"
-        if score:
-            header += (
-                f", score={score:.4f}"
-                if isinstance(score, float)
-                else f", score={score}"
-            )
-        header += ")"
+        header = f"[{idx}] (source={source})"
 
         content = doc.content or "(empty)"
         entry = f"{header}\n{content}"

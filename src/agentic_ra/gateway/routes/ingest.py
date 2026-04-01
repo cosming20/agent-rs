@@ -70,7 +70,7 @@ async def ingest_endpoint(
 
     docs = [Document(content=d.content, meta=d.metadata) for d in body.documents]
 
-    # 1. Parse with Docling HybridChunker (structure-aware chunking)
+    # 1. Parse with Docling HierarchicalChunker (structure-aware chunking)
     chunk_result = await asyncio.to_thread(pipeline.embedding_pipeline.chunk_text, docs)
 
     # 2. Persist DoclingDocument JSON in Postgres (provenance)

@@ -5,8 +5,12 @@ from __future__ import annotations
 import logging
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
+from pathlib import Path
 
 from fastapi import FastAPI, Request
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import RedirectResponse
+from fastapi.staticfiles import StaticFiles
 from starlette.responses import JSONResponse
 
 from agentic_ra.auth.opa import OPAClient
@@ -17,6 +21,7 @@ from agentic_ra.gateway.middleware.auth import OPAAuthMiddleware
 from agentic_ra.gateway.routes.health import router as health_router
 from agentic_ra.gateway.routes.ingest import router as ingest_router
 from agentic_ra.gateway.routes.query import router as query_router
+from agentic_ra.gateway.routes.upload import router as upload_router
 from agentic_ra.observability.cost_tracker import setup_cost_tracking
 from agentic_ra.observability.metrics import setup_metrics
 from agentic_ra.observability.tracing import instrument_fastapi, setup_tracing
@@ -73,6 +78,11 @@ def create_app() -> FastAPI:
     """Create and configure the FastAPI application."""
     settings = get_settings()
 
+    # Suppress noisy health check access logs
+    logging.getLogger("uvicorn.access").addFilter(
+        type("_HealthFilter", (), {"filter": staticmethod(lambda r: "/health" not in r.getMessage())})()
+    )
+
     app = FastAPI(
         title="Agentic RAG",
         description="Near-perfect agentic RAG system API",
@@ -83,6 +93,16 @@ def create_app() -> FastAPI:
     app.include_router(health_router)
     app.include_router(query_router)
     app.include_router(ingest_router)
+    app.include_router(upload_router)
+
+    # CORS middleware — needed when frontend runs on a different origin (dev)
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=[o.strip() for o in settings.cors_allowed_origins.split(",") if o.strip()],
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
 
     # OPA middleware — client stored on app.state for lifecycle management
     opa_client = OPAClient(base_url=settings.opa_url)
@@ -103,5 +123,15 @@ def create_app() -> FastAPI:
             status_code=500,
             content={"error": str(exc), "type": type(exc).__name__},
         )
+
+    # Convenience redirect: / → /ui/
+    @app.get("/", include_in_schema=False)
+    async def root_redirect() -> RedirectResponse:
+        return RedirectResponse(url="/ui/")
+
+    # Serve frontend static files at /ui/
+    static_dir = Path(__file__).parent / "static"
+    if static_dir.is_dir():
+        app.mount("/ui", StaticFiles(directory=str(static_dir), html=True), name="ui")
 
     return app

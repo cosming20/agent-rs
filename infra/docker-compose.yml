@@ -23,7 +23,7 @@ services:
   # Qdrant — Vector similarity search
   # ----------------------------------------------------------
   qdrant:
-    image: qdrant/qdrant:v1.14.0
+    image: qdrant/qdrant:v1.17.1
     container_name: agentic-ra-qdrant
     restart: "on-failure:5"
     ports:
@@ -110,6 +110,7 @@ services:
   # ----------------------------------------------------------
   opa:
     image: openpolicyagent/opa:1.4.2-debug
+    platform: linux/amd64
     container_name: agentic-ra-opa
     restart: unless-stopped
     ports:

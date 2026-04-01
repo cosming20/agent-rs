@@ -25,6 +25,7 @@ dependencies = [
     "opentelemetry-sdk>=1.29",
     "sqlalchemy[asyncio]>=2.0",
     "uvicorn>=0.34",
+    "nltk>=3.9.4",
 ]
 
 [build-system]

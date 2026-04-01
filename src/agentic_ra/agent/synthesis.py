@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 
 from haystack import Document
@@ -83,13 +84,31 @@ class ResponseSynthesizer:
             Structured response with citations and metadata.
         """
         try:
-            citations = self._build_citations(evidence)
+            all_citations = self._build_citations(evidence)
+
+            # Only include citations the LLM actually referenced in the answer
+            # (e.g., [1], [4], [7]).  Unreferenced evidence is noise.
+            referenced = self._find_referenced_indices(answer)
+            if referenced:
+                citations = tuple(c for c in all_citations if c.index in referenced)
+            else:
+                # If no explicit references found, keep top 5 for context
+                citations = all_citations[:5]
+
+            # The verifier's confidence is meta-confidence ("how certain am I
+            # about this grounding assessment"), not answer quality.  When the
+            # answer is ungrounded, high verifier confidence means "I'm very
+            # sure this is bad" — invert for user-facing semantics.
+            if verification.is_grounded:
+                answer_confidence = verification.confidence
+            else:
+                answer_confidence = 1.0 - verification.confidence
 
             return SynthesizedResponse(
                 answer=answer,
                 citations=citations,
                 query=query,
-                confidence=verification.confidence,
+                confidence=answer_confidence,
                 is_grounded=verification.is_grounded,
                 strategy=strategy,
             )
@@ -113,13 +132,21 @@ class ResponseSynthesizer:
             if len(content) > self._max_snippet:
                 snippet += "..."
 
+            # Prefer original retrieval score (cosine similarity 0-1) for
+            # display.  RRF scores are tiny fractions useful only for
+            # ordering — showing them as percentages misleads users.
             citations.append(
                 Citation(
                     index=idx,
                     content_snippet=snippet,
                     source=doc.meta.get("source", "unknown"),
-                    score=doc.meta.get("rrf_score", doc.meta.get("score", 0.0)),
+                    score=doc.meta.get("score", doc.meta.get("rrf_score", 0.0)),
                 )
             )
 
         return tuple(citations)
+
+    @staticmethod
+    def _find_referenced_indices(answer: str) -> set[int]:
+        """Extract citation indices like [1], [4] from the answer text."""
+        return {int(m) for m in re.findall(r"\[(\d+)\]", answer)}

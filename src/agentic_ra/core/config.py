@@ -65,7 +65,7 @@ class Settings(BaseSettings):
     embedding_model: str = "text-embedding-3-small"
     embedding_dimension: int = 1536
     embedding_batch_size: int = 32
-    chunk_max_tokens: int = 2048
+    chunk_max_tokens: int = 1024
     chunk_merge_peers: bool = True
 
     # --- Cognee (Knowledge Graph) ---
@@ -83,6 +83,9 @@ class Settings(BaseSettings):
     neo4j_user: str = "neo4j"
     neo4j_password: SecretStr
     neo4j_db: str = "neo4j"
+
+    # --- CORS ---
+    cors_allowed_origins: str = "http://localhost:1059,http://localhost:8000,http://localhost:3000"
 
     # --- Application ---
     log_level: str = "INFO"

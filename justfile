@@ -90,6 +90,11 @@ health:
 docs:
     @open http://127.0.0.1:1059/docs
 
+# Open the web UI then start server in foreground (Ctrl+C to stop)
+web:
+    @open http://127.0.0.1:1059/ui/
+    uv run uvicorn agentic_ra.gateway.app:create_app --factory --host 127.0.0.1 --port 1059 --reload
+
 # ─── Quality ─────────────────────────────────────────────────
 
 # Run all quality checks (lint + typecheck)
@@ -124,6 +129,19 @@ stores-reset:
 
 # ─── Ingest ──────────────────────────────────────────────────
 
+# Test Docling chunking only — outputs docling_chunks.json for inspection
+# Usage: just docling test.pdf
+docling FILE:
+    uv run python scripts/docling_test.py {{ FILE }}
+
+# Test Docling + chunking on a CDEP crawled page from the database
+# Usage: just docling-cdep                              (random page)
+#        just docling-cdep --page-type deputy_profile    (by type)
+#        just docling-cdep --page-id 42                  (by ID)
+#        just docling-cdep --search "comisia juridica"   (search text)
+docling-cdep *ARGS:
+    uv run python scripts/docling_test_cdep.py {{ ARGS }}
+
 # Ingest sample documents for testing (server must be running)
 ingest-sample:
     uv run python scripts/ingest_sample.py
@@ -134,6 +152,20 @@ ingest-sample:
 #        just ingest-file https://arxiv.org/pdf/2408.09869 (URL)
 ingest-file +FILES:
     uv run python scripts/ingest_file.py {{ FILES }}
+
+# Ingest crawled CDEP pages from the crawler database
+# Usage: just ingest-cdep --dry-run --limit 3         (preview)
+#        just ingest-cdep --priority high              (deputies, committees)
+#        just ingest-cdep --page-types deputy_profile  (specific type)
+#        just ingest-cdep --depth 2                    (BFS: depth 0+1 all, depth 2 high-priority)
+#        just ingest-cdep --depth 2 --dry-run --limit 5
+ingest-cdep *ARGS:
+    uv run python scripts/ingest_cdep.py {{ ARGS }}
+
+# Wipe all Cognee data: Qdrant collections + Neo4j graph + local files
+# Use before re-ingesting from scratch
+cognee-reset:
+    uv run python scripts/cognee_reset.py
 
 # Run E2E validation: ingest test.pdf + query via gateway
 # Requires: infra running (just infra-up), server running (just server)
@@ -207,6 +239,7 @@ clean:
     @find . -type d -name .mypy_cache -exec rm -rf {} + 2>/dev/null || true
     @find . -type d -name .ruff_cache -exec rm -rf {} + 2>/dev/null || true
     @rm -rf .pytest_cache dist build *.egg-info
+    @rm -rf .cognee_data .cognee_system
     @echo "Cleaned"
 
 # Full reset: clean + infra reset + reinstall

@@ -52,3 +52,8 @@ infra/data/
 artifacts/
 node-compile-cache/
 lawren_crawler_dump.sql.zst
+
+# Docling/chunker test outputs
+cdep_chunks.json
+cdep_source.md
+docling_chunks.json
