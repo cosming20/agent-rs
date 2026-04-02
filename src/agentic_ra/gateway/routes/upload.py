@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import io
+import os
 import logging
 import uuid as uuid_mod
 from pathlib import Path
@@ -23,9 +24,11 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/v1", tags=["upload"])
 
-MAX_FILE_SIZE = 50 * 1024 * 1024  # 50 MB
+MAX_FILE_SIZE: int = int(os.environ.get("UPLOAD_MAX_FILE_SIZE", str(50 * 1024 * 1024)))
 
-ALLOWED_EXTENSIONS = frozenset({".pdf", ".docx", ".pptx", ".html", ".htm", ".txt", ".md"})
+ALLOWED_EXTENSIONS = frozenset(
+    os.environ.get("UPLOAD_ALLOWED_EXTENSIONS", ".pdf,.docx,.pptx,.html,.htm,.txt,.md").split(",")
+)
 
 
 class UploadResponse(BaseModel):
@@ -141,6 +144,13 @@ async def upload_endpoint(
                 f"Unsupported file type '{ext}'. "
                 f"Allowed: {', '.join(sorted(ALLOWED_EXTENSIONS))}"
             ),
+        )
+
+    # Check Content-Length before reading to prevent OOM on large uploads
+    if file.size and file.size > MAX_FILE_SIZE:
+        raise HTTPException(
+            status_code=413,
+            detail=f"File exceeds {MAX_FILE_SIZE // (1024 * 1024)} MB limit",
         )
 
     content = await file.read()

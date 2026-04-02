@@ -190,14 +190,14 @@ class ResultRanker:
             # Score KB documents (with weight boost)
             for rank_idx, doc in enumerate(unique_kb):
                 content_key = doc.content if doc.content else f"__empty_{doc.id}"
-                rrf_scores[content_key] = kb_weight / (self._rrf_k + rank_idx + 1)
+                rrf_scores[content_key] = rrf_scores.get(content_key, 0.0) + kb_weight / (self._rrf_k + rank_idx + 1)
                 if content_key not in content_to_doc:
                     content_to_doc[content_key] = doc
 
-            # Score web documents (standard weight)
+            # Score web documents (standard weight) — accumulate, don't overwrite
             for rank_idx, doc in enumerate(unique_web):
                 content_key = doc.content if doc.content else f"__empty_{doc.id}"
-                rrf_scores[content_key] = 1.0 / (self._rrf_k + rank_idx + 1)
+                rrf_scores[content_key] = rrf_scores.get(content_key, 0.0) + 1.0 / (self._rrf_k + rank_idx + 1)
                 if content_key not in content_to_doc:
                     content_to_doc[content_key] = doc
 

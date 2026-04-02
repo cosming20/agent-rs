@@ -78,7 +78,7 @@ class EmbeddingPipeline:
         try:
             pdf_opts.table_structure_options = TableStructureOptions(mode="accurate")
         except Exception:
-            pass
+            logger.debug("TableStructureOptions 'accurate' mode not available, using default")
 
         self._converter = DocumentConverter(
             format_options={

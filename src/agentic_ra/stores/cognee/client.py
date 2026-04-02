@@ -252,33 +252,28 @@ class CogneeStore:
                 original_error="Empty chunk list",
             )
 
-        try:
-            # Suppress Cognee's verbose per-chunk logging
-            import logging as _logging
-            _cognee_logger = _logging.getLogger("cognee")
-            _prev_level = _cognee_logger.level
-            _cognee_logger.setLevel(_logging.WARNING)
+        # Suppress Cognee's verbose per-chunk logging
+        import logging as _logging
+        _cognee_logger = _logging.getLogger("cognee")
+        _prev_level = _cognee_logger.level
+        _cognee_logger.setLevel(_logging.WARNING)
 
+        try:
             total = len(chunks)
             for i, chunk_text in enumerate(chunks):
                 if not chunk_text.strip():
                     continue
                 await cognee.add(data=chunk_text, dataset_name=ds)
-                pct = (i + 1) * 100 // total
-                bar = f"[{'█' * (pct // 2)}{'░' * (50 - pct // 2)}]"
-                print(f"\r  Cognee add {bar} {i + 1}/{total}", end="", flush=True)
+                if (i + 1) % 10 == 0 or i + 1 == total:
+                    logger.info("Cognee add: %d/%d chunks", i + 1, total)
 
-            print()  # newline after progress bar
-            print("  Starting cognify (graph + vector)...")
+            logger.info("Starting cognify (graph + vector) for dataset=%s", ds)
 
             cognify_result = await cognee.cognify(
                 datasets=[ds],
                 chunker=self._chunker,
                 chunk_size=16000,
             )
-
-            # Restore logging
-            _cognee_logger.setLevel(_prev_level)
 
             logger.info("Cognee cognify complete for dataset=%s", ds)
             return {"add_count": total, "cognify_result": cognify_result}
@@ -293,6 +288,8 @@ class CogneeStore:
                 operation="add_chunks",
                 original_error=str(e),
             ) from e
+        finally:
+            _cognee_logger.setLevel(_prev_level)
 
     async def add(self, text: str, dataset: str | None = None) -> object:
         """Ingest text into Cognee without building the graph.

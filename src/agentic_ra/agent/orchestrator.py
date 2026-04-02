@@ -143,8 +143,8 @@ class AgentOrchestrator:
             )
             chat_messages.append(ChatMessage.from_user(query + hint))
 
-            # 3. Build per-request tools scoped to this user's dataset
-            dataset = f"user_{_sanitize_user_id(user_id)}"
+            # 3. Build per-request tools — use configured dataset
+            dataset = get_settings().cognee_dataset
             kb_evidence: list[Document] = []
             web_evidence: list[Document] = []
 
@@ -211,7 +211,7 @@ class AgentOrchestrator:
                 )
             except Exception as agent_err:
                 err_name = type(agent_err).__name__
-                logger.warning(
+                logger.error(
                     "Agent run failed (%s): %s — using accumulated evidence",
                     err_name,
                     str(agent_err)[:200],
@@ -278,19 +278,22 @@ class AgentOrchestrator:
                 ]
                 kb_evidence.clear()
                 web_evidence.clear()
-                agent_result = await asyncio.to_thread(
-                    agent.run, messages=retry_messages
-                )
-                answer = self._extract_answer(agent_result)
-                fused_pack = self._ranker.fuse_evidence(
-                    kb_documents=kb_evidence,
-                    web_documents=web_evidence,
-                    query=query,
-                )
-                evidence = list(fused_pack.documents)
-                verification = await asyncio.to_thread(
-                    self._verifier.verify, answer=answer, evidence=evidence
-                )
+                try:
+                    agent_result = await asyncio.to_thread(
+                        agent.run, messages=retry_messages
+                    )
+                    answer = self._extract_answer(agent_result)
+                    fused_pack = self._ranker.fuse_evidence(
+                        kb_documents=kb_evidence,
+                        web_documents=web_evidence,
+                        query=query,
+                    )
+                    evidence = list(fused_pack.documents)
+                    verification = await asyncio.to_thread(
+                        self._verifier.verify, answer=answer, evidence=evidence
+                    )
+                except Exception as retry_err:
+                    logger.error("Retry failed: %s", str(retry_err)[:200])
 
             # 8. Synthesize citations
             response = self._synthesizer.synthesize(

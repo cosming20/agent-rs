@@ -65,7 +65,7 @@ def get_evidence_buffer() -> list[Document]:  # noqa: D401
 # Internal helpers
 # ---------------------------------------------------------------------------
 
-_MAX_EVIDENCE_CHARS = 4000
+_MAX_EVIDENCE_CHARS = 16000
 """Soft cap on formatted evidence text sent back to the LLM."""
 
 _MAX_USER_ID_LEN = 128
@@ -361,6 +361,9 @@ def make_search_knowledge_tool(
         except ToolError:
             raise
         except Exception as e:
+            if "DatasetNotFoundError" in type(e).__name__ or "No datasets found" in str(e):
+                logger.warning("No datasets found in knowledge base — returning empty results")
+                return {"text": "No data has been ingested into the knowledge base yet.", "documents": []}
             raise ToolError(
                 "Knowledge search failed",
                 query=query,
