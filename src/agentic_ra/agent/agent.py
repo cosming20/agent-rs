@@ -39,7 +39,10 @@ Rules:
 - Do not cite a chunk just because it was retrieved — only if it supports your claim.
 - Use search_knowledge first, search_web only if local knowledge is insufficient.
 - For multi-part questions, make multiple search calls with different queries.
-- Use remember to save important facts the user asks you to remember.
+- Use remember(action='save', key=..., value=...) to save important facts: \
+user preferences, key findings from complex queries, or anything the user asks you to remember.
+- When answering complex questions, proactively save the synthesized answer as a memory \
+so future questions on the same topic can benefit from it.
 - Respond in the same language the user used.
 """
 
@@ -61,6 +64,9 @@ def build_agent(
             description=tc["description"],
             function=tc["function"],
             parameters=tc["parameters"],
+            # Extract only the "text" key from tool results so the LLM sees
+            # clean formatted evidence, not a Python dict repr with Document objects.
+            outputs_to_string={"source": "text"},
         )
         haystack_tools.append(tool)
 
@@ -114,6 +120,7 @@ def build_agent_with_tools(
             description=tc["description"],
             function=tc["function"],
             parameters=tc["parameters"],
+            outputs_to_string={"source": "text"},
         )
         haystack_tools.append(tool)
 

@@ -9,8 +9,20 @@ Usage: uv run python scripts/ingest_file.py <file_or_url> [file2] [file3] ...
 from __future__ import annotations
 
 import asyncio
+import logging
 import sys
 import time
+
+# Silence all noisy loggers — only errors and our progress output
+logging.basicConfig(level=logging.ERROR, format="%(levelname)s %(name)s: %(message)s")
+for _name in (
+    "cognee", "aiosqlite", "neo4j", "neo4j.io", "neo4j.pool", "instructor",
+    "OntologyAdapter", "cognee.shared", "httpx", "httpcore",
+    "docling", "docling.backend", "docling.pipeline", "docling.models",
+    "docling.document_converter", "docling.datamodel",
+    "litellm", "openai", "qdrant_client",
+):
+    logging.getLogger(_name).setLevel(logging.ERROR)
 
 from agentic_ra.core.config import get_settings
 from agentic_ra.observability.cost_tracker import setup_cost_tracking
@@ -55,37 +67,71 @@ async def ingest_file(source: str) -> None:
         neo4j_db=s.neo4j_db,
     )
 
-    # 1. Parse + chunk with Docling
-    print(f"Parsing: {source}")
-    chunk_result = pipeline.chunk_file(source)
-    print(f"  Chunks: {chunk_result.chunk_count}")
-
-    if chunk_result.chunk_count == 0:
-        print("  No chunks produced — skipping.")
+    # Check for incomplete previous ingestion (resume support)
+    existing = await doc_store.get_by_source(source, user_id="anonymous")
+    if existing and not existing.cognify_done:
+        print(f"Resuming: {source} ({existing.chunks_added}/{existing.chunk_count} chunks added)")
+        parsed_doc = existing
+        # Re-parse to get chunks (DoclingDocument JSON is in Postgres but we need chunk list)
+        chunk_result = pipeline.chunk_file(source)
+        breadcrumb_chunks = pipeline.build_breadcrumb_chunks(chunk_result)
+        skip = existing.chunks_added
+    elif existing and existing.cognify_done:
+        print(f"Already ingested: {source} — skipping (use --force to re-ingest)")
         await pg.close()
         return
+    else:
+        # Fresh ingestion
+        print(f"Parsing: {source}")
+        chunk_result = pipeline.chunk_file(source)
+        print(f"  Chunks: {chunk_result.chunk_count}")
 
-    # 2. Persist DoclingDocument JSON in Postgres
-    docling_json = (
-        chunk_result.docling_doc.export_to_dict()
-        if chunk_result.docling_doc is not None
-        else {}
-    )
-    parsed_doc = await doc_store.save(
-        source_path=source,
-        docling_json=docling_json,
-        chunk_count=chunk_result.chunk_count,
-        metadata={"file": source},
-    )
-    print(f"  Persisted DoclingDocument: {parsed_doc.id}")
+        if chunk_result.chunk_count == 0:
+            print("  No chunks produced — skipping.")
+            await pg.close()
+            return
 
-    # 3. Cognee: add individual chunks + cognify (embedding → Qdrant, entities → Neo4j)
-    print("  Building breadcrumb chunks...")
-    breadcrumb_chunks = pipeline.build_breadcrumb_chunks(chunk_result)
-    print(f"  Breadcrumb chunks: {len(breadcrumb_chunks)}")
+        docling_json = (
+            chunk_result.docling_doc.export_to_dict()
+            if chunk_result.docling_doc is not None
+            else {}
+        )
+        parsed_doc = await doc_store.save(
+            source_path=source,
+            docling_json=docling_json,
+            chunk_count=chunk_result.chunk_count,
+            metadata={"file": source},
+        )
+        print(f"  Persisted DoclingDocument: {parsed_doc.id}")
+        breadcrumb_chunks = pipeline.build_breadcrumb_chunks(chunk_result)
+        skip = 0
 
-    print("  Cognee add (per-chunk) + cognify...")
-    await cognee_store.add_chunks(chunks=breadcrumb_chunks)
+    # Cognee: add chunks with progress tracking
+    total = len(breadcrumb_chunks)
+    chunks_to_add = breadcrumb_chunks[skip:]
+    print(f"  Adding chunks to Cognee: {len(chunks_to_add)}/{total} (skip={skip})")
+
+    import cognee
+    for i, chunk_text in enumerate(chunks_to_add):
+        if not chunk_text.strip():
+            continue
+        await cognee.add(data=chunk_text, dataset_name=s.cognee_dataset)
+        added = skip + i + 1
+        # Progress bar
+        pct = added * 100 // total
+        bar = f"[{'█' * (pct // 2)}{'░' * (50 - pct // 2)}]"
+        print(f"\r  Cognee add {bar} {added}/{total}", end="", flush=True)
+        # Save progress every 25 chunks
+        if added % 25 == 0:
+            await doc_store.update_progress(parsed_doc.id, chunks_added=added)
+    print()  # newline after progress bar
+
+    await doc_store.update_progress(parsed_doc.id, chunks_added=total)
+
+    # Cognify
+    print("  Running cognify (graph + vector)...")
+    await cognee_store.cognify()
+    await doc_store.update_progress(parsed_doc.id, chunks_added=total, cognify_done=True)
     print("  Cognee: graph + vector ingestion complete")
 
     await pg.close()

@@ -18,6 +18,7 @@ from typing import Any, TypedDict
 from haystack import Document
 
 from agentic_ra.core.errors import ToolError, WebBudgetExhaustedError
+from agentic_ra.observability.tracing import get_tracer
 from agentic_ra.retrieval.ranker import ResultRanker
 from agentic_ra.retrieval.router import RetrievalRouter, RetrievalStrategy
 from agentic_ra.tools.budgets import WebToolBudget
@@ -67,6 +68,25 @@ def get_evidence_buffer() -> list[Document]:  # noqa: D401
 
 _MAX_EVIDENCE_CHARS = 16000
 """Soft cap on formatted evidence text sent back to the LLM."""
+
+_MAX_CONTEXT_CHARS = 300
+"""Max characters of conversation context prepended to search queries."""
+
+_CONTEXT_SEARCH_TYPES: frozenset[str] = frozenset({"CHUNKS", "GRAPH_COMPLETION"})
+"""Search types that benefit from conversation context augmentation."""
+
+_STRATEGY_SEARCH_TYPES: dict[RetrievalStrategy, list[str]] = {
+    RetrievalStrategy.SEMANTIC: ["CHUNKS"],
+    RetrievalStrategy.KEYWORD: ["CHUNKS_LEXICAL"],
+    RetrievalStrategy.GRAPH: ["GRAPH_COMPLETION"],
+    RetrievalStrategy.HYBRID: ["CHUNKS", "CHUNKS_LEXICAL"],
+    RetrievalStrategy.GRAPH_HYBRID: [
+        "GRAPH_COMPLETION",
+        "CHUNKS",
+        "CHUNKS_LEXICAL",
+    ],
+}
+"""Maps each retrieval strategy to the Cognee search types it dispatches."""
 
 _MAX_USER_ID_LEN = 128
 """Maximum length for sanitized user IDs in dataset names."""
@@ -156,6 +176,26 @@ def _format_evidence(documents: list[Document] | tuple[Document, ...]) -> str:
     return "\n\n".join(parts)
 
 
+def _build_contextual_query(query: str, conversation_context: str) -> str:
+    """Augment a search query with conversation context for better retrieval.
+
+    Prepends a brief conversation summary so embedding models and graph
+    traversal can anchor on entities/topics from the ongoing conversation.
+    Keeps context short to avoid diluting the query signal.
+
+    Args:
+        query: The raw search query.
+        conversation_context: Brief summary of recent conversation turns.
+
+    Returns:
+        Augmented query string, or the original if no context is available.
+    """
+    if not conversation_context:
+        return query
+    ctx = conversation_context[:_MAX_CONTEXT_CHARS]
+    return f"Context: {ctx}\nQuery: {query}"
+
+
 def _search_dataset(
     cognee_store: Any,
     dataset: str,
@@ -163,6 +203,7 @@ def _search_dataset(
     strategy: RetrievalStrategy,
     limit: int = 10,
     session_id: str | None = None,
+    conversation_context: str = "",
 ) -> list[Document]:
     """Search a specific Cognee dataset using the given strategy.
 
@@ -176,32 +217,38 @@ def _search_dataset(
         strategy: Which retrieval strategy to use.
         limit: Maximum results per search type.
         session_id: Cognee session ID for feedback tracking.
+        conversation_context: Recent conversation summary for search augmentation.
 
     Returns:
         A flat list of :class:`Document` results across all search types.
     """
-    search_types: dict[RetrievalStrategy, list[str]] = {
-        RetrievalStrategy.SEMANTIC: ["CHUNKS"],
-        RetrievalStrategy.KEYWORD: ["CHUNKS_LEXICAL"],
-        RetrievalStrategy.GRAPH: ["GRAPH_COMPLETION"],
-        RetrievalStrategy.HYBRID: ["CHUNKS", "CHUNKS_LEXICAL"],
-        RetrievalStrategy.GRAPH_HYBRID: [
-            "GRAPH_COMPLETION",
-            "CHUNKS",
-            "CHUNKS_LEXICAL",
-        ],
-    }
-    types = search_types.get(strategy, ["CHUNKS", "CHUNKS_LEXICAL"])
+    tracer = get_tracer()
+    types = _STRATEGY_SEARCH_TYPES.get(strategy, ["CHUNKS", "CHUNKS_LEXICAL"])
 
     all_results: list[Document] = []
     for st in types:
-        results: list[Document] = _run_async(
-            cognee_store.search(
-                query=query, search_type=st, top_k=limit, dataset=dataset,
-                session_id=session_id,
+        with tracer.start_as_current_span(
+            "cognee.search",
+            attributes={
+                "search_type": st,
+                "dataset": dataset,
+                "strategy": strategy.value,
+                "query": query[:100],
+            },
+        ) as search_span:
+            effective_query = (
+                _build_contextual_query(query, conversation_context)
+                if st in _CONTEXT_SEARCH_TYPES
+                else query
             )
-        )
-        all_results.extend(results)
+            results: list[Document] = _run_async(
+                cognee_store.search(
+                    query=effective_query, search_type=st, top_k=limit, dataset=dataset,
+                    session_id=session_id,
+                )
+            )
+            search_span.set_attribute("result_count", len(results))
+            all_results.extend(results)
     return all_results
 
 
@@ -261,6 +308,7 @@ def make_search_knowledge_tool(
     role: str = "user",
     evidence_accumulator: list[Document] | None = None,
     session_id: str | None = None,
+    conversation_context: str = "",
 ) -> ToolConfig:
     """Create the ``search_knowledge`` tool for the Haystack Agent.
 
@@ -318,6 +366,7 @@ def make_search_knowledge_tool(
                             results = _search_dataset(
                                 cognee_store, ds, query, retrieval_strategy,
                                 limit=10, session_id=session_id,
+                                conversation_context=conversation_context,
                             )
                             all_results.extend(results)
                         except Exception:
@@ -330,6 +379,7 @@ def make_search_knowledge_tool(
                     raw_docs = _search_dataset(
                         cognee_store, dataset, query, retrieval_strategy,
                         limit=10, session_id=session_id,
+                        conversation_context=conversation_context,
                     )
             else:
                 # Fallback: use router (no dataset scoping)

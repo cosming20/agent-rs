@@ -8,6 +8,8 @@ import time
 import uuid
 from typing import Any
 
+from opentelemetry import trace
+
 from haystack import Document
 from haystack.components.agents import Agent
 from haystack.dataclasses import ChatMessage
@@ -16,7 +18,6 @@ from agentic_ra.agent.agent import build_agent_with_tools
 from agentic_ra.agent.memory import MemoryStore
 from agentic_ra.agent.synthesis import ResponseSynthesizer, SynthesizedResponse
 from agentic_ra.agent.tools import (
-    _sanitize_user_id,
     make_fetch_url_tool,
     make_ingest_tool,
     make_remember_tool,
@@ -25,19 +26,25 @@ from agentic_ra.agent.tools import (
     make_search_web_tool,
 )
 from agentic_ra.agent.feedback import FeedbackAdapter, confidence_to_score
-from agentic_ra.agent.verifier import GroundingVerifier
+from agentic_ra.agent.verifier import GroundingVerifier, VerificationResult
 from agentic_ra.core.config import get_settings
 from agentic_ra.core.errors import OrchestratorError
+from agentic_ra.retrieval.router import RetrievalStrategy
 from agentic_ra.retrieval.strategy_learner import StrategyLearner
 from agentic_ra.tools.budgets import WebToolBudget
 from agentic_ra.tools.mcp_http_client import MCPHttpClient
 from agentic_ra.tools.url_safety import URLValidator
 from agentic_ra.observability.cost_tracker import get_tracker
 from agentic_ra.observability.metrics import RAGMetrics
+from agentic_ra.observability.tracing import get_tracer
 from agentic_ra.stores.postgres.models import MessageRole
 from agentic_ra.stores.postgres.runs import RunStore
 
 logger = logging.getLogger(__name__)
+
+# Tuning constants for context building
+_CONTEXT_MAX_MESSAGES = 4
+_CONTEXT_MAX_CHARS_PER_MSG = 150
 
 
 class AgentOrchestrator:
@@ -98,7 +105,40 @@ class AgentOrchestrator:
         role: str = "user",
     ) -> SynthesizedResponse:
         """Process a user query through the agent + quality gate pipeline."""
+        tracer = get_tracer()
+        with tracer.start_as_current_span(
+            "orchestrator.process_query",
+            attributes={
+                "query": query[:200],
+                "session_id": str(session_id),
+                "user_id": user_id,
+                "strategy": strategy,
+            },
+        ) as root_span:
+            return await self._process_query_traced(
+                query, session_id, user_id, strategy, limit, role, root_span,
+            )
+
+    async def _process_query_traced(
+        self,
+        query: str,
+        session_id: uuid.UUID,
+        user_id: str,
+        strategy: str,
+        limit: int,
+        role: str,
+        root_span: trace.Span,
+    ) -> SynthesizedResponse:
+        """Inner query processing with tracing spans."""
+        tracer = get_tracer()
         try:
+            # Validate strategy against enum to prevent prompt injection
+            try:
+                RetrievalStrategy(strategy)
+            except ValueError:
+                logger.warning("Invalid strategy %r, falling back to hybrid", strategy)
+                strategy = "hybrid"
+
             if self._metrics:
                 self._metrics.record_query(strategy)
 
@@ -112,35 +152,102 @@ class AgentOrchestrator:
             )
 
             # 2. Load conversation history as ChatMessages
-            db_messages = await self._memory.get_messages(session_id, limit=10)
-            chat_messages: list[ChatMessage] = []
-            for msg in db_messages[:-1]:
-                if msg.role == MessageRole.USER:
-                    chat_messages.append(ChatMessage.from_user(msg.content))
-                elif msg.role == MessageRole.ASSISTANT:
-                    chat_messages.append(ChatMessage.from_assistant(msg.content))
-            # Strategy prediction (Loop 2)
-            # Compute embedding once and reuse for both predict() and record()
-            query_embedding: list[float] | None = None
-            if self._strategy_learner and strategy == "hybrid":
-                query_embedding = self._strategy_learner.embed_query(query)
-                predicted = await self._strategy_learner.predict(
-                    query, query_embedding=query_embedding
-                )
-                if predicted != strategy:
-                    logger.info(
-                        "Strategy learner: %s → %s", strategy, predicted
-                    )
-                    if self._metrics:
-                        self._metrics.record_strategy_prediction(
-                            predicted, strategy, was_override=True
-                        )
-                    strategy = predicted
+            with tracer.start_as_current_span("orchestrator.load_memory") as mem_span:
+                db_messages = await self._memory.get_messages(session_id, limit=10)
+                chat_messages: list[ChatMessage] = []
+                for msg in db_messages[:-1]:
+                    if msg.role == MessageRole.USER:
+                        chat_messages.append(ChatMessage.from_user(msg.content))
+                    elif msg.role == MessageRole.ASSISTANT:
+                        chat_messages.append(ChatMessage.from_assistant(msg.content))
+                mem_span.set_attribute("history_messages", len(chat_messages))
 
-            # Inject strategy hint into the user message
-            hint = (
-                f"\n\n[System hint: prefer '{strategy}' search strategy for this query]"
-            )
+                # 2b. Inject long-term memories as context
+                try:
+                    memories = await self._memory.get_memories(user_id=user_id, limit=20)
+                    if memories:
+                        memory_lines = [f"- {m.key}: {m.value}" for m in memories]
+                        memory_context = (
+                            "[User's stored memories]\n"
+                            + "\n".join(memory_lines)
+                        )
+                        chat_messages.insert(0, ChatMessage.from_system(memory_context))
+                        logger.info("Injected %d long-term memories", len(memories))
+                    mem_span.set_attribute("long_term_memories", len(memories) if memories else 0)
+                except Exception:
+                    logger.warning("Failed to load long-term memories", exc_info=True)
+                    mem_span.set_attribute("long_term_memories", 0)
+                    mem_span.set_attribute("memory_load_error", True)
+
+            # Strategy prediction (Loop 2)
+            query_embedding: list[float] | None = None
+            strategy_reason = ""
+            if self._strategy_learner and strategy == "hybrid":
+                with tracer.start_as_current_span("orchestrator.strategy_prediction") as strat_span:
+                    query_embedding = self._strategy_learner.embed_query(query)
+                    prediction = await self._strategy_learner.predict(
+                        query, query_embedding=query_embedding
+                    )
+                    predicted_str = prediction.strategy.value
+                    strat_span.set_attribute("original_strategy", strategy)
+                    strat_span.set_attribute("predicted_strategy", predicted_str)
+                    strat_span.set_attribute("prediction_reason", prediction.reason)
+                    strategy_reason = prediction.reason
+                    if predicted_str != strategy:
+                        logger.info(
+                            "Strategy learner: %s → %s (%s)",
+                            strategy, predicted_str, prediction.reason,
+                        )
+                        if self._metrics:
+                            self._metrics.record_strategy_prediction(
+                                predicted_str, strategy, was_override=True
+                            )
+                        strategy = predicted_str
+
+            # Failure memory lookup (FB → AT: warn about similar past failures)
+            failure_warning = ""
+            if self._strategy_learner and query_embedding is not None:
+                try:
+                    failures = await self._strategy_learner.find_similar_failures(
+                        query_embedding, limit=3,
+                    )
+                    if failures:
+                        # FailureRecord.strategy is already validated RetrievalStrategy
+                        failed_strategies = {f.strategy.value for f in failures}
+                        failure_warning = (
+                            f"Warning: similar queries previously failed with "
+                            f"strategies: {', '.join(sorted(failed_strategies))}. "
+                            f"Try a different strategy or broaden your search."
+                        )
+                        logger.info(
+                            "Failure memory: %d similar failures found (%s)",
+                            len(failures), ", ".join(sorted(failed_strategies)),
+                        )
+                except Exception:
+                    logger.warning("Failure memory lookup failed", exc_info=True)
+
+            # Build conversation context for search augmentation (S → C)
+            # Filter to USER/ASSISTANT only — exclude system messages (e.g. memories)
+            conversation_context = ""
+            if chat_messages:
+                ctx_parts: list[str] = []
+                user_assistant_msgs = [
+                    m for m in chat_messages
+                    if hasattr(m, "role") and m.role.value in ("user", "assistant")
+                ]
+                for msg in user_assistant_msgs[-_CONTEXT_MAX_MESSAGES:]:
+                    text = msg.text if hasattr(msg, "text") and msg.text else ""
+                    if text:
+                        ctx_parts.append(text[:_CONTEXT_MAX_CHARS_PER_MSG])
+                conversation_context = " | ".join(ctx_parts)
+
+            # Inject strategy hint with reasoning into the user message (FB → AT)
+            hint_parts = [f"prefer '{strategy}' search strategy"]
+            if strategy_reason:
+                hint_parts.append(strategy_reason)
+            if failure_warning:
+                hint_parts.append(failure_warning)
+            hint = "\n\n[System hint: " + ". ".join(hint_parts) + "]"
             chat_messages.append(ChatMessage.from_user(query + hint))
 
             # 3. Build per-request tools — use configured dataset
@@ -167,6 +274,7 @@ class AgentOrchestrator:
                     role=role,
                     evidence_accumulator=kb_evidence,
                     session_id=str(session_id),
+                    conversation_context=conversation_context,
                 ),
                 make_search_web_tool(
                     brave_client=self._brave_client,
@@ -197,26 +305,28 @@ class AgentOrchestrator:
             agent = build_agent_with_tools(self._base_agent, tools_config)
 
             # 4. Run Haystack Agent (offloaded to thread — Agent.run is sync)
-            #    Haystack's agent snapshot code tries to serialize tool functions
-            #    on pipeline errors.  Our closure-based tools can't be serialized,
-            #    so we catch SerializationError and fall back to evidence already
-            #    accumulated by the tool closures.
+            #    Haystack's auto-tracing covers Agent.run() and tool calls.
             kb_evidence.clear()
             web_evidence.clear()
             agent_result: dict[str, Any] | None = None
-            agent_start = time.monotonic()
-            try:
-                agent_result = await asyncio.to_thread(
-                    agent.run, messages=chat_messages
-                )
-            except Exception as agent_err:
-                err_name = type(agent_err).__name__
-                logger.error(
-                    "Agent run failed (%s): %s — using accumulated evidence",
-                    err_name,
-                    str(agent_err)[:200],
-                )
-            agent_latency_ms = int((time.monotonic() - agent_start) * 1000)
+            with tracer.start_as_current_span("orchestrator.agent_run") as agent_span:
+                agent_start = time.monotonic()
+                try:
+                    agent_result = await asyncio.to_thread(
+                        agent.run, messages=chat_messages
+                    )
+                except Exception as agent_err:
+                    err_name = type(agent_err).__name__
+                    agent_span.set_attribute("error", True)
+                    agent_span.set_attribute("error.type", err_name)
+                    logger.error(
+                        "Agent run failed (%s): %s — using accumulated evidence",
+                        err_name,
+                        str(agent_err)[:200],
+                    )
+                agent_latency_ms = int((time.monotonic() - agent_start) * 1000)
+                agent_span.set_attribute("latency_ms", agent_latency_ms)
+                agent_span.set_attribute("success", agent_result is not None)
 
             # 4b. Record agent LLM costs from response metadata
             self._record_agent_costs(
@@ -224,29 +334,56 @@ class AgentOrchestrator:
             )
 
             # 5. Extract answer and evidence (accumulated via closure)
-            answer = (
-                self._extract_answer(agent_result)
-                if agent_result is not None
-                else "I was unable to generate an answer due to a processing error."
-            )
+            if agent_result is not None:
+                answer = self._extract_answer(agent_result)
+            else:
+                answer = "I was unable to generate an answer due to a processing error."
+                root_span.set_attribute("agent_crashed", True)
 
             # 5b. Fuse KB + web evidence
-            fused_pack = self._ranker.fuse_evidence(
-                kb_documents=kb_evidence,
-                web_documents=web_evidence,
-                query=query,
-            )
-            evidence = list(fused_pack.documents)
+            with tracer.start_as_current_span("orchestrator.evidence_fusion") as fuse_span:
+                fused_pack = self._ranker.fuse_evidence(
+                    kb_documents=kb_evidence,
+                    web_documents=web_evidence,
+                    query=query,
+                )
+                evidence = list(fused_pack.documents)
+                fuse_span.set_attribute("kb_raw", len(kb_evidence))
+                fuse_span.set_attribute("web_raw", len(web_evidence))
+                fuse_span.set_attribute("fused", len(evidence))
+                fuse_span.set_attribute("strategy", strategy)
 
-            elapsed_ms = (time.monotonic() - start) * 1000
+            elapsed_ms = int((time.monotonic() - start) * 1000)
+
+            if not evidence:
+                logger.warning(
+                    "ZERO EVIDENCE after retrieval — "
+                    "kb_raw=%d, web_raw=%d, fused=%d, strategy=%s, "
+                    "agent_ok=%s, query=%.100s",
+                    len(kb_evidence),
+                    len(web_evidence),
+                    len(fused_pack.documents),
+                    strategy,
+                    agent_result is not None,
+                    query,
+                )
+            else:
+                logger.info(
+                    "Evidence collected: kb=%d, web=%d, fused=%d, strategy=%s",
+                    len(kb_evidence), len(web_evidence), len(evidence), strategy,
+                )
 
             if self._metrics:
                 self._metrics.record_retrieval(elapsed_ms, len(evidence), strategy)
 
             # 6. Verify grounding (offloaded — verify() calls LLM synchronously)
-            verification = await asyncio.to_thread(
-                self._verifier.verify, answer=answer, evidence=evidence
-            )
+            with tracer.start_as_current_span("orchestrator.verification") as ver_span:
+                verification = await asyncio.to_thread(
+                    self._verifier.verify, answer=answer, evidence=evidence
+                )
+                ver_span.set_attribute("is_grounded", verification.is_grounded)
+                ver_span.set_attribute("confidence", verification.confidence)
+                ver_span.set_attribute("evidence_count", len(evidence))
             if self._metrics:
                 self._metrics.record_verification(
                     verification.confidence, verification.is_grounded
@@ -258,51 +395,89 @@ class AgentOrchestrator:
                 self._verifier.needs_retry(verification) and retries < self._max_retries
             ):
                 retries += 1
-                logger.info(
-                    "Grounding failed (confidence=%.3f), retry %d/%d",
-                    verification.confidence,
-                    retries,
-                    self._max_retries,
-                )
-                if self._metrics:
-                    self._metrics.record_stage2_retry()
+                with tracer.start_as_current_span(
+                    "orchestrator.retry",
+                    attributes={"retry_number": retries},
+                ) as retry_span:
+                    logger.warning(
+                        "Grounding failed — confidence=%.3f, is_grounded=%s, "
+                        "evidence=%d, retry %d/%d, query=%.100s",
+                        verification.confidence,
+                        verification.is_grounded,
+                        len(evidence),
+                        retries,
+                        self._max_retries,
+                        query,
+                    )
+                    if self._metrics:
+                        self._metrics.record_stage2_retry()
 
-                feedback = ChatMessage.from_user(
-                    "Your previous answer was not well-grounded in the evidence. "
-                    "Please search again with a broader strategy (try 'graph_hybrid') "
-                    "and provide a more evidence-based answer."
-                )
-                retry_messages = chat_messages + [
-                    ChatMessage.from_assistant(answer),
-                    feedback,
-                ]
-                kb_evidence.clear()
-                web_evidence.clear()
-                try:
-                    agent_result = await asyncio.to_thread(
-                        agent.run, messages=retry_messages
+                    feedback = ChatMessage.from_user(
+                        "Your previous answer was not well-grounded in the evidence. "
+                        "Please search again with a broader strategy (try 'graph_hybrid') "
+                        "and provide a more evidence-based answer."
                     )
-                    answer = self._extract_answer(agent_result)
-                    fused_pack = self._ranker.fuse_evidence(
-                        kb_documents=kb_evidence,
-                        web_documents=web_evidence,
-                        query=query,
-                    )
-                    evidence = list(fused_pack.documents)
-                    verification = await asyncio.to_thread(
-                        self._verifier.verify, answer=answer, evidence=evidence
-                    )
-                except Exception as retry_err:
-                    logger.error("Retry failed: %s", str(retry_err)[:200])
+                    retry_messages = chat_messages + [
+                        ChatMessage.from_assistant(answer),
+                        feedback,
+                    ]
+                    kb_evidence.clear()
+                    web_evidence.clear()
+                    try:
+                        agent_result = await asyncio.to_thread(
+                            agent.run, messages=retry_messages
+                        )
+                        answer = self._extract_answer(agent_result)
+                        fused_pack = self._ranker.fuse_evidence(
+                            kb_documents=kb_evidence,
+                            web_documents=web_evidence,
+                            query=query,
+                        )
+                        evidence = list(fused_pack.documents)
+                        retry_span.set_attribute("retry_evidence", len(evidence))
+                        logger.info(
+                            "Retry %d evidence: kb=%d, web=%d, fused=%d",
+                            retries, len(kb_evidence), len(web_evidence), len(evidence),
+                        )
+                        verification = await asyncio.to_thread(
+                            self._verifier.verify, answer=answer, evidence=evidence
+                        )
+                        retry_span.set_attribute("retry_grounded", verification.is_grounded)
+                    except Exception as retry_err:
+                        retry_span.set_attribute("error", True)
+                        logger.error(
+                            "Retry %d failed (%s): %s",
+                            retries, type(retry_err).__name__, str(retry_err)[:200],
+                        )
+                        # Force ungrounded state so synthesis doesn't claim grounded
+                        verification = VerificationResult(
+                            is_grounded=False,
+                            confidence=0.0,
+                            reasoning=f"Retry {retries} failed: {type(retry_err).__name__}",
+                        )
+                        break
 
             # 8. Synthesize citations
-            response = self._synthesizer.synthesize(
-                answer=answer,
-                evidence=evidence,
-                query=query,
-                verification=verification,
-                strategy=strategy,
-            )
+            with tracer.start_as_current_span("orchestrator.synthesis") as syn_span:
+                response = self._synthesizer.synthesize(
+                    answer=answer,
+                    evidence=evidence,
+                    query=query,
+                    verification=verification,
+                    strategy=strategy,
+                )
+                syn_span.set_attribute("citation_count", len(response.citations))
+                syn_span.set_attribute("is_grounded", response.is_grounded)
+                syn_span.set_attribute("confidence", response.confidence)
+
+            # Record final outcome on root span
+            root_span.set_attribute("result.confidence", response.confidence)
+            root_span.set_attribute("result.is_grounded", response.is_grounded)
+            root_span.set_attribute("result.citations", len(response.citations))
+            root_span.set_attribute("result.evidence", len(evidence))
+            root_span.set_attribute("result.retries", retries)
+            root_span.set_attribute("result.strategy", strategy)
+            root_span.set_attribute("result.elapsed_ms", elapsed_ms)
 
             # 9. Persist pipeline run
             if self._run_store:

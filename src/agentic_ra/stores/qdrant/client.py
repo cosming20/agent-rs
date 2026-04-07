@@ -99,6 +99,7 @@ class QdrantStore:
         query_vector: list[float],
         limit: int = 20,
         score_threshold: float | None = None,
+        query_filter: models.Filter | None = None,
     ) -> list[dict[str, object]]:
         """Vector similarity search returning raw payload dicts.
 
@@ -107,6 +108,7 @@ class QdrantStore:
             query_vector: Query embedding.
             limit: Maximum results to return.
             score_threshold: Optional minimum similarity score cutoff.
+            query_filter: Optional Qdrant filter for server-side payload filtering.
 
         Returns:
             List of payload dicts from matching points, each enriched with
@@ -121,6 +123,8 @@ class QdrantStore:
             }
             if score_threshold is not None:
                 kwargs["score_threshold"] = score_threshold
+            if query_filter is not None:
+                kwargs["query_filter"] = query_filter
 
             results = await self._client.search(**kwargs)  # type: ignore[arg-type, attr-defined]
 

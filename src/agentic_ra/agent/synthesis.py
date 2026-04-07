@@ -36,7 +36,10 @@ class SynthesizedResponse:
         answer: The synthesized answer text.
         citations: Source citations supporting the answer.
         query: Original user query.
-        confidence: Verification confidence score.
+        confidence: User-facing answer quality score. Semantics:
+            - 0.0: no evidence available (unknown quality)
+            - close to 0.0: verifier is confident the answer is ungrounded
+            - close to 1.0: verifier is confident the answer is well-grounded
         is_grounded: Whether the answer passed grounding verification.
         strategy: Retrieval strategy used.
     """
@@ -99,8 +102,13 @@ class ResponseSynthesizer:
             # about this grounding assessment"), not answer quality.  When the
             # answer is ungrounded, high verifier confidence means "I'm very
             # sure this is bad" — invert for user-facing semantics.
+            #
+            # Special case: confidence=0.0 means "no evidence to assess" —
+            # keep it at 0.0 (unknown quality), don't invert to 1.0.
             if verification.is_grounded:
                 answer_confidence = verification.confidence
+            elif verification.confidence < 1e-9:
+                answer_confidence = 0.0
             else:
                 answer_confidence = 1.0 - verification.confidence
 

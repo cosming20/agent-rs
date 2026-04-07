@@ -102,6 +102,8 @@ class ParsedDocument(Base):
     )
     docling_json: Mapped[dict[str, Any]] = mapped_column(JSONB)
     chunk_count: Mapped[int] = mapped_column(Integer)
+    chunks_added: Mapped[int] = mapped_column(Integer, default=0)
+    cognify_done: Mapped[bool] = mapped_column(default=False)
     metadata_: Mapped[dict[str, Any]] = mapped_column(
         "metadata",
         JSONB,

@@ -5,17 +5,68 @@ from __future__ import annotations
 import logging
 import uuid
 from collections import defaultdict
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 
 from haystack.components.embedders import OpenAITextEmbedder
 from haystack.utils import Secret
 
 from agentic_ra.core.errors import EmbeddingError
+from agentic_ra.retrieval.router import RetrievalStrategy
 from agentic_ra.stores.qdrant.client import QdrantStore
 
 logger = logging.getLogger(__name__)
 
-_DEFAULT_STRATEGY = "hybrid"
+_DEFAULT_STRATEGY = RetrievalStrategy.HYBRID
+
+
+@dataclass(frozen=True)
+class StrategyPrediction:
+    """Result of a strategy prediction with reasoning.
+
+    Attributes:
+        strategy: The predicted retrieval strategy.
+        reason: Human-readable explanation of why this strategy was chosen.
+        avg_confidence: Average confidence of similar past queries using this strategy.
+        sample_count: Number of similar past queries this prediction is based on.
+    """
+
+    strategy: RetrievalStrategy
+    reason: str
+    avg_confidence: float = 0.0
+    sample_count: int = 0
+
+    def __post_init__(self) -> None:
+        if not 0.0 <= self.avg_confidence <= 1.0:
+            logger.warning(
+                "StrategyPrediction avg_confidence=%.4f out of range, clamping",
+                self.avg_confidence,
+            )
+            object.__setattr__(
+                self, "avg_confidence",
+                max(0.0, min(1.0, self.avg_confidence)),
+            )
+        if self.sample_count < 0:
+            logger.warning(
+                "StrategyPrediction sample_count=%d negative, resetting to 0",
+                self.sample_count,
+            )
+            object.__setattr__(self, "sample_count", 0)
+
+
+@dataclass(frozen=True)
+class FailureRecord:
+    """A past query that failed grounding verification.
+
+    Attributes:
+        strategy: The retrieval strategy that was used.
+        confidence: Verifier confidence score at the time.
+        evidence_count: Number of evidence documents retrieved.
+    """
+
+    strategy: RetrievalStrategy
+    confidence: float
+    evidence_count: int
 
 
 def _parse_dt(val: object) -> datetime | None:
@@ -32,6 +83,15 @@ def _parse_dt(val: object) -> datetime | None:
         return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
     except (ValueError, TypeError):
         return None
+
+
+def _to_strategy(val: object) -> RetrievalStrategy:
+    """Safely convert a stored strategy string to RetrievalStrategy enum."""
+    try:
+        return RetrievalStrategy(str(val))
+    except ValueError:
+        logger.warning("Unknown strategy value %r, using default", val)
+        return _DEFAULT_STRATEGY
 
 
 class QueryEmbedder:
@@ -143,8 +203,8 @@ class StrategyLearner:
 
     async def predict(
         self, query: str, query_embedding: list[float] | None = None
-    ) -> str:
-        """Predict the best strategy for a query.
+    ) -> StrategyPrediction:
+        """Predict the best strategy for a query with reasoning.
 
         Returns the default strategy when there is insufficient historical data
         or when no strategy clearly outperforms the default.
@@ -155,7 +215,7 @@ class StrategyLearner:
                 recomputing when the caller already has one.
 
         Returns:
-            Strategy name string (e.g. ``"hybrid"``, ``"graph_hybrid"``).
+            StrategyPrediction with strategy name and reasoning.
         """
         try:
             embedding = query_embedding or self._embedder.embed_query(query)
@@ -172,7 +232,11 @@ class StrategyLearner:
                     len(results),
                     self._min_neighbors,
                 )
-                return _DEFAULT_STRATEGY
+                return StrategyPrediction(
+                    strategy=_DEFAULT_STRATEGY,
+                    reason="Insufficient historical data for prediction",
+                    sample_count=len(results),
+                )
 
             cutoff = datetime.now(timezone.utc) - timedelta(days=self._max_age_days)
             recent = [
@@ -186,47 +250,116 @@ class StrategyLearner:
                     len(recent),
                     self._min_neighbors,
                 )
-                return _DEFAULT_STRATEGY
+                return StrategyPrediction(
+                    strategy=_DEFAULT_STRATEGY,
+                    reason="Too few recent results for prediction",
+                    sample_count=len(recent),
+                )
 
             strategy_scores: dict[str, list[float]] = defaultdict(list)
             for r in recent:
-                strategy = str(r.get("strategy", _DEFAULT_STRATEGY))
+                strategy = str(r.get("strategy", _DEFAULT_STRATEGY.value))
                 raw_conf = r.get("confidence", 0.0)
                 confidence = float(raw_conf) if isinstance(raw_conf, (int, float)) else 0.0
                 strategy_scores[strategy].append(confidence)
 
-            best_strategy = _DEFAULT_STRATEGY
+            best_strategy = _DEFAULT_STRATEGY.value
             best_avg = 0.0
             default_avg = 0.0
 
             for strategy, scores in strategy_scores.items():
                 avg = sum(scores) / len(scores)
-                if strategy == _DEFAULT_STRATEGY:
+                if strategy == _DEFAULT_STRATEGY.value:
                     default_avg = avg
                 if avg > best_avg:
                     best_avg = avg
                     best_strategy = strategy
 
             if (
-                best_strategy != _DEFAULT_STRATEGY
+                best_strategy != _DEFAULT_STRATEGY.value
                 and (best_avg - default_avg) >= self._confidence_threshold
             ):
+                resolved = _to_strategy(best_strategy)
                 logger.info(
                     "Strategy prediction: %s (avg=%.2f) over default %s (avg=%.2f)",
-                    best_strategy,
+                    resolved.value,
                     best_avg,
-                    _DEFAULT_STRATEGY,
+                    _DEFAULT_STRATEGY.value,
                     default_avg,
                 )
-                return best_strategy
+                return StrategyPrediction(
+                    strategy=resolved,
+                    reason=(
+                        f"Similar past queries achieved avg confidence {best_avg:.0%} "
+                        f"with '{resolved.value}' vs {default_avg:.0%} with default"
+                    ),
+                    avg_confidence=best_avg,
+                    sample_count=len(recent),
+                )
 
-            return _DEFAULT_STRATEGY
+            return StrategyPrediction(
+                strategy=_DEFAULT_STRATEGY,
+                reason=f"Default strategy ({len(recent)} similar queries, avg confidence {default_avg:.0%})",
+                avg_confidence=default_avg,
+                sample_count=len(recent),
+            )
 
         except EmbeddingError:
             raise
         except Exception:
             logger.exception("Strategy prediction failed, using default")
-            return _DEFAULT_STRATEGY
+            return StrategyPrediction(
+                strategy=_DEFAULT_STRATEGY, reason="Prediction failed, using default"
+            )
+
+    async def find_similar_failures(
+        self,
+        query_embedding: list[float],
+        limit: int = 5,
+    ) -> list[FailureRecord]:
+        """Find similar past queries that failed grounding.
+
+        Searches the strategy collection for queries similar to the given
+        embedding where ``is_grounded`` was False. Used to warn the agent
+        about known failure patterns.
+
+        Args:
+            query_embedding: Pre-computed embedding of the current query.
+            limit: Maximum number of failures to return.
+
+        Returns:
+            List of FailureRecord instances from similar past failures.
+        """
+        try:
+            from qdrant_client import models as qmodels
+
+            results = await self._qdrant.search(
+                collection=self._collection,
+                query_vector=query_embedding,
+                limit=limit,
+                query_filter=qmodels.Filter(
+                    must=[
+                        qmodels.FieldCondition(
+                            key="is_grounded",
+                            match=qmodels.MatchValue(value=False),
+                        ),
+                    ],
+                ),
+            )
+
+            records: list[FailureRecord] = []
+            for r in results:
+                raw_conf = r.get("confidence", 0.0)
+                raw_evi = r.get("evidence_count", 0)
+                records.append(FailureRecord(
+                    strategy=_to_strategy(r.get("strategy", "unknown")),
+                    confidence=float(raw_conf) if isinstance(raw_conf, (int, float)) else 0.0,
+                    evidence_count=int(raw_evi) if isinstance(raw_evi, (int, float)) else 0,
+                ))
+            return records
+        except Exception:
+            logger.warning("Failed to query failure memory", exc_info=True)
+            return []
 
     async def record(
         self,

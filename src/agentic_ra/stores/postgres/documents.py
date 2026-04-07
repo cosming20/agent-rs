@@ -5,7 +5,7 @@ from __future__ import annotations
 import uuid
 from typing import Any
 
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.exc import SQLAlchemyError
 
 from agentic_ra.core.errors import PostgresError
@@ -152,6 +152,58 @@ class DocumentStore:
             raise PostgresError(
                 "Failed to list user datasets",
                 operation="list_user_datasets",
+                original_error=str(e),
+            ) from e
+
+    async def update_progress(
+        self,
+        doc_id: uuid.UUID,
+        chunks_added: int,
+        cognify_done: bool = False,
+    ) -> None:
+        """Update ingestion progress for a parsed document.
+
+        Called after each batch of chunks is added to Cognee, and again
+        when cognify completes.  Enables resume on crash.
+        """
+        try:
+            stmt = (
+                update(ParsedDocument)
+                .where(ParsedDocument.id == doc_id)
+                .values(chunks_added=chunks_added, cognify_done=cognify_done)
+            )
+            async with self._pg.session() as session:
+                await session.execute(stmt)
+                await session.commit()
+        except SQLAlchemyError as e:
+            raise PostgresError(
+                "Failed to update ingestion progress",
+                doc_id=str(doc_id),
+                operation="update_progress",
+                original_error=str(e),
+            ) from e
+
+    async def get_incomplete(self, user_id: str = ANONYMOUS_USER_ID) -> list[ParsedDocument]:
+        """Get documents where ingestion didn't finish (for resume)."""
+        try:
+            stmt = (
+                select(ParsedDocument)
+                .where(
+                    ParsedDocument.user_id == user_id,
+                    ParsedDocument.cognify_done == False,  # noqa: E712
+                )
+                .order_by(ParsedDocument.created_at.asc())
+            )
+            async with self._pg.session() as session:
+                result = await session.execute(stmt)
+                entries = list(result.scalars().all())
+                for entry in entries:
+                    session.expunge(entry)
+                return entries
+        except SQLAlchemyError as e:
+            raise PostgresError(
+                "Failed to get incomplete documents",
+                operation="get_incomplete",
                 original_error=str(e),
             ) from e
 

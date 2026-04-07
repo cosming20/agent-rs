@@ -861,14 +861,14 @@ async def test_strategy_predict_cold_start() -> TestResult:
             confidence_threshold=STRATEGY_CONFIDENCE_THRESHOLD,
         )
 
-        predicted = await learner.predict("test cold start query")
+        prediction = await learner.predict("test cold start query")
 
         await qdrant.close()
 
-        if predicted != STRATEGY_DEFAULT:
+        if prediction.strategy.value != STRATEGY_DEFAULT:
             return TestResult(
                 False,
-                f"Cold start predicted '{predicted}', expected '{STRATEGY_DEFAULT}'",
+                f"Cold start predicted '{prediction.strategy.value}', expected '{STRATEGY_DEFAULT}'",
                 category="loop2_learner", loops=(2,),
             )
 
@@ -959,14 +959,14 @@ async def test_strategy_predict_with_data() -> TestResult:
         )
 
         # Query with a similar sentence
-        predicted = await learner.predict("Ce prevede articolul penal")
+        prediction = await learner.predict("Ce prevede articolul penal")
 
         await qdrant.close()
 
-        if predicted != "graph":
+        if prediction.strategy.value != "graph":
             return TestResult(
                 False,
-                f"Expected 'graph' with seeded data, got '{predicted}'",
+                f"Expected 'graph' with seeded data, got '{prediction.strategy.value}'",
                 category="loop2_learner", loops=(2,),
             )
 
@@ -1040,14 +1040,14 @@ async def test_strategy_predict_threshold() -> TestResult:
             confidence_threshold=STRATEGY_CONFIDENCE_THRESHOLD,
         )
 
-        predicted = await learner.predict("test query for threshold check")
+        prediction = await learner.predict("test query for threshold check")
 
         await qdrant.close()
 
-        if predicted != STRATEGY_DEFAULT:
+        if prediction.strategy.value != STRATEGY_DEFAULT:
             return TestResult(
                 False,
-                f"Expected default '{STRATEGY_DEFAULT}' when no strategy beats threshold, got '{predicted}'",
+                f"Expected default '{STRATEGY_DEFAULT}' when no strategy beats threshold, got '{prediction.strategy.value}'",
                 category="loop2_learner", loops=(2,),
             )
 
@@ -1119,14 +1119,14 @@ async def test_strategy_predict_age_filter() -> TestResult:
             max_age_days=STRATEGY_MAX_AGE_DAYS,
         )
 
-        predicted = await learner.predict("test query for age filter check")
+        prediction = await learner.predict("test query for age filter check")
 
         await qdrant.close()
 
-        if predicted != STRATEGY_DEFAULT:
+        if prediction.strategy.value != STRATEGY_DEFAULT:
             return TestResult(
                 False,
-                f"Expected default '{STRATEGY_DEFAULT}' for old data, got '{predicted}'",
+                f"Expected default '{STRATEGY_DEFAULT}' for old data, got '{prediction.strategy.value}'",
                 category="loop2_learner", loops=(2,),
             )
 

@@ -123,10 +123,10 @@ class GroundingVerifier:
     def needs_retry(self, result: VerificationResult) -> bool:
         """Determine if the answer should trigger a Stage-2 retrieval retry.
 
-        Only retries when grounding failed despite having evidence.
-        Zero-evidence case (confidence=0.0) is not retried.
+        Retries on any ungrounded result — including zero-evidence cases,
+        where a broader retrieval strategy may succeed.
         """
-        return not result.is_grounded and result.confidence > 0.0
+        return not result.is_grounded
 
     def _verify_with_llm(
         self,
