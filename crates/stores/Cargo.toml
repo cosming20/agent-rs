@@ -1,0 +1,19 @@
+[package]
+name = "agent-rs-stores"
+version = "0.1.0"
+edition.workspace = true
+
+[dependencies]
+agent-rs-core = { workspace = true }
+async-trait = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+tokio = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }
+diesel = { workspace = true }
+diesel-async = { workspace = true }
+qdrant-client = { workspace = true }
+neo4rs = { workspace = true }
