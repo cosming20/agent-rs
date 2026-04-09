@@ -1,6 +1,5 @@
 """Async PostgreSQL client wrapping SQLAlchemy engine and session factory."""
 
-from __future__ import annotations
 
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager

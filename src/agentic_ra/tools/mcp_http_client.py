@@ -7,7 +7,6 @@ One MCPHttpClient instance per remote MCP server per app instance.
 See: https://modelcontextprotocol.io/specification/2025-06-18/basic/transports#streamable-http
 """
 
-from __future__ import annotations
 
 import logging
 from typing import Any

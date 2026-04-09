@@ -1,6 +1,5 @@
 """Short-term (session) and long-term (persistent) memory over Postgres."""
 
-from __future__ import annotations
 
 import uuid
 from typing import Any

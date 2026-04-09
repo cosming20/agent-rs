@@ -6,7 +6,6 @@ Flow:
   3. Postgres persists DoclingDocument JSON for provenance
 """
 
-from __future__ import annotations
 
 import asyncio
 import logging

@@ -8,7 +8,6 @@ footers, cookie banners). Falls back to markdownify if trafilatura
 returns None.
 """
 
-from __future__ import annotations
 
 import json
 import logging

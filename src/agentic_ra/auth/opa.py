@@ -1,6 +1,5 @@
 """OPA (Open Policy Agent) integration for request authorization."""
 
-from __future__ import annotations
 
 import logging
 from dataclasses import dataclass

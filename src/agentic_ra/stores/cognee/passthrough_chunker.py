@@ -6,7 +6,6 @@ chunk_size is set very high.  This chunker bypasses that entirely: each document
 becomes exactly one DocumentChunk, preserving our upstream chunking decisions.
 """
 
-from __future__ import annotations
 
 from uuid import NAMESPACE_OID, uuid5
 

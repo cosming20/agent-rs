@@ -1,6 +1,5 @@
 """Parsed document persistence — store and retrieve DoclingDocument JSON."""
 
-from __future__ import annotations
 
 import uuid
 from typing import Any

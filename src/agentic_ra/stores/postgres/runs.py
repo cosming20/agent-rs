@@ -1,6 +1,5 @@
 """Pipeline run persistence — track each RAG query execution."""
 
-from __future__ import annotations
 
 import uuid
 from datetime import datetime

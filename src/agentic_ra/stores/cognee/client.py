@@ -1,6 +1,5 @@
 """Cognee knowledge graph store — entity extraction, graph building, and graph-augmented search."""
 
-from __future__ import annotations
 
 import logging
 from typing import Any
@@ -26,16 +25,101 @@ class CogneeStore:
 
     Args:
         dataset: Default Cognee dataset name.
+        chunk_size: Maximum tokens per chunk passed to Cognee during cognify.
     """
 
-    def __init__(self, dataset: str = "agentic_rag") -> None:
+    def __init__(self, dataset: str = "agentic_rag", chunk_size: int = 16000) -> None:
         self._dataset = dataset
+        self._chunk_size = chunk_size
         # Use PassthroughChunker to prevent Cognee from re-chunking our
         # pre-chunked text.  Cognee's default TextChunker always runs
         # sentence-level tokenization which can split at boundaries.
         from agentic_ra.stores.cognee.passthrough_chunker import PassthroughChunker
 
         self._chunker = PassthroughChunker
+
+    @staticmethod
+    def _register_qdrant_adapter() -> None:
+        """Register the Qdrant community vector adapter with a compatibility shim.
+
+        Cognee 0.5.5 passes ``database_name`` to the adapter ``__init__``, but
+        the community adapter v0.1.0 doesn't accept it.  The shim absorbs the
+        extra kwarg until upstream fixes the mismatch.  It also overrides
+        ``get_qdrant_client`` to remove the hardcoded ``port=6333`` that
+        triggers "insecure connection" and version mismatch warnings, and
+        ``search`` to drop ``include_payload``/``node_name`` kwargs that
+        Cognee passes but the community adapter doesn't accept.
+        """
+        from cognee_community_vector_adapter_qdrant.register import (  # type: ignore[import-untyped]
+            QDrantAdapter as _BaseQDrantAdapter,
+            use_vector_adapter,
+        )
+
+        class _CompatQDrantAdapter(_BaseQDrantAdapter):  # type: ignore[misc]
+            """Shim: absorb extra kwargs Cognee 0.5.5 passes to adapter v0.1.0.
+
+            - ``__init__``: ignores ``database_name``
+            - ``search``: ignores ``include_payload``, ``node_name``
+            - ``get_qdrant_client``: removes hardcoded port=6333 that
+              triggers "insecure connection" and version mismatch warnings
+            """
+
+            def __init__(  # type: ignore[no-untyped-def]
+                self, *args: Any, database_name: str = "", **kwargs: Any
+            ) -> None:
+                super().__init__(*args, **kwargs)
+
+            def get_qdrant_client(self):  # type: ignore[no-untyped-def]
+                import warnings
+
+                from qdrant_client import AsyncQdrantClient
+
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore", UserWarning)
+                    if self.qdrant_path is not None:
+                        return AsyncQdrantClient(path=self.qdrant_path)
+                    elif self.url is not None:
+                        return AsyncQdrantClient(
+                            url=self.url,
+                            api_key=self.api_key,
+                            check_compatibility=False,
+                        )
+                    return AsyncQdrantClient(location=":memory:")
+
+            async def search(  # type: ignore[no-untyped-def]
+                self,
+                *args: Any,
+                include_payload: bool = True,
+                node_name: str | None = None,
+                **kwargs: Any,
+            ) -> list[Any]:
+                return await super().search(*args, **kwargs)
+
+        use_vector_adapter("qdrant", _CompatQDrantAdapter)
+
+    @staticmethod
+    def _register_ruvector_adapter() -> None:
+        """Register the RuVector vector adapter with Cognee."""
+        from agentic_ra.stores.ruvector.cognee_vector_adapter import (
+            RuVectorVectorAdapter,
+        )
+        from cognee.infrastructure.databases.vector.use_vector_adapter import (
+            use_vector_adapter,
+        )
+
+        use_vector_adapter("ruvector", RuVectorVectorAdapter)
+
+    @staticmethod
+    def _register_vector_adapter(provider: str) -> None:
+        """Register the appropriate vector adapter for Cognee.
+
+        Args:
+            provider: Vector backend identifier (``qdrant``, ``ruvector``).
+        """
+        if provider == "qdrant":
+            CogneeStore._register_qdrant_adapter()
+        elif provider == "ruvector":
+            CogneeStore._register_ruvector_adapter()
 
     def configure(
         self,
@@ -52,6 +136,8 @@ class CogneeStore:
         neo4j_user: str = "neo4j",
         neo4j_password: str = "",
         neo4j_db: str = "neo4j",
+        chunk_size: int = 16000,
+        chunk_overlap: int = 0,
     ) -> None:
         """Configure Cognee runtime settings programmatically.
 
@@ -71,69 +157,15 @@ class CogneeStore:
             neo4j_user: Neo4j username.
             neo4j_password: Neo4j password.
             neo4j_db: Neo4j database name.
+            chunk_size: Maximum tokens per chunk.  Smaller chunks improve
+                retrieval precision for structured documents (legal codes,
+                technical specs).  Stored as instance attribute.
+            chunk_overlap: Token overlap between consecutive chunks.
         """
+        self._chunk_size = chunk_size
+
         try:
-            # Register Qdrant community adapter if using qdrant.
-            # Cognee 0.5.5 passes `database_name` to adapter __init__, but the
-            # community adapter v0.1.0 doesn't accept it. We wrap the adapter
-            # to absorb the extra kwarg until upstream fixes the mismatch.
-            if vector_db_provider == "qdrant":
-                from cognee_community_vector_adapter_qdrant.register import (  # type: ignore[import-untyped]
-                    QDrantAdapter as _BaseQDrantAdapter,
-                    use_vector_adapter,
-                )
-
-                class _CompatQDrantAdapter(_BaseQDrantAdapter):  # type: ignore[misc]
-                    """Shim: absorb extra kwargs Cognee 0.5.5 passes to adapter v0.1.0.
-
-                    - ``__init__``: ignores ``database_name``
-                    - ``search``: ignores ``include_payload``, ``node_name``
-                    - ``get_qdrant_client``: removes hardcoded port=6333 that
-                      triggers "insecure connection" and version mismatch warnings
-                    """
-
-                    def __init__(  # type: ignore[no-untyped-def]
-                        self, *args: Any, database_name: str = "", **kwargs: Any
-                    ) -> None:
-                        super().__init__(*args, **kwargs)
-
-                    def get_qdrant_client(self):  # type: ignore[no-untyped-def]
-                        import warnings
-
-                        from qdrant_client import AsyncQdrantClient
-
-                        with warnings.catch_warnings():
-                            warnings.simplefilter("ignore", UserWarning)
-                            if self.qdrant_path is not None:
-                                return AsyncQdrantClient(path=self.qdrant_path)
-                            elif self.url is not None:
-                                return AsyncQdrantClient(
-                                    url=self.url,
-                                    api_key=self.api_key,
-                                    check_compatibility=False,
-                                )
-                            return AsyncQdrantClient(location=":memory:")
-
-                    async def search(  # type: ignore[no-untyped-def]
-                        self,
-                        *args: Any,
-                        include_payload: bool = True,
-                        node_name: str | None = None,
-                        **kwargs: Any,
-                    ) -> list[Any]:
-                        return await super().search(*args, **kwargs)
-
-                use_vector_adapter("qdrant", _CompatQDrantAdapter)
-
-            if vector_db_provider == "ruvector":
-                from agentic_ra.stores.ruvector.cognee_vector_adapter import (
-                    RuVectorVectorAdapter,
-                )
-                from cognee.infrastructure.databases.vector.use_vector_adapter import (
-                    use_vector_adapter,
-                )
-
-                use_vector_adapter("ruvector", RuVectorVectorAdapter)
+            self._register_vector_adapter(vector_db_provider)
 
             # LLM config
             cognee.config.set_llm_api_key(llm_api_key)
@@ -164,8 +196,8 @@ class CogneeStore:
             # structured documents (legal codes, technical specs, articles).
             # Default Cognee chunk size is too large, merging unrelated
             # sections into one embedding.
-            cognee.config.set_chunk_size(16000)
-            cognee.config.set_chunk_overlap(0)
+            cognee.config.set_chunk_size(chunk_size)
+            cognee.config.set_chunk_overlap(chunk_overlap)
 
             # Storage directories
             if data_root:
@@ -208,7 +240,7 @@ class CogneeStore:
             cognify_result = await cognee.cognify(
                 datasets=[ds],
                 chunker=self._chunker,
-                chunk_size=16000,
+                chunk_size=self._chunk_size,
             )
 
             logger.info(
@@ -272,7 +304,7 @@ class CogneeStore:
             cognify_result = await cognee.cognify(
                 datasets=[ds],
                 chunker=self._chunker,
-                chunk_size=16000,
+                chunk_size=self._chunk_size,
             )
 
             logger.info("Cognee cognify complete for dataset=%s", ds)
@@ -326,7 +358,7 @@ class CogneeStore:
         ds = dataset or self._dataset
         try:
             return await cognee.cognify(
-                datasets=[ds], chunker=self._chunker, chunk_size=16000
+                datasets=[ds], chunker=self._chunker, chunk_size=self._chunk_size
             )
         except Exception as e:
             raise CogneeError(

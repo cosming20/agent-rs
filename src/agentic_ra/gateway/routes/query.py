@@ -1,6 +1,5 @@
 """Query endpoint — main RAG query API."""
 
-from __future__ import annotations
 
 import uuid
 

@@ -7,7 +7,6 @@ Architecture:
   4. Store chunk metadata alongside embeddings
 """
 
-from __future__ import annotations
 
 import logging
 import re
@@ -127,8 +126,10 @@ class EmbeddingPipeline:
 
         Supports PDF, DOCX, PPTX, HTML, Markdown, images, and more.
         """
+        actual_source = self._maybe_preprocess_html(source)
+        # If preprocessing created a temp file, clean it up regardless of outcome.
+        temp_created = actual_source is not source and isinstance(actual_source, Path)
         try:
-            actual_source = self._maybe_preprocess_html(source)
             result = self._converter.convert(actual_source)
             docling_doc: DoclingDocument = result.document
 
@@ -152,6 +153,9 @@ class EmbeddingPipeline:
                 source=str(source),
                 original_error=str(e),
             ) from e
+        finally:
+            if temp_created:
+                Path(actual_source).unlink(missing_ok=True)  # type: ignore[arg-type]
 
     def chunk_html(self, html: str, source_path: str = "html_input") -> ChunkResult:
         """Parse an HTML string through the pipeline."""

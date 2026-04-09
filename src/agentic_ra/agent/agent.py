@@ -1,50 +1,16 @@
 """Haystack Agent builder — configures the ReACT tool-calling agent."""
 
-from __future__ import annotations
 
 import logging
 
 from haystack.components.agents import Agent
-from haystack.components.generators.chat import OpenAIChatGenerator
 from haystack.tools import Tool
-from haystack.utils import Secret
 
+from agentic_ra.agent.prompts import DEFAULT_SYSTEM_PROMPT
 from agentic_ra.agent.tools import ToolConfig
+from agentic_ra.core.llm import create_generator
 
 logger = logging.getLogger(__name__)
-
-_SYSTEM_PROMPT = """\
-You are an expert RAG agent. Your job is to answer questions accurately using \
-ONLY the evidence retrieved by your tools. Follow this approach:
-
-1. ANALYZE the query — determine what information is needed.
-2. SEARCH using the most appropriate strategy:
-   - Queries mentioning a specific article, section, or clause number → "keyword" first
-   - Simple factual questions → "semantic" or "keyword"
-   - Complex questions needing entity relationships → "graph"
-   - Most questions → "hybrid" (default, recommended)
-   - Multi-hop reasoning questions → "graph_hybrid"
-3. EVALUATE the results — check if the retrieved evidence actually answers the query.
-   - If results seem off-topic, retry with a DIFFERENT strategy (e.g. keyword for exact lookups).
-   - If still insufficient, use search_web as fallback.
-4. ANSWER based strictly on the evidence found.
-
-Rules:
-- ONLY state facts that appear explicitly in the retrieved evidence.
-- NEVER infer, guess, or extrapolate beyond what the evidence contains.
-- If the specific information requested is NOT in the evidence, say clearly: \
-"The requested information was not found in the knowledge base."
-- Always cite your sources by referencing the evidence chunks [1], [2], etc.
-- Only cite a chunk if the answer actually comes from that chunk.
-- Do not cite a chunk just because it was retrieved — only if it supports your claim.
-- Use search_knowledge first, search_web only if local knowledge is insufficient.
-- For multi-part questions, make multiple search calls with different queries.
-- Use remember(action='save', key=..., value=...) to save important facts: \
-user preferences, key findings from complex queries, or anything the user asks you to remember.
-- When answering complex questions, proactively save the synthesized answer as a memory \
-so future questions on the same topic can benefit from it.
-- Respond in the same language the user used.
-"""
 
 
 def build_agent(
@@ -53,7 +19,7 @@ def build_agent(
     api_key: str,
     tools_config: list[ToolConfig],
     max_steps: int = 10,
-    system_prompt: str = _SYSTEM_PROMPT,
+    system_prompt: str = DEFAULT_SYSTEM_PROMPT,
 ) -> Agent:
     """Build a Haystack Agent with the given tools and configuration."""
     haystack_tools: list[Tool] = []
@@ -70,13 +36,7 @@ def build_agent(
         )
         haystack_tools.append(tool)
 
-    # Strip provider prefix for OpenAIChatGenerator (e.g. "openai/gpt-4o" -> "gpt-4o")
-    bare_model = model.split("/", 1)[-1] if "/" in model else model
-    chat_generator = OpenAIChatGenerator(
-        model=bare_model,
-        api_key=Secret.from_token(api_key),
-        generation_kwargs={"temperature": 0.1},
-    )
+    chat_generator = create_generator(model=model, api_key=api_key, purpose="agent", temperature=0.1)
 
     agent = Agent(
         chat_generator=chat_generator,

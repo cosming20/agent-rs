@@ -9,7 +9,6 @@ Usage::
     # str: "Graph query failed [dataset='agentic_rag', operation='search']"
 """
 
-from __future__ import annotations
 
 
 class AgenticRAError(Exception):

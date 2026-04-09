@@ -1,6 +1,5 @@
 """Embedding-similarity strategy learner — predicts optimal retrieval strategy from past query performance."""
 
-from __future__ import annotations
 
 import logging
 import uuid

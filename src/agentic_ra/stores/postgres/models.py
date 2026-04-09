@@ -4,7 +4,6 @@ All models inherit from ``Base``. Alembic uses ``Base.metadata``
 for migration autogeneration.
 """
 
-from __future__ import annotations
 
 import enum
 import uuid

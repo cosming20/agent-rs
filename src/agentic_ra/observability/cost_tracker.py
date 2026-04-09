@@ -1,6 +1,5 @@
 """LiteLLM cost tracking callback — writes every LLM call to Postgres + logs."""
 
-from __future__ import annotations
 
 import asyncio
 import logging

@@ -17,41 +17,31 @@ Strategies:
   full Neo4j entity extraction forthcoming)
 """
 
-from __future__ import annotations
-
 import asyncio
-import enum
 import logging
 
 from haystack import Document
 
 from agentic_ra.core.errors import CogneeError, RoutingError
+from agentic_ra.retrieval.strategies import (
+    STRATEGY_REGISTRY,
+    RetrievalStrategy,
+    StrategyDescriptor,
+)
 from agentic_ra.stores.cognee.client import CogneeStore
 
+# Re-export for backward compatibility — callers that import RetrievalStrategy
+# from this module continue to work unchanged.
+__all__ = ["RetrievalRouter", "RetrievalStrategy"]
+
 logger = logging.getLogger(__name__)
-
-
-class RetrievalStrategy(enum.StrEnum):
-    """Available retrieval strategies."""
-
-    SEMANTIC = "semantic"
-    KEYWORD = "keyword"
-    HYBRID = "hybrid"
-    GRAPH = "graph"
-    GRAPH_HYBRID = "graph_hybrid"
-    # Extended Cognee search types
-    RAG_COMPLETION = "rag_completion"
-    SUMMARIES = "summaries"
-    TEMPORAL = "temporal"
-    GRAPH_COT = "graph_cot"
-    GRAPH_CONSTRAINED = "graph_constrained"
 
 
 class RetrievalRouter:
     """Dispatches retrieval to Cognee for all search strategies.
 
-    Cognee owns both vector storage (Qdrant) and knowledge graph (Neo4j),
-    so all strategies route through the single CogneeStore.
+    Uses STRATEGY_REGISTRY for data-driven dispatch instead of
+    per-strategy if/elif branches.
 
     Args:
         cognee_store: CogneeStore for graph + vector + lexical retrieval.
@@ -80,150 +70,16 @@ class RetrievalRouter:
         Returns:
             Retrieved documents (unranked, may contain duplicates for hybrid).
         """
+        descriptor = STRATEGY_REGISTRY.get(strategy)
+        if descriptor is None:
+            raise RoutingError(
+                f"Unknown retrieval strategy: {strategy!r}",
+                strategy=str(strategy),
+                operation="retrieve",
+            )
+
         try:
-            if strategy == RetrievalStrategy.SEMANTIC:
-                return await self._cognee.search(
-                    query=query,
-                    search_type="CHUNKS",
-                    top_k=limit,
-
-                    session_id=session_id,
-                )
-
-            if strategy == RetrievalStrategy.KEYWORD:
-                return await self._cognee.search(
-                    query=query,
-                    search_type="CHUNKS_LEXICAL",
-                    top_k=limit,
-
-                    session_id=session_id,
-                )
-
-            if strategy == RetrievalStrategy.GRAPH:
-                return await self._cognee.search(
-                    query=query,
-                    search_type="GRAPH_COMPLETION",
-                    top_k=limit,
-
-                    session_id=session_id,
-                )
-
-            if strategy == RetrievalStrategy.HYBRID:
-                results = await asyncio.gather(
-                    self._cognee.search(
-                        query=query,
-                        search_type="CHUNKS",
-                        top_k=limit,
-    
-                        session_id=session_id,
-                    ),
-                    self._cognee.search(
-                        query=query,
-                        search_type="CHUNKS_LEXICAL",
-                        top_k=limit,
-    
-                        session_id=session_id,
-                    ),
-                    return_exceptions=True,
-                )
-                return self._collect_results(list(results), "hybrid")
-
-            # GRAPH_HYBRID: triple fusion
-            if strategy == RetrievalStrategy.GRAPH_HYBRID:
-                triple_results = await asyncio.gather(
-                    self._cognee.search(
-                        query=query,
-                        search_type="GRAPH_COMPLETION",
-                        top_k=limit,
-    
-                        session_id=session_id,
-                    ),
-                    self._cognee.search(
-                        query=query,
-                        search_type="CHUNKS",
-                        top_k=limit,
-    
-                        session_id=session_id,
-                    ),
-                    self._cognee.search(
-                        query=query,
-                        search_type="CHUNKS_LEXICAL",
-                        top_k=limit,
-    
-                        session_id=session_id,
-                    ),
-                    return_exceptions=True,
-                )
-                return self._collect_results(list(triple_results), "graph_hybrid")
-
-            elif strategy == RetrievalStrategy.RAG_COMPLETION:
-                return await self._cognee.search(
-                    query=query,
-                    search_type="RAG_COMPLETION",
-                    top_k=limit,
-
-                    session_id=session_id,
-                )
-
-            elif strategy == RetrievalStrategy.SUMMARIES:
-                return await self._cognee.search(
-                    query=query,
-                    search_type="SUMMARIES",
-                    top_k=limit,
-
-                    session_id=session_id,
-                )
-
-            elif strategy == RetrievalStrategy.TEMPORAL:
-                return await self._cognee.search(
-                    query=query,
-                    search_type="TEMPORAL",
-                    top_k=limit,
-
-                    session_id=session_id,
-                )
-
-            elif strategy == RetrievalStrategy.GRAPH_COT:
-                return await self._cognee.search(
-                    query=query,
-                    search_type="GRAPH_COMPLETION_COT",
-                    top_k=limit,
-
-                    session_id=session_id,
-                )
-
-            elif strategy == RetrievalStrategy.GRAPH_CONSTRAINED:
-                # Graph-constrained: use GRAPH_COMPLETION to find entity neighbourhood,
-                # then CHUNKS filtered to that neighbourhood.
-                # Full Neo4j entity extraction + Qdrant filtering is pending;
-                # this combines both sources as an interim approach similar to
-                # GRAPH_HYBRID but without lexical fusion.
-                constrained_results = await asyncio.gather(
-                    self._cognee.search(
-                        query=query,
-                        search_type="GRAPH_COMPLETION",
-                        top_k=limit,
-    
-                        session_id=session_id,
-                    ),
-                    self._cognee.search(
-                        query=query,
-                        search_type="CHUNKS",
-                        top_k=limit,
-    
-                        session_id=session_id,
-                    ),
-                    return_exceptions=True,
-                )
-                return self._collect_results(list(constrained_results), "graph_constrained")
-
-            else:
-                raise RoutingError(
-                    f"Unknown retrieval strategy: {strategy!r}",
-                    strategy=str(strategy),
-                    operation="retrieve",
-                )
-
+            return await self._dispatch(descriptor, query, limit, session_id)
         except (RoutingError, CogneeError):
             raise
         except Exception as e:
@@ -233,6 +89,30 @@ class RetrievalRouter:
                 operation="retrieve",
                 original_error=str(e),
             ) from e
+
+    async def _dispatch(
+        self,
+        descriptor: StrategyDescriptor,
+        query: str,
+        limit: int,
+        session_id: str | None,
+    ) -> list[Document]:
+        """Execute retrieval based on strategy descriptor."""
+        coros = [
+            self._cognee.search(
+                query=query,
+                search_type=st,
+                top_k=limit,
+                session_id=session_id,
+            )
+            for st in descriptor.search_types
+        ]
+
+        if descriptor.is_parallel:
+            results = await asyncio.gather(*coros, return_exceptions=True)
+            return self._collect_results(list(results), descriptor.strategy.value)
+
+        return await coros[0]
 
     @staticmethod
     def _collect_results(

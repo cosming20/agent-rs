@@ -7,7 +7,6 @@ hood, enabling provider/model switching via config strings (e.g.
 Every call flows through LiteLLM's callback system for cost tracking.
 """
 
-from __future__ import annotations
 
 import logging
 from typing import Any

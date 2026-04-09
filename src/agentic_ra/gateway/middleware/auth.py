@@ -1,6 +1,5 @@
 """OPA authorization middleware for FastAPI."""
 
-from __future__ import annotations
 
 import logging
 

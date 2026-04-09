@@ -1,6 +1,5 @@
 """FastAPI application factory for the Agentic RAG gateway."""
 
-from __future__ import annotations
 
 import logging
 from collections.abc import AsyncGenerator
@@ -14,7 +13,7 @@ from fastapi.staticfiles import StaticFiles
 from starlette.responses import JSONResponse
 
 from agentic_ra.auth.opa import OPAClient
-from agentic_ra.core.errors import AgenticRAError
+from agentic_ra.core.errors import AgenticRAError, AuthError, OPAError, SSRFError, WebBudgetExhaustedError
 from agentic_ra.core.config import get_settings
 from agentic_ra.core.logging import setup_logging
 from agentic_ra.gateway.middleware.auth import OPAAuthMiddleware
@@ -56,13 +55,11 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
 
     # Shutdown — close all components, tolerating individual failures
     logger.info("Shutting down RAG pipeline...")
-    for close_fn in [pipeline.close]:
-        try:
-            await close_fn()
-        except Exception:
-            logger.exception("Error during shutdown")
+    try:
+        await pipeline.close()
+    except Exception:
+        logger.exception("Error during pipeline shutdown")
 
-    # Close OPA httpx client
     if hasattr(app.state, "opa_client"):
         try:
             await app.state.opa_client.close()
@@ -113,14 +110,26 @@ def create_app() -> FastAPI:
         enabled=settings.opa_auth_enabled,
     )
 
-    # C4: Global exception handler for domain exceptions
+    # HTTP status code map for domain errors — order matters: most specific first
+    _ERROR_STATUS_MAP: dict[type, int] = {
+        SSRFError: 400,
+        AuthError: 403,
+        OPAError: 403,
+        WebBudgetExhaustedError: 429,
+    }
+
+    # Global exception handler for domain exceptions
     @app.exception_handler(AgenticRAError)
     async def agentic_ra_error_handler(
         request: Request, exc: AgenticRAError
     ) -> JSONResponse:
         logger.error("Domain error: %s", exc, exc_info=True)
+        status_code = next(
+            (code for err_type, code in _ERROR_STATUS_MAP.items() if isinstance(exc, err_type)),
+            500,
+        )
         return JSONResponse(
-            status_code=500,
+            status_code=status_code,
             content={"error": str(exc), "type": type(exc).__name__},
         )
 

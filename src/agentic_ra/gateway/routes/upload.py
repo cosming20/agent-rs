@@ -4,11 +4,9 @@ Supported formats: PDF, DOCX, PPTX, HTML, TXT, Markdown.
 Server-side parsing avoids fragile client-side extraction.
 """
 
-from __future__ import annotations
 
 import asyncio
 import io
-import os
 import logging
 import uuid as uuid_mod
 from pathlib import Path
@@ -18,17 +16,16 @@ from haystack import Document
 from pydantic import BaseModel
 
 from agentic_ra.agent.tools import _sanitize_user_id
+from agentic_ra.core.config import get_settings
 from agentic_ra.pipelines.factory import RAGPipeline
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/v1", tags=["upload"])
 
-MAX_FILE_SIZE: int = int(os.environ.get("UPLOAD_MAX_FILE_SIZE", str(50 * 1024 * 1024)))
-
-ALLOWED_EXTENSIONS = frozenset(
-    os.environ.get("UPLOAD_ALLOWED_EXTENSIONS", ".pdf,.docx,.pptx,.html,.htm,.txt,.md").split(",")
-)
+_settings = get_settings()
+MAX_FILE_SIZE: int = _settings.upload_max_file_size
+ALLOWED_EXTENSIONS: frozenset[str] = frozenset(_settings.upload_allowed_extensions.split(","))
 
 
 class UploadResponse(BaseModel):

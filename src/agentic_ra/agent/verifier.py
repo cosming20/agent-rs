@@ -1,18 +1,17 @@
 """Faithfulness and grounding verification for agent responses."""
 
-from __future__ import annotations
 
 import json
 import logging
+import time
 from dataclasses import dataclass
+from typing import Any
 
 from haystack import Document
-from haystack.components.generators.chat import OpenAIChatGenerator
 from haystack.dataclasses import ChatMessage
-from haystack.utils import Secret
 
 from agentic_ra.core.errors import VerificationError
-from agentic_ra.observability.cost_tracker import get_tracker
+from agentic_ra.core.llm import create_generator
 
 logger = logging.getLogger(__name__)
 
@@ -75,15 +74,15 @@ class GroundingVerifier:
         model: str = "gpt-4o-mini",
     ) -> None:
         self._threshold = confidence_threshold
-        self._llm: OpenAIChatGenerator | None = None
+        self._llm: Any | None = None
 
         if api_key:
-            # Strip provider prefix (e.g. "openai/gpt-4o-mini" -> "gpt-4o-mini")
-            bare_model = model.split("/", 1)[-1] if "/" in model else model
-            self._llm = OpenAIChatGenerator(
-                model=bare_model,
-                api_key=Secret.from_token(api_key),
-                generation_kwargs={"temperature": 0.0, "max_completion_tokens": 512},
+            self._llm = create_generator(
+                model=model,
+                api_key=api_key,
+                purpose="verifier",
+                temperature=0.0,
+                max_completion_tokens=512,
             )
 
     def verify(
@@ -151,24 +150,10 @@ class GroundingVerifier:
                 "LLM verifier not configured", operation="verify_llm"
             )
         try:
-            import time as _time
-
-            _v_start = _time.monotonic()
+            _start = time.monotonic()
             result = self._llm.run(messages=messages)
-            _v_latency = int((_time.monotonic() - _v_start) * 1000)
+            logger.debug("Verifier LLM call took %.3fs", time.monotonic() - _start)
             replies: list[ChatMessage] = result["replies"]
-
-            # Record verifier LLM cost
-            if replies:
-                meta = replies[0]._meta if hasattr(replies[0], "_meta") else {}
-                usage = meta.get("usage")
-                model = meta.get("model", "")
-                tracker = get_tracker()
-                if tracker and usage and model:
-                    tracker.record_call(
-                        model=model, purpose="verifier", usage=usage,
-                        latency_ms=_v_latency,
-                    )
 
             if not replies or not replies[0].text:
                 return self._verify_heuristic(answer, evidence)
@@ -191,120 +176,7 @@ class GroundingVerifier:
                 original_error=str(e),
             ) from e
 
-    _STOP_WORDS: frozenset[str] = frozenset(
-        {
-            "the",
-            "a",
-            "an",
-            "is",
-            "are",
-            "was",
-            "were",
-            "be",
-            "been",
-            "being",
-            "have",
-            "has",
-            "had",
-            "do",
-            "does",
-            "did",
-            "will",
-            "would",
-            "could",
-            "should",
-            "may",
-            "might",
-            "shall",
-            "can",
-            "to",
-            "of",
-            "in",
-            "for",
-            "on",
-            "with",
-            "at",
-            "by",
-            "from",
-            "as",
-            "into",
-            "through",
-            "during",
-            "before",
-            "after",
-            "above",
-            "below",
-            "between",
-            "out",
-            "off",
-            "over",
-            "under",
-            "again",
-            "further",
-            "then",
-            "once",
-            "here",
-            "there",
-            "when",
-            "where",
-            "why",
-            "how",
-            "all",
-            "each",
-            "every",
-            "both",
-            "few",
-            "more",
-            "most",
-            "other",
-            "some",
-            "such",
-            "no",
-            "nor",
-            "not",
-            "only",
-            "own",
-            "same",
-            "so",
-            "than",
-            "too",
-            "very",
-            "just",
-            "because",
-            "but",
-            "and",
-            "or",
-            "if",
-            "while",
-            "about",
-            "up",
-            "its",
-            "it",
-            "this",
-            "that",
-            "these",
-            "those",
-            "i",
-            "me",
-            "my",
-            "we",
-            "our",
-            "you",
-            "your",
-            "he",
-            "him",
-            "his",
-            "she",
-            "her",
-            "they",
-            "them",
-            "their",
-            "what",
-            "which",
-            "who",
-            "whom",
-        }
-    )
+    _STOP_WORDS: frozenset[str] = frozenset("the a an is are was were be been being have has had do does did will would could should may might shall can to of in for on with at by from as into through during before after above below between out off over under again further then once here there when where why how all each every both few more most other some such no nor not only own same so than too very just because but and or if while about up its it this that these those i me my we our you your he him his she her they them their what which who whom".split())
 
     def _verify_heuristic(
         self,

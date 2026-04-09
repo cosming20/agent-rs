@@ -1,6 +1,5 @@
 """MCP client for tool discovery and invocation via the official Python SDK."""
 
-from __future__ import annotations
 
 import logging
 from dataclasses import dataclass

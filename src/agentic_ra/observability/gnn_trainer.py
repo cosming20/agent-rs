@@ -1,6 +1,5 @@
 """GNN training pipeline — feeds query performance data to RuVector for index optimization."""
 
-from __future__ import annotations
 
 import logging
 from datetime import datetime, timedelta, timezone

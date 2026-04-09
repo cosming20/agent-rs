@@ -24,7 +24,6 @@ Mapping:
     S_HDR  (Header)    → <h1>
 """
 
-from __future__ import annotations
 
 import logging
 import re

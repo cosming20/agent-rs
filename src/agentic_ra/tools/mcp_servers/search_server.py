@@ -4,7 +4,6 @@ Run standalone: ``python -m agentic_ra.tools.mcp_servers.search_server``
 Or connect via MCPToolClient with stdio transport.
 """
 
-from __future__ import annotations
 
 from mcp.server.fastmcp import FastMCP
 

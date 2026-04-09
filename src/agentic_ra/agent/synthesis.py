@@ -1,6 +1,5 @@
 """Response synthesis with citations and provenance."""
 
-from __future__ import annotations
 
 import re
 from dataclasses import dataclass

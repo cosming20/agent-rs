@@ -1,9 +1,7 @@
 """Async Qdrant client wrapper with error handling and collection management."""
 
-from __future__ import annotations
 
 import uuid
-from datetime import datetime, timezone
 
 from pydantic import SecretStr
 from qdrant_client import AsyncQdrantClient, models
@@ -150,6 +148,3 @@ class QdrantStore:
             raise QdrantError("Failed to close client", operation="close") from e
 
 
-def _utc_now_iso() -> str:
-    """Return current UTC time as ISO-8601 string."""
-    return datetime.now(timezone.utc).isoformat()

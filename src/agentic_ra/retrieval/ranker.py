@@ -1,6 +1,5 @@
 """Dedup, reciprocal rank fusion, and evidence pack assembly."""
 
-from __future__ import annotations
 
 import logging
 from collections import defaultdict
@@ -40,6 +39,46 @@ class ResultRanker:
     def __init__(self, rrf_k: int = 60) -> None:
         self._rrf_k = rrf_k
 
+    def _compute_rrf(
+        self,
+        doc_groups: list[tuple[list[Document], float]],
+        limit: int,
+    ) -> list[Document]:
+        """Compute RRF scores across document groups.
+
+        Args:
+            doc_groups: List of (documents, weight) tuples. Each group's documents
+                are scored with RRF using the given weight multiplier.
+            limit: Maximum documents to return.
+
+        Returns:
+            Documents sorted by fused RRF score, with rrf_score in meta.
+        """
+        rrf_scores: dict[str, float] = defaultdict(float)
+        content_to_doc: dict[str, Document] = {}
+
+        for group_docs, weight in doc_groups:
+            for rank_idx, doc in enumerate(group_docs):
+                content_key = doc.content if doc.content else f"__empty_{doc.id}"
+                rrf_scores[content_key] += weight / (self._rrf_k + rank_idx + 1)
+                if content_key not in content_to_doc:
+                    content_to_doc[content_key] = doc
+
+        ranked_keys = sorted(
+            rrf_scores.keys(), key=lambda k: rrf_scores[k], reverse=True
+        )[:limit]
+
+        return [
+            Document(
+                content=content_to_doc[key].content,
+                meta={
+                    **content_to_doc[key].meta,
+                    "rrf_score": rrf_scores[key],
+                },
+            )
+            for key in ranked_keys
+        ]
+
     def rank(
         self,
         results: list[Document],
@@ -69,13 +108,13 @@ class ResultRanker:
                 source = doc.meta.get("source", "unknown")
                 source_counts[source] += 1
 
-            # Group by source for RRF scoring
+            # Group by source and sort each group by original score (descending)
             by_source: dict[str, list[Document]] = defaultdict(list)
             for doc in results:
                 source = doc.meta.get("source", "unknown")
                 by_source[source].append(doc)
 
-            # Sort each source's results by their original score (descending)
+            doc_groups: list[tuple[list[Document], float]] = []
             for source, source_docs in by_source.items():
                 for doc in source_docs:
                     if "score" not in doc.meta:
@@ -84,37 +123,11 @@ class ResultRanker:
                             extra={"source": source, "doc_id": doc.id},
                         )
                 source_docs.sort(key=lambda d: d.meta.get("score", 0.0), reverse=True)
-
-            # Compute RRF scores — dedup key uses doc.id for empty content
-            rrf_scores: dict[str, float] = defaultdict(float)
-            content_to_doc: dict[str, Document] = {}
-
-            for source_docs in by_source.values():
-                for rank_idx, doc in enumerate(source_docs):
-                    content_key = doc.content if doc.content else f"__empty_{doc.id}"
-                    rrf_scores[content_key] += 1.0 / (self._rrf_k + rank_idx + 1)
-                    if content_key not in content_to_doc:
-                        content_to_doc[content_key] = doc
-
-            # Sort by fused RRF score descending, take top limit
-            ranked_keys = sorted(
-                rrf_scores.keys(), key=lambda k: rrf_scores[k], reverse=True
-            )[:limit]
+                doc_groups.append((source_docs, 1.0))
 
             # Build final documents — RRF score used for ordering only,
             # original retrieval score preserved for display
-            ranked_docs = []
-            for key in ranked_keys:
-                doc = content_to_doc[key]
-                ranked_docs.append(
-                    Document(
-                        content=doc.content,
-                        meta={
-                            **doc.meta,
-                            "rrf_score": rrf_scores[key],
-                        },
-                    )
-                )
+            ranked_docs = self._compute_rrf(doc_groups, limit)
 
             return EvidencePack(
                 documents=tuple(ranked_docs),
@@ -183,45 +196,15 @@ class ResultRanker:
                     seen_content.add(key)
                     unique_web.append(doc)
 
-            # RRF scoring with source weighting
-            rrf_scores: dict[str, float] = {}
-            content_to_doc: dict[str, Document] = {}
+            ranked_docs = self._compute_rrf(
+                [(unique_kb, kb_weight), (unique_web, 1.0)],
+                limit,
+            )
 
-            # Score KB documents (with weight boost)
-            for rank_idx, doc in enumerate(unique_kb):
-                content_key = doc.content if doc.content else f"__empty_{doc.id}"
-                rrf_scores[content_key] = rrf_scores.get(content_key, 0.0) + kb_weight / (self._rrf_k + rank_idx + 1)
-                if content_key not in content_to_doc:
-                    content_to_doc[content_key] = doc
-
-            # Score web documents (standard weight) — accumulate, don't overwrite
-            for rank_idx, doc in enumerate(unique_web):
-                content_key = doc.content if doc.content else f"__empty_{doc.id}"
-                rrf_scores[content_key] = rrf_scores.get(content_key, 0.0) + 1.0 / (self._rrf_k + rank_idx + 1)
-                if content_key not in content_to_doc:
-                    content_to_doc[content_key] = doc
-
-            # Sort by fused score descending
-            ranked_keys = sorted(
-                rrf_scores.keys(), key=lambda k: rrf_scores[k], reverse=True
-            )[:limit]
-
-            ranked_docs = []
-            for content_key in ranked_keys:
-                doc = content_to_doc[content_key]
-                ranked_docs.append(
-                    Document(
-                        content=doc.content,
-                        meta={
-                            **doc.meta,
-                            "rrf_score": rrf_scores[content_key],
-                        },
-                    )
-                )
-
-            source_counts: dict[str, int] = {}
-            source_counts["kb"] = len(unique_kb)
-            source_counts["web"] = len(unique_web)
+            source_counts: dict[str, int] = {
+                "kb": len(unique_kb),
+                "web": len(unique_web),
+            }
 
             logger.info(
                 "Evidence fusion: %d KB + %d web -> %d fused documents",

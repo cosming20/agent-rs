@@ -5,7 +5,6 @@ endpoints, and DNS rebinding attacks. Every URL must pass validation
 before any network I/O occurs.
 """
 
-from __future__ import annotations
 
 import ipaddress
 import logging
@@ -26,6 +25,14 @@ class ValidatedURL:
     safe_url: str  # URL with hostname replaced by resolved IP
     hostname: str  # Original hostname for Host header
 
+
+# Ports that must never be targeted, covering project infrastructure and common databases.
+# Project infra: 1050-1063 (Qdrant, Postgres, OPA, Hayhooks, OTel, Jaeger, Neo4j, Brave MCP).
+# Common databases: Postgres(5432), MySQL(3306), Redis(6379), MongoDB(27017),
+#                   Neo4j Bolt(7687), Elasticsearch(9200), etcd(2379).
+_BLOCKED_PORTS: frozenset[int] = frozenset(
+    range(1050, 1064)  # 1050–1063 inclusive
+) | frozenset({5432, 3306, 6379, 27017, 7687, 9200, 2379})
 
 # IP networks that must never be reached by fetch_url
 _BLOCKED_NETWORKS: tuple[ipaddress.IPv4Network | ipaddress.IPv6Network, ...] = (
@@ -127,6 +134,10 @@ class URLValidator:
         if hostname_lower in ("localhost", "localhost.localdomain"):
             raise SSRFError("Blocked localhost access", url=url)
 
+        # Port check — block infrastructure and database ports
+        if parsed.port is not None:
+            self._check_port(parsed.port, url)
+
         # DNS resolution + IP validation — returns the first safe IP
         resolved_ip = self._validate_resolved_ips(hostname, url)
 
@@ -205,6 +216,24 @@ class URLValidator:
             raise SSRFError(f"DNS returned no usable IPs for {hostname!r}", url=url)
 
         return first_ip
+
+    @staticmethod
+    def _check_port(port: int, url: str) -> None:
+        """Check a port number against the blocked-ports set.
+
+        Args:
+            port: The port number parsed from the URL.
+            url: Original URL (for error context).
+
+        Raises:
+            SSRFError: If the port is in ``_BLOCKED_PORTS``.
+        """
+        if port in _BLOCKED_PORTS:
+            raise SSRFError(
+                f"Blocked port: {port}",
+                url=url,
+                port=port,
+            )
 
     @staticmethod
     def _check_ip(

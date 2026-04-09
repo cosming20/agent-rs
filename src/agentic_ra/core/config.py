@@ -4,7 +4,6 @@ Reads from a root ``.env`` file using pydantic-settings.
 All service connection details are typed and validated at startup.
 """
 
-from __future__ import annotations
 
 from functools import lru_cache
 from pathlib import Path
@@ -93,6 +92,40 @@ class Settings(BaseSettings):
     # --- Agent ---
     agent_max_steps: int = 10
     agent_max_retries: int = 1
+    system_prompt_file: str = ""
+
+    # --- Orchestrator context building ---
+    context_max_messages: int = 4
+    context_max_chars_per_msg: int = 150
+
+    # --- Tool evidence limits ---
+    max_evidence_chars: int = 16000
+    max_context_chars: int = 300
+
+    # --- Synthesis ---
+    max_snippet_length: int = 200
+
+    # --- Ranker ---
+    rrf_k: int = 60
+
+    # --- Verifier ---
+    verifier_confidence_threshold: float = 0.5
+
+    # --- Postgres connection pool ---
+    postgres_pool_size: int = 5
+    postgres_max_overflow: int = 10
+
+    # --- Cognee chunking ---
+    cognee_chunk_size: int = 16000
+    cognee_chunk_overlap: int = 0
+
+    # --- Upload ---
+    upload_max_file_size: int = 50_000_000
+    upload_allowed_extensions: str = ".pdf,.docx,.pptx,.html,.htm,.txt,.md"
+
+    # --- Admin ---
+    admin_max_fan_out: int = 50
+    admin_concurrent_searches: int = 5
 
     # --- Brave Search MCP ---
     brave_api_key: SecretStr = SecretStr("")

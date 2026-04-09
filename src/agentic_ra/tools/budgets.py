@@ -4,9 +4,9 @@ Prevents the ReACT loop from making unbounded web calls.
 Each tool closure checks the shared budget before executing.
 """
 
-from __future__ import annotations
 
 import logging
+import threading
 import time
 
 from agentic_ra.core.errors import WebBudgetExhaustedError
@@ -50,6 +50,7 @@ class WebToolBudget:
         self._fetch_calls_used: int = 0
         self._bytes_fetched: int = 0
         self._start_time: float = time.monotonic()
+        self._lock = threading.Lock()
 
     def _check_timeout(self) -> None:
         """Raise if total web timeout has been exceeded."""
@@ -110,35 +111,41 @@ class WebToolBudget:
             )
 
     def record_web_search(self) -> None:
-        """Record one web search call."""
-        self._web_searches_used += 1
+        """Record one web search call (thread-safe)."""
+        with self._lock:
+            self._web_searches_used += 1
+            used = self._web_searches_used
         logger.debug(
             "Web search budget: %d/%d used",
-            self._web_searches_used,
+            used,
             self._max_web_searches,
         )
 
     def record_news_search(self) -> None:
-        """Record one news search call."""
-        self._news_searches_used += 1
+        """Record one news search call (thread-safe)."""
+        with self._lock:
+            self._news_searches_used += 1
+            used = self._news_searches_used
         logger.debug(
             "News search budget: %d/%d used",
-            self._news_searches_used,
+            used,
             self._max_news_searches,
         )
 
     def record_fetch(self, bytes_fetched: int) -> None:
-        """Record one fetch call with byte count.
+        """Record one fetch call with byte count (thread-safe).
 
         Args:
             bytes_fetched: Number of bytes downloaded in this fetch.
         """
-        self._fetch_calls_used += 1
-        self._bytes_fetched += bytes_fetched
+        with self._lock:
+            self._fetch_calls_used += 1
+            self._bytes_fetched += bytes_fetched
+            calls, total_bytes = self._fetch_calls_used, self._bytes_fetched
         logger.debug(
             "Fetch budget: %d/%d calls, %d/%d bytes",
-            self._fetch_calls_used,
+            calls,
             self._max_fetch_calls,
-            self._bytes_fetched,
+            total_bytes,
             self._total_fetch_bytes,
         )

@@ -1,6 +1,5 @@
 """Feedback adapter — bridges verifier scores to Cognee's session feedback system."""
 
-from __future__ import annotations
 
 import logging
 

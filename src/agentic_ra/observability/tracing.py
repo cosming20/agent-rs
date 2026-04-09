@@ -4,7 +4,6 @@ Configures OTel TracerProvider, enables Haystack's built-in OTel tracing,
 and provides a module-level tracer for custom spans in the pipeline.
 """
 
-from __future__ import annotations
 
 import logging
 

@@ -4,7 +4,6 @@ Configures Python's logging module with structured JSON output for production
 and human-readable output for development.
 """
 
-from __future__ import annotations
 
 import json
 import logging

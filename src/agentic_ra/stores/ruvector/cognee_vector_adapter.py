@@ -1,6 +1,5 @@
 """Cognee VectorDBInterface adapter backed by RuVector REST API."""
 
-from __future__ import annotations
 
 import logging
 from typing import Any
