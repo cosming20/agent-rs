@@ -45,9 +45,9 @@ pub enum ConfigError {
 #[derive(Debug, Error)]
 pub enum StoreError {
     #[error("qdrant: {0}")]
-    Qdrant(#[from] qdrant_client::QdrantError),
+    Qdrant(Box<qdrant_client::QdrantError>),
     #[error("neo4j: {0}")]
-    Neo4j(#[from] neo4rs::Error),
+    Neo4j(Box<neo4rs::Error>),
     #[error("postgres: {0}")]
     Postgres(#[from] diesel::result::Error),
     #[error("connection pool: {0}")]
@@ -132,4 +132,18 @@ pub enum AuthError {
     OpaDenied { reason: String },
     #[error("OPA unreachable: {0}")]
     OpaUnreachable(String),
+}
+
+// ---- Manual From impls for boxed error variants ----
+
+impl From<qdrant_client::QdrantError> for StoreError {
+    fn from(err: qdrant_client::QdrantError) -> Self {
+        Self::Qdrant(Box::new(err))
+    }
+}
+
+impl From<neo4rs::Error> for StoreError {
+    fn from(err: neo4rs::Error) -> Self {
+        Self::Neo4j(Box::new(err))
+    }
 }
