@@ -48,6 +48,7 @@ chrono     = { version = "0.4", features = ["serde"] }
 pdf-extract = "0.7"
 regex      = "1"
 qdrant-client = "1"
+dotenvy    = "0.15"
 
 [workspace.package]
 edition = "2024"

@@ -30,6 +30,7 @@ dependencies = [
  "agent-rs-tools",
  "anyhow",
  "chrono",
+ "dotenvy",
  "pdf-extract",
  "qdrant-client",
  "regex",
