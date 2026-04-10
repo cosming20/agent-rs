@@ -336,10 +336,7 @@ impl Embedder for FastEmbedder {
         // E5 multilingual models require "query: " or "passage: " prefix.
         // embed_batch is used for queries (retrieval path); embed_documents
         // should be used for passage/document embedding.
-        let owned: Vec<String> = texts
-            .iter()
-            .map(|t| format!("query: {t}"))
-            .collect();
+        let owned: Vec<String> = texts.iter().map(|t| format!("query: {t}")).collect();
         let model = Arc::clone(&self.dense);
         let batch_size = self.dense_batch_size;
 
@@ -369,10 +366,7 @@ impl Embedder for FastEmbedder {
         }
 
         // E5 multilingual models require "passage: " prefix for documents.
-        let owned: Vec<String> = texts
-            .iter()
-            .map(|t| format!("passage: {t}"))
-            .collect();
+        let owned: Vec<String> = texts.iter().map(|t| format!("passage: {t}")).collect();
         let model = Arc::clone(&self.dense);
         let batch_size = self.dense_batch_size;
 

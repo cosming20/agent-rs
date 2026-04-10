@@ -11,9 +11,11 @@
 //! - [`router`] — query rewriting and strategy dispatch
 //! - [`ranker`] — reciprocal rank fusion, dedup, and [`EvidencePack`] assembly
 //! - [`search`] — concrete search back-ends (vector, keyword, graph, hybrid)
+//! - [`ingestion`] — universal document ingestion pipeline (chunking, metadata, embedding, graph)
 
 pub mod embedder;
 pub mod error;
+pub mod ingestion;
 pub mod openai_embedder;
 pub mod ranker;
 pub mod router;
@@ -22,6 +24,9 @@ pub mod strategy;
 
 pub use embedder::{Embedder, FastEmbedder, FastEmbedderConfig, SparseVector};
 pub use error::RetrievalError;
+pub use ingestion::{
+    ChunkStrategy, ChunkerConfig, DocumentChunk, IngestionPipeline, IngestionResult,
+};
 pub use openai_embedder::{OpenAIEmbedder, OpenAIEmbedderConfig};
 pub use ranker::{EvidencePack, ResultRanker};
 pub use router::RetrievalRouter;

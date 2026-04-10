@@ -102,14 +102,18 @@ dependencies = [
  "agent-rs-stores",
  "async-trait",
  "backon",
+ "chrono",
  "fastembed",
+ "pdf-extract",
  "rayon",
+ "regex",
  "reqwest 0.12.28",
  "serde",
  "serde_json",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
+ "uuid",
 ]
 
 [[package]]
