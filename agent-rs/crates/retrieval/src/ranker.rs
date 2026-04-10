@@ -169,8 +169,6 @@ impl ResultRanker {
             }
         }
 
-        let source_counts = build_source_counts(&doc_index);
-
         let mut fused: Vec<(String, f64)> = if rrf_scores.len() > PARALLEL_THRESHOLD {
             rrf_scores.into_par_iter().collect()
         } else {
@@ -195,6 +193,9 @@ impl ResultRanker {
                 })
             })
             .collect();
+
+        // Compute source_counts AFTER truncation so they reflect the final result set
+        let source_counts = build_source_counts_from_docs(&documents);
 
         EvidencePack {
             documents,
@@ -261,9 +262,10 @@ fn apply_source_weight(results: Vec<SearchResult>, weight: f64) -> Vec<SearchRes
 ///
 /// The source is extracted from the `"source"` field in the document payload,
 /// falling back to `"unknown"` when the field is absent or not a string.
-fn build_source_counts(doc_index: &HashMap<String, SearchResult>) -> HashMap<String, usize> {
+/// Computed from the final truncated result set to ensure accuracy.
+fn build_source_counts_from_docs(documents: &[SearchResult]) -> HashMap<String, usize> {
     let mut counts: HashMap<String, usize> = HashMap::new();
-    for doc in doc_index.values() {
+    for doc in documents {
         let source = doc
             .payload
             .get("source")
