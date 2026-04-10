@@ -10,6 +10,30 @@ members = [
     "crates/server",
 ]
 
+[package]
+name = "agent-rs"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "MIT"
+description = "Agentic RAG system -- gRPC server with LLM agents, retrieval, and tools."
+
+[[bin]]
+name = "agent-rs"
+path = "src/main.rs"
+
+[dependencies]
+agent-rs-core          = { path = "crates/core" }
+agent-rs-stores        = { path = "crates/stores" }
+agent-rs-retrieval     = { path = "crates/retrieval" }
+agent-rs-agent         = { path = "crates/agent" }
+agent-rs-tools         = { path = "crates/tools" }
+agent-rs-observability = { path = "crates/observability" }
+agent-rs-server        = { path = "crates/server" }
+tokio  = { version = "1", features = ["full"] }
+anyhow = "1"
+tracing = "0.1"
+
 [workspace.package]
 edition = "2024"
 rust-version = "1.85"
