@@ -4,6 +4,7 @@ members = [
     "crates/core",
     "crates/stores",
     "crates/retrieval",
+    "crates/agent",
 ]
 
 [workspace.package]
@@ -49,6 +50,14 @@ neo4rs = { version = "0.8", features = ["json"] }
 uuid = { version = "1", features = ["v4", "serde"] }
 chrono = { version = "0.4", features = ["serde"] }
 
+# LLM agent framework
+rig-core = { version = "0.34", features = ["derive"] }
+
+# Regex (citation extraction)
+regex = "1"
+
 # Workspace crates
 agent-rs-core = { path = "crates/core" }
 agent-rs-stores = { path = "crates/stores" }
+agent-rs-retrieval = { path = "crates/retrieval" }
+agent-rs-agent = { path = "crates/agent" }
