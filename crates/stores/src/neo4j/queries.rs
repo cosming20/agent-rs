@@ -7,7 +7,7 @@
 
 use neo4rs::query;
 
-use crate::types::{GraphEdge, GraphNode, NodeLabel, RelationType};
+use crate::types::{GraphEdge, GraphNode, RelationType};
 
 /// Convert a `serde_json::Value` to `neo4rs::types::BoltType`.
 ///
@@ -100,12 +100,4 @@ pub(crate) fn traverse(
 /// BUILD: `DETACH DELETE` for a node by id.
 pub(crate) fn delete_node_by_id(id: &str) -> neo4rs::Query {
     query("MATCH (n {id: $id}) DETACH DELETE n").param("id", id)
-}
-
-/// Helper: format a `NodeLabel` for use in a Cypher label position.
-///
-/// Only exposed inside this module; callers use the specific query builders.
-#[allow(dead_code)]
-pub(crate) fn label_str(label: &NodeLabel) -> &str {
-    label.as_str()
 }

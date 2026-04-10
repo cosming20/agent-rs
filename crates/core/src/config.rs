@@ -13,25 +13,46 @@ use figment::{
     Figment,
 };
 use serde::{Deserialize, Serialize};
+use std::fmt;
 
 use crate::errors::ConfigError;
 
 // ---- Sub-configs ----
 
 /// LLM provider configuration.
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Clone, Deserialize, Serialize)]
 pub struct LlmConfig {
     pub api_key: String,
     pub model: String,
 }
 
+impl fmt::Debug for LlmConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("LlmConfig")
+            .field("api_key", &"***")
+            .field("model", &self.model)
+            .finish()
+    }
+}
+
 /// Qdrant vector database configuration.
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Clone, Deserialize, Serialize)]
 pub struct QdrantConfig {
     pub host: String,
     pub http_port: u16,
     pub grpc_port: u16,
     pub api_key: String,
+}
+
+impl fmt::Debug for QdrantConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("QdrantConfig")
+            .field("host", &self.host)
+            .field("http_port", &self.http_port)
+            .field("grpc_port", &self.grpc_port)
+            .field("api_key", &"***")
+            .finish()
+    }
 }
 
 impl QdrantConfig {
@@ -47,13 +68,25 @@ impl QdrantConfig {
 }
 
 /// PostgreSQL database configuration.
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Clone, Deserialize, Serialize)]
 pub struct PostgresConfig {
     pub host: String,
     pub port: u16,
     pub user: String,
     pub password: String,
     pub db: String,
+}
+
+impl fmt::Debug for PostgresConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PostgresConfig")
+            .field("host", &self.host)
+            .field("port", &self.port)
+            .field("user", &self.user)
+            .field("password", &"***")
+            .field("db", &self.db)
+            .finish()
+    }
 }
 
 impl PostgresConfig {
@@ -67,12 +100,23 @@ impl PostgresConfig {
 }
 
 /// Neo4j graph database configuration.
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Clone, Deserialize, Serialize)]
 pub struct Neo4jConfig {
     pub host: String,
     pub bolt_port: u16,
     pub user: String,
     pub password: String,
+}
+
+impl fmt::Debug for Neo4jConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Neo4jConfig")
+            .field("host", &self.host)
+            .field("bolt_port", &self.bolt_port)
+            .field("user", &self.user)
+            .field("password", &"***")
+            .finish()
+    }
 }
 
 impl Neo4jConfig {
