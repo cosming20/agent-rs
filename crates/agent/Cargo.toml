@@ -10,6 +10,7 @@ description = "Agent orchestration: pipeline steps, verification, synthesis, mem
 agent-rs-core      = { workspace = true }
 agent-rs-stores    = { workspace = true }
 agent-rs-retrieval = { workspace = true }
+agent-rs-tools     = { workspace = true }
 
 # LLM agent
 rig-core = { workspace = true }

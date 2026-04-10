@@ -3,18 +3,56 @@
 //! Both tools check the [`WebBudgetTracker`] before executing and return
 //! a budget-exhausted error if the per-query limit has been reached.
 //!
-//! Phase 5a: stub implementations that return "not available" messages.
-//! Phase 5b will integrate Brave Search via the MCP client or direct API.
+//! Web searches use the Brave Search API (GET /web/search).
+//! News searches use the Brave News API (GET /news/search).
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use agent_rs_core::ToolError;
+use agent_rs_core::config::BraveConfig;
 use rig::completion::ToolDefinition;
 use rig::tool::Tool;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 use crate::budget::WebBudgetTracker;
+
+// ---- Brave API response types ----
+
+/// A single web search result from the Brave API.
+#[derive(Debug, Deserialize)]
+struct BraveWebResult {
+    title: Option<String>,
+    url: Option<String>,
+    description: Option<String>,
+}
+
+/// Top-level response from the Brave web search API.
+#[derive(Debug, Deserialize)]
+struct BraveWebResponse {
+    web: Option<BraveWebResults>,
+}
+
+/// Container for web search results.
+#[derive(Debug, Deserialize)]
+struct BraveWebResults {
+    results: Option<Vec<BraveWebResult>>,
+}
+
+/// A single news result from the Brave API.
+#[derive(Debug, Deserialize)]
+struct BraveNewsResult {
+    title: Option<String>,
+    url: Option<String>,
+    description: Option<String>,
+}
+
+/// Top-level response from the Brave news search API.
+#[derive(Debug, Deserialize)]
+struct BraveNewsResponse {
+    results: Option<Vec<BraveNewsResult>>,
+}
 
 // ---- search_web ----
 
@@ -25,21 +63,24 @@ pub struct SearchWebArgs {
     pub query: String,
 }
 
-/// Searches the web for information using an external search provider.
+/// Searches the web for information using the Brave Search API.
 ///
-/// Currently a stub -- will integrate with Brave Search in Phase 5b.
 /// Enforces the per-query web search budget via [`WebBudgetTracker`].
+/// Returns formatted results with titles, URLs, and descriptions.
 #[derive(Serialize, Deserialize)]
 pub struct SearchWebTool {
     #[serde(skip)]
     budget: Option<Arc<WebBudgetTracker>>,
+    #[serde(skip)]
+    config: Option<BraveConfig>,
 }
 
 impl SearchWebTool {
-    /// Create a new `SearchWebTool` with the given budget tracker.
-    pub fn new(budget: Arc<WebBudgetTracker>) -> Self {
+    /// Create a new `SearchWebTool` with the given budget tracker and config.
+    pub fn new(budget: Arc<WebBudgetTracker>, config: BraveConfig) -> Self {
         Self {
             budget: Some(budget),
+            config: Some(config),
         }
     }
 }
@@ -77,14 +118,82 @@ impl Tool for SearchWebTool {
 
         budget.record_search()?;
 
-        tracing::info!(query = %args.query, "web search requested (stub)");
+        let config = self.config.as_ref().ok_or_else(|| {
+            ToolError::McpClient("search_web: brave config not initialized".into())
+        })?;
 
-        // Phase 5b: Brave Search integration.
-        Ok(format!(
-            "Web search is not yet available. Query: '{}'. \
-             Please rely on the knowledge base for now.",
-            args.query
-        ))
+        // If no API key is configured, return a graceful fallback.
+        if config.api_key.is_empty() {
+            tracing::warn!(query = %args.query, "Brave API key not configured; web search unavailable");
+            return Ok(format!(
+                "Web search is not available (no API key configured). Query: '{}'.",
+                args.query
+            ));
+        }
+
+        tracing::info!(query = %args.query, "executing Brave web search");
+
+        let url = format!("{}/web/search", config.base_url);
+
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(config.timeout_s))
+            .build()
+            .map_err(|e| ToolError::WebSearch(format!("HTTP client build error: {e}")))?;
+
+        let response = client
+            .get(&url)
+            .query(&[("q", &args.query)])
+            .header("Accept", "application/json")
+            .header("X-Subscription-Token", &config.api_key)
+            .send()
+            .await
+            .map_err(|e| ToolError::WebSearch(format!("Brave API request failed: {e}")))?;
+
+        let status = response.status();
+        if !status.is_success() {
+            let body = response.text().await.unwrap_or_default();
+            return Err(ToolError::WebSearch(format!(
+                "Brave API returned HTTP {status}: {body}"
+            )));
+        }
+
+        let brave_response: BraveWebResponse = response
+            .json()
+            .await
+            .map_err(|e| ToolError::WebSearch(format!("Brave API response parse error: {e}")))?;
+
+        let results = brave_response
+            .web
+            .and_then(|w| w.results)
+            .unwrap_or_default();
+
+        if results.is_empty() {
+            return Ok(format!("No web results found for query: '{}'.", args.query));
+        }
+
+        let mut output = format!("Web search results for '{}':\n\n", args.query);
+
+        for (i, result) in results.iter().enumerate().take(10) {
+            let title = result.title.as_deref().unwrap_or("(no title)");
+            let url = result.url.as_deref().unwrap_or("(no url)");
+            let desc = result.description.as_deref().unwrap_or("(no description)");
+
+            output.push_str(&format!(
+                "[{}] {}\n    URL: {}\n    {}\n\n",
+                i + 1,
+                title,
+                url,
+                desc
+            ));
+        }
+
+        tracing::info!(
+            query = %args.query,
+            result_count = results.len(),
+            "Brave web search complete"
+        );
+
+        Ok(output)
     }
 }
 
@@ -97,21 +206,24 @@ pub struct SearchNewsArgs {
     pub query: String,
 }
 
-/// Searches recent news articles using an external search provider.
+/// Searches recent news articles using the Brave News API.
 ///
-/// Currently a stub -- will integrate with Brave News in Phase 5b.
 /// Enforces the per-query news search budget via [`WebBudgetTracker`].
+/// Returns formatted results with titles, URLs, and descriptions.
 #[derive(Serialize, Deserialize)]
 pub struct SearchNewsTool {
     #[serde(skip)]
     budget: Option<Arc<WebBudgetTracker>>,
+    #[serde(skip)]
+    config: Option<BraveConfig>,
 }
 
 impl SearchNewsTool {
-    /// Create a new `SearchNewsTool` with the given budget tracker.
-    pub fn new(budget: Arc<WebBudgetTracker>) -> Self {
+    /// Create a new `SearchNewsTool` with the given budget tracker and config.
+    pub fn new(budget: Arc<WebBudgetTracker>, config: BraveConfig) -> Self {
         Self {
             budget: Some(budget),
+            config: Some(config),
         }
     }
 }
@@ -149,13 +261,80 @@ impl Tool for SearchNewsTool {
 
         budget.record_news()?;
 
-        tracing::info!(query = %args.query, "news search requested (stub)");
+        let config = self.config.as_ref().ok_or_else(|| {
+            ToolError::McpClient("search_news: brave config not initialized".into())
+        })?;
 
-        // Phase 5b: Brave News integration.
-        Ok(format!(
-            "News search is not yet available. Query: '{}'. \
-             Please rely on the knowledge base for now.",
-            args.query
-        ))
+        // If no API key is configured, return a graceful fallback.
+        if config.api_key.is_empty() {
+            tracing::warn!(query = %args.query, "Brave API key not configured; news search unavailable");
+            return Ok(format!(
+                "News search is not available (no API key configured). Query: '{}'.",
+                args.query
+            ));
+        }
+
+        tracing::info!(query = %args.query, "executing Brave news search");
+
+        let url = format!("{}/news/search", config.base_url);
+
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(config.timeout_s))
+            .build()
+            .map_err(|e| ToolError::WebSearch(format!("HTTP client build error: {e}")))?;
+
+        let response = client
+            .get(&url)
+            .query(&[("q", &args.query)])
+            .header("Accept", "application/json")
+            .header("X-Subscription-Token", &config.api_key)
+            .send()
+            .await
+            .map_err(|e| ToolError::WebSearch(format!("Brave News API request failed: {e}")))?;
+
+        let status = response.status();
+        if !status.is_success() {
+            let body = response.text().await.unwrap_or_default();
+            return Err(ToolError::WebSearch(format!(
+                "Brave News API returned HTTP {status}: {body}"
+            )));
+        }
+
+        let brave_response: BraveNewsResponse = response.json().await.map_err(|e| {
+            ToolError::WebSearch(format!("Brave News API response parse error: {e}"))
+        })?;
+
+        let results = brave_response.results.unwrap_or_default();
+
+        if results.is_empty() {
+            return Ok(format!(
+                "No news results found for query: '{}'.",
+                args.query
+            ));
+        }
+
+        let mut output = format!("News results for '{}':\n\n", args.query);
+
+        for (i, result) in results.iter().enumerate().take(10) {
+            let title = result.title.as_deref().unwrap_or("(no title)");
+            let url = result.url.as_deref().unwrap_or("(no url)");
+            let desc = result.description.as_deref().unwrap_or("(no description)");
+
+            output.push_str(&format!(
+                "[{}] {}\n    URL: {}\n    {}\n\n",
+                i + 1,
+                title,
+                url,
+                desc
+            ));
+        }
+
+        tracing::info!(
+            query = %args.query,
+            result_count = results.len(),
+            "Brave news search complete"
+        );
+
+        Ok(output)
     }
 }
