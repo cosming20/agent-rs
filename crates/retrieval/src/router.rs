@@ -199,9 +199,12 @@ impl RetrievalRouter {
 
             // ---- Single-backend: keyword ----
             RetrievalStrategy::Keyword => {
-                let sparse = sparse_opt
-                    .as_ref()
-                    .expect("sparse embedding required for Keyword strategy");
+                let sparse = sparse_opt.as_ref().ok_or_else(|| {
+                    RetrievalError::Routing {
+                        strategy: strategy.to_string(),
+                        reason: "sparse embedding required but not computed".into(),
+                    }
+                })?;
                 let results = keyword_search(
                     &*self.vector_store,
                     &self.collection,
@@ -254,9 +257,12 @@ impl RetrievalRouter {
 
             // ---- Parallel: vector + keyword (HYBRID) ----
             RetrievalStrategy::Hybrid => {
-                let sparse = sparse_opt
-                    .as_ref()
-                    .expect("sparse embedding required for Hybrid strategy");
+                let sparse = sparse_opt.as_ref().ok_or_else(|| {
+                    RetrievalError::Routing {
+                        strategy: strategy.to_string(),
+                        reason: "sparse embedding required but not computed".into(),
+                    }
+                })?;
                 let hybrid_results = hybrid_search(
                     &*self.vector_store,
                     &self.collection,
@@ -270,9 +276,12 @@ impl RetrievalRouter {
 
             // ---- Parallel: vector + keyword + graph (GRAPH_HYBRID) ----
             RetrievalStrategy::GraphHybrid => {
-                let sparse = sparse_opt
-                    .as_ref()
-                    .expect("sparse embedding required for GraphHybrid strategy");
+                let sparse = sparse_opt.as_ref().ok_or_else(|| {
+                    RetrievalError::Routing {
+                        strategy: strategy.to_string(),
+                        reason: "sparse embedding required but not computed".into(),
+                    }
+                })?;
                 let params = GraphHybridParams {
                     query_embedding: &dense,
                     sparse_query: sparse,
