@@ -230,8 +230,11 @@ fn bolt_node_to_graph_node(node: neo4rs::Node) -> Result<GraphNode, StoreError> 
     // neo4rs serde bridge (node.get::<serde_json::Value>(key)).
     let mut map = serde_json::Map::new();
     for key in node.keys() {
-        if let Ok(val) = node.get::<serde_json::Value>(key) {
-            map.insert(key.to_owned(), val);
+        match node.get::<serde_json::Value>(key) {
+            Ok(val) => { map.insert(key.to_owned(), val); }
+            Err(e) => {
+                tracing::warn!(property = %key, error = %e, "failed to deserialize node property; skipping");
+            }
         }
     }
     let properties = serde_json::Value::Object(map);
@@ -259,11 +262,15 @@ fn bolt_path_to_graph_path(path: neo4rs::Path) -> Result<GraphPath, StoreError> 
         let src_id = graph_nodes
             .get(i)
             .map(|n| n.id.clone())
-            .unwrap_or_default();
+            .ok_or_else(|| StoreError::QueryFailed(
+                format!("path relationship {i} has no source node")
+            ))?;
         let dst_id = graph_nodes
             .get(i + 1)
             .map(|n| n.id.clone())
-            .unwrap_or_default();
+            .ok_or_else(|| StoreError::QueryFailed(
+                format!("path relationship {i} has no target node (index {})", i + 1)
+            ))?;
 
         let rel_type_str = rel.typ();
         let relation_type = RelationType::new(rel_type_str).map_err(|e| {
@@ -272,8 +279,11 @@ fn bolt_path_to_graph_path(path: neo4rs::Path) -> Result<GraphPath, StoreError> 
 
         let mut prop_map = serde_json::Map::new();
         for key in rel.keys() {
-            if let Ok(val) = rel.get::<serde_json::Value>(key) {
-                prop_map.insert(key.to_owned(), val);
+            match rel.get::<serde_json::Value>(key) {
+                Ok(val) => { prop_map.insert(key.to_owned(), val); }
+                Err(e) => {
+                    tracing::warn!(property = %key, error = %e, "failed to deserialize relationship property; skipping");
+                }
             }
         }
 

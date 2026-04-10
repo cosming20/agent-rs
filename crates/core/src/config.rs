@@ -331,8 +331,16 @@ impl Settings {
     /// - `AGENT_RS__QDRANT__HOST` -> `qdrant.host`
     /// - `AGENT_RS__LLM__API_KEY` -> `llm.api_key`
     pub fn load() -> Result<Self, ConfigError> {
-        // Load .env file if present (ignored if missing)
-        dotenvy::dotenv().ok();
+        // Load .env file — distinguish "not found" (ok) from "unreadable" (error)
+        match dotenvy::dotenv() {
+            Ok(path) => tracing::debug!("loaded .env from {}", path.display()),
+            Err(dotenvy::Error::Io(ref e)) if e.kind() == std::io::ErrorKind::NotFound => {
+                tracing::debug!("no .env file found; using env vars and defaults");
+            }
+            Err(e) => {
+                return Err(ConfigError::LoadFailed(format!(".env load error: {e}")));
+            }
+        }
 
         Figment::from(Serialized::defaults(Settings::default()))
             .merge(Toml::file("config.toml"))
