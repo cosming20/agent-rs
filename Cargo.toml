@@ -5,6 +5,9 @@ members = [
     "crates/stores",
     "crates/retrieval",
     "crates/agent",
+    "crates/tools",
+    "crates/observability",
+    "crates/server",
 ]
 
 [workspace.package]
@@ -31,6 +34,13 @@ anyhow = "1"
 # Logging & tracing
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+tracing-opentelemetry = "0.29"
+
+# OpenTelemetry
+opentelemetry = { version = "0.28", features = ["trace", "metrics"] }
+opentelemetry_sdk = { version = "0.28", features = ["trace", "metrics", "rt-tokio"] }
+opentelemetry-otlp = { version = "0.28", features = ["trace", "metrics", "grpc-tonic"] }
+opentelemetry-semantic-conventions = "0.28"
 
 # Config
 figment = { version = "0.10", features = ["env", "toml"] }
@@ -61,3 +71,9 @@ agent-rs-core = { path = "crates/core" }
 agent-rs-stores = { path = "crates/stores" }
 agent-rs-retrieval = { path = "crates/retrieval" }
 agent-rs-agent = { path = "crates/agent" }
+agent-rs-tools = { path = "crates/tools" }
+agent-rs-observability = { path = "crates/observability" }
+agent-rs-server = { path = "crates/server" }
+
+# HTTP client
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
