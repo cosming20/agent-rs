@@ -316,9 +316,9 @@ async fn ingest_chunks(
         );
 
         let dense_batch = embedder
-            .embed_batch(text_batch)
+            .embed_documents(text_batch)
             .await
-            .context("embed dense batch")?;
+            .context("embed dense batch (passage prefix)")?;
         let sparse_batch = embedder
             .embed_sparse_batch(text_batch)
             .await

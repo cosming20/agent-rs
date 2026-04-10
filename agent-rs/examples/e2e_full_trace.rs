@@ -446,7 +446,7 @@ async fn run_ingestion(
         }),
         || async {
             let embs = embedder
-                .embed_batch(&texts)
+                .embed_documents(&texts)
                 .await
                 .map_err(|e| anyhow::anyhow!("embedding: {e}"))?;
             let out = serde_json::json!({
