@@ -29,3 +29,9 @@ serde_json = { workspace = true }
 
 # Error handling
 thiserror = { workspace = true }
+
+# HTTP client (OpenAI embeddings API)
+reqwest = { workspace = true }
+
+# Retry with backoff (rate-limit handling)
+backon = "1"
