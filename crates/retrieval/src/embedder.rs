@@ -389,7 +389,15 @@ impl Embedder for FastEmbedder {
                 .into_iter()
                 .map(|se| {
                     Ok(SparseVector {
-                        indices: se.indices.into_iter().map(|i| i as u32).collect(),
+                        indices: se
+                            .indices
+                            .into_iter()
+                            .map(|i| {
+                                u32::try_from(i).map_err(|_| RetrievalError::Embedding {
+                                    reason: format!("sparse index {i} exceeds u32::MAX"),
+                                })
+                            })
+                            .collect::<Result<Vec<u32>, _>>()?,
                         values: se.values,
                     })
                 })
