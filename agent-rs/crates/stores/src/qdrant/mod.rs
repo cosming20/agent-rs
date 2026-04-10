@@ -110,8 +110,20 @@ impl VectorStore for QdrantStore {
 
                 let payload = payload_from_json(p.payload);
 
+                // Qdrant requires point IDs to be UUID or u64.
+                // If the ID is a valid UUID, use it directly; otherwise
+                // generate a deterministic UUID v5 from the string.
+                let point_id = match uuid::Uuid::parse_str(&p.id) {
+                    Ok(uuid) => PointId::from(uuid.to_string()),
+                    Err(_) => {
+                        let ns = uuid::Uuid::NAMESPACE_OID;
+                        let uuid = uuid::Uuid::new_v5(&ns, p.id.as_bytes());
+                        PointId::from(uuid.to_string())
+                    }
+                };
+
                 PointStruct {
-                    id: Some(PointId::from(p.id.as_str())),
+                    id: Some(point_id),
                     vectors: Some(Vectors {
                         vectors_options: Some(
                             qdrant_client::qdrant::vectors::VectorsOptions::Vectors(NamedVectors {
