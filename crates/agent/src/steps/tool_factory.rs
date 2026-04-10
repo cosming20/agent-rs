@@ -1,83 +1,100 @@
 //! Tool factory -- builds per-request tool configuration for the Rig agent.
 //!
-//! In Phase 4, this produces a list of [`ToolSpec`] descriptors.
-//! In Phase 5, these specs will be mapped to actual rig-core `Tool`
-//! implementations from the `tools` crate.
+//! Accepts shared references to the retrieval router, state store, and
+//! configuration, then constructs concrete tool instances for each request.
 
-use serde::{Deserialize, Serialize};
+use std::sync::{Arc, Mutex};
 
-use crate::context::QueryContext;
+use agent_rs_core::config::{BraveConfig, FetchConfig, WebBudgetConfig};
+use agent_rs_core::types::UserId;
+use agent_rs_retrieval::RetrievalRouter;
+use agent_rs_stores::traits::StateStore;
+use agent_rs_stores::types::SearchResult;
+use agent_rs_tools::{
+    FetchUrlTool, IngestTool, RememberTool, SearchKnowledgeTool, SearchNewsTool, SearchWebTool,
+    WebBudgetTracker,
+};
+use rig::tool::ToolDyn;
 
-/// Description of a tool available to the agent for a given request.
+/// Per-request tool set: boxed dynamic tools and shared evidence collector.
+pub type ToolSet = (Vec<Box<dyn ToolDyn>>, Arc<Mutex<Vec<SearchResult>>>);
+
+/// Builds per-request tool sets for the Rig agent.
 ///
-/// Phase 4: metadata only. Phase 5 maps these to rig-core `Tool` impls.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ToolSpec {
-    /// Unique tool name (e.g., "search_knowledge").
-    pub name: String,
-    /// Human-readable description of what the tool does.
-    pub description: String,
-    /// Whether this tool is enabled for the current request.
-    pub enabled: bool,
+/// Constructed once at startup with shared dependencies. Each call to
+/// [`build`] creates a fresh set of tools (with a new budget tracker)
+/// for a single query.
+pub struct ToolFactory {
+    router: Arc<RetrievalRouter>,
+    store: Arc<dyn StateStore>,
+    brave_config: BraveConfig,
+    fetch_config: FetchConfig,
+    web_budget_config: WebBudgetConfig,
 }
-
-/// Builds per-request tool specifications.
-///
-/// In Phase 4, this produces the standard set of tool specs.
-/// In Phase 5, it will also configure tool-specific state (budgets,
-/// evidence accumulators, etc.).
-pub struct ToolFactory;
 
 impl ToolFactory {
     /// Create a new ToolFactory.
-    pub fn new() -> Self {
-        Self
-    }
-
-    /// Build tool specifications for the current request.
     ///
-    /// Returns the standard set of tools the agent can use.
-    /// All tools are enabled by default; Phase 5 will add conditional
-    /// enabling based on configuration and available services.
-    pub fn build(&self, _ctx: &QueryContext) -> Vec<ToolSpec> {
-        vec![
-            ToolSpec {
-                name: "search_knowledge".into(),
-                description: "Search the knowledge base using the specified retrieval strategy."
-                    .into(),
-                enabled: true,
-            },
-            ToolSpec {
-                name: "search_web".into(),
-                description: "Search the web via Brave Search for external information.".into(),
-                enabled: true,
-            },
-            ToolSpec {
-                name: "search_news".into(),
-                description: "Search recent news via Brave News.".into(),
-                enabled: true,
-            },
-            ToolSpec {
-                name: "fetch_url".into(),
-                description: "Fetch and extract text content from a URL.".into(),
-                enabled: true,
-            },
-            ToolSpec {
-                name: "remember".into(),
-                description: "Save important facts to long-term memory.".into(),
-                enabled: true,
-            },
-            ToolSpec {
-                name: "ingest".into(),
-                description: "Trigger document ingestion into the knowledge base.".into(),
-                enabled: true,
-            },
-        ]
+    /// # Parameters
+    ///
+    /// - `router` -- shared retrieval router for knowledge search.
+    /// - `store` -- shared state store for the remember tool.
+    /// - `brave_config` -- Brave Search API configuration.
+    /// - `fetch_config` -- URL fetch configuration.
+    /// - `web_budget_config` -- per-query web budget limits.
+    pub fn new(
+        router: Arc<RetrievalRouter>,
+        store: Arc<dyn StateStore>,
+        brave_config: BraveConfig,
+        fetch_config: FetchConfig,
+        web_budget_config: WebBudgetConfig,
+    ) -> Self {
+        Self {
+            router,
+            store,
+            brave_config,
+            fetch_config,
+            web_budget_config,
+        }
     }
-}
 
-impl Default for ToolFactory {
-    fn default() -> Self {
-        Self::new()
+    /// Build a vector of boxed dynamic tools and the shared evidence collector
+    /// for a single query.
+    ///
+    /// Each call creates a fresh [`WebBudgetTracker`] and evidence collector,
+    /// ensuring per-query isolation.
+    ///
+    /// # Returns
+    ///
+    /// A tuple of:
+    /// - `Vec<Box<dyn ToolDyn>>` -- tools to register with the Rig agent.
+    /// - `Arc<Mutex<Vec<SearchResult>>>` -- shared KB evidence collector
+    ///   populated by the `search_knowledge` tool during execution.
+    pub fn build(&self, user_id: &UserId) -> ToolSet {
+        let budget = Arc::new(WebBudgetTracker::new(&self.web_budget_config));
+        let evidence_collector: Arc<Mutex<Vec<SearchResult>>> = Arc::new(Mutex::new(Vec::new()));
+
+        let tools: Vec<Box<dyn ToolDyn>> = vec![
+            Box::new(SearchKnowledgeTool::new(
+                Arc::clone(&self.router),
+                Arc::clone(&evidence_collector),
+            )),
+            Box::new(SearchWebTool::new(
+                Arc::clone(&budget),
+                self.brave_config.clone(),
+            )),
+            Box::new(SearchNewsTool::new(
+                Arc::clone(&budget),
+                self.brave_config.clone(),
+            )),
+            Box::new(FetchUrlTool::new(
+                self.fetch_config.clone(),
+                Arc::clone(&budget),
+            )),
+            Box::new(RememberTool::new(Arc::clone(&self.store), user_id.clone())),
+            Box::new(IngestTool::new()),
+        ];
+
+        (tools, evidence_collector)
     }
 }

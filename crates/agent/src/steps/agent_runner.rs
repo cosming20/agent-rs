@@ -1,31 +1,38 @@
-//! Agent runner -- executes Rig agent, extracts answer, accumulates evidence.
+//! Agent runner -- executes Rig agent with tools, extracts answer,
+//! accumulates evidence from tool calls.
 //!
-//! In Phase 4, the runner creates a rig-core agent with the system prompt
-//! and chat history, runs it, and extracts the text answer. Tools are
-//! wired in Phase 5.
+//! Builds a per-request Rig agent with tools from the ToolFactory,
+//! runs it with multi-turn tool calling, and extracts the text answer
+//! and accumulated evidence.
 
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use agent_rs_core::errors::AgentError;
+use agent_rs_stores::types::SearchResult;
+use rig::client::CompletionClient;
+use rig::completion::Prompt;
 use tracing::{error, info, instrument};
 
 use crate::context::QueryContext;
 use crate::prompts;
+use crate::steps::tool_factory::ToolFactory;
 
-/// Runs the Rig agent and extracts the answer.
+/// Runs the Rig agent with tools and extracts the answer.
 ///
-/// In Phase 4: creates a no-tool agent that answers from context only.
-/// In Phase 5: tools are attached via the ToolFactory.
+/// Each call to [`run`] builds a fresh agent with per-request tools
+/// and evidence collectors.
 pub struct AgentRunner {
     /// rig-core OpenAI client for agent creation.
     llm_client: rig::providers::openai::Client,
     /// Model identifier for the agent.
     model: String,
-    /// Maximum number of tool-calling turns (used in Phase 5).
-    #[allow(dead_code)]
+    /// Maximum number of tool-calling turns.
     max_turns: usize,
     /// System prompt (loaded once, shared across requests).
     system_prompt: String,
+    /// Tool factory for building per-request tool sets.
+    tool_factory: Arc<ToolFactory>,
 }
 
 impl AgentRunner {
@@ -37,6 +44,8 @@ impl AgentRunner {
     /// - `model` -- Model identifier (e.g., "gpt-4o").
     /// - `max_turns` -- Maximum tool-calling turns.
     /// - `system_prompt_file` -- Path to custom system prompt file (empty = default).
+    /// - `tool_factory` -- Shared tool factory for building per-request tools.
+    ///
     /// # Errors
     ///
     /// Returns `AgentError::Orchestrator` if the OpenAI client cannot be created.
@@ -45,6 +54,7 @@ impl AgentRunner {
         model: &str,
         max_turns: usize,
         system_prompt_file: &str,
+        tool_factory: Arc<ToolFactory>,
     ) -> Result<Self, AgentError> {
         let system_prompt = prompts::load_system_prompt(system_prompt_file);
         let llm_client = rig::providers::openai::Client::new(api_key).map_err(|e| {
@@ -55,36 +65,41 @@ impl AgentRunner {
             model: model.to_owned(),
             max_turns,
             system_prompt,
+            tool_factory,
         })
     }
 
-    /// Execute the agent and populate `ctx.answer` and `ctx.agent_latency_ms`.
+    /// Execute the agent with tools and populate `ctx.answer`,
+    /// `ctx.kb_evidence`, and `ctx.agent_latency_ms`.
     ///
-    /// Phase 4: No tools. The agent answers from chat history context only.
-    /// Phase 5: Tools will be attached here.
+    /// Builds a fresh Rig agent per request with tools from the factory.
+    /// The `search_knowledge` tool accumulates evidence into a shared
+    /// collector, which is drained into `ctx.kb_evidence` after execution.
     #[instrument(skip(self, ctx), fields(
         session_id = %ctx.session_id,
         strategy = %ctx.strategy,
     ))]
     pub async fn run(&self, ctx: &mut QueryContext) -> Result<(), AgentError> {
-        use rig::client::CompletionClient;
-        use rig::completion::Prompt;
-
         ctx.kb_evidence.clear();
         ctx.web_evidence.clear();
 
         let start = Instant::now();
 
+        // Build per-request tools and evidence collector.
+        let (tools, evidence_collector) = self.tool_factory.build(&ctx.user_id);
+
         // Build the prompt from chat history + current query
         let full_prompt = self.build_prompt(ctx);
 
+        // Build agent with tools
         let agent = self
             .llm_client
             .agent(&self.model)
             .preamble(&self.system_prompt)
+            .tools(tools)
             .build();
 
-        match agent.prompt(&full_prompt).await {
+        match agent.prompt(&full_prompt).max_turns(self.max_turns).await {
             Ok(response) => {
                 ctx.answer = response;
                 info!(
@@ -99,11 +114,16 @@ impl AgentRunner {
             }
         }
 
+        // Drain accumulated evidence from the search_knowledge tool.
+        drain_evidence(&evidence_collector, &mut ctx.kb_evidence);
+
         ctx.agent_latency_ms = start.elapsed().as_millis() as u64;
         Ok(())
     }
 
-    /// Re-run the agent with retry messages (used by GroundingGate).
+    /// Re-run the agent with a retry prompt (used by GroundingGate).
+    ///
+    /// Builds a fresh agent with tools so the retry can make new tool calls.
     #[instrument(skip(self, ctx, retry_prompt), fields(
         session_id = %ctx.session_id,
         retry = ctx.retries,
@@ -113,19 +133,20 @@ impl AgentRunner {
         ctx: &mut QueryContext,
         retry_prompt: &str,
     ) -> Result<(), AgentError> {
-        use rig::client::CompletionClient;
-        use rig::completion::Prompt;
-
         ctx.kb_evidence.clear();
         ctx.web_evidence.clear();
+
+        // Build per-request tools and evidence collector for the retry.
+        let (tools, evidence_collector) = self.tool_factory.build(&ctx.user_id);
 
         let agent = self
             .llm_client
             .agent(&self.model)
             .preamble(&self.system_prompt)
+            .tools(tools)
             .build();
 
-        match agent.prompt(retry_prompt).await {
+        match agent.prompt(retry_prompt).max_turns(self.max_turns).await {
             Ok(response) => {
                 ctx.answer = response;
             }
@@ -135,6 +156,9 @@ impl AgentRunner {
                 )));
             }
         }
+
+        // Drain accumulated evidence from the retry.
+        drain_evidence(&evidence_collector, &mut ctx.kb_evidence);
 
         Ok(())
     }
@@ -162,5 +186,14 @@ impl AgentRunner {
         }
 
         parts.join("\n\n")
+    }
+}
+
+/// Drain accumulated evidence from the shared collector into the context.
+fn drain_evidence(collector: &Arc<Mutex<Vec<SearchResult>>>, target: &mut Vec<SearchResult>) {
+    if let Ok(mut collected) = collector.lock() {
+        target.append(&mut collected);
+    } else {
+        tracing::warn!("evidence collector lock poisoned; evidence may be incomplete");
     }
 }

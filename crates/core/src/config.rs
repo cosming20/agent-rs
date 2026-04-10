@@ -177,6 +177,27 @@ pub struct WebBudgetConfig {
     pub max_bytes: usize,
 }
 
+/// Brave Search API configuration.
+#[derive(Clone, Deserialize, Serialize)]
+pub struct BraveConfig {
+    /// Brave Search API key (X-Subscription-Token header).
+    pub api_key: String,
+    /// Base URL for the Brave Search API.
+    pub base_url: String,
+    /// Request timeout in seconds.
+    pub timeout_s: u64,
+}
+
+impl fmt::Debug for BraveConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("BraveConfig")
+            .field("api_key", &"***")
+            .field("base_url", &self.base_url)
+            .field("timeout_s", &self.timeout_s)
+            .finish()
+    }
+}
+
 /// URL fetch configuration.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct FetchConfig {
@@ -256,6 +277,7 @@ pub struct Settings {
     pub ranker: RankerConfig,
     pub verifier: VerifierConfig,
     pub web_budget: WebBudgetConfig,
+    pub brave: BraveConfig,
     pub fetch: FetchConfig,
     pub otel: OtelConfig,
     pub opa: OpaConfig,
@@ -315,6 +337,11 @@ impl Default for Settings {
                 max_fetches: 3,
                 timeout_s: 45.0,
                 max_bytes: 6_000_000,
+            },
+            brave: BraveConfig {
+                api_key: String::new(),
+                base_url: "https://api.search.brave.com/res/v1".into(),
+                timeout_s: 15,
             },
             fetch: FetchConfig {
                 max_length: 5000,
