@@ -60,8 +60,8 @@ impl GraphStore for Neo4jStore {
     /// Add a single node, using MERGE on `id` for idempotency.
     #[instrument(name = "neo4j_store.add_node", skip(self, node), fields(node_id = %node.id))]
     async fn add_node(&self, node: &GraphNode) -> Result<(), StoreError> {
-        let q = queries::upsert_node(node).map_err(StoreError::Neo4j)?;
-        self.graph.run(q).await.map_err(StoreError::Neo4j)?;
+        let q = queries::upsert_node(node).map_err(StoreError::from)?;
+        self.graph.run(q).await.map_err(StoreError::from)?;
         Ok(())
     }
 
@@ -69,8 +69,8 @@ impl GraphStore for Neo4jStore {
     #[instrument(name = "neo4j_store.add_nodes", skip(self, nodes), fields(count = nodes.len()))]
     async fn add_nodes(&self, nodes: &[GraphNode]) -> Result<(), StoreError> {
         for node in nodes {
-            let q = queries::upsert_node(node).map_err(StoreError::Neo4j)?;
-            self.graph.run(q).await.map_err(StoreError::Neo4j)?;
+            let q = queries::upsert_node(node).map_err(StoreError::from)?;
+            self.graph.run(q).await.map_err(StoreError::from)?;
         }
         Ok(())
     }
@@ -82,8 +82,8 @@ impl GraphStore for Neo4jStore {
         fields(src = %edge.source_id, dst = %edge.target_id, rel = %edge.relation_type)
     )]
     async fn add_edge(&self, edge: &GraphEdge) -> Result<(), StoreError> {
-        let q = queries::create_edge(edge).map_err(StoreError::Neo4j)?;
-        self.graph.run(q).await.map_err(StoreError::Neo4j)?;
+        let q = queries::create_edge(edge).map_err(StoreError::from)?;
+        self.graph.run(q).await.map_err(StoreError::from)?;
         Ok(())
     }
 
@@ -91,8 +91,8 @@ impl GraphStore for Neo4jStore {
     #[instrument(name = "neo4j_store.add_edges", skip(self, edges), fields(count = edges.len()))]
     async fn add_edges(&self, edges: &[GraphEdge]) -> Result<(), StoreError> {
         for edge in edges {
-            let q = queries::create_edge(edge).map_err(StoreError::Neo4j)?;
-            self.graph.run(q).await.map_err(StoreError::Neo4j)?;
+            let q = queries::create_edge(edge).map_err(StoreError::from)?;
+            self.graph.run(q).await.map_err(StoreError::from)?;
         }
         Ok(())
     }
@@ -104,9 +104,9 @@ impl GraphStore for Neo4jStore {
             .graph
             .execute(queries::get_node_by_id(id))
             .await
-            .map_err(StoreError::Neo4j)?;
+            .map_err(StoreError::from)?;
 
-        match result.next().await.map_err(StoreError::Neo4j)? {
+        match result.next().await.map_err(StoreError::from)? {
             None => Ok(None),
             Some(row) => {
                 let node: neo4rs::Node = row.get("n").map_err(|e| {
@@ -128,10 +128,10 @@ impl GraphStore for Neo4jStore {
             .graph
             .execute(queries::get_neighbors(node_id, depth))
             .await
-            .map_err(StoreError::Neo4j)?;
+            .map_err(StoreError::from)?;
 
         let mut nodes = Vec::new();
-        while let Some(row) = result.next().await.map_err(StoreError::Neo4j)? {
+        while let Some(row) = result.next().await.map_err(StoreError::from)? {
             let node: neo4rs::Node = row.get("neighbor").map_err(|e| {
                 StoreError::QueryFailed(format!("failed to deserialize neighbor: {e}"))
             })?;
@@ -159,10 +159,10 @@ impl GraphStore for Neo4jStore {
             .graph
             .execute(queries::traverse(start_id, relation_types, max_depth))
             .await
-            .map_err(StoreError::Neo4j)?;
+            .map_err(StoreError::from)?;
 
         let mut paths = Vec::new();
-        while let Some(row) = result.next().await.map_err(StoreError::Neo4j)? {
+        while let Some(row) = result.next().await.map_err(StoreError::from)? {
             let path: neo4rs::Path = row.get("p").map_err(|e| {
                 StoreError::QueryFailed(format!("failed to deserialize path: {e}"))
             })?;
@@ -182,10 +182,10 @@ impl GraphStore for Neo4jStore {
             .graph
             .execute(query(cypher))
             .await
-            .map_err(StoreError::Neo4j)?;
+            .map_err(StoreError::from)?;
 
         let mut nodes = Vec::new();
-        while let Some(row) = result.next().await.map_err(StoreError::Neo4j)? {
+        while let Some(row) = result.next().await.map_err(StoreError::from)? {
             // Raw Cypher may return nodes under any alias; try "n" first.
             if let Ok(node) = row.get::<neo4rs::Node>("n") {
                 nodes.push(bolt_node_to_graph_node(node)?);
@@ -200,7 +200,7 @@ impl GraphStore for Neo4jStore {
         self.graph
             .run(queries::delete_node_by_id(id))
             .await
-            .map_err(StoreError::Neo4j)?;
+            .map_err(StoreError::from)?;
         Ok(())
     }
 }
