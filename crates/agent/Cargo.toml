@@ -1,0 +1,36 @@
+[package]
+name = "agent-rs-agent"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Agent orchestration: pipeline steps, verification, synthesis, memory."
+
+[dependencies]
+agent-rs-core      = { workspace = true }
+agent-rs-stores    = { workspace = true }
+agent-rs-retrieval = { workspace = true }
+
+# LLM agent
+rig-core = { workspace = true }
+
+# Async
+tokio       = { workspace = true }
+async-trait = { workspace = true }
+
+# Serialization
+serde      = { workspace = true }
+serde_json = { workspace = true }
+
+# Error handling
+thiserror = { workspace = true }
+
+# Logging
+tracing = { workspace = true }
+
+# Common types
+uuid   = { workspace = true }
+chrono = { workspace = true }
+
+# Citation extraction
+regex = { workspace = true }
