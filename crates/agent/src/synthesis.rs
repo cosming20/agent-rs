@@ -4,7 +4,7 @@
 //! citations linking answer claims to source evidence documents.
 
 use agent_rs_core::errors::AgentError;
-use agent_rs_core::types::{Confidence, RetrievalStrategy};
+use agent_rs_core::types::{Confidence, RetrievalStrategy, truncate_to_char_boundary};
 use agent_rs_stores::types::SearchResult;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
@@ -123,8 +123,11 @@ impl ResponseSynthesizer {
                     .and_then(|v| v.as_str())
                     .unwrap_or("");
 
-                let snippet = if content.len() > self.max_snippet_length {
-                    format!("{}...", &content[..self.max_snippet_length])
+                let snippet = if content.chars().count() > self.max_snippet_length {
+                    format!(
+                        "{}...",
+                        truncate_to_char_boundary(content, self.max_snippet_length)
+                    )
                 } else {
                     content.to_owned()
                 };
