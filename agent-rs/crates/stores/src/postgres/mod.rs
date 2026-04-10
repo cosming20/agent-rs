@@ -20,8 +20,8 @@ use agent_rs_core::{SessionId, StoreError, UserId};
 use async_trait::async_trait;
 use diesel::prelude::*;
 use diesel_async::{
-    pooled_connection::{bb8::Pool, AsyncDieselConnectionManager},
     AsyncPgConnection, RunQueryDsl,
+    pooled_connection::{AsyncDieselConnectionManager, bb8::Pool},
 };
 use tracing::instrument;
 use uuid::Uuid;
@@ -60,8 +60,7 @@ impl PgStore {
     /// Returns [`StoreError::ConnectionPool`] if the pool fails to build or
     /// if no initial connection can be established.
     pub async fn new(database_url: &str) -> Result<Self, StoreError> {
-        let manager =
-            AsyncDieselConnectionManager::<AsyncPgConnection>::new(database_url);
+        let manager = AsyncDieselConnectionManager::<AsyncPgConnection>::new(database_url);
         let pool = Pool::builder()
             .build(manager)
             .await

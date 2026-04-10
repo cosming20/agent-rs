@@ -99,10 +99,7 @@ impl NodeLabel {
         if label.is_empty() {
             return Err(InvalidLabelError::Empty);
         }
-        if !label
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '_')
-        {
+        if !label.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
             return Err(InvalidLabelError::InvalidChars(label.to_string()));
         }
         Ok(Self(label.to_string()))
@@ -159,7 +156,9 @@ impl std::fmt::Display for RelationType {
 pub enum InvalidLabelError {
     #[error("label/type must not be empty")]
     Empty,
-    #[error("label/type contains invalid characters (only ASCII alphanumeric + underscore allowed): {0}")]
+    #[error(
+        "label/type contains invalid characters (only ASCII alphanumeric + underscore allowed): {0}"
+    )]
     InvalidChars(String),
 }
 

@@ -7,7 +7,7 @@
 //! Filter level is controlled via the `RUST_LOG` environment variable
 //! (defaults to `info`).
 
-use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
+use tracing_subscriber::{EnvFilter, fmt, layer::SubscriberExt, util::SubscriberInitExt};
 
 /// Initialize the global tracing subscriber.
 ///
@@ -20,8 +20,7 @@ use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt, Env
 ///   aggregation systems. When `false`, emit pretty-printed logs for
 ///   local development.
 pub fn init_logging(json: bool) {
-    let env_filter =
-        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
 
     if json {
         tracing_subscriber::registry()
