@@ -1,0 +1,32 @@
+[package]
+name = "agent-rs-server"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+# Workspace crates
+agent-rs-core = { workspace = true }
+agent-rs-agent = { workspace = true }
+
+# gRPC
+tonic = "0.14"
+tonic-prost = "0.14"
+prost = "0.14"
+
+# Async
+tokio = { workspace = true }
+
+# Error handling
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+
+# Logging & tracing
+tracing = { workspace = true }
+
+# Common types
+uuid = { workspace = true }
+
+[build-dependencies]
+tonic-prost-build = "0.14"

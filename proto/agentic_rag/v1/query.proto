@@ -1,0 +1,39 @@
+syntax = "proto3";
+
+package agentic_rag.v1;
+
+import "agentic_rag/v1/types.proto";
+
+/// Query service for submitting user queries to the agent pipeline.
+service QueryService {
+  /// Submit a query and receive a synthesized response with citations.
+  rpc Query(QueryRequest) returns (QueryResponse);
+}
+
+/// Request to process a user query through the agent pipeline.
+message QueryRequest {
+  /// The user's question or instruction.
+  string query = 1;
+  /// Session identifier for conversation continuity.
+  string session_id = 2;
+  /// Identifier of the requesting user.
+  string user_id = 3;
+  /// Retrieval strategy to use. Defaults to STRATEGY_HYBRID when unspecified.
+  Strategy strategy = 4;
+  /// Maximum number of evidence documents to retrieve.
+  int32 limit = 5;
+}
+
+/// Response from the agent pipeline containing the synthesized answer.
+message QueryResponse {
+  /// The synthesized answer text.
+  string answer = 1;
+  /// Source citations supporting the answer.
+  repeated Citation citations = 2;
+  /// Answer quality confidence score (0.0 to 1.0).
+  double confidence = 3;
+  /// Whether the answer passed grounding verification.
+  bool is_grounded = 4;
+  /// Retrieval strategy that was used.
+  Strategy strategy = 5;
+}
