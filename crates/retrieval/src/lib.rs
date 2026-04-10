@@ -21,4 +21,5 @@ pub mod strategy;
 pub use embedder::{Embedder, FastEmbedder, FastEmbedderConfig, SparseVector};
 pub use error::RetrievalError;
 pub use ranker::{EvidencePack, ResultRanker};
+pub use router::RetrievalRouter;
 pub use strategy::StrategyRegistry;
