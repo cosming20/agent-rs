@@ -126,11 +126,7 @@ impl MemoryManager {
 
     /// Store a long-term memory fact for a user.
     #[instrument(skip(self, content), fields(%user_id))]
-    pub async fn store_memory(
-        &self,
-        user_id: &UserId,
-        content: &str,
-    ) -> Result<(), AgentError> {
+    pub async fn store_memory(&self, user_id: &UserId, content: &str) -> Result<(), AgentError> {
         let memory = Memory {
             id: Uuid::new_v4(),
             user_id: user_id.clone(),

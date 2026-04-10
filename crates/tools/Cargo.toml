@@ -1,0 +1,38 @@
+[package]
+name = "agent-rs-tools"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Agent tool implementations: knowledge search, web search, fetch, remember, ingest."
+
+[dependencies]
+agent-rs-core      = { workspace = true }
+agent-rs-stores    = { workspace = true }
+agent-rs-retrieval = { workspace = true }
+
+# LLM agent framework (Tool trait)
+rig-core = { workspace = true }
+
+# Async
+tokio = { workspace = true }
+
+# Serialization
+serde      = { workspace = true }
+serde_json = { workspace = true }
+
+# Error handling
+thiserror = { workspace = true }
+
+# Logging
+tracing = { workspace = true }
+
+# Common types
+uuid   = { workspace = true }
+chrono = { workspace = true }
+
+# HTTP client (fetch_url)
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+
+# URL parsing (SSRF validation)
+url = "2"

@@ -42,19 +42,16 @@ struct VerifierLlmResponse {
 /// Common English function words that carry no semantic weight for
 /// grounding assessment.
 const STOP_WORDS: &[&str] = &[
-    "the", "a", "an", "is", "are", "was", "were", "be", "been", "being",
-    "have", "has", "had", "do", "does", "did", "will", "would", "could",
-    "should", "may", "might", "shall", "can", "to", "of", "in", "for",
-    "on", "with", "at", "by", "from", "as", "into", "through", "during",
-    "before", "after", "above", "below", "between", "out", "off", "over",
-    "under", "again", "further", "then", "once", "here", "there", "when",
-    "where", "why", "how", "all", "each", "every", "both", "few", "more",
-    "most", "other", "some", "such", "no", "nor", "not", "only", "own",
-    "same", "so", "than", "too", "very", "just", "because", "but", "and",
-    "or", "if", "while", "about", "up", "its", "it", "this", "that",
-    "these", "those", "i", "me", "my", "we", "our", "you", "your", "he",
-    "him", "his", "she", "her", "they", "them", "their", "what", "which",
-    "who", "whom",
+    "the", "a", "an", "is", "are", "was", "were", "be", "been", "being", "have", "has", "had",
+    "do", "does", "did", "will", "would", "could", "should", "may", "might", "shall", "can", "to",
+    "of", "in", "for", "on", "with", "at", "by", "from", "as", "into", "through", "during",
+    "before", "after", "above", "below", "between", "out", "off", "over", "under", "again",
+    "further", "then", "once", "here", "there", "when", "where", "why", "how", "all", "each",
+    "every", "both", "few", "more", "most", "other", "some", "such", "no", "nor", "not", "only",
+    "own", "same", "so", "than", "too", "very", "just", "because", "but", "and", "or", "if",
+    "while", "about", "up", "its", "it", "this", "that", "these", "those", "i", "me", "my", "we",
+    "our", "you", "your", "he", "him", "his", "she", "her", "they", "them", "their", "what",
+    "which", "who", "whom",
 ];
 
 /// Verifies that an answer is faithfully grounded in retrieved evidence.
@@ -114,9 +111,8 @@ impl GroundingVerifier {
         if answer.is_empty() {
             return Ok(VerificationResult {
                 is_grounded: false,
-                confidence: Confidence::new(0.0).map_err(|e| {
-                    AgentError::Verification(format!("confidence error: {e}"))
-                })?,
+                confidence: Confidence::new(0.0)
+                    .map_err(|e| AgentError::Verification(format!("confidence error: {e}")))?,
                 reasoning: "Empty answer cannot be verified.".into(),
                 ungrounded_claims: Vec::new(),
             });
@@ -125,9 +121,8 @@ impl GroundingVerifier {
         if evidence.is_empty() {
             return Ok(VerificationResult {
                 is_grounded: false,
-                confidence: Confidence::new(0.0).map_err(|e| {
-                    AgentError::Verification(format!("confidence error: {e}"))
-                })?,
+                confidence: Confidence::new(0.0)
+                    .map_err(|e| AgentError::Verification(format!("confidence error: {e}")))?,
                 reasoning: "No evidence provided for grounding check.".into(),
                 ungrounded_claims: Vec::new(),
             });
@@ -177,30 +172,28 @@ impl GroundingVerifier {
             .collect::<Vec<_>>()
             .join("\n\n");
 
-        let user_message = format!(
-            "<evidence>\n{evidence_text}\n</evidence>\n\n<answer>\n{answer}\n</answer>"
-        );
+        let user_message =
+            format!("<evidence>\n{evidence_text}\n</evidence>\n\n<answer>\n{answer}\n</answer>");
 
         let agent = client
             .agent(&self.model)
             .preamble(VERIFICATION_PROMPT)
             .build();
 
-        let response_text = agent.prompt(&user_message).await.map_err(|e| {
-            AgentError::Verification(format!("LLM verifier call failed: {e}"))
-        })?;
+        let response_text = agent
+            .prompt(&user_message)
+            .await
+            .map_err(|e| AgentError::Verification(format!("LLM verifier call failed: {e}")))?;
 
-        let parsed: VerifierLlmResponse =
-            serde_json::from_str(&response_text).map_err(|e| {
-                AgentError::Verification(format!(
-                    "LLM verifier JSON parse failed: {e} -- raw: {response_text}"
-                ))
-            })?;
+        let parsed: VerifierLlmResponse = serde_json::from_str(&response_text).map_err(|e| {
+            AgentError::Verification(format!(
+                "LLM verifier JSON parse failed: {e} -- raw: {response_text}"
+            ))
+        })?;
 
         let confidence_val = parsed.confidence.clamp(0.0, 1.0);
-        let confidence = Confidence::new(confidence_val).map_err(|e| {
-            AgentError::Verification(format!("confidence error: {e}"))
-        })?;
+        let confidence = Confidence::new(confidence_val)
+            .map_err(|e| AgentError::Verification(format!("confidence error: {e}")))?;
 
         Ok(VerificationResult {
             is_grounded: parsed.is_grounded,
@@ -228,9 +221,8 @@ impl GroundingVerifier {
         if answer_tokens.is_empty() {
             return Ok(VerificationResult {
                 is_grounded: false,
-                confidence: Confidence::new(0.0).map_err(|e| {
-                    AgentError::Verification(format!("confidence error: {e}"))
-                })?,
+                confidence: Confidence::new(0.0)
+                    .map_err(|e| AgentError::Verification(format!("confidence error: {e}")))?,
                 reasoning: "Answer contains no meaningful tokens.".into(),
                 ungrounded_claims: Vec::new(),
             });
@@ -254,9 +246,8 @@ impl GroundingVerifier {
         let confidence_val = overlap as f64 / answer_tokens.len() as f64;
         let is_grounded = confidence_val >= self.confidence_threshold;
 
-        let confidence = Confidence::new(confidence_val.clamp(0.0, 1.0)).map_err(|e| {
-            AgentError::Verification(format!("confidence error: {e}"))
-        })?;
+        let confidence = Confidence::new(confidence_val.clamp(0.0, 1.0))
+            .map_err(|e| AgentError::Verification(format!("confidence error: {e}")))?;
 
         info!(
             overlap = overlap,
