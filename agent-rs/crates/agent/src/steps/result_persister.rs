@@ -10,7 +10,7 @@ use agent_rs_core::types::MessageRole;
 use agent_rs_stores::traits::StateStore;
 use agent_rs_stores::types::QueryRun;
 use chrono::Utc;
-use tracing::{info, instrument, warn};
+use tracing::{error, info, instrument};
 use uuid::Uuid;
 
 use crate::context::QueryContext;
@@ -78,7 +78,7 @@ impl ResultPersister {
         };
 
         if let Err(err) = self.store.persist_run(&run).await {
-            warn!(error = %err, "failed to persist query run");
+            error!(error = %err, "failed to persist query run");
         }
 
         // Persist evidence items
@@ -107,7 +107,7 @@ impl ResultPersister {
 
         if !evidence_items.is_empty() {
             if let Err(err) = self.store.store_evidence_batch(&evidence_items).await {
-                warn!(error = %err, "failed to persist evidence items");
+                error!(error = %err, "failed to persist evidence items");
             }
         }
 
@@ -117,7 +117,7 @@ impl ResultPersister {
             .store_message(&ctx.session_id, MessageRole::Assistant, &response.answer)
             .await
         {
-            warn!(error = %err, "failed to store assistant message");
+            error!(error = %err, "failed to store assistant message");
         }
 
         Ok(response)
