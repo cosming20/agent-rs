@@ -47,6 +47,18 @@ pub trait VectorStore: Send + Sync {
         limit: usize,
     ) -> Result<Vec<SearchResult>, StoreError>;
 
+    /// Dense vector similarity search with optional payload filter.
+    ///
+    /// The `filter` is a JSON object describing Qdrant payload conditions.
+    /// When `None`, behaves identically to [`search`].
+    async fn search_with_filter(
+        &self,
+        collection: &CollectionName,
+        query: &Embedding,
+        limit: usize,
+        filter: Option<serde_json::Value>,
+    ) -> Result<Vec<SearchResult>, StoreError>;
+
     /// Hybrid search: dense + sparse vectors fused via prefetch + RRF.
     async fn search_hybrid(
         &self,

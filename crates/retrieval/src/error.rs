@@ -30,6 +30,14 @@ pub enum RetrievalError {
     #[error("store error during retrieval: {0}")]
     Store(#[from] agent_rs_core::StoreError),
 
+    /// An ingestion operation failed (chunking, metadata extraction, pipeline).
+    #[error("ingestion failed: {reason}")]
+    Ingestion { reason: String },
+
+    /// PDF text extraction failed.
+    #[error("pdf extraction failed: {reason}")]
+    PdfExtraction { reason: String },
+
     /// Feature not yet implemented (used only during phased development).
     #[error("not implemented: {0}")]
     NotImplemented(String),
@@ -49,6 +57,12 @@ impl From<RetrievalError> for agent_rs_core::errors::RetrievalError {
                 agent_rs_core::errors::RetrievalError::NoResults { query }
             }
             RetrievalError::Store(e) => agent_rs_core::errors::RetrievalError::Store(e),
+            RetrievalError::Ingestion { reason } => {
+                agent_rs_core::errors::RetrievalError::Ranking(format!("ingestion: {reason}"))
+            }
+            RetrievalError::PdfExtraction { reason } => {
+                agent_rs_core::errors::RetrievalError::Ranking(format!("pdf extraction: {reason}"))
+            }
             RetrievalError::NotImplemented(msg) => {
                 agent_rs_core::errors::RetrievalError::Ranking(format!("not implemented: {msg}"))
             }

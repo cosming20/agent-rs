@@ -226,6 +226,41 @@ impl VectorStore for QdrantStore {
             .collect()
     }
 
+    /// Dense vector similarity search with optional payload filter.
+    ///
+    /// The `filter` JSON is converted to a Qdrant `Filter` with `must` conditions.
+    /// Supported condition shapes:
+    /// - `{"key": "field_name", "match": {"value": "exact_value"}}` (exact match)
+    ///
+    /// When `filter` is `None`, behaves identically to [`search`].
+    #[instrument(skip(self, query, filter), fields(collection = %collection, limit = limit))]
+    async fn search_with_filter(
+        &self,
+        collection: &CollectionName,
+        query: &Embedding,
+        limit: usize,
+        filter: Option<serde_json::Value>,
+    ) -> Result<Vec<SearchResult>, StoreError> {
+        let mut builder = QueryPointsBuilder::new(collection.as_str())
+            .query(qdrant_client::qdrant::Query::from(query.0.clone()))
+            .using("dense")
+            .limit(limit as u64)
+            .with_payload(true);
+
+        if let Some(filter_json) = filter {
+            let qdrant_filter = json_to_qdrant_filter(filter_json)?;
+            builder = builder.filter(qdrant_filter);
+        }
+
+        let response = self.client.query(builder).await.map_err(StoreError::from)?;
+
+        response
+            .result
+            .into_iter()
+            .map(scored_point_to_result)
+            .collect()
+    }
+
     /// Delete points by string IDs.
     #[instrument(skip(self, ids), fields(collection = %collection, count = ids.len()))]
     async fn delete(
@@ -345,6 +380,81 @@ fn scored_point_to_result(
         id,
         score: Score(point.score as f64),
         payload,
+    })
+}
+
+/// Convert a JSON filter specification into a Qdrant `Filter`.
+///
+/// Accepts either:
+/// - A JSON object with `"must"` array of conditions.
+/// - A single condition object with `"key"` and `"match"` fields.
+///
+/// Each condition must have:
+/// - `"key"`: the payload field name (string)
+/// - `"match"`: `{"value": <string|integer|bool>}`
+fn json_to_qdrant_filter(
+    json: serde_json::Value,
+) -> Result<qdrant_client::qdrant::Filter, StoreError> {
+    use qdrant_client::qdrant::{Condition, Filter};
+
+    let conditions_json = match &json {
+        serde_json::Value::Object(map) if map.contains_key("must") => match map.get("must") {
+            Some(serde_json::Value::Array(arr)) => arr.clone(),
+            _ => {
+                return Err(StoreError::InvalidData(
+                    "filter 'must' field must be an array".into(),
+                ));
+            }
+        },
+        serde_json::Value::Object(_) => vec![json],
+        _ => {
+            return Err(StoreError::InvalidData(
+                "filter must be a JSON object".into(),
+            ));
+        }
+    };
+
+    let mut must = Vec::with_capacity(conditions_json.len());
+
+    for cond in conditions_json {
+        let key = cond
+            .get("key")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| StoreError::InvalidData("filter condition missing 'key'".into()))?
+            .to_string();
+
+        let match_value = cond
+            .get("match")
+            .and_then(|m| m.get("value"))
+            .ok_or_else(|| {
+                StoreError::InvalidData("filter condition missing 'match.value'".into())
+            })?;
+
+        let condition = match match_value {
+            serde_json::Value::String(s) => Condition::matches(key, s.clone()),
+            serde_json::Value::Number(n) => {
+                if let Some(i) = n.as_i64() {
+                    Condition::matches(key, i)
+                } else {
+                    return Err(StoreError::InvalidData(format!(
+                        "filter match value must be string, integer, or bool; got: {n}"
+                    )));
+                }
+            }
+            serde_json::Value::Bool(b) => Condition::matches(key, *b),
+            other => {
+                return Err(StoreError::InvalidData(format!(
+                    "unsupported filter match value type: {other}"
+                )));
+            }
+        };
+
+        must.push(condition);
+    }
+
+    Ok(Filter {
+        must,
+        ..Default::default()
     })
 }
 

@@ -79,6 +79,10 @@ pub enum RetrievalError {
     NoResults { query: String },
     #[error("store error during retrieval: {0}")]
     Store(#[from] StoreError),
+    #[error("ingestion failed: {reason}")]
+    Ingestion { reason: String },
+    #[error("pdf extraction failed: {reason}")]
+    PdfExtraction { reason: String },
 }
 
 // ---- Agent ----
