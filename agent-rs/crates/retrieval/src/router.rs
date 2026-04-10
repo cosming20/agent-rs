@@ -65,13 +65,6 @@ fn to_store_sparse(sv: crate::SparseVector) -> StoreSparseVector {
 /// Shallower traversals are faster and typically sufficient for Phase 3.
 /// Phase 4 will make this configurable per-query.
 const DEFAULT_GRAPH_DEPTH: usize = 2;
-
-/// Empty seed list used as the default for graph-based strategies.
-///
-/// When the seed list is empty the graph back-end performs a best-effort
-/// traversal from its internal entry points (implementation-dependent).
-const EMPTY_SEEDS: &[String] = &[];
-
 // ---- RetrievalRouter ----
 
 /// Routes queries to the appropriate search back-ends and returns fused results.
@@ -137,6 +130,30 @@ impl RetrievalRouter {
             "query rewriting not yet implemented; using raw query"
         );
         query.to_owned()
+    }
+
+    /// Derive seed node IDs for graph traversal by running a quick vector search
+    /// and extracting document IDs from the top results.
+    ///
+    /// This bridges vector → graph: find relevant documents first, then traverse
+    /// their entity graph neighborhood.
+    async fn derive_seed_ids(
+        &self,
+        _query: &str,
+        dense: &agent_rs_core::Embedding,
+        limit: usize,
+    ) -> Result<Vec<String>, RetrievalError> {
+        let top_docs = vector_search(
+            &*self.vector_store,
+            &self.collection,
+            dense,
+            limit.min(10), // cap seed count
+        )
+        .await?;
+
+        let seeds: Vec<String> = top_docs.into_iter().map(|r| r.id).collect();
+        tracing::debug!(seed_count = seeds.len(), "derived graph seed IDs from vector search");
+        Ok(seeds)
     }
 
     /// Embed, dispatch, rank, and return an [`EvidencePack`] for `query`.
@@ -215,11 +232,13 @@ impl RetrievalRouter {
             }
 
             // ---- Single-backend: graph (base traversal) ----
+            // Seed graph traversal from vector search nearest neighbors
             RetrievalStrategy::Graph => {
+                let seeds = self.derive_seed_ids(query_str, &dense, limit).await?;
                 let results = graph_search(
                     &*self.graph_store,
                     query_str,
-                    EMPTY_SEEDS,
+                    &seeds,
                     DEFAULT_GRAPH_DEPTH,
                     limit,
                 )
@@ -229,10 +248,11 @@ impl RetrievalRouter {
 
             // ---- Single-backend: graph RAG completion ----
             RetrievalStrategy::RagCompletion => {
+                let seeds = self.derive_seed_ids(query_str, &dense, limit).await?;
                 let results = graph_rag_context_search(
                     &*self.graph_store,
                     query_str,
-                    EMPTY_SEEDS,
+                    &seeds,
                     DEFAULT_GRAPH_DEPTH,
                     limit,
                 )
@@ -242,10 +262,11 @@ impl RetrievalRouter {
 
             // ---- Single-backend: graph chain-of-thought ----
             RetrievalStrategy::GraphCoT => {
+                let seeds = self.derive_seed_ids(query_str, &dense, limit).await?;
                 let results = graph_cot_search(
                     &*self.graph_store,
                     query_str,
-                    EMPTY_SEEDS,
+                    &seeds,
                     DEFAULT_GRAPH_DEPTH,
                     limit,
                 )
@@ -274,11 +295,12 @@ impl RetrievalRouter {
                     strategy: strategy.to_string(),
                     reason: "sparse embedding required but not computed".into(),
                 })?;
+                let seeds = self.derive_seed_ids(query_str, &dense, limit).await?;
                 let params = GraphHybridParams {
                     query_embedding: &dense,
                     sparse_query: sparse,
                     query: query_str,
-                    seed_node_ids: EMPTY_SEEDS,
+                    seed_node_ids: &seeds,
                     max_depth: DEFAULT_GRAPH_DEPTH,
                     limit,
                 };
@@ -301,11 +323,12 @@ impl RetrievalRouter {
 
             // ---- Parallel: graph + vector (GRAPH_CONSTRAINED) ----
             RetrievalStrategy::GraphConstrained => {
+                let seeds = self.derive_seed_ids(query_str, &dense, limit).await?;
                 let (graph_result, vector_result) = tokio::join!(
                     graph_constrained_search(
                         &*self.graph_store,
                         query_str,
-                        EMPTY_SEEDS,
+                        &seeds,
                         DEFAULT_GRAPH_DEPTH,
                         limit,
                     ),
