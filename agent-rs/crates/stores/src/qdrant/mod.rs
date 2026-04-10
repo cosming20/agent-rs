@@ -271,7 +271,10 @@ fn json_to_qdrant_value(value: serde_json::Value) -> qdrant_client::qdrant::Valu
             if let Some(i) = n.as_i64() {
                 Kind::IntegerValue(i)
             } else {
-                Kind::DoubleValue(n.as_f64().unwrap_or(0.0))
+                Kind::DoubleValue(n.as_f64().unwrap_or_else(|| {
+                    tracing::warn!(number = %n, "JSON number cannot be represented as f64, using 0.0");
+                    0.0
+                }))
             }
         }
         serde_json::Value::String(s) => Kind::StringValue(s),
