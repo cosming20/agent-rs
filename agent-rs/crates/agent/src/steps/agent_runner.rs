@@ -47,8 +47,9 @@ impl AgentRunner {
         system_prompt_file: &str,
     ) -> Result<Self, AgentError> {
         let system_prompt = prompts::load_system_prompt(system_prompt_file);
-        let llm_client = rig::providers::openai::Client::new(api_key)
-            .map_err(|e| AgentError::Orchestrator(format!("failed to create OpenAI client: {e}")))?;
+        let llm_client = rig::providers::openai::Client::new(api_key).map_err(|e| {
+            AgentError::Orchestrator(format!("failed to create OpenAI client: {e}"))
+        })?;
         Ok(Self {
             llm_client,
             model: model.to_owned(),
@@ -94,8 +95,7 @@ impl AgentRunner {
             }
             Err(err) => {
                 error!(error = %err, "agent run failed");
-                ctx.answer =
-                    "I was unable to generate an answer due to a processing error.".into();
+                ctx.answer = "I was unable to generate an answer due to a processing error.".into();
             }
         }
 

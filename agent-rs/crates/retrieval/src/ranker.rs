@@ -186,16 +186,14 @@ impl ResultRanker {
         let documents: Vec<SearchResult> = fused
             .into_iter()
             .take(limit)
-            .filter_map(|(id, fused_score)| {
-                match doc_index.remove(&id) {
-                    Some(mut doc) => {
-                        doc.score = Score(fused_score);
-                        Some(doc)
-                    }
-                    None => {
-                        tracing::error!(doc_id = %id, "ranked document missing from index — logic bug");
-                        None
-                    }
+            .filter_map(|(id, fused_score)| match doc_index.remove(&id) {
+                Some(mut doc) => {
+                    doc.score = Score(fused_score);
+                    Some(doc)
+                }
+                None => {
+                    tracing::error!(doc_id = %id, "ranked document missing from index — logic bug");
+                    None
                 }
             })
             .collect();

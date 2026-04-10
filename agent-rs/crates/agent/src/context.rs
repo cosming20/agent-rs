@@ -17,7 +17,6 @@ use crate::verifier::VerificationResult;
 /// are `Option` and populated by successive pipeline steps.
 pub struct QueryContext {
     // ---- Immutable request parameters ----
-
     /// The user's query text.
     pub query: String,
     /// Session identifier for conversation continuity.
@@ -34,14 +33,12 @@ pub struct QueryContext {
     pub start_time: Instant,
 
     // ---- Accumulated by ContextBuilder ----
-
     /// Chat history messages for the Rig agent.
     pub chat_messages: Vec<String>,
     /// Conversation context string for search augmentation.
     pub conversation_context: String,
 
     // ---- Accumulated by AgentRunner ----
-
     /// Knowledge-base evidence accumulated by tool calls.
     pub kb_evidence: Vec<SearchResult>,
     /// Web evidence accumulated by tool calls.
@@ -52,14 +49,12 @@ pub struct QueryContext {
     pub agent_latency_ms: u64,
 
     // ---- Accumulated by EvidenceFuser ----
-
     /// Fused and ranked evidence documents.
     pub evidence: Vec<SearchResult>,
     /// The full evidence pack with provenance metadata.
     pub fused_pack: Option<EvidencePack>,
 
     // ---- Accumulated by GroundingGate ----
-
     /// Verification result from the grounding check.
     pub verification: Option<VerificationResult>,
     /// Number of retry attempts performed.

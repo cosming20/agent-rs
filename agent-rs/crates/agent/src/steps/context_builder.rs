@@ -58,10 +58,7 @@ impl ContextBuilder {
             .await?;
 
         // 2. Load conversation history
-        let history = self
-            .memory
-            .load_history(&ctx.session_id, 10)
-            .await?;
+        let history = self.memory.load_history(&ctx.session_id, 10).await?;
 
         let mut chat_messages: Vec<String> = Vec::new();
 
