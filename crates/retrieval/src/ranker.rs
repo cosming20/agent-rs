@@ -187,10 +187,16 @@ impl ResultRanker {
             .into_iter()
             .take(limit)
             .filter_map(|(id, fused_score)| {
-                doc_index.remove(&id).map(|mut doc| {
-                    doc.score = Score(fused_score);
-                    doc
-                })
+                match doc_index.remove(&id) {
+                    Some(mut doc) => {
+                        doc.score = Score(fused_score);
+                        Some(doc)
+                    }
+                    None => {
+                        tracing::error!(doc_id = %id, "ranked document missing from index — logic bug");
+                        None
+                    }
+                }
             })
             .collect();
 
@@ -266,12 +272,13 @@ fn apply_source_weight(results: Vec<SearchResult>, weight: f64) -> Vec<SearchRes
 fn build_source_counts_from_docs(documents: &[SearchResult]) -> HashMap<String, usize> {
     let mut counts: HashMap<String, usize> = HashMap::new();
     for doc in documents {
-        let source = doc
-            .payload
-            .get("source")
-            .and_then(|v| v.as_str())
-            .unwrap_or("unknown")
-            .to_owned();
+        let source = match doc.payload.get("source").and_then(|v| v.as_str()) {
+            Some(s) => s.to_owned(),
+            None => {
+                tracing::warn!(doc_id = %doc.id, "document missing 'source' field in payload");
+                "unknown".to_owned()
+            }
+        };
         *counts.entry(source).or_insert(0) += 1;
     }
     counts
