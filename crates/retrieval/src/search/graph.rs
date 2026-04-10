@@ -1,4 +1,213 @@
 //! Cypher graph traversal search back-end.
 //!
-//! Queries Neo4j for entity-relation graph completions.
-//! Full implementation will be added in Phase 3 Step 8.
+//! Provides graph-based retrieval by expanding from seed nodes via
+//! [`GraphStore::get_neighbors`]. Results are converted from [`GraphNode`]s to
+//! [`SearchResult`]s with scores derived from traversal depth: shallower nodes
+//! receive a higher score, modelling relevance-by-proximity.
+//!
+//! # Variants
+//!
+//! - [`graph_search`] — base graph traversal from seed node IDs.
+//! - [`graph_cot_search`] — chain-of-thought graph search (Phase 3: delegates
+//!   to base; Phase 4 adds LLM-guided step selection).
+//! - [`graph_constrained_search`] — constraint-filtered graph search (Phase 3:
+//!   delegates to base; Phase 4 adds property-filter pushdown).
+//! - [`graph_rag_context_search`] — context-augmented graph search (Phase 3:
+//!   delegates to base; Phase 4 adds context injection into the Cypher query).
+
+use std::collections::HashMap;
+
+use agent_rs_core::Score;
+use agent_rs_stores::{traits::GraphStore, types::SearchResult};
+use serde_json::json;
+use tracing::instrument;
+
+use crate::error::RetrievalError;
+
+// ---- Scoring constants ----
+
+/// Score assigned to a node found at depth 1 (direct neighbour).
+///
+/// Scores decay linearly with depth. Nodes at depth `d` receive
+/// `BASE_DEPTH_SCORE / d as f64`.
+const BASE_DEPTH_SCORE: f64 = 1.0;
+
+// ---- graph_search ----
+
+/// Perform a graph traversal search starting from `seed_node_ids`.
+///
+/// For each seed node, the function fetches all neighbours up to `max_depth`
+/// via [`GraphStore::get_neighbors`]. Returned [`GraphNode`]s are converted to
+/// [`SearchResult`]s with scores inversely proportional to their discovery
+/// depth. Nodes discovered from multiple seeds are deduplicated and scored by
+/// their best (highest) individual score.
+///
+/// # Parameters
+///
+/// - `store` — the graph backend to query.
+/// - `query` — the original user query string (stored in result payload for
+///   provenance; not used for graph traversal in Phase 3).
+/// - `seed_node_ids` — IDs of the starting nodes for traversal.
+/// - `max_depth` — maximum traversal depth from each seed.
+/// - `limit` — maximum number of results to return.
+///
+/// # Errors
+///
+/// Returns [`RetrievalError::Store`] if any `get_neighbors` call fails.
+#[instrument(skip(store), fields(
+    num_seeds = seed_node_ids.len(),
+    max_depth,
+    limit,
+))]
+pub async fn graph_search(
+    store: &(dyn GraphStore + Send + Sync),
+    query: &str,
+    seed_node_ids: &[String],
+    max_depth: usize,
+    limit: usize,
+) -> Result<Vec<SearchResult>, RetrievalError> {
+    // best_score tracks the highest score seen for each unique node ID so that
+    // nodes reachable from multiple seeds keep only their best result.
+    let mut best_score: HashMap<String, f64> = HashMap::new();
+    // node_payload retains the payload of the first (highest-score) encounter.
+    let mut node_payload: HashMap<String, serde_json::Value> = HashMap::new();
+
+    for seed_id in seed_node_ids {
+        let neighbors = store
+            .get_neighbors(seed_id, max_depth)
+            .await
+            .map_err(RetrievalError::Store)?;
+
+        for (depth_0based, node) in neighbors.iter().enumerate() {
+            // Shift to 1-based depth so the seed's immediate neighbours are depth 1.
+            let depth = depth_0based + 1;
+            let score = BASE_DEPTH_SCORE / depth as f64;
+
+            let entry = best_score.entry(node.id.clone()).or_insert(0.0);
+            if score > *entry {
+                *entry = score;
+                node_payload.insert(
+                    node.id.clone(),
+                    json!({
+                        "node_id": node.id,
+                        "label": node.label.as_str(),
+                        "properties": node.properties,
+                        "source": "neo4j",
+                        "query": query,
+                        "depth": depth,
+                    }),
+                );
+            }
+        }
+    }
+
+    // Sort by descending score then by ID for determinism.
+    let mut scored: Vec<(String, f64)> = best_score.into_iter().collect();
+    scored.sort_unstable_by(|(id_a, score_a), (id_b, score_b)| {
+        score_b
+            .partial_cmp(score_a)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| id_a.cmp(id_b))
+    });
+
+    let results: Vec<SearchResult> = scored
+        .into_iter()
+        .take(limit)
+        .filter_map(|(id, score)| {
+            node_payload.remove(&id).map(|payload| SearchResult {
+                id,
+                score: Score(score),
+                payload,
+            })
+        })
+        .collect();
+
+    Ok(results)
+}
+
+// ---- graph_cot_search ----
+
+/// Graph chain-of-thought search.
+///
+/// **Phase 3 stub:** delegates to [`graph_search`]. Phase 4 will interleave
+/// LLM-guided step selection between graph hops to reason over the retrieved
+/// subgraph iteratively.
+///
+/// # Errors
+///
+/// Returns [`RetrievalError::Store`] if the underlying traversal fails.
+#[instrument(skip(store), fields(
+    num_seeds = seed_node_ids.len(),
+    max_depth,
+    limit,
+))]
+pub async fn graph_cot_search(
+    store: &(dyn GraphStore + Send + Sync),
+    query: &str,
+    seed_node_ids: &[String],
+    max_depth: usize,
+    limit: usize,
+) -> Result<Vec<SearchResult>, RetrievalError> {
+    tracing::debug!(
+        "graph_cot_search: LLM chain-of-thought not yet implemented; using graph_search"
+    );
+    graph_search(store, query, seed_node_ids, max_depth, limit).await
+}
+
+// ---- graph_constrained_search ----
+
+/// Graph search with constraint filtering.
+///
+/// **Phase 3 stub:** delegates to [`graph_search`]. Phase 4 will add
+/// property-filter predicates pushed down into the Cypher `WHERE` clause
+/// to restrict which nodes and edges qualify during traversal.
+///
+/// # Errors
+///
+/// Returns [`RetrievalError::Store`] if the underlying traversal fails.
+#[instrument(skip(store), fields(
+    num_seeds = seed_node_ids.len(),
+    max_depth,
+    limit,
+))]
+pub async fn graph_constrained_search(
+    store: &(dyn GraphStore + Send + Sync),
+    query: &str,
+    seed_node_ids: &[String],
+    max_depth: usize,
+    limit: usize,
+) -> Result<Vec<SearchResult>, RetrievalError> {
+    tracing::debug!(
+        "graph_constrained_search: constraint filtering not yet implemented; using graph_search"
+    );
+    graph_search(store, query, seed_node_ids, max_depth, limit).await
+}
+
+// ---- graph_rag_context_search ----
+
+/// Context-augmented graph (RAG completion) search.
+///
+/// **Phase 3 stub:** delegates to [`graph_search`]. Phase 4 will inject a
+/// context string (e.g. conversation history or a query reformulation) into
+/// the Cypher query to guide the traversal toward contextually relevant nodes.
+///
+/// # Errors
+///
+/// Returns [`RetrievalError::Store`] if the underlying traversal fails.
+#[instrument(skip(store), fields(
+    num_seeds = seed_node_ids.len(),
+    max_depth,
+    limit,
+))]
+pub async fn graph_rag_context_search(
+    store: &(dyn GraphStore + Send + Sync),
+    query: &str,
+    seed_node_ids: &[String],
+    max_depth: usize,
+    limit: usize,
+) -> Result<Vec<SearchResult>, RetrievalError> {
+    tracing::debug!(
+        "graph_rag_context_search: context injection not yet implemented; using graph_search"
+    );
+    graph_search(store, query, seed_node_ids, max_depth, limit).await
+}
