@@ -151,7 +151,7 @@ impl VectorStore for QdrantStore {
             .await
             .map_err(StoreError::from)?;
 
-        Ok(response.result.into_iter().map(scored_point_to_result).collect())
+        response.result.into_iter().map(scored_point_to_result).collect()
     }
 
     /// Hybrid search: dense + sparse prefetch fused via RRF.
@@ -200,7 +200,7 @@ impl VectorStore for QdrantStore {
             .await
             .map_err(StoreError::from)?;
 
-        Ok(response.result.into_iter().map(scored_point_to_result).collect())
+        response.result.into_iter().map(scored_point_to_result).collect()
     }
 
     /// Delete points by string IDs.
@@ -293,7 +293,9 @@ fn json_to_qdrant_value(value: serde_json::Value) -> qdrant_client::qdrant::Valu
 }
 
 /// Convert a scored point from the Qdrant response into a domain [`SearchResult`].
-fn scored_point_to_result(point: qdrant_client::qdrant::ScoredPoint) -> SearchResult {
+///
+/// Returns `Err` if the point has no valid ID — never produces empty-ID results.
+fn scored_point_to_result(point: qdrant_client::qdrant::ScoredPoint) -> Result<SearchResult, StoreError> {
     let id = match point.id {
         Some(qdrant_client::qdrant::PointId {
             point_id_options:
@@ -303,7 +305,11 @@ fn scored_point_to_result(point: qdrant_client::qdrant::ScoredPoint) -> SearchRe
             point_id_options:
                 Some(qdrant_client::qdrant::point_id::PointIdOptions::Num(n)),
         }) => n.to_string(),
-        _ => String::new(),
+        other => {
+            return Err(StoreError::InvalidData(
+                format!("scored point has no valid ID: {other:?}")
+            ));
+        }
     };
 
     let payload = serde_json::Value::Object(
@@ -314,11 +320,11 @@ fn scored_point_to_result(point: qdrant_client::qdrant::ScoredPoint) -> SearchRe
             .collect(),
     );
 
-    SearchResult {
+    Ok(SearchResult {
         id,
         score: Score(point.score as f64),
         payload,
-    }
+    })
 }
 
 /// Recursively convert a `qdrant_client::qdrant::Value` back into `serde_json::Value`.
