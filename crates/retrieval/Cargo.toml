@@ -1,0 +1,31 @@
+[package]
+name = "agent-rs-retrieval"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Retrieval engine: embedding, search strategies, routing, and ranking."
+
+[dependencies]
+agent-rs-core   = { workspace = true }
+agent-rs-stores = { workspace = true }
+
+# Embeddings (ONNX local inference)
+fastembed = "5"
+
+# CPU-bound batch parallelism
+rayon = { workspace = true }
+
+# Async
+tokio       = { workspace = true }
+async-trait = { workspace = true }
+
+# Logging
+tracing = { workspace = true }
+
+# Serialization
+serde      = { workspace = true }
+serde_json = { workspace = true }
+
+# Error handling
+thiserror = { workspace = true }

@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/core",
     "crates/stores",
+    "crates/retrieval",
 ]
 
 [workspace.package]
@@ -14,6 +15,9 @@ license = "MIT"
 # Async
 tokio = { version = "1", features = ["full"] }
 async-trait = "0.1"
+
+# CPU-bound parallelism
+rayon = "1"
 
 # Serialization
 serde = { version = "1", features = ["derive"] }
