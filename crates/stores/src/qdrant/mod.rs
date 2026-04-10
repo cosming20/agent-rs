@@ -15,16 +15,16 @@ use std::collections::HashMap;
 
 use agent_rs_core::{CollectionName, Embedding, StoreError};
 use async_trait::async_trait;
+use qdrant_client::Qdrant;
 use qdrant_client::qdrant::{
     DeletePointsBuilder, DenseVector, NamedVectors, PointId, PointStruct, PointsIdsList,
     PrefetchQueryBuilder, QueryPointsBuilder, UpsertPointsBuilder, Vector, Vectors,
 };
-use qdrant_client::Qdrant;
 use tracing::instrument;
 
-use agent_rs_core::Score;
 use crate::traits::VectorStore;
 use crate::types::{CollectionConfig, SearchResult, SparseVector, VectorPoint};
+use agent_rs_core::Score;
 
 // ---- QdrantStore ----
 
@@ -91,7 +91,10 @@ impl VectorStore for QdrantStore {
 
                 // Dense vector under the named vector key "dense".
                 // `DenseVector` implements `Into<Vector>` (non-deprecated path).
-                let dense_vector: Vector = DenseVector { data: p.embedding.0 }.into();
+                let dense_vector: Vector = DenseVector {
+                    data: p.embedding.0,
+                }
+                .into();
                 vectors.insert("dense".into(), dense_vector);
 
                 // Sparse vector under "sparse" when present.
@@ -111,9 +114,9 @@ impl VectorStore for QdrantStore {
                     id: Some(PointId::from(p.id.as_str())),
                     vectors: Some(Vectors {
                         vectors_options: Some(
-                            qdrant_client::qdrant::vectors::VectorsOptions::Vectors(
-                                NamedVectors { vectors },
-                            ),
+                            qdrant_client::qdrant::vectors::VectorsOptions::Vectors(NamedVectors {
+                                vectors,
+                            }),
                         ),
                     }),
                     payload,
@@ -151,7 +154,11 @@ impl VectorStore for QdrantStore {
             .await
             .map_err(StoreError::from)?;
 
-        response.result.into_iter().map(scored_point_to_result).collect()
+        response
+            .result
+            .into_iter()
+            .map(scored_point_to_result)
+            .collect()
     }
 
     /// Hybrid search: dense + sparse prefetch fused via RRF.
@@ -200,7 +207,11 @@ impl VectorStore for QdrantStore {
             .await
             .map_err(StoreError::from)?;
 
-        response.result.into_iter().map(scored_point_to_result).collect()
+        response
+            .result
+            .into_iter()
+            .map(scored_point_to_result)
+            .collect()
     }
 
     /// Delete points by string IDs.
@@ -243,9 +254,7 @@ impl VectorStore for QdrantStore {
 ///
 /// Non-object JSON values are wrapped under the key `"value"` so that the
 /// payload is always a valid `HashMap<String, qdrant_client::qdrant::Value>`.
-fn payload_from_json(
-    value: serde_json::Value,
-) -> HashMap<String, qdrant_client::qdrant::Value> {
+fn payload_from_json(value: serde_json::Value) -> HashMap<String, qdrant_client::qdrant::Value> {
     match value {
         serde_json::Value::Object(map) => map
             .into_iter()
@@ -295,20 +304,20 @@ fn json_to_qdrant_value(value: serde_json::Value) -> qdrant_client::qdrant::Valu
 /// Convert a scored point from the Qdrant response into a domain [`SearchResult`].
 ///
 /// Returns `Err` if the point has no valid ID — never produces empty-ID results.
-fn scored_point_to_result(point: qdrant_client::qdrant::ScoredPoint) -> Result<SearchResult, StoreError> {
+fn scored_point_to_result(
+    point: qdrant_client::qdrant::ScoredPoint,
+) -> Result<SearchResult, StoreError> {
     let id = match point.id {
         Some(qdrant_client::qdrant::PointId {
-            point_id_options:
-                Some(qdrant_client::qdrant::point_id::PointIdOptions::Uuid(s)),
+            point_id_options: Some(qdrant_client::qdrant::point_id::PointIdOptions::Uuid(s)),
         }) => s,
         Some(qdrant_client::qdrant::PointId {
-            point_id_options:
-                Some(qdrant_client::qdrant::point_id::PointIdOptions::Num(n)),
+            point_id_options: Some(qdrant_client::qdrant::point_id::PointIdOptions::Num(n)),
         }) => n.to_string(),
         other => {
-            return Err(StoreError::InvalidData(
-                format!("scored point has no valid ID: {other:?}")
-            ));
+            return Err(StoreError::InvalidData(format!(
+                "scored point has no valid ID: {other:?}"
+            )));
         }
     };
 

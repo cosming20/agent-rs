@@ -196,9 +196,8 @@ impl QueryRunRow {
     /// - [`StoreError::InvalidData`] if `confidence` is outside `[0.0, 1.0]`.
     pub fn into_domain(self) -> Result<QueryRun, StoreError> {
         let strategy = str_to_strategy(&self.strategy)?;
-        let confidence = Confidence::new(self.confidence).map_err(|e| {
-            StoreError::InvalidData(format!("confidence out of range in DB: {e}"))
-        })?;
+        let confidence = Confidence::new(self.confidence)
+            .map_err(|e| StoreError::InvalidData(format!("confidence out of range in DB: {e}")))?;
         Ok(QueryRun {
             id: self.id,
             session_id: SessionId(self.session_id),

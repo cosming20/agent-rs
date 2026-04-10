@@ -6,9 +6,9 @@
 
 mod queries;
 
-use agent_rs_core::{config::Neo4jConfig, StoreError};
+use agent_rs_core::{StoreError, config::Neo4jConfig};
 use async_trait::async_trait;
-use neo4rs::{query, Graph};
+use neo4rs::{Graph, query};
 use tracing::instrument;
 
 use crate::{
@@ -163,9 +163,9 @@ impl GraphStore for Neo4jStore {
 
         let mut paths = Vec::new();
         while let Some(row) = result.next().await.map_err(StoreError::from)? {
-            let path: neo4rs::Path = row.get("p").map_err(|e| {
-                StoreError::QueryFailed(format!("failed to deserialize path: {e}"))
-            })?;
+            let path: neo4rs::Path = row
+                .get("p")
+                .map_err(|e| StoreError::QueryFailed(format!("failed to deserialize path: {e}")))?;
             paths.push(bolt_path_to_graph_path(path)?);
         }
         Ok(paths)
@@ -212,9 +212,9 @@ impl GraphStore for Neo4jStore {
 /// The domain `id` property must be stored on the node as a string property
 /// named `"id"`. The first label is used as the [`crate::types::NodeLabel`].
 fn bolt_node_to_graph_node(node: neo4rs::Node) -> Result<GraphNode, StoreError> {
-    let id: String = node.get("id").map_err(|e| {
-        StoreError::QueryFailed(format!("node missing 'id' property: {e}"))
-    })?;
+    let id: String = node
+        .get("id")
+        .map_err(|e| StoreError::QueryFailed(format!("node missing 'id' property: {e}")))?;
 
     let label_str = node
         .labels()
@@ -222,16 +222,17 @@ fn bolt_node_to_graph_node(node: neo4rs::Node) -> Result<GraphNode, StoreError> 
         .next()
         .ok_or_else(|| StoreError::QueryFailed("node has no labels".into()))?;
 
-    let label = crate::types::NodeLabel::new(label_str).map_err(|e| {
-        StoreError::QueryFailed(format!("invalid node label '{label_str}': {e}"))
-    })?;
+    let label = crate::types::NodeLabel::new(label_str)
+        .map_err(|e| StoreError::QueryFailed(format!("invalid node label '{label_str}': {e}")))?;
 
     // Reconstruct properties from the node's property keys using the
     // neo4rs serde bridge (node.get::<serde_json::Value>(key)).
     let mut map = serde_json::Map::new();
     for key in node.keys() {
         match node.get::<serde_json::Value>(key) {
-            Ok(val) => { map.insert(key.to_owned(), val); }
+            Ok(val) => {
+                map.insert(key.to_owned(), val);
+            }
             Err(e) => {
                 tracing::warn!(property = %key, error = %e, "failed to deserialize node property; skipping");
             }
@@ -239,7 +240,11 @@ fn bolt_node_to_graph_node(node: neo4rs::Node) -> Result<GraphNode, StoreError> 
     }
     let properties = serde_json::Value::Object(map);
 
-    Ok(GraphNode { id, label, properties })
+    Ok(GraphNode {
+        id,
+        label,
+        properties,
+    })
 }
 
 /// Convert a `neo4rs::Path` into a domain [`GraphPath`].
@@ -259,18 +264,18 @@ fn bolt_path_to_graph_path(path: neo4rs::Path) -> Result<GraphPath, StoreError> 
     let mut graph_edges: Vec<GraphEdge> = Vec::with_capacity(rels.len());
 
     for (i, rel) in rels.into_iter().enumerate() {
-        let src_id = graph_nodes
-            .get(i)
-            .map(|n| n.id.clone())
-            .ok_or_else(|| StoreError::QueryFailed(
-                format!("path relationship {i} has no source node")
-            ))?;
+        let src_id = graph_nodes.get(i).map(|n| n.id.clone()).ok_or_else(|| {
+            StoreError::QueryFailed(format!("path relationship {i} has no source node"))
+        })?;
         let dst_id = graph_nodes
             .get(i + 1)
             .map(|n| n.id.clone())
-            .ok_or_else(|| StoreError::QueryFailed(
-                format!("path relationship {i} has no target node (index {})", i + 1)
-            ))?;
+            .ok_or_else(|| {
+                StoreError::QueryFailed(format!(
+                    "path relationship {i} has no target node (index {})",
+                    i + 1
+                ))
+            })?;
 
         let rel_type_str = rel.typ();
         let relation_type = RelationType::new(rel_type_str).map_err(|e| {
@@ -280,7 +285,9 @@ fn bolt_path_to_graph_path(path: neo4rs::Path) -> Result<GraphPath, StoreError> 
         let mut prop_map = serde_json::Map::new();
         for key in rel.keys() {
             match rel.get::<serde_json::Value>(key) {
-                Ok(val) => { prop_map.insert(key.to_owned(), val); }
+                Ok(val) => {
+                    prop_map.insert(key.to_owned(), val);
+                }
                 Err(e) => {
                     tracing::warn!(property = %key, error = %e, "failed to deserialize relationship property; skipping");
                 }
