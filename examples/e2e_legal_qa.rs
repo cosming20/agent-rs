@@ -597,6 +597,10 @@ async fn cleanup(
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // 0. Load .env from parent directory (project root) for API keys.
+    let _ = dotenvy::from_filename("../.env"); // parent .env (LLM_API_KEY, etc.)
+    let _ = dotenvy::dotenv(); // local .env if present
+
     // 1. Load configuration.
     let settings = Settings::load().context("failed to load configuration")?;
     agent_rs_core::logging::init_logging(false);
@@ -668,7 +672,8 @@ async fn main() -> Result<()> {
     let embedder: Arc<dyn Embedder + Send + Sync> = if uses_openai {
         info!("initializing OpenAI embedder...");
         let api_key = std::env::var("OPENAI_API_KEY")
-            .context("OPENAI_API_KEY must be set when EMBEDDER_TYPE=openai")?;
+            .or_else(|_| std::env::var("LLM_API_KEY"))
+            .context("OPENAI_API_KEY or LLM_API_KEY must be set when EMBEDDER_TYPE=openai")?;
         let model = std::env::var("OPENAI_EMBEDDING_MODEL")
             .unwrap_or_else(|_| "text-embedding-3-large".to_owned());
         let dims: usize = std::env::var("OPENAI_EMBEDDING_DIMS")
@@ -725,27 +730,20 @@ async fn main() -> Result<()> {
     // 9. Run queries.
     info!("--- QUERY PHASE ---");
 
+    // Use Semantic (dense-only) for OpenAI since it doesn't support sparse vectors.
+    // Use Hybrid (dense + sparse) for fastembed which supports both.
+    let default_strategy = if uses_openai {
+        RetrievalStrategy::Semantic
+    } else {
+        RetrievalStrategy::Hybrid
+    };
+
     let questions: Vec<(&str, RetrievalStrategy)> = vec![
-        (
-            "Ce prevede articolul 170 din Codul Penal?",
-            RetrievalStrategy::Hybrid,
-        ),
-        (
-            "Ce se intampla daca fur si bat o persoana?",
-            RetrievalStrategy::Hybrid,
-        ),
-        (
-            "Care sunt pedepsele pentru furt calificat?",
-            RetrievalStrategy::Hybrid,
-        ),
-        (
-            "Ce este tentativa conform Codului Penal?",
-            RetrievalStrategy::Hybrid,
-        ),
-        (
-            "Care sunt circumstantele agravante?",
-            RetrievalStrategy::Hybrid,
-        ),
+        ("Ce prevede articolul 170 din Codul Penal?", default_strategy),
+        ("Ce se intampla daca fur si bat o persoana?", default_strategy),
+        ("Care sunt pedepsele pentru furt calificat?", default_strategy),
+        ("Ce este tentativa conform Codului Penal?", default_strategy),
+        ("Care sunt circumstantele agravante?", default_strategy),
     ];
 
     let limit = 5;
