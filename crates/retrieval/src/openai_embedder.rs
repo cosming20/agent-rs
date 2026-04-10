@@ -246,18 +246,13 @@ impl OpenAIEmbedder {
                     })?;
 
                 let status = resp.status();
-                let bytes = resp
-                    .bytes()
-                    .await
-                    .map_err(|e| RetrievalError::Embedding {
-                        reason: format!("failed to read response body: {e}"),
-                    })?;
+                let bytes = resp.bytes().await.map_err(|e| RetrievalError::Embedding {
+                    reason: format!("failed to read response body: {e}"),
+                })?;
 
                 if status.is_success() {
                     Ok(bytes)
-                } else if status == StatusCode::TOO_MANY_REQUESTS
-                    || status.is_server_error()
-                {
+                } else if status == StatusCode::TOO_MANY_REQUESTS || status.is_server_error() {
                     // Parse error message for logging, then return retryable error.
                     let msg = parse_api_error(&bytes, status);
                     tracing::warn!(status = %status, error = %msg, "retryable API error");
@@ -279,7 +274,9 @@ impl OpenAIEmbedder {
             // Only retry rate-limit and server errors.
             match e {
                 RetrievalError::Embedding { reason } => {
-                    reason.contains("429") || reason.contains("5xx") || reason.contains("server error")
+                    reason.contains("429")
+                        || reason.contains("5xx")
+                        || reason.contains("server error")
                 }
                 _ => false,
             }
@@ -427,9 +424,7 @@ fn parse_api_error(bytes: &[u8], status: StatusCode) -> String {
             msg
         }
         Err(_) => {
-            let body_preview = String::from_utf8_lossy(
-                &bytes[..bytes.len().min(200)],
-            );
+            let body_preview = String::from_utf8_lossy(&bytes[..bytes.len().min(200)]);
             format!(
                 "OpenAI API error (HTTP {}): {}",
                 status.as_u16(),

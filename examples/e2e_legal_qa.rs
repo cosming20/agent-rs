@@ -349,10 +349,12 @@ async fn ingest_chunks(
         .map(|((chunk, dense), sparse)| VectorPoint {
             id: format!("art_{}", chunk.article_number),
             embedding: Embedding(dense.0.clone()),
-            sparse_vector: sparse.as_ref().map(|s| agent_rs_stores::types::SparseVector {
-                indices: s.indices.clone(),
-                values: s.values.clone(),
-            }),
+            sparse_vector: sparse
+                .as_ref()
+                .map(|s| agent_rs_stores::types::SparseVector {
+                    indices: s.indices.clone(),
+                    values: s.values.clone(),
+                }),
             payload: serde_json::json!({
                 "article_number": chunk.article_number,
                 "title": chunk.title,
@@ -739,9 +741,18 @@ async fn main() -> Result<()> {
     };
 
     let questions: Vec<(&str, RetrievalStrategy)> = vec![
-        ("Ce prevede articolul 170 din Codul Penal?", default_strategy),
-        ("Ce se intampla daca fur si bat o persoana?", default_strategy),
-        ("Care sunt pedepsele pentru furt calificat?", default_strategy),
+        (
+            "Ce prevede articolul 170 din Codul Penal?",
+            default_strategy,
+        ),
+        (
+            "Ce se intampla daca fur si bat o persoana?",
+            default_strategy,
+        ),
+        (
+            "Care sunt pedepsele pentru furt calificat?",
+            default_strategy,
+        ),
         ("Ce este tentativa conform Codului Penal?", default_strategy),
         ("Care sunt circumstantele agravante?", default_strategy),
     ];

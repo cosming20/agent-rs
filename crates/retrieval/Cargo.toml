@@ -35,3 +35,15 @@ reqwest = { workspace = true }
 
 # Retry with backoff (rate-limit handling)
 backon = "1"
+
+# UUIDs (chunk IDs)
+uuid = { workspace = true }
+
+# Regex (section detection, entity extraction, metadata)
+regex = { workspace = true }
+
+# Timestamps (ingestion duration)
+chrono = { workspace = true }
+
+# PDF text extraction
+pdf-extract = { workspace = true }
