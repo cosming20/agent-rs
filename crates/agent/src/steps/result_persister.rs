@@ -45,9 +45,7 @@ impl ResultPersister {
     ))]
     pub async fn persist(&self, ctx: &QueryContext) -> Result<SynthesizedResponse, AgentError> {
         let verification = ctx.verification.as_ref().ok_or_else(|| {
-            AgentError::Orchestrator(
-                "verification result missing before persist".into(),
-            )
+            AgentError::Orchestrator("verification result missing before persist".into())
         })?;
 
         // Synthesize citations

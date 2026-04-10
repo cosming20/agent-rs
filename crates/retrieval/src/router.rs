@@ -29,16 +29,21 @@ use agent_rs_core::{CollectionName, RetrievalStrategy};
 use tracing::instrument;
 
 use crate::{
-    Embedder, EvidencePack, RetrievalError, ResultRanker,
+    Embedder, EvidencePack, ResultRanker, RetrievalError,
     search::{
-        graph::{graph_cot_search, graph_constrained_search, graph_rag_context_search, graph_search},
+        graph::{
+            graph_constrained_search, graph_cot_search, graph_rag_context_search, graph_search,
+        },
         hybrid::{GraphHybridParams, graph_hybrid_search, hybrid_search},
         keyword::keyword_search,
         vector::{summaries_search, temporal_search, vector_search},
     },
     strategy::get_descriptor,
 };
-use agent_rs_stores::{traits::{GraphStore, VectorStore}, types::SparseVector as StoreSparseVector};
+use agent_rs_stores::{
+    traits::{GraphStore, VectorStore},
+    types::SparseVector as StoreSparseVector,
+};
 
 // ---- Helpers ----
 
@@ -199,20 +204,13 @@ impl RetrievalRouter {
 
             // ---- Single-backend: keyword ----
             RetrievalStrategy::Keyword => {
-                let sparse = sparse_opt.as_ref().ok_or_else(|| {
-                    RetrievalError::Routing {
-                        strategy: strategy.to_string(),
-                        reason: "sparse embedding required but not computed".into(),
-                    }
+                let sparse = sparse_opt.as_ref().ok_or_else(|| RetrievalError::Routing {
+                    strategy: strategy.to_string(),
+                    reason: "sparse embedding required but not computed".into(),
                 })?;
-                let results = keyword_search(
-                    &*self.vector_store,
-                    &self.collection,
-                    &dense,
-                    sparse,
-                    limit,
-                )
-                .await?;
+                let results =
+                    keyword_search(&*self.vector_store, &self.collection, &dense, sparse, limit)
+                        .await?;
                 vec![results]
             }
 
@@ -257,30 +255,24 @@ impl RetrievalRouter {
 
             // ---- Parallel: vector + keyword (HYBRID) ----
             RetrievalStrategy::Hybrid => {
-                let sparse = sparse_opt.as_ref().ok_or_else(|| {
-                    RetrievalError::Routing {
-                        strategy: strategy.to_string(),
-                        reason: "sparse embedding required but not computed".into(),
-                    }
+                let sparse = sparse_opt.as_ref().ok_or_else(|| RetrievalError::Routing {
+                    strategy: strategy.to_string(),
+                    reason: "sparse embedding required but not computed".into(),
                 })?;
-                let hybrid_results = hybrid_search(
-                    &*self.vector_store,
-                    &self.collection,
-                    &dense,
-                    sparse,
-                    limit,
-                )
-                .await?;
-                vec![hybrid_results.vector_results, hybrid_results.keyword_results]
+                let hybrid_results =
+                    hybrid_search(&*self.vector_store, &self.collection, &dense, sparse, limit)
+                        .await?;
+                vec![
+                    hybrid_results.vector_results,
+                    hybrid_results.keyword_results,
+                ]
             }
 
             // ---- Parallel: vector + keyword + graph (GRAPH_HYBRID) ----
             RetrievalStrategy::GraphHybrid => {
-                let sparse = sparse_opt.as_ref().ok_or_else(|| {
-                    RetrievalError::Routing {
-                        strategy: strategy.to_string(),
-                        reason: "sparse embedding required but not computed".into(),
-                    }
+                let sparse = sparse_opt.as_ref().ok_or_else(|| RetrievalError::Routing {
+                    strategy: strategy.to_string(),
+                    reason: "sparse embedding required but not computed".into(),
                 })?;
                 let params = GraphHybridParams {
                     query_embedding: &dense,
@@ -290,9 +282,13 @@ impl RetrievalRouter {
                     max_depth: DEFAULT_GRAPH_DEPTH,
                     limit,
                 };
-                let hybrid_results =
-                    graph_hybrid_search(&*self.vector_store, &*self.graph_store, &self.collection, params)
-                        .await?;
+                let hybrid_results = graph_hybrid_search(
+                    &*self.vector_store,
+                    &*self.graph_store,
+                    &self.collection,
+                    params,
+                )
+                .await?;
                 let mut lists = vec![
                     hybrid_results.vector_results,
                     hybrid_results.keyword_results,
