@@ -92,6 +92,12 @@ pub trait Embedder: Send + Sync {
     /// any element in the batch.
     async fn embed_batch(&self, texts: &[&str]) -> Result<Vec<Embedding>, RetrievalError>;
 
+    /// Embed a batch of document/passage texts into dense [`Embedding`]s.
+    ///
+    /// Unlike [`embed_batch`], this prepends the "passage: " prefix required
+    /// by multilingual E5 models for optimal retrieval quality.
+    async fn embed_documents(&self, texts: &[&str]) -> Result<Vec<Embedding>, RetrievalError>;
+
     /// Embed a single text string into a [`SparseVector`] via SPLADE / BM42.
     ///
     /// # Errors
@@ -157,7 +163,7 @@ fn default_dense_model() -> EmbeddingModel {
 impl Default for FastEmbedderConfig {
     fn default() -> Self {
         Self {
-            dense_model: EmbeddingModel::BGESmallENV15,
+            dense_model: EmbeddingModel::MultilingualE5Large,
             dense_batch_size: None,
             sparse_batch_size: None,
             show_download_progress: false,
@@ -327,8 +333,13 @@ impl Embedder for FastEmbedder {
             return Ok(Vec::new());
         }
 
-        // Clone to owned strings so they can cross the spawn_blocking boundary.
-        let owned: Vec<String> = texts.iter().map(|t| t.to_string()).collect();
+        // E5 multilingual models require "query: " or "passage: " prefix.
+        // embed_batch is used for queries (retrieval path); embed_documents
+        // should be used for passage/document embedding.
+        let owned: Vec<String> = texts
+            .iter()
+            .map(|t| format!("query: {t}"))
+            .collect();
         let model = Arc::clone(&self.dense);
         let batch_size = self.dense_batch_size;
 
@@ -346,6 +357,39 @@ impl Embedder for FastEmbedder {
         .await
         .map_err(|join_err| RetrievalError::Embedding {
             reason: format!("embed_batch task panicked: {join_err}"),
+        })??;
+
+        Ok(raw_vecs.into_iter().map(Embedding).collect())
+    }
+
+    #[instrument(skip(self, texts), fields(batch_size = texts.len()))]
+    async fn embed_documents(&self, texts: &[&str]) -> Result<Vec<Embedding>, RetrievalError> {
+        if texts.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // E5 multilingual models require "passage: " prefix for documents.
+        let owned: Vec<String> = texts
+            .iter()
+            .map(|t| format!("passage: {t}"))
+            .collect();
+        let model = Arc::clone(&self.dense);
+        let batch_size = self.dense_batch_size;
+
+        let raw_vecs: Vec<Vec<f32>> = tokio::task::spawn_blocking(move || {
+            let mut guard = model.lock().map_err(|_| RetrievalError::Embedding {
+                reason: "dense model mutex poisoned".to_owned(),
+            })?;
+            let str_refs: Vec<&str> = owned.iter().map(String::as_str).collect();
+            guard
+                .embed(str_refs, batch_size)
+                .map_err(|e| RetrievalError::Embedding {
+                    reason: e.to_string(),
+                })
+        })
+        .await
+        .map_err(|join_err| RetrievalError::Embedding {
+            reason: format!("embed_documents task panicked: {join_err}"),
         })??;
 
         Ok(raw_vecs.into_iter().map(Embedding).collect())
