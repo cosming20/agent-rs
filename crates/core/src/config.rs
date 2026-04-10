@@ -221,6 +221,22 @@ pub struct RetrievalConfig {
     pub offline: bool,
 }
 
+/// gRPC server configuration.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ServerConfig {
+    /// Host address the gRPC server binds to.
+    pub host: String,
+    /// Port the gRPC server listens on (default: 1059).
+    pub port: u16,
+}
+
+impl ServerConfig {
+    /// Full bind address string (e.g., `[::]:1059`).
+    pub fn bind_addr(&self) -> String {
+        format!("{}:{}", self.host, self.port)
+    }
+}
+
 // ---- Root Settings ----
 
 /// Root configuration struct containing all subsystem configs.
@@ -244,6 +260,7 @@ pub struct Settings {
     pub otel: OtelConfig,
     pub opa: OpaConfig,
     pub retrieval: RetrievalConfig,
+    pub server: ServerConfig,
 }
 
 impl Default for Settings {
@@ -316,6 +333,10 @@ impl Default for Settings {
             retrieval: RetrievalConfig {
                 dataset: "default".into(),
                 offline: false,
+            },
+            server: ServerConfig {
+                host: "[::]".into(),
+                port: 1059,
             },
         }
     }
