@@ -26,6 +26,7 @@ use agent_rs_core::config::Settings;
 use agent_rs_core::types::{CollectionName, Embedding, RetrievalStrategy};
 use agent_rs_retrieval::Embedder;
 use agent_rs_retrieval::embedder::{FastEmbedder, FastEmbedderConfig};
+use agent_rs_retrieval::openai_embedder::{OpenAIEmbedder, OpenAIEmbedderConfig};
 use agent_rs_retrieval::ranker::ResultRanker;
 use agent_rs_retrieval::router::RetrievalRouter;
 use agent_rs_stores::neo4j::Neo4jStore;
@@ -259,7 +260,7 @@ fn dedup_chunks(chunks: Vec<LegalChunk>) -> Vec<LegalChunk> {
 /// Ingest legal chunks into Qdrant (vectors) and Neo4j (graph).
 async fn ingest_chunks(
     chunks: &[LegalChunk],
-    embedder: &FastEmbedder,
+    embedder: &dyn Embedder,
     vector_store: &dyn VectorStore,
     graph_store: &dyn GraphStore,
     collection: &CollectionName,
@@ -305,7 +306,14 @@ async fn ingest_chunks(
     // Process in batches to avoid OOM on large PDFs.
     let batch_size = 64;
     let mut all_dense: Vec<Embedding> = Vec::with_capacity(chunks.len());
-    let mut all_sparse: Vec<agent_rs_retrieval::SparseVector> = Vec::with_capacity(chunks.len());
+    let mut all_sparse: Vec<Option<agent_rs_retrieval::SparseVector>> =
+        Vec::with_capacity(chunks.len());
+
+    // Probe whether the embedder supports sparse embeddings (OpenAI does not).
+    let supports_sparse = embedder.embed_sparse("probe").await.is_ok();
+    if !supports_sparse {
+        info!("embedder does not support sparse embeddings; dense-only indexing");
+    }
 
     for (batch_idx, text_batch) in texts.chunks(batch_size).enumerate() {
         info!(
@@ -318,14 +326,19 @@ async fn ingest_chunks(
         let dense_batch = embedder
             .embed_documents(text_batch)
             .await
-            .context("embed dense batch (passage prefix)")?;
-        let sparse_batch = embedder
-            .embed_sparse_batch(text_batch)
-            .await
-            .context("embed sparse batch")?;
+            .context("embed dense batch")?;
+
+        if supports_sparse {
+            let sparse_batch = embedder
+                .embed_sparse_batch(text_batch)
+                .await
+                .context("embed sparse batch")?;
+            all_sparse.extend(sparse_batch.into_iter().map(Some));
+        } else {
+            all_sparse.extend(std::iter::repeat_n(None, text_batch.len()));
+        }
 
         all_dense.extend(dense_batch);
-        all_sparse.extend(sparse_batch);
     }
 
     // 4. Build vector points and upsert.
@@ -336,9 +349,9 @@ async fn ingest_chunks(
         .map(|((chunk, dense), sparse)| VectorPoint {
             id: format!("art_{}", chunk.article_number),
             embedding: Embedding(dense.0.clone()),
-            sparse_vector: Some(agent_rs_stores::types::SparseVector {
-                indices: sparse.indices.clone(),
-                values: sparse.values.clone(),
+            sparse_vector: sparse.as_ref().map(|s| agent_rs_stores::types::SparseVector {
+                indices: s.indices.clone(),
+                values: s.values.clone(),
             }),
             payload: serde_json::json!({
                 "article_number": chunk.article_number,
@@ -645,16 +658,42 @@ async fn main() -> Result<()> {
     info!("all storage backends connected");
 
     // 5. Initialize embedder.
-    info!("initializing embedder (may download ONNX models on first run)...");
-    let embedder = FastEmbedder::try_new(FastEmbedderConfig {
-        show_download_progress: true,
-        ..Default::default()
-    })
-    .await
-    .context("failed to initialize embedding models")?;
+    //
+    // Set `EMBEDDER_TYPE=openai` to use the OpenAI Embeddings API instead of
+    // local fastembed ONNX models. When using OpenAI, `OPENAI_API_KEY` must
+    // also be set. Default is `local` (fastembed) for offline use.
+    let embedder_type = std::env::var("EMBEDDER_TYPE").unwrap_or_else(|_| "local".to_owned());
+    let uses_openai = embedder_type.eq_ignore_ascii_case("openai");
+
+    let embedder: Arc<dyn Embedder + Send + Sync> = if uses_openai {
+        info!("initializing OpenAI embedder...");
+        let api_key = std::env::var("OPENAI_API_KEY")
+            .context("OPENAI_API_KEY must be set when EMBEDDER_TYPE=openai")?;
+        let model = std::env::var("OPENAI_EMBEDDING_MODEL")
+            .unwrap_or_else(|_| "text-embedding-3-large".to_owned());
+        let dims: usize = std::env::var("OPENAI_EMBEDDING_DIMS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(3072);
+        let config = OpenAIEmbedderConfig::new(api_key)
+            .with_model(model)
+            .with_dimensions(dims);
+        let emb = OpenAIEmbedder::new(config);
+        info!(dims = emb.dimensions(), "OpenAI embedder initialized");
+        Arc::new(emb)
+    } else {
+        info!("initializing local fastembed embedder (may download ONNX models on first run)...");
+        let emb = FastEmbedder::try_new(FastEmbedderConfig {
+            show_download_progress: true,
+            ..Default::default()
+        })
+        .await
+        .context("failed to initialize embedding models")?;
+        info!(dims = emb.dimensions(), "fastembed embedder initialized");
+        Arc::new(emb)
+    };
     let dims = embedder.dimensions();
-    let embedder = Arc::new(embedder);
-    info!(dims = dims, "embedder initialized");
+    info!(dims = dims, embedder_type = %embedder_type, "embedder ready");
 
     // 6. Set up collection.
     let collection = CollectionName("legal_code_ro".into());
@@ -663,7 +702,7 @@ async fn main() -> Result<()> {
     info!("--- INGESTION PHASE ---");
     let ingestion_ms = ingest_chunks(
         &chunks,
-        &embedder,
+        embedder.as_ref(),
         qdrant_store.as_ref(),
         neo4j_store.as_ref(),
         &collection,
@@ -676,7 +715,7 @@ async fn main() -> Result<()> {
     // 8. Create retrieval router.
     let ranker = ResultRanker::new(settings.ranker.rrf_k);
     let router = Arc::new(RetrievalRouter::new(
-        embedder.clone() as Arc<dyn agent_rs_retrieval::Embedder + Send + Sync>,
+        embedder.clone(),
         qdrant_store.clone() as Arc<dyn VectorStore + Send + Sync>,
         neo4j_store.clone() as Arc<dyn GraphStore + Send + Sync>,
         ranker,
