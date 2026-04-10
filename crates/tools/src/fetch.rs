@@ -10,6 +10,7 @@ use std::time::Duration;
 
 use agent_rs_core::ToolError;
 use agent_rs_core::config::FetchConfig;
+use agent_rs_core::types::truncate_to_char_boundary;
 use rig::completion::ToolDefinition;
 use rig::tool::Tool;
 use serde::{Deserialize, Serialize};
@@ -203,7 +204,20 @@ impl Tool for FetchUrlTool {
             });
         }
 
-        // Read body with size limit.
+        // Early reject when Content-Length header exceeds the budget.
+        if let Some(content_length) = response.content_length() {
+            if content_length as usize > config.max_bytes {
+                return Err(ToolError::FetchFailed {
+                    url: args.url,
+                    reason: format!(
+                        "response Content-Length too large: {} bytes (max: {})",
+                        content_length, config.max_bytes
+                    ),
+                });
+            }
+        }
+
+        // Read body with size limit (fallback for when Content-Length is absent).
         let bytes = response.bytes().await.map_err(|e| ToolError::FetchFailed {
             url: args.url.clone(),
             reason: format!("failed to read response body: {e}"),
@@ -225,10 +239,10 @@ impl Tool for FetchUrlTool {
         let text = String::from_utf8_lossy(&bytes);
 
         // Truncate to max_length characters for the LLM context.
-        let truncated = if text.len() > config.max_length {
+        let truncated = if text.chars().count() > config.max_length {
             format!(
                 "{}\n\n[Content truncated at {} characters]",
-                &text[..config.max_length],
+                truncate_to_char_boundary(&text, config.max_length),
                 config.max_length
             )
         } else {

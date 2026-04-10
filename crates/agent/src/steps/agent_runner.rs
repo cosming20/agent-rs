@@ -99,23 +99,24 @@ impl AgentRunner {
             .tools(tools)
             .build();
 
-        match agent.prompt(&full_prompt).max_turns(self.max_turns).await {
-            Ok(response) => {
-                ctx.answer = response;
-                info!(
-                    latency_ms = start.elapsed().as_millis() as u64,
-                    answer_len = ctx.answer.len(),
-                    "agent run complete"
-                );
-            }
-            Err(err) => {
+        let response = agent
+            .prompt(&full_prompt)
+            .max_turns(self.max_turns)
+            .await
+            .map_err(|err| {
                 error!(error = %err, "agent run failed");
-                ctx.answer = "I was unable to generate an answer due to a processing error.".into();
-            }
-        }
+                AgentError::Orchestrator(format!("agent run failed: {err}"))
+            })?;
+
+        ctx.answer = response;
+        info!(
+            latency_ms = start.elapsed().as_millis() as u64,
+            answer_len = ctx.answer.len(),
+            "agent run complete"
+        );
 
         // Drain accumulated evidence from the search_knowledge tool.
-        drain_evidence(&evidence_collector, &mut ctx.kb_evidence);
+        drain_evidence(&evidence_collector, &mut ctx.kb_evidence)?;
 
         ctx.agent_latency_ms = start.elapsed().as_millis() as u64;
         Ok(())
@@ -158,7 +159,7 @@ impl AgentRunner {
         }
 
         // Drain accumulated evidence from the retry.
-        drain_evidence(&evidence_collector, &mut ctx.kb_evidence);
+        drain_evidence(&evidence_collector, &mut ctx.kb_evidence)?;
 
         Ok(())
     }
@@ -190,10 +191,21 @@ impl AgentRunner {
 }
 
 /// Drain accumulated evidence from the shared collector into the context.
-fn drain_evidence(collector: &Arc<Mutex<Vec<SearchResult>>>, target: &mut Vec<SearchResult>) {
-    if let Ok(mut collected) = collector.lock() {
-        target.append(&mut collected);
-    } else {
-        tracing::warn!("evidence collector lock poisoned; evidence may be incomplete");
-    }
+///
+/// # Errors
+///
+/// Returns `AgentError::Orchestrator` if the mutex is poisoned, which
+/// indicates a prior panic in a tool call. Evidence must not be silently
+/// dropped because downstream verification depends on it.
+fn drain_evidence(
+    collector: &Arc<Mutex<Vec<SearchResult>>>,
+    target: &mut Vec<SearchResult>,
+) -> Result<(), AgentError> {
+    let mut collected = collector.lock().map_err(|_| {
+        AgentError::Orchestrator(
+            "evidence collector mutex poisoned; cannot drain evidence".to_string(),
+        )
+    })?;
+    target.append(&mut collected);
+    Ok(())
 }

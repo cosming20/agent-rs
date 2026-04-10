@@ -135,11 +135,12 @@ impl Tool for SearchKnowledgeTool {
 
         // Accumulate raw results for downstream evidence fusion.
         if let Some(collector) = &self.evidence_collector {
-            if let Ok(mut collected) = collector.lock() {
-                collected.extend(evidence_pack.documents.iter().cloned());
-            } else {
-                tracing::warn!("evidence collector lock poisoned; skipping accumulation");
-            }
+            let mut collected = collector.lock().map_err(|_| {
+                ToolError::McpClient(
+                    "evidence collector mutex poisoned; cannot accumulate evidence".to_string(),
+                )
+            })?;
+            collected.extend(evidence_pack.documents.iter().cloned());
         }
 
         if evidence_pack.is_empty() {
@@ -161,7 +162,7 @@ impl Tool for SearchKnowledgeTool {
                 .unwrap_or("unknown");
             let content = doc
                 .payload
-                .get("content")
+                .get("chunk_text")
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
 

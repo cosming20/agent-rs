@@ -13,5 +13,5 @@ pub use config::Settings;
 pub use errors::{AgentError, AgentRsError, RetrievalError, StoreError, ToolError};
 pub use types::{
     CollectionName, Confidence, DatasetName, Embedding, MessageRole, RetrievalStrategy, Score,
-    SessionId, UserId,
+    SessionId, UserId, truncate_to_char_boundary,
 };

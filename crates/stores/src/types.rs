@@ -89,7 +89,10 @@ pub struct SearchResult {
 /// This is safe to interpolate into Cypher queries because labels
 /// cannot be parameterized in Cypher. The ASCII-only restriction
 /// prevents Unicode injection attacks.
+///
+/// Deserialization goes through `TryFrom<String>` to enforce validation.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(try_from = "String")]
 pub struct NodeLabel(String);
 
 impl NodeLabel {
@@ -120,7 +123,10 @@ impl std::fmt::Display for NodeLabel {
 /// Validated relationship type -- only allows ASCII alphanumeric + underscore.
 ///
 /// Same safety guarantees as [`NodeLabel`] for Cypher interpolation.
+///
+/// Deserialization goes through `TryFrom<String>` to enforce validation.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(try_from = "String")]
 pub struct RelationType(String);
 
 impl RelationType {
@@ -160,6 +166,22 @@ pub enum InvalidLabelError {
         "label/type contains invalid characters (only ASCII alphanumeric + underscore allowed): {0}"
     )]
     InvalidChars(String),
+}
+
+impl TryFrom<String> for NodeLabel {
+    type Error = InvalidLabelError;
+
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        Self::new(&value)
+    }
+}
+
+impl TryFrom<String> for RelationType {
+    type Error = InvalidLabelError;
+
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        Self::new(&value)
+    }
 }
 
 /// A node in the knowledge graph.

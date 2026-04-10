@@ -6,7 +6,7 @@
 use std::sync::Arc;
 
 use agent_rs_core::errors::AgentError;
-use agent_rs_core::types::{MessageRole, SessionId, UserId};
+use agent_rs_core::types::{MessageRole, SessionId, UserId, truncate_to_char_boundary};
 use agent_rs_stores::traits::StateStore;
 use agent_rs_stores::types::{ChatMessage, Memory};
 use chrono::Utc;
@@ -68,10 +68,8 @@ impl MemoryManager {
             .filter_map(|msg| {
                 if msg.content.is_empty() {
                     None
-                } else if msg.content.len() > max_chars_per_msg {
-                    Some(&msg.content[..max_chars_per_msg])
                 } else {
-                    Some(msg.content.as_str())
+                    Some(truncate_to_char_boundary(&msg.content, max_chars_per_msg))
                 }
             })
             .collect::<Vec<_>>()

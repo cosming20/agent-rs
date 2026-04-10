@@ -152,7 +152,10 @@ impl RetrievalRouter {
         .await?;
 
         let seeds: Vec<String> = top_docs.into_iter().map(|r| r.id).collect();
-        tracing::debug!(seed_count = seeds.len(), "derived graph seed IDs from vector search");
+        tracing::debug!(
+            seed_count = seeds.len(),
+            "derived graph seed IDs from vector search"
+        );
         Ok(seeds)
     }
 

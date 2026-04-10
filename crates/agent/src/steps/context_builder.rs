@@ -89,8 +89,7 @@ impl ContextBuilder {
         let db_messages = self
             .memory
             .load_history(&ctx.session_id, self.max_messages)
-            .await
-            .unwrap_or_default();
+            .await?;
         ctx.conversation_context = self.memory.build_conversation_context(
             &db_messages,
             self.max_messages,

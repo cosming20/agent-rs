@@ -47,7 +47,10 @@ impl fmt::Display for UserId {
 /// Construction via [`Confidence::new`] validates the range and returns
 /// an error if the value is out of bounds. This type never silently
 /// defaults to 0.0.
+///
+/// Deserialization goes through `TryFrom<f64>` to enforce validation.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(try_from = "f64")]
 pub struct Confidence(f64);
 
 impl Confidence {
@@ -76,6 +79,14 @@ impl Confidence {
 pub enum ConfidenceError {
     #[error("confidence {0} out of range [0.0, 1.0]")]
     OutOfRange(f64),
+}
+
+impl TryFrom<f64> for Confidence {
+    type Error = ConfidenceError;
+
+    fn try_from(value: f64) -> Result<Self, Self::Error> {
+        Self::new(value)
+    }
 }
 
 /// A numeric score (e.g., search relevance, RRF rank).
@@ -204,4 +215,23 @@ pub enum MessageRole {
     User,
     Assistant,
     System,
+}
+
+// ---- Utilities ----
+
+/// Truncate a string to at most `max_chars` Unicode characters, returning
+/// a sub-slice that always ends on a valid char boundary.
+///
+/// This is safe for multi-byte UTF-8 content -- unlike `&s[..n]` which
+/// panics when `n` falls inside a multi-byte character.
+pub fn truncate_to_char_boundary(s: &str, max_chars: usize) -> &str {
+    if s.chars().count() <= max_chars {
+        return s;
+    }
+    let byte_idx = s
+        .char_indices()
+        .nth(max_chars)
+        .map(|(i, _)| i)
+        .unwrap_or(s.len());
+    &s[..byte_idx]
 }
