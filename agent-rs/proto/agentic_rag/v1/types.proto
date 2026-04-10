@@ -1,0 +1,32 @@
+syntax = "proto3";
+
+package agentic_rag.v1;
+
+/// Retrieval strategies supported by the system.
+///
+/// Values mirror `core::types::RetrievalStrategy`.
+enum Strategy {
+  STRATEGY_UNSPECIFIED = 0;
+  STRATEGY_SEMANTIC = 1;
+  STRATEGY_KEYWORD = 2;
+  STRATEGY_HYBRID = 3;
+  STRATEGY_GRAPH = 4;
+  STRATEGY_GRAPH_HYBRID = 5;
+  STRATEGY_RAG_COMPLETION = 6;
+  STRATEGY_SUMMARIES = 7;
+  STRATEGY_TEMPORAL = 8;
+  STRATEGY_GRAPH_COT = 9;
+  STRATEGY_GRAPH_CONSTRAINED = 10;
+}
+
+/// A citation linking an answer claim to its source evidence.
+message Citation {
+  /// Citation number (1-based).
+  int32 index = 1;
+  /// Relevant excerpt from the source document.
+  string content_snippet = 2;
+  /// Origin of the evidence (e.g., "qdrant", "brave").
+  string source = 3;
+  /// Relevance score from retrieval.
+  double score = 4;
+}
