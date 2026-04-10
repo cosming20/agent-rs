@@ -20,8 +20,12 @@ dependencies = [
  "agent-rs-stores",
  "agent-rs-tools",
  "anyhow",
+ "chrono",
+ "serde",
+ "serde_json",
  "tokio",
  "tracing",
+ "uuid",
 ]
 
 [[package]]
