@@ -1,0 +1,22 @@
+[package]
+name = "agent-rs-observability"
+version = "0.1.0"
+edition.workspace = true
+
+[dependencies]
+# Workspace dependencies
+agent-rs-core = { workspace = true }
+
+# Tracing
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+tracing-opentelemetry = { workspace = true }
+
+# OpenTelemetry
+opentelemetry = { workspace = true }
+opentelemetry_sdk = { workspace = true }
+opentelemetry-otlp = { workspace = true }
+opentelemetry-semantic-conventions = { workspace = true }
+
+# Error handling
+thiserror = { workspace = true }
