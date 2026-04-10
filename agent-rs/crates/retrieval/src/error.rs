@@ -26,6 +26,10 @@ pub enum RetrievalError {
     #[error("search returned no results for query: {query}")]
     NoResults { query: String },
 
+    /// A storage backend returned an error during a search operation.
+    #[error("store error during retrieval: {0}")]
+    Store(#[from] agent_rs_core::StoreError),
+
     /// Feature not yet implemented (used only during phased development).
     #[error("not implemented: {0}")]
     NotImplemented(String),
@@ -44,6 +48,7 @@ impl From<RetrievalError> for agent_rs_core::errors::RetrievalError {
             RetrievalError::NoResults { query } => {
                 agent_rs_core::errors::RetrievalError::NoResults { query }
             }
+            RetrievalError::Store(e) => agent_rs_core::errors::RetrievalError::Store(e),
             RetrievalError::NotImplemented(msg) => {
                 agent_rs_core::errors::RetrievalError::Ranking(format!("not implemented: {msg}"))
             }
