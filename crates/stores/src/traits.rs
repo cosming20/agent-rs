@@ -57,11 +57,8 @@ pub trait VectorStore: Send + Sync {
     ) -> Result<Vec<SearchResult>, StoreError>;
 
     /// Delete points by their string IDs.
-    async fn delete(
-        &self,
-        collection: &CollectionName,
-        ids: Vec<String>,
-    ) -> Result<(), StoreError>;
+    async fn delete(&self, collection: &CollectionName, ids: Vec<String>)
+    -> Result<(), StoreError>;
 
     /// Check if a collection exists.
     async fn collection_exists(&self, name: &CollectionName) -> Result<bool, StoreError>;

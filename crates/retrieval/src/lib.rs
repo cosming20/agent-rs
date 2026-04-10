@@ -12,11 +12,13 @@
 //! - [`search`] — concrete search back-ends (vector, keyword, graph, hybrid)
 
 pub mod embedder;
+pub mod error;
 pub mod ranker;
 pub mod router;
 pub mod search;
 pub mod strategy;
 
-pub use embedder::{Embedder, FastEmbedder, FastEmbedderConfig};
+pub use embedder::{Embedder, FastEmbedder, FastEmbedderConfig, SparseVector};
+pub use error::RetrievalError;
 pub use ranker::{EvidencePack, ResultRanker};
 pub use strategy::StrategyRegistry;

@@ -18,9 +18,7 @@ use crate::types::{GraphEdge, GraphNode, RelationType};
 ///
 /// Returns `neo4rs::Error` if the JSON value cannot be represented as a
 /// Bolt type — for example when a JSON number exceeds `i64::MAX`.
-pub(crate) fn json_to_bolt(
-    value: serde_json::Value,
-) -> Result<neo4rs::BoltType, neo4rs::Error> {
+pub(crate) fn json_to_bolt(value: serde_json::Value) -> Result<neo4rs::BoltType, neo4rs::Error> {
     neo4rs::BoltType::try_from(value)
 }
 
@@ -29,9 +27,7 @@ pub(crate) fn json_to_bolt(
 /// Uses MERGE on `id` so re-ingesting the same node is idempotent.
 pub(crate) fn upsert_node(node: &GraphNode) -> Result<neo4rs::Query, neo4rs::Error> {
     let label = node.label.as_str();
-    let cypher = format!(
-        "MERGE (n:{label} {{id: $id}}) SET n += $props"
-    );
+    let cypher = format!("MERGE (n:{label} {{id: $id}}) SET n += $props");
     let props = json_to_bolt(node.properties.clone())?;
     Ok(query(&cypher)
         .param("id", node.id.clone())

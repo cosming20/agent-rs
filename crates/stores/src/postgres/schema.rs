@@ -47,9 +47,4 @@ diesel::table! {
 
 diesel::joinable!(evidence_items -> query_runs (run_id));
 
-diesel::allow_tables_to_appear_in_same_query!(
-    chat_messages,
-    evidence_items,
-    memories,
-    query_runs,
-);
+diesel::allow_tables_to_appear_in_same_query!(chat_messages, evidence_items, memories, query_runs,);

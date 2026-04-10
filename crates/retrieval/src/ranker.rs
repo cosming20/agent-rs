@@ -163,7 +163,9 @@ impl ResultRanker {
                 *rrf_scores.entry(doc.id.clone()).or_insert(0.0) += contribution;
 
                 // Keep the first-seen payload (highest-ranked in first list).
-                doc_index.entry(doc.id.clone()).or_insert_with(|| doc.clone());
+                doc_index
+                    .entry(doc.id.clone())
+                    .or_insert_with(|| doc.clone());
             }
         }
 
@@ -235,12 +237,7 @@ impl ResultRanker {
         let weighted_kb = apply_source_weight(kb_results, KB_SOURCE_WEIGHT);
         let weighted_web = apply_source_weight(web_results, WEB_SOURCE_WEIGHT);
 
-        self.rank(
-            vec![weighted_kb, weighted_web],
-            query,
-            strategy,
-            limit,
-        )
+        self.rank(vec![weighted_kb, weighted_web], query, strategy, limit)
     }
 }
 
