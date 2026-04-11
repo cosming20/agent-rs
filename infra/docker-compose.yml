@@ -17,6 +17,7 @@ volumes:
   prometheus_data:
   grafana_data:
   ruvector_data:
+  docling_models:
 
 services:
   # ----------------------------------------------------------
@@ -296,3 +297,40 @@ services:
       start_period: 15s
     profiles:
       - ruvector
+
+  # ----------------------------------------------------------
+  # Docling Sidecar — PDF parsing + structural chunking (gRPC)
+  # Port 1068 (1064/1065 reserved for ruvector profile)
+  # Build context: repo root (../ from infra/) per amendment G1
+  # ----------------------------------------------------------
+  docling-sidecar:
+    build:
+      context: ..
+      dockerfile: infra/docling-sidecar/Dockerfile
+    container_name: agentic-ra-docling-sidecar
+    restart: "on-failure:5"
+    ports:
+      - "${DOCLING_SIDECAR_PORT:-1068}:1068"
+    volumes:
+      - docling_models:/root/.cache/docling
+    environment:
+      - DOCLING_CACHE_DIR=/root/.cache/docling
+      - DOCLING_LOG_LEVEL=INFO
+      - DOCLING_GRPC_HOST=0.0.0.0
+      - DOCLING_GRPC_PORT=1068
+      - DOCLING_MAX_PDF_BYTES=104857600
+      - DOCLING_MAX_PAGES=500
+      - DOCLING_PARSE_TIMEOUT_S=300
+      - DOCLING_STREAM_IDLE_TIMEOUT_S=600
+      - DOCLING_MAX_CHUNKS_PER_DOC=10000
+    networks:
+      - agentic-ra-net
+    mem_limit: 4g
+    mem_reservation: 2g
+    cpus: 2.0
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/grpc_health_probe", "-addr=:1068", "-rpc-timeout=5s"]
+      interval: 15s
+      timeout: 5s
+      start_period: 120s
+      retries: 3
