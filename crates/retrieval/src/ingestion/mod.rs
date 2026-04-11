@@ -5,7 +5,7 @@
 //!
 //! # Modules
 //!
-//! - [`chunker`] -- configurable text chunking (recursive, section-based, sliding window)
+//! - [`chunker`] -- configurable text chunking (recursive, section-based, sliding window, token-aware paragraph)
 //! - [`metadata`] -- automatic metadata extraction from text content
 //! - [`pipeline`] -- end-to-end ingestion pipeline wiring all stages together
 
@@ -14,5 +14,5 @@ pub mod metadata;
 pub mod pipeline;
 
 pub use chunker::{ChunkStrategy, ChunkerConfig, DocumentChunk};
-pub use metadata::ChunkMetadata;
+pub use metadata::{ChunkExtras, ChunkMetadata};
 pub use pipeline::{IngestionPipeline, IngestionResult};

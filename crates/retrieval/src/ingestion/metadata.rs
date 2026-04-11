@@ -27,6 +27,32 @@ pub struct ChunkMetadata {
     pub char_count: usize,
     /// Total word count (whitespace-delimited).
     pub word_count: usize,
+    /// Exact token count using the cl100k_base tokeniser (text-embedding-3-large).
+    ///
+    /// Set to `0` when tokenisation is unavailable (e.g. non-token-aware strategies).
+    pub token_count: usize,
+    /// Byte offset of the first byte of this chunk within the original document text.
+    pub byte_start: usize,
+    /// Byte offset one past the last byte of this chunk within the original document text.
+    pub byte_end: usize,
+    /// Deterministic UUIDs (v5, OID namespace, content-keyed) for each paragraph
+    /// that was grouped into this chunk.
+    pub paragraph_ids: Vec<String>,
+}
+
+/// Extra positional + token information supplied by token-aware chunking strategies.
+///
+/// Callers that do not have this information available should pass `Default::default()`.
+#[derive(Debug, Default, Clone)]
+pub struct ChunkExtras {
+    /// Exact token count (cl100k_base).  `0` when not applicable.
+    pub token_count: usize,
+    /// Byte start offset in the original document.
+    pub byte_start: usize,
+    /// Byte end offset (exclusive) in the original document.
+    pub byte_end: usize,
+    /// Deterministic paragraph UUIDs contained in this chunk.
+    pub paragraph_ids: Vec<String>,
 }
 
 /// Extract metadata from a chunk of text.
@@ -34,8 +60,15 @@ pub struct ChunkMetadata {
 /// Performs lightweight heuristic analysis -- no external calls required.
 /// The `source` parameter is the filename or URL of the parent document.
 /// `headings` is the heading hierarchy accumulated from previous chunks.
-#[tracing::instrument(skip(text, headings), fields(text_len = text.len()))]
-pub fn extract_metadata(text: &str, source: &str, headings: &[String]) -> ChunkMetadata {
+/// `extras` carries token/byte/paragraph information from token-aware strategies;
+/// pass [`ChunkExtras::default()`] when that information is unavailable.
+#[tracing::instrument(skip(text, headings, extras), fields(text_len = text.len()))]
+pub fn extract_metadata(
+    text: &str,
+    source: &str,
+    headings: &[String],
+    extras: ChunkExtras,
+) -> ChunkMetadata {
     let section_title = detect_section_title(text);
     let has_table = detect_table(text);
     let has_list = detect_list(text);
@@ -53,6 +86,10 @@ pub fn extract_metadata(text: &str, source: &str, headings: &[String]) -> ChunkM
         language,
         char_count,
         word_count,
+        token_count: extras.token_count,
+        byte_start: extras.byte_start,
+        byte_end: extras.byte_end,
+        paragraph_ids: extras.paragraph_ids,
     }
 }
 
