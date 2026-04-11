@@ -326,11 +326,19 @@ class ChunkerPool:
 
     @staticmethod
     def _build_converter() -> DocumentConverter:
-        """Build a DocumentConverter with ACCURATE table mode, no OCR."""
+        """Build a DocumentConverter with ACCURATE table mode, no OCR.
+
+        PdfPipelineOptions in docling 2.86 expects `table_structure_options`
+        to be a TableStructureOptions instance, not a dict.
+        """
+        from docling.datamodel.pipeline_options import TableStructureOptions
+
         pdf_options = PdfPipelineOptions(
             do_ocr=False,
             do_table_structure=True,
-            table_structure_options={"mode": TableFormerMode.ACCURATE},
+            table_structure_options=TableStructureOptions(
+                mode=TableFormerMode.ACCURATE,
+            ),
         )
         return DocumentConverter(
             format_options={
@@ -340,12 +348,16 @@ class ChunkerPool:
 
     @staticmethod
     def _build_chunker() -> HybridChunker:
-        """Build a HybridChunker with cl100k tokenizer, 1024-token chunks."""
+        """Build a HybridChunker with cl100k tokenizer, 1024-token chunks.
+
+        OpenAITokenizer(tokenizer=enc, max_tokens=N) — the `tokenizer` field
+        takes a tiktoken.Encoding object, not a model name string.
+        """
         from docling_core.transforms.chunker.tokenizer.openai import OpenAITokenizer
 
-        tokenizer = OpenAITokenizer(model_name="text-embedding-3-large")
+        enc = tiktoken.encoding_for_model("text-embedding-3-large")
+        tokenizer = OpenAITokenizer(tokenizer=enc, max_tokens=1024)
         return HybridChunker(
             tokenizer=tokenizer,
-            max_tokens=1024,
             merge_peers=True,
         )
