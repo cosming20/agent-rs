@@ -5,6 +5,7 @@
 //! cheap to clone and share across tasks.
 
 mod queries;
+pub mod structural;
 
 use agent_rs_core::{StoreError, config::Neo4jConfig};
 use async_trait::async_trait;
