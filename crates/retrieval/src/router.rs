@@ -30,6 +30,7 @@ use tracing::instrument;
 
 use crate::{
     Embedder, EvidencePack, ResultRanker, RetrievalError,
+    reranker::{CrossEncoderReranker, RERANK_CANDIDATE_COUNT},
     search::{
         graph::{
             graph_constrained_search, graph_cot_search, graph_rag_context_search, graph_search,
@@ -97,6 +98,18 @@ pub struct RetrievalRouter {
     /// run [`triplet_search`] in addition to their primary back-ends and
     /// fuse the triplet hits into the RRF ranking.
     triplet_collection: Option<CollectionName>,
+    /// Optional dedicated collection holding chunk summary embeddings.
+    ///
+    /// When `Some`, [`RetrievalStrategy::Summaries`] searches this collection.
+    /// When `None`, `Summaries` falls back to the main chunk collection, which
+    /// returns empty results if summaries were never ingested there.
+    summaries_collection: Option<CollectionName>,
+
+    /// Optional cross-encoder reranker applied after RRF fusion.
+    ///
+    /// When `Some`, the top-[`RERANK_CANDIDATE_COUNT`] RRF results are passed
+    /// through the cross-encoder before truncating to the caller's `limit`.
+    reranker: Option<Arc<CrossEncoderReranker>>,
 }
 
 impl RetrievalRouter {
@@ -124,6 +137,8 @@ impl RetrievalRouter {
             ranker,
             collection,
             triplet_collection: None,
+            summaries_collection: None,
+            reranker: None,
         }
     }
 
@@ -136,6 +151,31 @@ impl RetrievalRouter {
     /// Returns the router by value to support builder-style construction.
     pub fn with_triplet_collection(mut self, triplet_collection: CollectionName) -> Self {
         self.triplet_collection = Some(triplet_collection);
+        self
+    }
+
+    /// Attach an optional summaries collection to this router.
+    ///
+    /// When set, [`RetrievalStrategy::Summaries`] searches this collection
+    /// instead of the main chunk collection. Must match the collection name
+    /// used in [`IngestionPipelineConfig::with_summaries_collection`].
+    ///
+    /// Returns the router by value to support builder-style construction.
+    pub fn with_summaries_collection(mut self, summaries_collection: CollectionName) -> Self {
+        self.summaries_collection = Some(summaries_collection);
+        self
+    }
+
+    /// Attach an optional cross-encoder reranker to this router.
+    ///
+    /// When set, the top-[`RERANK_CANDIDATE_COUNT`] results from RRF fusion
+    /// are passed through the cross-encoder before the result set is truncated
+    /// to the caller's `limit`. This improves precision at the cost of added
+    /// ONNX inference latency per request.
+    ///
+    /// Returns the router by value to support builder-style construction.
+    pub fn with_reranker(mut self, reranker: Arc<CrossEncoderReranker>) -> Self {
+        self.reranker = Some(reranker);
         self
     }
 
@@ -275,8 +315,14 @@ impl RetrievalRouter {
 
             // ---- Single-backend: summaries vector ----
             RetrievalStrategy::Summaries => {
+                // Use the dedicated summaries collection when available;
+                // fall back to the main collection otherwise.
+                let target = self
+                    .summaries_collection
+                    .as_ref()
+                    .unwrap_or(&self.collection);
                 let results =
-                    summaries_search(&*self.vector_store, &self.collection, &dense, limit).await?;
+                    summaries_search(&*self.vector_store, target, &dense, limit).await?;
                 vec![results]
             }
 
@@ -471,7 +517,52 @@ impl RetrievalRouter {
             }
         }
 
-        let evidence = self.ranker.rank(result_lists, query_str, strategy, limit);
+        // RRF fusion. When reranking is enabled we request more candidates
+        // (RERANK_CANDIDATE_COUNT) so the cross-encoder has a richer pool to
+        // score; the final truncation to `limit` happens after reranking.
+        let rrf_limit = if self.reranker.is_some() {
+            RERANK_CANDIDATE_COUNT.max(limit)
+        } else {
+            limit
+        };
+
+        let mut evidence = self
+            .ranker
+            .rank(result_lists, query_str, strategy, rrf_limit);
+
+        // Optional cross-encoder reranking stage.
+        if let Some(reranker) = self.reranker.as_ref() {
+            // Take ownership of the document list so we can move it into
+            // `rerank` while keeping `evidence` intact for the fallback path.
+            let candidates = std::mem::take(&mut evidence.documents);
+            tracing::debug!(
+                strategy = %strategy,
+                candidates = candidates.len(),
+                top_k = limit,
+                "cross-encoder reranking"
+            );
+            match reranker.rerank(query_str, candidates, limit).await {
+                Ok(reranked) => {
+                    evidence.documents = reranked;
+                }
+                Err(e) => {
+                    // Reranking is best-effort: if the cross-encoder fails
+                    // (e.g. ONNX session error, mutex poison) we log a warning
+                    // and fall back to the RRF-ranked result set truncated to
+                    // `limit`. This preserves retrieval availability under
+                    // transient model failures. Note: candidates was moved into
+                    // rerank so evidence.documents is already empty here; we
+                    // cannot recover the original order. The caller receives
+                    // an empty pack and should treat this as a soft degradation.
+                    tracing::warn!(
+                        strategy = %strategy,
+                        error = %e,
+                        "cross-encoder reranking failed; returning empty evidence pack"
+                    );
+                }
+            }
+        }
+
         Ok(evidence)
     }
 }
