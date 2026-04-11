@@ -284,9 +284,7 @@ fn token_aware_paragraph_split(text: &str, config: &ChunkerConfig) -> Vec<(Strin
 
         let paragraph_ids = current_paras
             .iter()
-            .map(|(p, _, _, _)| {
-                Uuid::new_v5(&Uuid::NAMESPACE_OID, p.as_bytes()).to_string()
-            })
+            .map(|(p, _, _, _)| Uuid::new_v5(&Uuid::NAMESPACE_OID, p.as_bytes()).to_string())
             .collect();
 
         Some((
@@ -524,9 +522,7 @@ fn hard_token_split(
         let end = (start + max_tokens).min(token_ids.len());
         let slice = &token_ids[start..end];
         // Decode the token slice back to text.
-        let content = bpe
-            .decode(slice.to_vec())
-            .unwrap_or_else(|_| String::new());
+        let content = bpe.decode(slice.to_vec()).unwrap_or_else(|_| String::new());
         if !content.trim().is_empty() {
             let token_count = slice.len();
             let para_id = Uuid::new_v5(&Uuid::NAMESPACE_OID, content.as_bytes()).to_string();
@@ -561,8 +557,7 @@ fn build_token_overlap(text: &str, overlap_budget: usize, bpe: &tiktoken_rs::Cor
         return text.to_owned();
     }
     let start = token_ids.len() - overlap_budget;
-    bpe.decode(token_ids[start..].to_vec())
-        .unwrap_or_default()
+    bpe.decode(token_ids[start..].to_vec()).unwrap_or_default()
 }
 
 // ---- Character-based strategy helpers ----
