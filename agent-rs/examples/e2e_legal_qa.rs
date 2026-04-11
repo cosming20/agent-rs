@@ -26,7 +26,6 @@ use agent_rs_core::config::Settings;
 use agent_rs_core::types::{CollectionName, Embedding, RetrievalStrategy};
 use agent_rs_retrieval::Embedder;
 use agent_rs_retrieval::embedder::{FastEmbedder, FastEmbedderConfig};
-use agent_rs_retrieval::hybrid_embedder::HybridEmbedder;
 use agent_rs_retrieval::openai_embedder::{OpenAIEmbedder, OpenAIEmbedderConfig};
 use agent_rs_retrieval::ranker::ResultRanker;
 use agent_rs_retrieval::router::RetrievalRouter;
@@ -301,20 +300,15 @@ async fn ingest_chunks(
         .context("create_collection")?;
     info!(collection = %collection, dims = dims, "collection created");
 
-    // 3. Embed all chunks (batch for efficiency).
+    // 3. Embed all chunks (dense only — sparse handled server-side via BM25).
+    //
+    // Each VectorPoint carries the raw chunk text so Qdrant can infer sparse
+    // vectors using the `qdrant/bm25` model during upsert. No local SPLADE
+    // model is required.
     let texts: Vec<&str> = chunks.iter().map(|c| c.content.as_str()).collect();
 
-    // Process in batches to avoid OOM on large PDFs.
     let batch_size = 64;
     let mut all_dense: Vec<Embedding> = Vec::with_capacity(chunks.len());
-    let mut all_sparse: Vec<Option<agent_rs_retrieval::SparseVector>> =
-        Vec::with_capacity(chunks.len());
-
-    // Probe whether the embedder supports sparse embeddings (OpenAI does not).
-    let supports_sparse = embedder.embed_sparse("probe").await.is_ok();
-    if !supports_sparse {
-        info!("embedder does not support sparse embeddings; dense-only indexing");
-    }
 
     for (batch_idx, text_batch) in texts.chunks(batch_size).enumerate() {
         info!(
@@ -329,16 +323,6 @@ async fn ingest_chunks(
             .await
             .context("embed dense batch")?;
 
-        if supports_sparse {
-            let sparse_batch = embedder
-                .embed_sparse_batch(text_batch)
-                .await
-                .context("embed sparse batch")?;
-            all_sparse.extend(sparse_batch.into_iter().map(Some));
-        } else {
-            all_sparse.extend(std::iter::repeat_n(None, text_batch.len()));
-        }
-
         all_dense.extend(dense_batch);
     }
 
@@ -346,16 +330,10 @@ async fn ingest_chunks(
     let points: Vec<VectorPoint> = chunks
         .iter()
         .zip(all_dense.iter())
-        .zip(all_sparse.iter())
-        .map(|((chunk, dense), sparse)| VectorPoint {
+        .map(|(chunk, dense)| VectorPoint {
             id: format!("art_{}", chunk.article_number),
             embedding: Embedding(dense.0.clone()),
-            sparse_vector: sparse
-                .as_ref()
-                .map(|s| agent_rs_stores::types::SparseVector {
-                    indices: s.indices.clone(),
-                    values: s.values.clone(),
-                }),
+            text: chunk.content.clone(),
             payload: serde_json::json!({
                 "article_number": chunk.article_number,
                 "title": chunk.title,
@@ -672,8 +650,9 @@ async fn main() -> Result<()> {
     let embedder_type = std::env::var("EMBEDDER_TYPE").unwrap_or_else(|_| "local".to_owned());
     let uses_openai = embedder_type.eq_ignore_ascii_case("openai");
 
+    // Sparse BM25 inference is handled server-side by Qdrant — no local sparse model needed.
     let embedder: Arc<dyn Embedder + Send + Sync> = if uses_openai {
-        info!("initializing OpenAI dense embedder + local FastEmbedder for sparse...");
+        info!("initializing OpenAI dense embedder (sparse BM25 handled server-side by Qdrant)...");
         let api_key = std::env::var("OPENAI_API_KEY")
             .or_else(|_| std::env::var("LLM_API_KEY"))
             .context("OPENAI_API_KEY or LLM_API_KEY must be set when EMBEDDER_TYPE=openai")?;
@@ -687,18 +666,11 @@ async fn main() -> Result<()> {
             .with_model(model)
             .with_dimensions(dims);
         let dense = OpenAIEmbedder::new(config);
-        let sparse = FastEmbedder::try_new(FastEmbedderConfig {
-            show_download_progress: true,
-            ..Default::default()
-        })
-        .await
-        .context("failed to initialize local fastembed for sparse (OpenAI hybrid mode)")?;
         info!(
             dims = dense.dimensions(),
-            "HybridEmbedder (OpenAI dense + local sparse) initialized"
+            "OpenAI dense embedder initialized"
         );
-        let hybrid = HybridEmbedder::new(Arc::new(dense), Arc::new(sparse));
-        Arc::new(hybrid)
+        Arc::new(dense)
     } else {
         info!("initializing local fastembed embedder (may download ONNX models on first run)...");
         let emb = FastEmbedder::try_new(FastEmbedderConfig {
@@ -743,7 +715,7 @@ async fn main() -> Result<()> {
     // 9. Run queries.
     info!("--- QUERY PHASE ---");
 
-    // Both OpenAI (via HybridEmbedder) and fastembed now support sparse vectors.
+    // Sparse BM25 is handled server-side by Qdrant; both embedder types support hybrid.
     let default_strategy = RetrievalStrategy::Hybrid;
 
     let questions: Vec<(&str, RetrievalStrategy)> = vec![

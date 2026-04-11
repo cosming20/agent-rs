@@ -17,13 +17,13 @@ use agent_rs_core::{CollectionName, Embedding, StoreError};
 use async_trait::async_trait;
 use qdrant_client::Qdrant;
 use qdrant_client::qdrant::{
-    DeletePointsBuilder, DenseVector, NamedVectors, PointId, PointStruct, PointsIdsList,
+    DeletePointsBuilder, DenseVector, Document, NamedVectors, PointId, PointStruct, PointsIdsList,
     PrefetchQueryBuilder, QueryPointsBuilder, UpsertPointsBuilder, Vector, Vectors,
 };
 use tracing::instrument;
 
 use crate::traits::VectorStore;
-use crate::types::{CollectionConfig, SearchResult, SparseVector, VectorPoint};
+use crate::types::{CollectionConfig, SearchResult, VectorPoint};
 use agent_rs_core::Score;
 
 // ---- QdrantStore ----
@@ -76,8 +76,9 @@ impl VectorStore for QdrantStore {
             .map_err(StoreError::from)
     }
 
-    /// Upsert vector points. Each point may carry a dense embedding and an
-    /// optional sparse vector for hybrid search.
+    /// Upsert vector points. Each point carries a dense embedding and,
+    /// when `text` is non-empty, a server-side BM25 sparse vector inferred
+    /// by Qdrant via `Document { model: "qdrant/bm25" }`.
     #[instrument(skip(self, points), fields(collection = %collection, count = points.len()))]
     async fn upsert(
         &self,
@@ -97,14 +98,15 @@ impl VectorStore for QdrantStore {
                 .into();
                 vectors.insert("dense".into(), dense_vector);
 
-                // Sparse vector under "sparse" when present.
-                // `qdrant_client::qdrant::SparseVector` implements `Into<Vector>`.
-                if let Some(sv) = p.sparse_vector {
-                    let sparse_vector: Vector = qdrant_client::qdrant::SparseVector {
-                        values: sv.values,
-                        indices: sv.indices,
-                    }
-                    .into();
+                // Sparse vector via server-side BM25 inference.
+                //
+                // When the point carries raw chunk text, we let Qdrant infer
+                // the sparse vector using the `qdrant/bm25` model. This
+                // requires the collection's sparse vector to be configured
+                // with `Modifier::Idf` (set in `create_named_vector_collection`).
+                // No local SPLADE/fastembed model is needed.
+                if !p.text.is_empty() {
+                    let sparse_vector: Vector = Document::new(&p.text, "qdrant/bm25").into();
                     vectors.insert("sparse".into(), sparse_vector);
                 }
 
@@ -173,16 +175,21 @@ impl VectorStore for QdrantStore {
             .collect()
     }
 
-    /// Hybrid search: dense + sparse prefetch fused via RRF.
+    /// Hybrid search: dense vector + server-side BM25, fused via prefetch + RRF.
     ///
     /// Two prefetch sub-queries are issued (one per vector type), then the
     /// top-level query merges them with Reciprocal Rank Fusion.
-    #[instrument(skip(self, dense, sparse), fields(collection = %collection, limit = limit))]
+    ///
+    /// `query_text` is sent to Qdrant as a `Document { model: "qdrant/bm25" }`
+    /// so Qdrant performs tokenisation and BM25 scoring server-side. The
+    /// collection must have been created with `Modifier::Idf` on the sparse
+    /// named vector for this to produce valid scores.
+    #[instrument(skip(self, dense), fields(collection = %collection, limit = limit))]
     async fn search_hybrid(
         &self,
         collection: &CollectionName,
         dense: &Embedding,
-        sparse: &SparseVector,
+        query_text: &str,
         limit: usize,
     ) -> Result<Vec<SearchResult>, StoreError> {
         let prefetch_dense = PrefetchQueryBuilder::default()
@@ -191,16 +198,13 @@ impl VectorStore for QdrantStore {
             .limit(limit as u64)
             .build();
 
-        // Sparse query uses Vec<(index, value)> — the supported From impl.
-        let sparse_pairs: Vec<(u32, f32)> = sparse
-            .indices
-            .iter()
-            .copied()
-            .zip(sparse.values.iter().copied())
-            .collect();
-
+        // Server-side BM25 sparse query using the `qdrant/bm25` model.
+        // `Document` implements `Into<VectorInput>` which the Query API accepts.
         let prefetch_sparse = PrefetchQueryBuilder::default()
-            .query(qdrant_client::qdrant::Query::from(sparse_pairs))
+            .query(qdrant_client::qdrant::Query::new_nearest(Document::new(
+                query_text,
+                "qdrant/bm25",
+            )))
             .using("sparse")
             .limit(limit as u64)
             .build();

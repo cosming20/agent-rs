@@ -15,7 +15,7 @@
 
 pub mod embedder;
 pub mod error;
-pub mod hybrid_embedder;
+pub mod graph_cot;
 pub mod ingestion;
 pub mod openai_embedder;
 pub mod ranker;
@@ -26,7 +26,7 @@ pub mod strategy;
 
 pub use embedder::{Embedder, FastEmbedder, FastEmbedderConfig, SparseVector};
 pub use error::RetrievalError;
-pub use hybrid_embedder::HybridEmbedder;
+pub use graph_cot::{GraphCotConfig, GraphCotRetriever};
 pub use ingestion::{
     ChunkStrategy, ChunkerConfig, DocumentChunk, ExtractedEdge, ExtractedNode, IngestionPipeline,
     IngestionPipelineConfig, IngestionResult, KnowledgeGraph, LlmGraphExtractor, Triplet,
