@@ -153,6 +153,50 @@ impl RetrievalRouter {
         query.to_owned()
     }
 
+    /// Hydrate triplet search results by looking up the chunks that generated
+    /// them. Each triplet carries a `chunk_id` in its payload; this method
+    /// runs a filtered search on the main collection to retrieve the actual
+    /// chunk documents with their `chunk_text` for proper ranking.
+    async fn hydrate_chunks_from_triplets(
+        &self,
+        chunk_ids: &[String],
+        dense: &agent_rs_core::Embedding,
+        limit: usize,
+    ) -> Vec<agent_rs_stores::types::SearchResult> {
+        use std::collections::HashSet;
+        let unique_ids: HashSet<&String> = chunk_ids.iter().collect();
+        let mut hydrated = Vec::new();
+
+        for chunk_id in unique_ids {
+            let filter = serde_json::json!({
+                "key": "chunk_id",
+                "match": {"value": chunk_id}
+            });
+            match self
+                .vector_store
+                .search_with_filter(&self.collection, dense, 1, Some(filter))
+                .await
+            {
+                Ok(mut results) => {
+                    if let Some(chunk) = results.pop() {
+                        hydrated.push(chunk);
+                    }
+                }
+                Err(e) => {
+                    tracing::debug!(
+                        chunk_id = %chunk_id,
+                        error = %e,
+                        "failed to hydrate triplet chunk"
+                    );
+                }
+            }
+            if hydrated.len() >= limit {
+                break;
+            }
+        }
+        hydrated
+    }
+
     /// Derive seed node IDs for graph traversal by running a quick vector search
     /// and extracting document IDs from the top results.
     ///
@@ -372,6 +416,35 @@ impl RetrievalRouter {
             if let Some(triplet_collection) = self.triplet_collection.as_ref() {
                 match triplet_search(&*self.vector_store, triplet_collection, &dense, limit).await {
                     Ok(triplet_results) => {
+                        // Hydrate triplet results with their source chunks.
+                        // Each triplet payload carries a chunk_id pointing to
+                        // the chunk that generated it. We fetch those chunks
+                        // from the main collection so the fused result list
+                        // contains real chunk_text for ranking and evidence.
+                        let chunk_ids: Vec<String> = triplet_results
+                            .iter()
+                            .filter_map(|r| {
+                                r.payload
+                                    .get("chunk_id")
+                                    .and_then(|v| v.as_str())
+                                    .map(String::from)
+                            })
+                            .collect();
+
+                        if !chunk_ids.is_empty() {
+                            // Retrieve the actual chunk documents via a filtered
+                            // scroll on the main collection. For each chunk_id,
+                            // run a filtered search with a dummy vector and take
+                            // the first match. This is a simple approach; a
+                            // proper scroll-by-id would be faster.
+                            let hydrated = self
+                                .hydrate_chunks_from_triplets(&chunk_ids, &dense, limit)
+                                .await;
+                            if !hydrated.is_empty() {
+                                result_lists.push(hydrated);
+                            }
+                        }
+
                         tracing::debug!(
                             strategy = %strategy,
                             count = triplet_results.len(),
