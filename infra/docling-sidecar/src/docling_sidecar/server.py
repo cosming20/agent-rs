@@ -154,26 +154,12 @@ class DoclingChunkerServicer(chunker_pb2_grpc.DoclingChunkerServicer):
         actual_sha256 = hashlib.sha256(content).hexdigest()
         effective_mimetype = _sniff_mimetype(content, mimetype_hint)
 
-        # -- 4. Emit DocumentHeader (always first, even before conversion) --
-        yield chunker_pb2.ChunkDocumentResponse(
-            header=chunker_pb2.DocumentHeader(
-                schema_version=_SCHEMA_VERSION,
-                document_id=doc_id_str,
-                sha256=actual_sha256,
-                filename=filename,
-                mimetype=effective_mimetype,
-                docling_version=_DOCLING_VERSION,
-                docling_core_version=_DOCLING_CORE_VERSION,
-                # n_pages and language filled in on footer after conversion
-            )
-        )
-
-        # -- 5. Check client cancel after header --
+        # -- 4. Check client cancel before we touch the disk --
         if context.cancelled():
-            logger.info("Client cancelled after header for doc %s", doc_id_str)
+            logger.info("Client cancelled before processing for doc %s", doc_id_str)
             return
 
-        # -- 6. Write bytes to a temp file (Docling needs a path) --
+        # -- 5. Write bytes to a temp file (Docling needs a path) --
         # Determine file extension from filename for Docling's format detection.
         suffix = Path(filename).suffix or ".pdf"
         try:
@@ -192,7 +178,13 @@ class DoclingChunkerServicer(chunker_pb2_grpc.DoclingChunkerServicer):
             )
             return
 
-        # -- 7. Run Docling in thread pool (CPU-bound, not async) --
+        # -- 6. Run Docling in thread pool (CPU-bound, not async) --
+        #
+        # IMPORTANT: header emission is DEFERRED until after this step so
+        # that n_pages, language, title, and parse_latency_ms can be
+        # populated from the real conversion result. The header-first
+        # protocol contract is honoured by ensuring no payload is yielded
+        # between now and the header emission below.
         parse_start_ns = time.monotonic_ns()
         try:
             conversion_result = await asyncio.wait_for(
@@ -238,7 +230,7 @@ class DoclingChunkerServicer(chunker_pb2_grpc.DoclingChunkerServicer):
 
         parse_latency_ms = (time.monotonic_ns() - parse_start_ns) // 1_000_000
 
-        # -- 8. Check page limit after conversion --
+        # -- 7. Check page limit after conversion --
         if (
             conversion_result.n_pages > 0
             and conversion_result.n_pages > effective.max_pages
@@ -257,6 +249,42 @@ class DoclingChunkerServicer(chunker_pb2_grpc.DoclingChunkerServicer):
                 )
             )
             return
+
+        # -- 8. Emit DocumentHeader (after conversion, fully populated) --
+        # Build per-page metadata if the DoclingDocument exposes it.
+        proto_pages: list[chunker_pb2.PageInfo] = []
+        docling_doc = conversion_result.docling_doc
+        if hasattr(docling_doc, "pages") and docling_doc.pages:
+            for page_no, page in docling_doc.pages.items():
+                width = 0.0
+                height = 0.0
+                size = getattr(page, "size", None)
+                if size is not None:
+                    width = float(getattr(size, "width", 0.0) or 0.0)
+                    height = float(getattr(size, "height", 0.0) or 0.0)
+                proto_pages.append(
+                    chunker_pb2.PageInfo(
+                        page_no=int(page_no),
+                        width=width,
+                        height=height,
+                    )
+                )
+
+        yield chunker_pb2.ChunkDocumentResponse(
+            header=chunker_pb2.DocumentHeader(
+                schema_version=_SCHEMA_VERSION,
+                document_id=doc_id_str,
+                sha256=actual_sha256,
+                filename=filename,
+                mimetype=effective_mimetype,
+                n_pages=conversion_result.n_pages,
+                language=conversion_result.language,
+                pages=proto_pages,
+                title=conversion_result.title,
+                docling_version=_DOCLING_VERSION,
+                docling_core_version=_DOCLING_CORE_VERSION,
+            )
+        )
 
         # -- 9. Emit chunks --
         total_chunks = len(conversion_result.chunks)

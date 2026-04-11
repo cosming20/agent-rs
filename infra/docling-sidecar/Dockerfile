@@ -32,13 +32,23 @@ RUN pip install --no-cache-dir .
 
 # Pre-download Docling models into a cache directory that will be mounted
 # as a named volume in production so downloads only happen on first boot.
+# Explicitly force a real PDF conversion so both the layout model AND the
+# TableFormer ACCURATE model are downloaded at build time — just
+# constructing DocumentConverter() does NOT load TableFormer weights.
+# Per W7 review: failure here MUST fail the build (no `|| echo` fallback),
+# otherwise first-request cold-start quietly pays the download cost + OOM
+# risk under load.
 ENV DOCLING_CACHE_DIR=/root/.cache/docling
 RUN python -c "\
-import logging; \
+import logging, io; \
 logging.basicConfig(level=logging.INFO); \
-from docling.document_converter import DocumentConverter; \
-DocumentConverter()" \
-    || echo "WARN: Model pre-download failed — will retry on first request."
+from docling.datamodel.base_models import InputFormat; \
+from docling.datamodel.pipeline_options import PdfPipelineOptions, TableFormerMode; \
+from docling.document_converter import DocumentConverter, PdfFormatOption; \
+opts = PdfPipelineOptions(do_ocr=False, do_table_structure=True, force_backend_text=True); \
+opts.table_structure_options.mode = TableFormerMode.ACCURATE; \
+converter = DocumentConverter(format_options={InputFormat.PDF: PdfFormatOption(pipeline_options=opts)}); \
+print('[models] Docling layout + tableformer-accurate pre-downloaded OK')"
 
 # =============================================================================
 # Compile protobuf stubs into the installed package.

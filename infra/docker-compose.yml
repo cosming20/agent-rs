@@ -325,12 +325,15 @@ services:
       - DOCLING_MAX_CHUNKS_PER_DOC=10000
     networks:
       - agentic-ra-net
-    mem_limit: 4g
-    mem_reservation: 2g
-    cpus: 2.0
+    # Docling layout-heron + tableformer + PDF processing spike to ~6-10 GB
+    # on large real-world legal/academic PDFs (penal_code_ro = 2.4 MB =
+    # hundreds of pages hit OOM at 4g). Bumped to 12g with a 6g reservation.
+    mem_limit: 12g
+    mem_reservation: 6g
+    cpus: 4.0
     healthcheck:
       test: ["CMD", "/usr/local/bin/grpc_health_probe", "-addr=:1068", "-rpc-timeout=5s"]
       interval: 15s
       timeout: 5s
-      start_period: 120s
+      start_period: 180s
       retries: 3

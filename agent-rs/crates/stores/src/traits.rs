@@ -153,6 +153,33 @@ pub trait GraphStore: Send + Sync {
     ///
     /// Returns [`StoreError`] if the backend call fails.
     async fn rollback_by_run_id(&self, ingest_run_id: Uuid) -> Result<u64, StoreError>;
+
+    /// Ensure the structural-layer constraints exist (idempotent).
+    ///
+    /// Safe to call on every pipeline startup. Uses `IF NOT EXISTS`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError`] if the backend call fails.
+    async fn ensure_structural_constraints(&self) -> Result<(), StoreError>;
+
+    /// Upsert the full structural layer for one document (Document, Page,
+    /// Section, Table, Picture nodes + ON_PAGE / IN_SECTION / REFERENCES_TABLE
+    /// / REFERENCES_PICTURE / FOLLOWS / PARENT_OF / HAS_PAGE / HAS_SECTION /
+    /// HAS_TABLE / HAS_PICTURE / CONTAINS_CHUNK edges), all tagged with
+    /// `ingest_run_id`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError`] on any backend failure; caller should call
+    /// `rollback_by_run_id(ingest_run_id)` to clean up partial state.
+    async fn upsert_document_structure(
+        &self,
+        header: &crate::neo4j::structural::DocumentHeaderSnapshot,
+        chunks: &[crate::neo4j::structural::StructuralChunk],
+        tables: &[crate::neo4j::structural::StructuralTable],
+        pictures: &[crate::neo4j::structural::StructuralPicture],
+    ) -> Result<(), StoreError>;
 }
 
 // ---- State Store ----
