@@ -218,6 +218,24 @@ impl GraphStore for Neo4jStore {
         // SAFETY: this is a plain async fn delegation — no unsafe code.
         Neo4jStore::rollback_by_run_id(self, ingest_run_id).await
     }
+
+    /// Delegate to the inherent `ensure_structural_constraints` on
+    /// [`Neo4jStore`] implemented in `structural.rs`.
+    async fn ensure_structural_constraints(&self) -> Result<(), StoreError> {
+        Neo4jStore::ensure_structural_constraints(self).await
+    }
+
+    /// Delegate to the inherent `upsert_document_structure` on [`Neo4jStore`]
+    /// implemented in `structural.rs`.
+    async fn upsert_document_structure(
+        &self,
+        header: &crate::neo4j::structural::DocumentHeaderSnapshot,
+        chunks: &[crate::neo4j::structural::StructuralChunk],
+        tables: &[crate::neo4j::structural::StructuralTable],
+        pictures: &[crate::neo4j::structural::StructuralPicture],
+    ) -> Result<(), StoreError> {
+        Neo4jStore::upsert_document_structure(self, header, chunks, tables, pictures).await
+    }
 }
 
 // ---- Conversion helpers ----

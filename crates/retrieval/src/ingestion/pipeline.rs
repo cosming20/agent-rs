@@ -33,7 +33,14 @@ use uuid::Uuid;
 
 use crate::embedder::Embedder;
 use crate::error::RetrievalError;
-use crate::proto::agentic_rag::v1::{Chunk as ProtoChunk, DocumentHeader as ProtoDocumentHeader};
+use crate::proto::agentic_rag::v1::{
+    Chunk as ProtoChunk, DocItemLabel, DocumentFooter as ProtoDocumentFooter,
+    DocumentHeader as ProtoDocumentHeader,
+};
+use agent_rs_stores::neo4j::structural::{
+    DocumentHeaderSnapshot, PageInfo as StructuralPageInfo, StructuralChunk, StructuralPicture,
+    StructuralTable,
+};
 
 use super::chunker::{self, ChunkerConfig, DocumentChunk};
 use super::docling_client::DoclingSidecarClient;
@@ -1128,7 +1135,9 @@ impl IngestionPipeline {
         if let Err(e) = graph_result {
             let reason = e.to_string();
             if let Some(pg) = &self.pg_store {
-                let _ = pg.mark_partial_failure(ingest_run_id, &reason).await;
+                if let Err(me) = pg.mark_partial_failure(ingest_run_id, &reason).await {
+                    tracing::warn!(?me, ingest_run_id = %ingest_run_id, "failed to mark partial failure");
+                }
             }
             return Err(e);
         }
@@ -1136,8 +1145,57 @@ impl IngestionPipeline {
             doc_id,
             graph_nodes_created,
             graph_edges_created,
-            "Docling: graph upsert complete"
+            "Docling: entity graph upsert complete"
         );
+
+        // ---- Step 5b: Neo4j STRUCTURAL upsert (Document / Page / Section / Table / Picture) ----
+        //
+        // Runs AFTER the entity graph step so that pre-existing Chunk nodes
+        // (created by `build_llm_graph_structures`) exist when the structural
+        // layer enriches them with page_start/page_end/section_id/has_* props.
+        // All new nodes are tagged with `ingest_run_id` so rollback by run_id
+        // can target exactly this ingestion without touching pre-existing data.
+        let structural_result: Result<(), RetrievalError> = async {
+            let snapshot =
+                proto_header_to_snapshot(header, &docling_response.footer, ingest_run_id, source);
+            let doc_uuid = snapshot.document_id;
+
+            // Build ordered StructuralChunk list with FOLLOWS back-pointers.
+            let mut structural_chunks: Vec<StructuralChunk> =
+                Vec::with_capacity(docling_response.chunks.len());
+            let mut prev: Option<Uuid> = None;
+            for proto_chunk in &docling_response.chunks {
+                let sc = proto_chunk_to_structural(proto_chunk, doc_uuid, prev);
+                prev = Some(sc.chunk_id);
+                structural_chunks.push(sc);
+            }
+
+            let structural_tables = extract_tables_from_chunks(doc_uuid, &docling_response.chunks);
+            let structural_pictures =
+                extract_pictures_from_chunks(doc_uuid, &docling_response.chunks);
+
+            self.graph_store
+                .upsert_document_structure(
+                    &snapshot,
+                    &structural_chunks,
+                    &structural_tables,
+                    &structural_pictures,
+                )
+                .await
+                .map_err(RetrievalError::Store)
+        }
+        .await;
+
+        if let Err(e) = structural_result {
+            let reason = e.to_string();
+            if let Some(pg) = &self.pg_store {
+                if let Err(me) = pg.mark_partial_failure(ingest_run_id, &reason).await {
+                    tracing::warn!(?me, ingest_run_id = %ingest_run_id, "failed to mark partial failure");
+                }
+            }
+            return Err(e);
+        }
+        tracing::info!(doc_id, "Docling: structural graph upsert complete");
 
         // ---- Step 6: Triplet indexing (optional) ----
         let triplets_upserted = match self.upsert_triplets_if_enabled(doc_id, &triplets).await {
@@ -1438,6 +1496,204 @@ fn build_summary_payload(summary: &super::summarizer::ChunkSummary) -> serde_jso
         "summary_text": summary.summary_text,
         "chunk_text_preview": summary.chunk_text_preview,
     })
+}
+
+// ---- Structural layer helpers (Docling metadata -> Neo4j structural nodes) ----
+
+/// Build a `DocumentHeaderSnapshot` from a proto `DocumentHeader` + `DocumentFooter`.
+///
+/// The document UUID is derived deterministically from the sha256 via UUIDv5
+/// so the same source bytes always produce the same document node.
+fn proto_header_to_snapshot(
+    header: &ProtoDocumentHeader,
+    footer: &ProtoDocumentFooter,
+    ingest_run_id: Uuid,
+    source: &str,
+) -> DocumentHeaderSnapshot {
+    let document_id = Uuid::new_v5(&NAMESPACE_OID, header.sha256.as_bytes());
+
+    let pages: Vec<StructuralPageInfo> = header
+        .pages
+        .iter()
+        .map(|p| StructuralPageInfo {
+            page_no: p.page_no as i64,
+            width: p.width,
+            height: p.height,
+        })
+        .collect();
+
+    let none_if_empty = |s: &str| {
+        if s.is_empty() {
+            None
+        } else {
+            Some(s.to_owned())
+        }
+    };
+
+    DocumentHeaderSnapshot {
+        document_id,
+        ingest_run_id,
+        sha256: header.sha256.clone(),
+        source: source.to_owned(),
+        docling_version: none_if_empty(&header.docling_version),
+        n_pages: header.n_pages as i64,
+        n_chunks: footer.n_chunks as i64,
+        n_tables: footer.n_tables as i64,
+        n_pictures: footer.n_pictures as i64,
+        language: none_if_empty(&header.language),
+        title: none_if_empty(&header.title),
+        mimetype: none_if_empty(&header.mimetype),
+        pages,
+    }
+}
+
+/// Convert one proto `Chunk` into a `StructuralChunk` for the Neo4j layer.
+///
+/// `prev_chunk_id` is the UUID of the previous chunk in the same document
+/// (`None` for the first chunk) — used to seed the `FOLLOWS` edge.
+fn proto_chunk_to_structural(
+    chunk: &ProtoChunk,
+    document_id: Uuid,
+    prev_chunk_id: Option<Uuid>,
+) -> StructuralChunk {
+    let chunk_uuid = Uuid::parse_str(&chunk.chunk_id)
+        .unwrap_or_else(|_| Uuid::new_v5(&NAMESPACE_OID, chunk.chunk_id.as_bytes()));
+
+    let section_id = if chunk.section_id.is_empty() {
+        None
+    } else {
+        Uuid::parse_str(&chunk.section_id).ok()
+    };
+
+    let section_title = if chunk.section_title.is_empty() {
+        None
+    } else {
+        Some(chunk.section_title.clone())
+    };
+
+    // Heading level = depth of the heading path (0 if no path).
+    let heading_level = if chunk.heading_path.is_empty() {
+        None
+    } else {
+        Some(chunk.heading_path.len() as i64)
+    };
+
+    // Derive the presence of list / footnote / caption / picture-ref flags
+    // from doc_items since the top-level Chunk proto only exposes table /
+    // picture / code / formula directly.
+    let mut has_list = false;
+    let mut has_footnote = false;
+    let mut has_caption = false;
+    let mut has_picture_ref = false;
+    let mut table_refs: Vec<Uuid> = Vec::new();
+    let mut picture_refs: Vec<Uuid> = Vec::new();
+    for item in &chunk.doc_items {
+        match DocItemLabel::try_from(item.label) {
+            Ok(DocItemLabel::ListItem) => has_list = true,
+            Ok(DocItemLabel::Footnote) => has_footnote = true,
+            Ok(DocItemLabel::Caption) => has_caption = true,
+            Ok(DocItemLabel::Table) => {
+                table_refs.push(doc_item_to_uuid(document_id, &item.self_ref));
+            }
+            Ok(DocItemLabel::Picture) => {
+                has_picture_ref = true;
+                picture_refs.push(doc_item_to_uuid(document_id, &item.self_ref));
+            }
+            _ => {}
+        }
+    }
+
+    StructuralChunk {
+        chunk_id: chunk_uuid,
+        page_start: chunk.page_start as i64,
+        page_end: chunk.page_end as i64,
+        section_id,
+        section_title,
+        heading_level,
+        heading_path: chunk.heading_path.clone(),
+        has_table: chunk.has_table,
+        has_list,
+        has_code: chunk.has_code,
+        has_formula: chunk.has_formula,
+        has_picture_ref,
+        has_footnote,
+        has_caption,
+        table_refs,
+        picture_refs,
+        prev_chunk_id,
+    }
+}
+
+/// Extract the set of unique `StructuralTable` records from all chunks.
+///
+/// Tables referenced from multiple chunks produce a single record, identified
+/// by the stable UUIDv5 derived from (document_id, self_ref).
+fn extract_tables_from_chunks(document_id: Uuid, chunks: &[ProtoChunk]) -> Vec<StructuralTable> {
+    use std::collections::BTreeMap;
+    let mut by_ref: BTreeMap<String, StructuralTable> = BTreeMap::new();
+    for chunk in chunks {
+        for item in &chunk.doc_items {
+            if DocItemLabel::try_from(item.label) != Ok(DocItemLabel::Table) {
+                continue;
+            }
+            if by_ref.contains_key(&item.self_ref) {
+                continue;
+            }
+            by_ref.insert(
+                item.self_ref.clone(),
+                StructuralTable {
+                    table_id: doc_item_to_uuid(document_id, &item.self_ref),
+                    doc_item_self_ref: item.self_ref.clone(),
+                    page_no: item.page_no as i64,
+                    n_rows: item.table_n_rows as i64,
+                    n_cols: item.table_n_cols as i64,
+                    caption: None, // caption ends up as a separate CAPTION doc_item
+                },
+            );
+        }
+    }
+    by_ref.into_values().collect()
+}
+
+/// Extract the set of unique `StructuralPicture` records from all chunks.
+fn extract_pictures_from_chunks(
+    document_id: Uuid,
+    chunks: &[ProtoChunk],
+) -> Vec<StructuralPicture> {
+    use std::collections::BTreeMap;
+    let mut by_ref: BTreeMap<String, StructuralPicture> = BTreeMap::new();
+    for chunk in chunks {
+        for item in &chunk.doc_items {
+            if DocItemLabel::try_from(item.label) != Ok(DocItemLabel::Picture) {
+                continue;
+            }
+            if by_ref.contains_key(&item.self_ref) {
+                continue;
+            }
+            let caption = if item.picture_caption.is_empty() {
+                None
+            } else {
+                Some(item.picture_caption.clone())
+            };
+            by_ref.insert(
+                item.self_ref.clone(),
+                StructuralPicture {
+                    picture_id: doc_item_to_uuid(document_id, &item.self_ref),
+                    doc_item_self_ref: item.self_ref.clone(),
+                    page_no: item.page_no as i64,
+                    caption,
+                },
+            );
+        }
+    }
+    by_ref.into_values().collect()
+}
+
+/// Deterministic UUIDv5 for a `DocItem` identified by its `self_ref` within a
+/// document.
+fn doc_item_to_uuid(document_id: Uuid, self_ref: &str) -> Uuid {
+    let seed = format!("{document_id}:{self_ref}");
+    Uuid::new_v5(&NAMESPACE_OID, seed.as_bytes())
 }
 
 /// Build the JSON payload for a triplet stored in the triplet collection.
