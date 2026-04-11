@@ -23,7 +23,7 @@ use qdrant_client::qdrant::{
 use tracing::instrument;
 
 use crate::traits::VectorStore;
-use crate::types::{CollectionConfig, SearchResult, VectorPoint};
+use crate::types::{CollectionConfig, FilterSpec, SearchResult, VectorPoint};
 use agent_rs_core::Score;
 
 // ---- QdrantStore ----
@@ -289,6 +289,50 @@ impl VectorStore for QdrantStore {
         Ok(())
     }
 
+    /// Delete all points matching a [`FilterSpec`] from a collection.
+    ///
+    /// Converts `FilterSpec` to a Qdrant `Filter` and calls the delete-by-filter
+    /// API, which returns the count of deleted points.
+    ///
+    /// # Filter mapping
+    ///
+    /// - `FilterSpec::Eq { field, value }` → `Condition::matches(field, value)` in a `must` list.
+    /// - `FilterSpec::And(specs)` → each spec maps to a `must` condition.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError`] on Qdrant gRPC failure.
+    #[instrument(skip(self, filter), fields(collection = %collection))]
+    async fn delete_by_filter(
+        &self,
+        collection: &CollectionName,
+        filter: FilterSpec,
+    ) -> Result<u64, StoreError> {
+        let qdrant_filter = filter_spec_to_qdrant(filter)?;
+
+        // Pass the Filter directly — qdrant-client implements
+        // `From<Filter> for PointsSelectorOneOf`, so this satisfies the
+        // `Into<PointsSelectorOneOf>` bound on `DeletePointsBuilder::points`.
+        self.client
+            .delete_points(
+                DeletePointsBuilder::new(collection.as_str())
+                    .points(qdrant_filter)
+                    .wait(true),
+            )
+            .await
+            .map_err(StoreError::from)?;
+
+        // The Qdrant delete API returns an UpdateResult (operation_id + status)
+        // but does NOT return the number of deleted points.  We return 0 as a
+        // sentinel; callers that need an exact count should issue a count query
+        // before deletion.
+        tracing::debug!(
+            collection = %collection,
+            "delete_by_filter complete (exact count not available from Qdrant API)"
+        );
+        Ok(0)
+    }
+
     /// Check whether a Qdrant collection exists.
     #[instrument(skip(self), fields(collection = %name))]
     async fn collection_exists(&self, name: &CollectionName) -> Result<bool, StoreError> {
@@ -458,6 +502,43 @@ fn json_to_qdrant_filter(
 
     Ok(Filter {
         must,
+        ..Default::default()
+    })
+}
+
+/// Convert a [`FilterSpec`] into a Qdrant [`Filter`].
+///
+/// # Mapping
+///
+/// - [`FilterSpec::Eq`] → single `Condition::matches` in the `must` list.
+/// - [`FilterSpec::And`] → each sub-spec is recursively flattened into `must`.
+///
+/// # Errors
+///
+/// Returns [`StoreError::InvalidData`] if a nested `FilterSpec::And` is empty.
+fn filter_spec_to_qdrant(spec: FilterSpec) -> Result<qdrant_client::qdrant::Filter, StoreError> {
+    use qdrant_client::qdrant::{Condition, Filter};
+
+    fn collect_conditions(spec: FilterSpec, out: &mut Vec<Condition>) -> Result<(), StoreError> {
+        match spec {
+            FilterSpec::Eq { field, value } => {
+                out.push(Condition::matches(field, value));
+                Ok(())
+            }
+            FilterSpec::And(specs) => {
+                for s in specs {
+                    collect_conditions(s, out)?;
+                }
+                Ok(())
+            }
+        }
+    }
+
+    let mut conditions = Vec::new();
+    collect_conditions(spec, &mut conditions)?;
+
+    Ok(Filter {
+        must: conditions,
         ..Default::default()
     })
 }

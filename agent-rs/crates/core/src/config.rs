@@ -242,6 +242,69 @@ pub struct RetrievalConfig {
     pub offline: bool,
 }
 
+// ---- Ingest backend ----
+
+/// Selects the PDF/document ingestion backend at runtime.
+///
+/// Controlled by `AGENT_RS__INGEST_BACKEND` env var.
+/// Default: `docling` (sidecar path only).
+///
+/// See the Strangler-Fig pattern note in the spec: `DoclingWithLegacyFallback`
+/// lets a controlled fraction of traffic validate the new path while the
+/// legacy path remains operational.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IngestBackend {
+    /// Use the legacy `pdf_extract` path.
+    ///
+    /// Requires the `legacy_pdf_extract` compile-time feature in `agent-rs-retrieval`.
+    Legacy,
+    /// Use the Docling sidecar exclusively. Errors propagate to the caller.
+    ///
+    /// Default — new deployments must explicitly opt in to the legacy path via
+    /// `AGENT_RS__INGEST_BACKEND=legacy`.
+    #[default]
+    Docling,
+    /// Try Docling first; fall back to legacy on errors where
+    /// `triggers_legacy_fallback = true`.
+    ///
+    /// On `retryable = true` errors, retry Docling once with backoff before
+    /// falling back.
+    DoclingWithLegacyFallback,
+}
+
+/// Configuration for the Docling sidecar gRPC connection.
+///
+/// All fields are overridable via `AGENT_RS__DOCLING__<FIELD>` env vars.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct DoclingConfig {
+    /// Full gRPC endpoint URL, e.g. `http://localhost:1068`.
+    ///
+    /// Override via `AGENT_RS__DOCLING__ENDPOINT`.
+    pub endpoint: String,
+    /// Timeout in seconds for establishing the gRPC channel.
+    ///
+    /// Override via `AGENT_RS__DOCLING__CONNECT_TIMEOUT_S`.
+    pub connect_timeout_s: u64,
+    /// Maximum idle time between stream messages before the client cancels
+    /// the RPC (seconds).  Matches the sidecar's own idle-timeout so that
+    /// the Rust client detects half-open connections promptly.
+    ///
+    /// Override via `AGENT_RS__DOCLING__STREAM_IDLE_TIMEOUT_S`.
+    pub stream_idle_timeout_s: u64,
+    /// Maximum document size the client will send (bytes).
+    ///
+    /// The sidecar enforces `min(server_default, request_value)` so this
+    /// value cannot exceed the sidecar's configured cap.
+    ///
+    /// Override via `AGENT_RS__DOCLING__MAX_PDF_BYTES`.
+    pub max_pdf_bytes: u32,
+    /// Maximum page count the client will request.
+    ///
+    /// Override via `AGENT_RS__DOCLING__MAX_PAGES`.
+    pub max_pages: u32,
+}
+
 /// gRPC server configuration.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ServerConfig {
@@ -283,6 +346,10 @@ pub struct Settings {
     pub opa: OpaConfig,
     pub retrieval: RetrievalConfig,
     pub server: ServerConfig,
+    /// Which PDF/document ingestion backend to use.
+    pub ingest_backend: IngestBackend,
+    /// Docling sidecar gRPC connection settings.
+    pub docling: DoclingConfig,
 }
 
 impl Default for Settings {
@@ -364,6 +431,14 @@ impl Default for Settings {
             server: ServerConfig {
                 host: "[::]".into(),
                 port: 1059,
+            },
+            ingest_backend: IngestBackend::default(),
+            docling: DoclingConfig {
+                endpoint: "http://localhost:1068".into(),
+                connect_timeout_s: 10,
+                stream_idle_timeout_s: 600,
+                max_pdf_bytes: 100 * 1024 * 1024, // 100 MiB
+                max_pages: 500,
             },
         }
     }
