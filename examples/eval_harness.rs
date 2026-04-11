@@ -46,7 +46,9 @@ use agent_rs_core::types::{CollectionName, RetrievalStrategy};
 use agent_rs_retrieval::Embedder;
 use agent_rs_retrieval::embedder::{FastEmbedder, FastEmbedderConfig};
 use agent_rs_retrieval::hybrid_embedder::HybridEmbedder;
-use agent_rs_retrieval::ingestion::{ChunkerConfig, IngestionPipeline};
+use agent_rs_retrieval::ingestion::{
+    ChunkerConfig, IngestionPipeline, IngestionPipelineConfig, LlmGraphExtractor,
+};
 use agent_rs_retrieval::openai_embedder::{OpenAIEmbedder, OpenAIEmbedderConfig};
 use agent_rs_retrieval::ranker::ResultRanker;
 use agent_rs_retrieval::router::RetrievalRouter;
@@ -733,12 +735,36 @@ async fn main() -> Result<()> {
     }
 
     // 6. Ingest each document via IngestionPipeline.
-    let pipeline = IngestionPipeline::new(
+    //
+    // When `LLM_API_KEY` (or `OPENAI_API_KEY`) is set, enable LLM-based
+    // knowledge graph extraction for every chunk. This mirrors Cognee's
+    // cognify step. Without a key we fall back to heuristic entity extraction
+    // so the harness still runs end-to-end without external LLM access.
+    let llm_extractor = std::env::var("LLM_API_KEY")
+        .or_else(|_| std::env::var("OPENAI_API_KEY"))
+        .ok()
+        .map(|api_key| {
+            let model = std::env::var("LLM_GRAPH_MODEL")
+                .or_else(|_| std::env::var("LLM_MODEL"))
+                .unwrap_or_else(|_| "gpt-4o-mini".to_owned());
+            info!(model = %model, "LLM graph extractor enabled for ingestion");
+            Arc::new(LlmGraphExtractor::new(api_key, model))
+        });
+    if llm_extractor.is_none() {
+        info!("LLM_API_KEY / OPENAI_API_KEY not set — falling back to heuristic entity extraction");
+    }
+
+    let mut pipeline_config = IngestionPipelineConfig::new(ChunkerConfig::default());
+    if let Some(extractor) = llm_extractor.clone() {
+        pipeline_config = pipeline_config.with_llm_extractor(extractor);
+    }
+
+    let pipeline = IngestionPipeline::with_config(
         embedder.clone(),
         qdrant_store.clone() as Arc<dyn VectorStore + Send + Sync>,
         neo4j_store.clone() as Arc<dyn GraphStore + Send + Sync>,
-        ChunkerConfig::default(),
         collection.clone(),
+        pipeline_config,
     );
 
     for doc in &dataset.documents {

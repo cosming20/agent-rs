@@ -6,6 +6,7 @@
 //! Works on any document type. PDF text extraction is supported via
 //! `pdf-extract`.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -20,6 +21,10 @@ use crate::embedder::Embedder;
 use crate::error::RetrievalError;
 
 use super::chunker::{self, ChunkerConfig, DocumentChunk};
+use super::graph_extractor::{
+    DEFAULT_BATCH_CONCURRENCY, ExtractedNode, KnowledgeGraph, LlmGraphExtractor,
+    sanitize_relationship,
+};
 
 // ---- Result type ----
 
@@ -41,6 +46,50 @@ pub struct IngestionResult {
 }
 
 // ---- Pipeline ----
+
+/// Optional extensions for the ingestion pipeline.
+///
+/// Use this to supply components that are not required for a minimal ingestion
+/// run (e.g. an [`LlmGraphExtractor`] for LLM-based entity extraction).
+///
+/// Defaults leave all optional extensions disabled; the pipeline then falls
+/// back to its heuristic entity extractor.
+#[derive(Clone, Default)]
+pub struct IngestionPipelineConfig {
+    /// Chunking configuration used when splitting documents.
+    pub chunker: ChunkerConfig,
+    /// Optional LLM-based knowledge graph extractor. When `Some`, the pipeline
+    /// calls the extractor after chunking and uses the typed entities +
+    /// relations it returns instead of the heuristic fallback.
+    pub llm_extractor: Option<Arc<LlmGraphExtractor>>,
+    /// Concurrency for batch LLM extraction. Defaults to
+    /// [`DEFAULT_BATCH_CONCURRENCY`].
+    pub llm_concurrency: usize,
+}
+
+impl IngestionPipelineConfig {
+    /// Create a new config with the given chunker settings. All optional
+    /// extensions are left disabled.
+    pub fn new(chunker: ChunkerConfig) -> Self {
+        Self {
+            chunker,
+            llm_extractor: None,
+            llm_concurrency: DEFAULT_BATCH_CONCURRENCY,
+        }
+    }
+
+    /// Attach an LLM-based graph extractor.
+    pub fn with_llm_extractor(mut self, extractor: Arc<LlmGraphExtractor>) -> Self {
+        self.llm_extractor = Some(extractor);
+        self
+    }
+
+    /// Override the batch extraction concurrency.
+    pub fn with_llm_concurrency(mut self, concurrency: usize) -> Self {
+        self.llm_concurrency = concurrency.max(1);
+        self
+    }
+}
 
 /// Universal document ingestion pipeline.
 ///
@@ -68,10 +117,15 @@ pub struct IngestionPipeline {
     graph_store: Arc<dyn GraphStore + Send + Sync>,
     chunker_config: ChunkerConfig,
     collection: CollectionName,
+    llm_extractor: Option<Arc<LlmGraphExtractor>>,
+    llm_concurrency: usize,
 }
 
 impl IngestionPipeline {
-    /// Create a new ingestion pipeline.
+    /// Create a new ingestion pipeline with only the mandatory dependencies.
+    ///
+    /// Uses heuristic entity extraction. Use [`Self::with_config`] to supply
+    /// an [`LlmGraphExtractor`] or other optional extensions.
     pub fn new(
         embedder: Arc<dyn Embedder + Send + Sync>,
         vector_store: Arc<dyn VectorStore + Send + Sync>,
@@ -79,12 +133,36 @@ impl IngestionPipeline {
         chunker_config: ChunkerConfig,
         collection: CollectionName,
     ) -> Self {
+        Self::with_config(
+            embedder,
+            vector_store,
+            graph_store,
+            collection,
+            IngestionPipelineConfig::new(chunker_config),
+        )
+    }
+
+    /// Create a new ingestion pipeline with full optional configuration.
+    pub fn with_config(
+        embedder: Arc<dyn Embedder + Send + Sync>,
+        vector_store: Arc<dyn VectorStore + Send + Sync>,
+        graph_store: Arc<dyn GraphStore + Send + Sync>,
+        collection: CollectionName,
+        config: IngestionPipelineConfig,
+    ) -> Self {
+        let llm_concurrency = if config.llm_concurrency == 0 {
+            DEFAULT_BATCH_CONCURRENCY
+        } else {
+            config.llm_concurrency
+        };
         Self {
             embedder,
             vector_store,
             graph_store,
-            chunker_config,
+            chunker_config: config.chunker,
             collection,
+            llm_extractor: config.llm_extractor,
+            llm_concurrency,
         }
     }
 
@@ -221,12 +299,27 @@ impl IngestionPipeline {
             .map_err(RetrievalError::Store)?;
         tracing::info!(doc_id, vectors_upserted, "vector upsert complete");
 
-        // 5. Extract entities from chunks (heuristic Phase 1).
-        let all_entities = extract_entities_from_chunks(&chunks);
+        // 5. Extract entities from chunks.
+        //
+        // If an `LlmGraphExtractor` is configured, run it in parallel across
+        // all chunks and deduplicate entities by `node_id` (cross-document
+        // entity linking). Otherwise fall back to the heuristic extractor.
+        let (graph_nodes, graph_edges) = if let Some(extractor) = self.llm_extractor.as_ref() {
+            tracing::debug!(
+                chunks = chunks.len(),
+                concurrency = self.llm_concurrency,
+                "running LLM graph extraction"
+            );
+            let text_refs: Vec<&str> = chunks.iter().map(|c| c.content.as_str()).collect();
+            let graphs = extractor
+                .extract_batch(&text_refs, self.llm_concurrency)
+                .await;
 
-        // 6. Build and store graph nodes.
-        let (graph_nodes, graph_edges) =
-            build_graph_structures(doc_id, source, &chunks, &all_entities)?;
+            build_llm_graph_structures(doc_id, source, &chunks, &graphs)?
+        } else {
+            let all_entities = extract_entities_from_chunks(&chunks);
+            build_graph_structures(doc_id, source, &chunks, &all_entities)?
+        };
 
         let graph_nodes_created = graph_nodes.len();
         let graph_edges_created = graph_edges.len();
@@ -488,6 +581,170 @@ fn build_graph_structures(
                     properties: json!({}),
                 });
             }
+        }
+    }
+
+    Ok((nodes, edges))
+}
+
+/// Build graph structures from LLM-extracted knowledge graphs.
+///
+/// Given one [`KnowledgeGraph`] per chunk, this function:
+/// 1. Creates the `Document` and `Chunk` nodes + their `HAS_CHUNK` / `NEXT`
+///    edges (identical to the heuristic path).
+/// 2. Deduplicates LLM-extracted entities across chunks by `id`. The first
+///    description / type / name wins; later occurrences are merged through
+///    `MENTIONS` edges only.
+/// 3. Emits typed relation edges between entity nodes, using the
+///    `relationship_name` (sanitized for Neo4j's `RelationType`).
+/// 4. Emits `Chunk -[MENTIONS]-> Entity` edges for every entity that appeared
+///    in a given chunk.
+fn build_llm_graph_structures(
+    doc_id: &str,
+    source: &str,
+    chunks: &[DocumentChunk],
+    graphs: &[KnowledgeGraph],
+) -> Result<(Vec<GraphNode>, Vec<GraphEdge>), RetrievalError> {
+    let map_label_err = |e| RetrievalError::Ingestion {
+        reason: format!("invalid graph label: {e}"),
+    };
+
+    let doc_label = NodeLabel::new("Document").map_err(map_label_err)?;
+    let chunk_label = NodeLabel::new("Chunk").map_err(map_label_err)?;
+    let entity_label = NodeLabel::new("Entity").map_err(map_label_err)?;
+
+    let has_chunk_rel = RelationType::new("HAS_CHUNK").map_err(map_label_err)?;
+    let next_rel = RelationType::new("NEXT").map_err(map_label_err)?;
+    let mentions_rel = RelationType::new("MENTIONS").map_err(map_label_err)?;
+
+    let mut nodes: Vec<GraphNode> = Vec::new();
+    let mut edges: Vec<GraphEdge> = Vec::new();
+
+    // Document node.
+    nodes.push(GraphNode {
+        id: doc_id.to_owned(),
+        label: doc_label,
+        properties: json!({
+            "source": source,
+            "total_chunks": chunks.len(),
+        }),
+    });
+
+    // Cross-chunk entity dedup: keep the first seen version of each entity.
+    let mut entity_index: HashMap<String, ExtractedNode> = HashMap::new();
+
+    // First pass: collect the unique entities from all chunks (first writer wins).
+    for graph in graphs {
+        for node in &graph.nodes {
+            entity_index
+                .entry(node.id.clone())
+                .or_insert_with(|| node.clone());
+        }
+    }
+
+    // Emit graph nodes for unique entities (sorted for determinism).
+    let mut entity_ids_sorted: Vec<&String> = entity_index.keys().collect();
+    entity_ids_sorted.sort();
+    for entity_id in &entity_ids_sorted {
+        let entity = &entity_index[*entity_id];
+        nodes.push(GraphNode {
+            id: (*entity_id).clone(),
+            label: entity_label.clone(),
+            properties: json!({
+                "name": entity.name,
+                "entity_type": entity.node_type,
+                "description": entity.description,
+            }),
+        });
+    }
+
+    // Second pass: emit chunk nodes + chunk<->entity edges + document<->chunk edges.
+    for (i, chunk) in chunks.iter().enumerate() {
+        let chunk_node_id = chunk.chunk_id.clone();
+
+        nodes.push(GraphNode {
+            id: chunk_node_id.clone(),
+            label: chunk_label.clone(),
+            properties: json!({
+                "doc_id": doc_id,
+                "chunk_index": chunk.chunk_index,
+                "section_title": chunk.metadata.section_title,
+            }),
+        });
+
+        edges.push(GraphEdge {
+            source_id: doc_id.to_owned(),
+            target_id: chunk_node_id.clone(),
+            relation_type: has_chunk_rel.clone(),
+            properties: json!({"chunk_index": chunk.chunk_index}),
+        });
+
+        if i > 0 {
+            edges.push(GraphEdge {
+                source_id: chunks[i - 1].chunk_id.clone(),
+                target_id: chunk_node_id.clone(),
+                relation_type: next_rel.clone(),
+                properties: json!({}),
+            });
+        }
+
+        let Some(graph) = graphs.get(i) else {
+            continue;
+        };
+
+        // MENTIONS edges from this chunk to every unique entity in its graph.
+        let mut mentioned_in_chunk: std::collections::HashSet<&str> =
+            std::collections::HashSet::new();
+        for node in &graph.nodes {
+            if !entity_index.contains_key(&node.id) {
+                continue;
+            }
+            if mentioned_in_chunk.insert(node.id.as_str()) {
+                edges.push(GraphEdge {
+                    source_id: chunk_node_id.clone(),
+                    target_id: node.id.clone(),
+                    relation_type: mentions_rel.clone(),
+                    properties: json!({}),
+                });
+            }
+        }
+
+        // Typed entity->entity edges from this chunk's graph.
+        for edge in &graph.edges {
+            if !entity_index.contains_key(&edge.source_node_id)
+                || !entity_index.contains_key(&edge.target_node_id)
+            {
+                tracing::debug!(
+                    src = %edge.source_node_id,
+                    dst = %edge.target_node_id,
+                    "dropping LLM edge referencing unknown node"
+                );
+                continue;
+            }
+
+            let rel_str = sanitize_relationship(&edge.relationship_name);
+            let relation_type = match RelationType::new(&rel_str) {
+                Ok(rt) => rt,
+                Err(e) => {
+                    tracing::warn!(
+                        raw = %edge.relationship_name,
+                        sanitized = %rel_str,
+                        error = %e,
+                        "dropping edge with invalid relation type"
+                    );
+                    continue;
+                }
+            };
+
+            edges.push(GraphEdge {
+                source_id: edge.source_node_id.clone(),
+                target_id: edge.target_node_id.clone(),
+                relation_type,
+                properties: json!({
+                    "description": edge.description,
+                    "chunk_id": chunk.chunk_id,
+                }),
+            });
         }
     }
 
