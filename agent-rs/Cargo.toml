@@ -100,6 +100,9 @@ qdrant-client = "1"
 # Graph DB
 neo4rs = { version = "0.8", features = ["json"] }
 
+# Tokenisation (OpenAI cl100k_base, token-aware chunking)
+tiktoken-rs = "0.6"
+
 # Common types
 uuid = { version = "1", features = ["v4", "v5", "serde"] }
 chrono = { version = "0.4", features = ["serde"] }
