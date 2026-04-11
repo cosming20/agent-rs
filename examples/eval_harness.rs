@@ -39,7 +39,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use chrono::Utc;
@@ -47,11 +47,12 @@ use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 use uuid::Uuid;
 
-use agent_rs_core::config::Settings;
+use agent_rs_core::config::{IngestBackend, Settings};
 use agent_rs_core::types::{CollectionName, RetrievalStrategy};
 use agent_rs_retrieval::Embedder;
 use agent_rs_retrieval::embedder::{FastEmbedder, FastEmbedderConfig};
 use agent_rs_retrieval::graph_cot::{GraphCotConfig, GraphCotRetriever};
+use agent_rs_retrieval::ingestion::docling_client::DoclingSidecarClient;
 use agent_rs_retrieval::ingestion::{
     ChunkSummarizer, ChunkerConfig, IngestionPipeline, IngestionPipelineConfig, LlmGraphExtractor,
 };
@@ -1057,6 +1058,29 @@ async fn main() -> Result<()> {
     // Enable triplet indexing so graph-oriented strategies can score complete
     // (source) -[relation]-> (target) triples against the query embedding.
     pipeline_config = pipeline_config.with_triplet_collection(triplet_collection.clone());
+
+    // Wire the runtime ingest backend + Docling sidecar client when Docling
+    // is selected. Default (from Settings) is `IngestBackend::Docling`, which
+    // requires the sidecar to be reachable at `settings.docling.endpoint`.
+    pipeline_config = pipeline_config.with_ingest_backend(settings.ingest_backend);
+    if matches!(
+        settings.ingest_backend,
+        IngestBackend::Docling | IngestBackend::DoclingWithLegacyFallback
+    ) {
+        info!(
+            endpoint = %settings.docling.endpoint,
+            "connecting to Docling sidecar"
+        );
+        let sidecar = DoclingSidecarClient::connect(
+            settings.docling.endpoint.clone(),
+            Duration::from_secs(settings.docling.connect_timeout_s),
+            Duration::from_secs(settings.docling.stream_idle_timeout_s),
+        )
+        .await
+        .context("connect to Docling sidecar")?;
+        pipeline_config = pipeline_config.with_docling_client(sidecar);
+        info!("Docling sidecar client ready");
+    }
 
     let pipeline = IngestionPipeline::with_config(
         embedder.clone(),
