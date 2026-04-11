@@ -27,7 +27,8 @@ pub use embedder::{Embedder, FastEmbedder, FastEmbedderConfig, SparseVector};
 pub use error::RetrievalError;
 pub use hybrid_embedder::HybridEmbedder;
 pub use ingestion::{
-    ChunkStrategy, ChunkerConfig, DocumentChunk, IngestionPipeline, IngestionResult,
+    ChunkStrategy, ChunkerConfig, DocumentChunk, ExtractedEdge, ExtractedNode, IngestionPipeline,
+    IngestionPipelineConfig, IngestionResult, KnowledgeGraph, LlmGraphExtractor,
 };
 pub use openai_embedder::{OpenAIEmbedder, OpenAIEmbedderConfig};
 pub use ranker::{EvidencePack, ResultRanker};
