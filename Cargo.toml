@@ -30,6 +30,10 @@ path = "examples/e2e_full_trace.rs"
 name = "e2e_legal_qa"
 path = "examples/e2e_legal_qa.rs"
 
+[[example]]
+name = "eval_harness"
+path = "examples/eval_harness.rs"
+
 [dependencies]
 agent-rs-core          = { path = "crates/core" }
 agent-rs-stores        = { path = "crates/stores" }
