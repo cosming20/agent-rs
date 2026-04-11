@@ -61,6 +61,7 @@ use agent_rs_retrieval::ranker::ResultRanker;
 use agent_rs_retrieval::reranker::CrossEncoderReranker;
 use agent_rs_retrieval::router::RetrievalRouter;
 use agent_rs_stores::neo4j::Neo4jStore;
+use agent_rs_stores::postgres::PgStore;
 use agent_rs_stores::qdrant::QdrantStore;
 use agent_rs_stores::traits::{GraphStore, VectorStore};
 
@@ -1080,6 +1081,17 @@ async fn main() -> Result<()> {
         .context("connect to Docling sidecar")?;
         pipeline_config = pipeline_config.with_docling_client(sidecar);
         info!("Docling sidecar client ready");
+
+        // Wire the PgStore so the ingest state machine (begin_ingestion ->
+        // mark_partial_failure / mark_complete) can persist `ingested_documents`
+        // rows. Without this, the Docling pipeline runs in best-effort mode
+        // and skips dedup + observability.
+        info!(dsn_host = %settings.postgres.host, dsn_port = settings.postgres.port, "connecting PgStore for ingest state machine");
+        let pg_store = PgStore::new(&settings.postgres.dsn())
+            .await
+            .context("connect PgStore for Docling ingest state machine")?;
+        pipeline_config = pipeline_config.with_pg_store(Arc::new(pg_store));
+        info!("PgStore wired into ingestion pipeline");
     }
 
     let pipeline = IngestionPipeline::with_config(

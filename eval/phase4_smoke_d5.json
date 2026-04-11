@@ -1,0 +1,121 @@
+{
+  "schema_version": "2",
+  "dataset_name": "phase4_smoke_d5_invoice",
+  "description": "Phase 4 smoke test on D5 invoice (32K). Validates Docling sidecar end-to-end integration on a doc small enough to fit in 7.65 GB Docker Desktop VM. NOT comparable to penal_code_ro 78.8% baseline.",
+  "allowed_difficulties": [
+    "easy",
+    "medium",
+    "hard"
+  ],
+  "allowed_types": [
+    "single_hop",
+    "lexical_exact",
+    "factoid",
+    "lookup"
+  ],
+  "documents": [
+    {
+      "path": "../agent-rs/experiments/docling_chunker_lab/fixtures/D5_invoice.pdf",
+      "doc_id": "d5_invoice",
+      "source": "ms_invoice"
+    }
+  ],
+  "questions": [
+    {
+      "id": "q01",
+      "difficulty": "easy",
+      "type": "single_hop",
+      "question": "What is the invoice number?",
+      "expected_doc_ids": [
+        "d5_invoice"
+      ],
+      "expected_text_contains": [
+        "ONXXDAN60001"
+      ]
+    },
+    {
+      "id": "q02",
+      "difficulty": "easy",
+      "type": "single_hop",
+      "question": "When is the date of issue?",
+      "expected_doc_ids": [
+        "d5_invoice"
+      ],
+      "expected_text_contains": [
+        "April 1, 2026"
+      ]
+    },
+    {
+      "id": "q03",
+      "difficulty": "medium",
+      "type": "single_hop",
+      "question": "What is the OpenAI VAT number?",
+      "expected_doc_ids": [
+        "d5_invoice"
+      ],
+      "expected_text_contains": [
+        "EU372041333"
+      ]
+    },
+    {
+      "id": "q04",
+      "difficulty": "medium",
+      "type": "single_hop",
+      "question": "What amount is due?",
+      "expected_doc_ids": [
+        "d5_invoice"
+      ],
+      "expected_text_contains": [
+        "$50.00 USD due April 1, 2026"
+      ]
+    },
+    {
+      "id": "q05",
+      "difficulty": "hard",
+      "type": "lexical_exact",
+      "question": "Which company name appears above the address?",
+      "expected_doc_ids": [
+        "d5_invoice"
+      ],
+      "expected_text_contains": [
+        "OpenAI OpCo, LLC"
+      ]
+    },
+    {
+      "id": "q06",
+      "difficulty": "easy",
+      "type": "single_hop",
+      "question": "What is the unit price for OpenAI API usage credit?",
+      "expected_doc_ids": [
+        "d5_invoice"
+      ],
+      "expected_text_contains": [
+        "$50.00"
+      ]
+    },
+    {
+      "id": "q07",
+      "difficulty": "easy",
+      "type": "single_hop",
+      "question": "What is the amount due?",
+      "expected_doc_ids": [
+        "d5_invoice"
+      ],
+      "expected_text_contains": [
+        "$50.00 USD"
+      ]
+    },
+    {
+      "id": "q08",
+      "difficulty": "medium",
+      "type": "single_hop",
+      "question": "What is the subtotal?",
+      "expected_doc_ids": [
+        "d5_invoice"
+      ],
+      "expected_text_contains": [
+        "$50.00"
+      ]
+    }
+  ]
+}
