@@ -36,6 +36,9 @@ reqwest = { workspace = true }
 # Retry with backoff (rate-limit handling)
 backon = "1"
 
+# Tokenisation (cl100k_base — used by text-embedding-3-large; token-aware chunking)
+tiktoken-rs = { workspace = true }
+
 # UUIDs (chunk IDs)
 uuid = { workspace = true }
 
