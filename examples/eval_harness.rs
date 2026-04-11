@@ -309,11 +309,23 @@ fn compute_metrics(
         .collect();
     let fuzzy_only = expected.is_empty();
 
-    let first_relevant_rank = documents
-        .iter()
-        .enumerate()
-        .find(|(_, doc)| is_relevant_doc(doc, &expected))
-        .map(|(idx, _)| idx + 1); // 1-based
+    // When expected_doc_ids is empty, fall back to text-based ranking:
+    // find the first document whose chunk_text contains ANY of the
+    // expected_text_contains terms. This gives real Hit@k/MRR signal
+    // even without manually-annotated expected_doc_ids.
+    let first_relevant_rank = if fuzzy_only {
+        documents
+            .iter()
+            .enumerate()
+            .find(|(_, doc)| doc_matches_text(doc, &question.expected_text_contains))
+            .map(|(idx, _)| idx + 1)
+    } else {
+        documents
+            .iter()
+            .enumerate()
+            .find(|(_, doc)| is_relevant_doc(doc, &expected))
+            .map(|(idx, _)| idx + 1)
+    };
 
     let hit_at_1 = first_relevant_rank == Some(1);
     let hit_at_3 = first_relevant_rank.is_some_and(|r| r <= 3);
@@ -321,7 +333,12 @@ fn compute_metrics(
     let reciprocal_rank = first_relevant_rank.map_or(0.0, |r| 1.0 / r as f64);
 
     // NDCG@5 — binary relevance (1 for hit, 0 otherwise).
-    let ndcg_at_5 = compute_ndcg_at_k(documents, &expected, NDCG_CUTOFF);
+    // In fuzzy-only mode, use text matching instead of expected_doc_ids.
+    let ndcg_at_5 = if fuzzy_only {
+        compute_ndcg_at_k_text(documents, &question.expected_text_contains, NDCG_CUTOFF)
+    } else {
+        compute_ndcg_at_k(documents, &expected, NDCG_CUTOFF)
+    };
 
     // Text overlap: fraction of expected_text_contains terms found across
     // concatenated top-5 payload chunk_text (case-insensitive).
@@ -343,6 +360,22 @@ fn compute_metrics(
         error: None,
         top_ids,
     }
+}
+
+/// Check if a document's chunk_text contains ANY of the expected terms.
+/// Case-insensitive substring match. Used for fuzzy-only evaluation when
+/// `expected_doc_ids` is empty.
+fn doc_matches_text(doc: &agent_rs_stores::types::SearchResult, terms: &[String]) -> bool {
+    if terms.is_empty() {
+        return false;
+    }
+    let Some(text) = doc.payload.get("chunk_text").and_then(|v| v.as_str()) else {
+        return false;
+    };
+    let haystack = text.to_ascii_lowercase();
+    terms
+        .iter()
+        .any(|t| haystack.contains(&t.to_ascii_lowercase()))
 }
 
 /// Check if a document matches any expected doc_id.
@@ -391,6 +424,40 @@ fn compute_ndcg_at_k(
     if ideal_hits == 0 {
         return 0.0;
     }
+    let idcg: f64 = (1..=ideal_hits)
+        .map(|i| 1.0 / ((i as f64) + 1.0).log2())
+        .sum();
+
+    if idcg == 0.0 { 0.0 } else { dcg / idcg }
+}
+
+/// NDCG@k using text-match relevance instead of expected_doc_ids.
+/// Binary relevance: 1 if doc contains any expected term, 0 otherwise.
+fn compute_ndcg_at_k_text(
+    documents: &[agent_rs_stores::types::SearchResult],
+    expected_terms: &[String],
+    k: usize,
+) -> f64 {
+    if expected_terms.is_empty() {
+        return 0.0;
+    }
+
+    let mut dcg = 0.0;
+    let mut hit_count = 0;
+    for (idx, doc) in documents.iter().take(k).enumerate() {
+        if doc_matches_text(doc, expected_terms) {
+            let rank = (idx + 1) as f64;
+            dcg += 1.0 / (rank + 1.0).log2();
+            hit_count += 1;
+        }
+    }
+
+    if hit_count == 0 {
+        return 0.0;
+    }
+
+    // Ideal DCG: all hits at the top.
+    let ideal_hits = hit_count.min(k);
     let idcg: f64 = (1..=ideal_hits)
         .map(|i| 1.0 / ((i as f64) + 1.0).log2())
         .sum();
@@ -742,17 +809,28 @@ async fn main() -> Result<()> {
     // knowledge graph extraction for every chunk. This mirrors Cognee's
     // cognify step. Without a key we fall back to heuristic entity extraction
     // so the harness still runs end-to-end without external LLM access.
-    let llm_extractor = std::env::var("LLM_API_KEY")
-        .or_else(|_| std::env::var("OPENAI_API_KEY"))
+    // Allow disabling LLM KG extraction for fast iteration runs:
+    //   EVAL_SKIP_KG_EXTRACTION=1
+    let skip_kg = std::env::var("EVAL_SKIP_KG_EXTRACTION")
         .ok()
-        .map(|api_key| {
-            let model = std::env::var("LLM_GRAPH_MODEL")
-                .or_else(|_| std::env::var("LLM_MODEL"))
-                .unwrap_or_else(|_| "gpt-4o-mini".to_owned());
-            info!(model = %model, "LLM graph extractor enabled for ingestion");
-            Arc::new(LlmGraphExtractor::new(api_key, model))
-        });
-    if llm_extractor.is_none() {
+        .is_some_and(|v| v == "1" || v.eq_ignore_ascii_case("true"));
+
+    let llm_extractor = if skip_kg {
+        info!("EVAL_SKIP_KG_EXTRACTION=1 — skipping LLM knowledge graph extraction");
+        None
+    } else {
+        std::env::var("LLM_API_KEY")
+            .or_else(|_| std::env::var("OPENAI_API_KEY"))
+            .ok()
+            .map(|api_key| {
+                let model = std::env::var("LLM_GRAPH_MODEL")
+                    .or_else(|_| std::env::var("LLM_MODEL"))
+                    .unwrap_or_else(|_| "gpt-4o-mini".to_owned());
+                info!(model = %model, "LLM graph extractor enabled for ingestion");
+                Arc::new(LlmGraphExtractor::new(api_key, model))
+            })
+    };
+    if llm_extractor.is_none() && !skip_kg {
         info!("LLM_API_KEY / OPENAI_API_KEY not set — falling back to heuristic entity extraction");
     }
 
