@@ -47,10 +47,11 @@ use agent_rs_retrieval::Embedder;
 use agent_rs_retrieval::embedder::{FastEmbedder, FastEmbedderConfig};
 use agent_rs_retrieval::hybrid_embedder::HybridEmbedder;
 use agent_rs_retrieval::ingestion::{
-    ChunkerConfig, IngestionPipeline, IngestionPipelineConfig, LlmGraphExtractor,
+    ChunkSummarizer, ChunkerConfig, IngestionPipeline, IngestionPipelineConfig, LlmGraphExtractor,
 };
 use agent_rs_retrieval::openai_embedder::{OpenAIEmbedder, OpenAIEmbedderConfig};
 use agent_rs_retrieval::ranker::ResultRanker;
+use agent_rs_retrieval::reranker::CrossEncoderReranker;
 use agent_rs_retrieval::router::RetrievalRouter;
 use agent_rs_stores::neo4j::Neo4jStore;
 use agent_rs_stores::qdrant::QdrantStore;
@@ -791,8 +792,10 @@ async fn main() -> Result<()> {
     // 5. Determine collection names and reset.
     let collection = CollectionName("eval_harness".into());
     let triplet_collection = CollectionName("eval_harness_triplets".into());
+    let summaries_collection = CollectionName("eval_harness_summaries".into());
     reset_collection(&collection, &settings).await?;
     reset_collection(&triplet_collection, &settings).await?;
+    reset_collection(&summaries_collection, &settings).await?;
 
     // Also clear any leftover graph nodes for our doc_ids from a previous run.
     // We only attempt delete on the top-level doc_id to keep cleanup bounded —
@@ -891,18 +894,46 @@ async fn main() -> Result<()> {
         );
     }
 
-    // 7. Build retrieval router.
+    // 7. Build retrieval router (with optional cross-encoder reranker).
+    //
+    // Reranking is enabled by default; set EVAL_SKIP_RERANKING=1 to bypass
+    // it for fast iteration runs where ONNX inference latency is undesirable.
+    let skip_reranking = std::env::var("EVAL_SKIP_RERANKING")
+        .ok()
+        .is_some_and(|v| v == "1" || v.eq_ignore_ascii_case("true"));
+
+    let reranker: Option<Arc<CrossEncoderReranker>> = if skip_reranking {
+        info!("EVAL_SKIP_RERANKING=1 — cross-encoder reranking disabled");
+        None
+    } else {
+        info!("initializing cross-encoder reranker (BGERerankerBase)...");
+        match CrossEncoderReranker::try_new().await {
+            Ok(r) => {
+                info!("cross-encoder reranker ready");
+                Some(Arc::new(r))
+            }
+            Err(e) => {
+                warn!(error = %e, "cross-encoder reranker init failed — running without reranking");
+                None
+            }
+        }
+    };
+
     let ranker = ResultRanker::new(settings.ranker.rrf_k);
-    let router = Arc::new(
-        RetrievalRouter::new(
-            embedder.clone(),
-            qdrant_store.clone() as Arc<dyn VectorStore + Send + Sync>,
-            neo4j_store.clone() as Arc<dyn GraphStore + Send + Sync>,
-            ranker,
-            collection.clone(),
-        )
-        .with_triplet_collection(triplet_collection.clone()),
-    );
+    let base_router = RetrievalRouter::new(
+        embedder.clone(),
+        qdrant_store.clone() as Arc<dyn VectorStore + Send + Sync>,
+        neo4j_store.clone() as Arc<dyn GraphStore + Send + Sync>,
+        ranker,
+        collection.clone(),
+    )
+    .with_triplet_collection(triplet_collection.clone());
+
+    let router = Arc::new(if let Some(r) = reranker {
+        base_router.with_reranker(r)
+    } else {
+        base_router
+    });
 
     // 8. Run each question through every strategy.
     info!("--- EVAL PHASE ---");

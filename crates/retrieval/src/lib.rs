@@ -19,6 +19,7 @@ pub mod hybrid_embedder;
 pub mod ingestion;
 pub mod openai_embedder;
 pub mod ranker;
+pub mod reranker;
 pub mod router;
 pub mod search;
 pub mod strategy;
@@ -32,5 +33,6 @@ pub use ingestion::{
 };
 pub use openai_embedder::{OpenAIEmbedder, OpenAIEmbedderConfig};
 pub use ranker::{EvidencePack, ResultRanker};
+pub use reranker::CrossEncoderReranker;
 pub use router::RetrievalRouter;
 pub use strategy::StrategyRegistry;
