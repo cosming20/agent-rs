@@ -12,12 +12,14 @@
 //! - [`ranker`] — reciprocal rank fusion, dedup, and [`EvidencePack`] assembly
 //! - [`search`] — concrete search back-ends (vector, keyword, graph, hybrid)
 //! - [`ingestion`] — universal document ingestion pipeline (chunking, metadata, embedding, graph)
+//! - [`proto`] — generated protobuf types for the Docling sidecar gRPC contract
 
 pub mod embedder;
 pub mod error;
 pub mod graph_cot;
 pub mod ingestion;
 pub mod openai_embedder;
+pub mod proto;
 pub mod ranker;
 pub mod reranker;
 pub mod router;
