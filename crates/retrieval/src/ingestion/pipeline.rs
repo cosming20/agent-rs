@@ -306,56 +306,35 @@ impl IngestionPipeline {
             });
         }
 
-        // 2b. Attempt sparse embedding for hybrid/keyword search.
+        // 2b. Server-side BM25 sparse inference via Qdrant `qdrant/bm25` model.
         //
-        // Falls back gracefully when the embedder does not support sparse
-        // (e.g. a bare `OpenAIEmbedder`). In that case ingestion continues
-        // with dense-only vectors and `enable_sparse: false`.
-        let sparse_vectors: Vec<Option<agent_rs_stores::types::SparseVector>> =
-            match self.embedder.embed_sparse_batch(&texts).await {
-                Ok(svecs) => {
-                    tracing::debug!(
-                        count = svecs.len(),
-                        "sparse vectors generated for ingestion"
-                    );
-                    svecs
-                        .into_iter()
-                        .map(|sv| {
-                            Some(agent_rs_stores::types::SparseVector {
-                                indices: sv.indices,
-                                values: sv.values,
-                            })
-                        })
-                        .collect()
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        error = %e,
-                        "embedder does not support sparse vectors; ingesting dense-only"
-                    );
-                    vec![None; chunks.len()]
-                }
-            };
-
-        let has_sparse = sparse_vectors.iter().any(Option::is_some);
+        // No local SPLADE/fastembed sparse model is needed. Each VectorPoint
+        // carries its raw `text`; the store layer sends a `Document { model:
+        // "qdrant/bm25" }` named vector at upsert time and Qdrant handles
+        // tokenisation and IDF weighting. The collection is always created with
+        // `enable_sparse: true` so the sparse named vector exists.
+        tracing::debug!(
+            count = chunks.len(),
+            "using server-side BM25 for sparse vectors"
+        );
 
         // 3. Build VectorPoints with rich payloads.
         let vector_points: Vec<VectorPoint> = chunks
             .iter()
             .zip(embeddings.into_iter())
-            .zip(sparse_vectors.into_iter())
-            .map(|((chunk, embedding), sparse_vector)| {
+            .map(|(chunk, embedding)| {
                 let payload = build_chunk_payload(chunk);
                 VectorPoint {
                     id: chunk.chunk_id.clone(),
                     embedding,
-                    sparse_vector,
+                    text: chunk.content.clone(),
                     payload,
                 }
             })
             .collect();
 
         // 4. Ensure collection exists, then upsert to vector store.
+        // Always enable sparse (BM25) — Qdrant infers it server-side.
         let dims = self.embedder.dimensions();
         let exists = self
             .vector_store
@@ -365,7 +344,7 @@ impl IngestionPipeline {
         if !exists {
             let config = agent_rs_stores::types::CollectionConfig {
                 dense_vector_size: dims,
-                enable_sparse: has_sparse,
+                enable_sparse: true,
                 dense_vector_name: "dense".to_owned(),
                 sparse_vector_name: "sparse".to_owned(),
             };
@@ -376,8 +355,8 @@ impl IngestionPipeline {
             tracing::info!(
                 collection = %self.collection,
                 dims,
-                enable_sparse = has_sparse,
-                "created collection for ingestion"
+                enable_sparse = true,
+                "created collection for ingestion with server-side BM25"
             );
         }
 
@@ -456,9 +435,7 @@ impl IngestionPipeline {
         // configured, generate a 1-2 sentence LLM summary for every chunk,
         // embed the summaries, and upsert them into the summaries collection.
         // This powers the `RetrievalStrategy::Summaries` search path.
-        let summaries_created = self
-            .upsert_summaries_if_enabled(doc_id, &chunks)
-            .await?;
+        let summaries_created = self.upsert_summaries_if_enabled(doc_id, &chunks).await?;
 
         let duration_ms = start.elapsed().as_millis() as u64;
         tracing::info!(doc_id, duration_ms, summaries_created, "ingestion complete");
@@ -551,7 +528,8 @@ impl IngestionPipeline {
             .map(|(triplet, embedding)| VectorPoint {
                 id: triplet.id.clone(),
                 embedding,
-                sparse_vector: None,
+                // Triplet collections use dense-only search; no BM25 needed.
+                text: String::new(),
                 payload: build_triplet_payload(triplet),
             })
             .collect();
@@ -586,10 +564,9 @@ impl IngestionPipeline {
         doc_id: &str,
         chunks: &[DocumentChunk],
     ) -> Result<usize, RetrievalError> {
-        let (Some(summarizer), Some(summaries_collection)) = (
-            self.summarizer.as_ref(),
-            self.summaries_collection.as_ref(),
-        ) else {
+        let (Some(summarizer), Some(summaries_collection)) =
+            (self.summarizer.as_ref(), self.summaries_collection.as_ref())
+        else {
             if !chunks.is_empty() && self.summarizer.is_some() {
                 tracing::debug!(
                     doc_id,
@@ -691,7 +668,8 @@ impl IngestionPipeline {
             .map(|(summary, embedding)| VectorPoint {
                 id: summary.summary_id.clone(),
                 embedding,
-                sparse_vector: None,
+                // Summaries collections use dense-only search; no BM25 needed.
+                text: String::new(),
                 payload: build_summary_payload(summary),
             })
             .collect();

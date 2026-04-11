@@ -30,6 +30,7 @@ use tracing::instrument;
 
 use crate::{
     Embedder, EvidencePack, ResultRanker, RetrievalError,
+    graph_cot::GraphCotRetriever,
     reranker::{CrossEncoderReranker, RERANK_CANDIDATE_COUNT},
     search::{
         graph::{
@@ -42,23 +43,7 @@ use crate::{
     },
     strategy::get_descriptor,
 };
-use agent_rs_stores::{
-    traits::{GraphStore, VectorStore},
-    types::SparseVector as StoreSparseVector,
-};
-
-// ---- Helpers ----
-
-/// Convert an [`crate::embedder::SparseVector`] (returned by the embedder) into
-/// the [`StoreSparseVector`] expected by the search back-ends.
-///
-/// Both types are structurally identical; this is a newtype-bridge conversion.
-fn to_store_sparse(sv: crate::SparseVector) -> StoreSparseVector {
-    StoreSparseVector {
-        indices: sv.indices,
-        values: sv.values,
-    }
-}
+use agent_rs_stores::traits::{GraphStore, VectorStore};
 
 // ---- Constants ----
 
@@ -110,6 +95,15 @@ pub struct RetrievalRouter {
     /// When `Some`, the top-[`RERANK_CANDIDATE_COUNT`] RRF results are passed
     /// through the cross-encoder before truncating to the caller's `limit`.
     reranker: Option<Arc<CrossEncoderReranker>>,
+
+    /// Optional iterative chain-of-thought retriever used only for the
+    /// [`RetrievalStrategy::GraphCoT`] strategy.
+    ///
+    /// When `Some`, after the initial graph traversal the router invokes
+    /// [`GraphCotRetriever::retrieve`] to iteratively generate follow-up
+    /// questions and merge additional evidence. When `None`, `GraphCoT`
+    /// behaves identically to a plain [`RetrievalStrategy::Graph`] search.
+    graph_cot_retriever: Option<Arc<GraphCotRetriever>>,
 }
 
 impl RetrievalRouter {
@@ -139,6 +133,7 @@ impl RetrievalRouter {
             triplet_collection: None,
             summaries_collection: None,
             reranker: None,
+            graph_cot_retriever: None,
         }
     }
 
@@ -176,6 +171,18 @@ impl RetrievalRouter {
     /// Returns the router by value to support builder-style construction.
     pub fn with_reranker(mut self, reranker: Arc<CrossEncoderReranker>) -> Self {
         self.reranker = Some(reranker);
+        self
+    }
+
+    /// Attach an optional iterative chain-of-thought retriever.
+    ///
+    /// When set, [`RetrievalStrategy::GraphCoT`] runs the initial graph
+    /// traversal followed by up to `max_iterations` follow-up passes driven
+    /// by an LLM. See [`crate::graph_cot::GraphCotRetriever`] for details.
+    ///
+    /// Returns the router by value to support builder-style construction.
+    pub fn with_graph_cot_retriever(mut self, retriever: Arc<GraphCotRetriever>) -> Self {
+        self.graph_cot_retriever = Some(retriever);
         self
     }
 
@@ -291,18 +298,10 @@ impl RetrievalRouter {
         let query_str: &str = &rewritten;
 
         // Always embed dense — every strategy needs at minimum a dense vector.
+        // Sparse embeddings are no longer computed client-side: the store layer
+        // sends the raw query text as `Document { model: "qdrant/bm25" }` and
+        // Qdrant performs BM25 inference server-side.
         let dense = self.embedder.embed_text(query_str).await?;
-
-        // Embed sparse only when a keyword back-end will be called.
-        let needs_sparse = descriptor
-            .search_types
-            .contains(&crate::strategy::SearchType::Keyword);
-        let sparse_opt: Option<StoreSparseVector> = if needs_sparse {
-            let sv = self.embedder.embed_sparse(query_str).await?;
-            Some(to_store_sparse(sv))
-        } else {
-            None
-        };
 
         // Dispatch and collect result lists for the ranker.
         let mut result_lists: Vec<Vec<agent_rs_stores::types::SearchResult>> = match strategy {
@@ -321,8 +320,7 @@ impl RetrievalRouter {
                     .summaries_collection
                     .as_ref()
                     .unwrap_or(&self.collection);
-                let results =
-                    summaries_search(&*self.vector_store, target, &dense, limit).await?;
+                let results = summaries_search(&*self.vector_store, target, &dense, limit).await?;
                 vec![results]
             }
 
@@ -334,14 +332,17 @@ impl RetrievalRouter {
             }
 
             // ---- Single-backend: keyword ----
+            // Query text is forwarded to Qdrant as a `Document { model: "qdrant/bm25" }`
+            // for server-side BM25 sparse inference — no local SPLADE model needed.
             RetrievalStrategy::Keyword => {
-                let sparse = sparse_opt.as_ref().ok_or_else(|| RetrievalError::Routing {
-                    strategy: strategy.to_string(),
-                    reason: "sparse embedding required but not computed".into(),
-                })?;
-                let results =
-                    keyword_search(&*self.vector_store, &self.collection, &dense, sparse, limit)
-                        .await?;
+                let results = keyword_search(
+                    &*self.vector_store,
+                    &self.collection,
+                    &dense,
+                    query_str,
+                    limit,
+                )
+                .await?;
                 vec![results]
             }
 
@@ -375,9 +376,21 @@ impl RetrievalRouter {
             }
 
             // ---- Single-backend: graph chain-of-thought ----
+            //
+            // Two-phase flow:
+            //   1. Initial retrieval: graph_cot_search (== graph_search on the
+            //      derived seeds) produces the starting evidence pool.
+            //   2. If a `GraphCotRetriever` is configured, that pool is passed
+            //      through the iterative CoT loop. Each follow-up question is
+            //      embedded with this router's embedder, seeds are re-derived
+            //      from a quick vector search, and graph_search is invoked to
+            //      produce new candidates which are merged and deduplicated by
+            //      the retriever.
+            //   3. If no retriever is configured, the initial pool is returned
+            //      unchanged (equivalent to plain graph search).
             RetrievalStrategy::GraphCoT => {
                 let seeds = self.derive_seed_ids(query_str, &dense, limit).await?;
-                let results = graph_cot_search(
+                let initial = graph_cot_search(
                     &*self.graph_store,
                     query_str,
                     &seeds,
@@ -385,18 +398,49 @@ impl RetrievalRouter {
                     limit,
                 )
                 .await?;
-                vec![results]
+
+                let final_results = if let Some(cot) = self.graph_cot_retriever.as_ref() {
+                    // Closure that re-runs a graph retrieval for a follow-up
+                    // question. Captures `&self` by reference (the enclosing
+                    // `retrieve` future outlives the CoT loop, so the borrow
+                    // is valid). Each call:
+                    //   a) embeds the follow-up question (dense only),
+                    //   b) derives fresh seeds from the main collection, and
+                    //   c) runs graph_search to the same depth/limit as the
+                    //      initial pass.
+                    let this = self;
+                    let depth = DEFAULT_GRAPH_DEPTH;
+                    let cot_limit = limit;
+                    let retrieve_fn = |follow_up: String| async move {
+                        let f_dense = this.embedder.embed_text(&follow_up).await?;
+                        let f_seeds = this
+                            .derive_seed_ids(&follow_up, &f_dense, cot_limit)
+                            .await?;
+                        graph_search(&*this.graph_store, &follow_up, &f_seeds, depth, cot_limit)
+                            .await
+                    };
+
+                    cot.retrieve(query_str, initial, retrieve_fn).await
+                } else {
+                    tracing::debug!(
+                        "GraphCoT: no retriever configured; returning initial graph pool"
+                    );
+                    initial
+                };
+
+                vec![final_results]
             }
 
             // ---- Parallel: vector + keyword (HYBRID) ----
             RetrievalStrategy::Hybrid => {
-                let sparse = sparse_opt.as_ref().ok_or_else(|| RetrievalError::Routing {
-                    strategy: strategy.to_string(),
-                    reason: "sparse embedding required but not computed".into(),
-                })?;
-                let hybrid_results =
-                    hybrid_search(&*self.vector_store, &self.collection, &dense, sparse, limit)
-                        .await?;
+                let hybrid_results = hybrid_search(
+                    &*self.vector_store,
+                    &self.collection,
+                    &dense,
+                    query_str,
+                    limit,
+                )
+                .await?;
                 vec![
                     hybrid_results.vector_results,
                     hybrid_results.keyword_results,
@@ -405,14 +449,10 @@ impl RetrievalRouter {
 
             // ---- Parallel: vector + keyword + graph (GRAPH_HYBRID) ----
             RetrievalStrategy::GraphHybrid => {
-                let sparse = sparse_opt.as_ref().ok_or_else(|| RetrievalError::Routing {
-                    strategy: strategy.to_string(),
-                    reason: "sparse embedding required but not computed".into(),
-                })?;
                 let seeds = self.derive_seed_ids(query_str, &dense, limit).await?;
                 let params = GraphHybridParams {
                     query_embedding: &dense,
-                    sparse_query: sparse,
+                    query_text: query_str,
                     query: query_str,
                     seed_node_ids: &seeds,
                     max_depth: DEFAULT_GRAPH_DEPTH,

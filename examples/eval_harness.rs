@@ -1,9 +1,9 @@
 //! Retrieval evaluation harness for agent-rs.
 //!
 //! Measures retrieval quality across all supported `RetrievalStrategy` variants
-//! using a JSON-defined test dataset. Produces per-strategy and per-question
-//! metrics (Hit@K, MRR, NDCG@K, text-overlap, latency) and writes a structured
-//! JSON report to `test_results/eval_report_{timestamp}.json`.
+//! using a JSON-defined test dataset. Produces per-strategy, per-difficulty-tier,
+//! and per-question-type metrics (Hit@K, MRR, NDCG@K, text-overlap, latency) and
+//! writes a structured JSON report to `test_results/eval_report_{timestamp}.json`.
 //!
 //! # Usage
 //!
@@ -11,6 +11,9 @@
 //! # Ensure infrastructure is up (Qdrant ports 1050/1051, Neo4j 1061, Postgres 1054).
 //! # Optional: EMBEDDER_TYPE=openai (uses text-embedding-3-large).
 //! cargo run --example eval_harness
+//!
+//! # Use a different dataset (v2 expanded suite):
+//! EVAL_DATASET=eval/test_questions_v2.json cargo run --example eval_harness
 //!
 //! # To save the current run as the baseline for future comparisons:
 //! EVAL_SAVE_BASELINE=1 cargo run --example eval_harness
@@ -21,13 +24,16 @@
 //! - `test_results/eval_report_{timestamp}.json` — full structured report
 //! - `test_results/baseline_eval.json` — written when EVAL_SAVE_BASELINE=1
 //! - Console summary table of per-strategy metrics
+//! - Per-difficulty-tier and per-question-type breakdown tables
 //! - Baseline delta report (if `baseline_eval.json` exists)
 //!
 //! # Dataset
 //!
-//! Reads `agent-rs/eval/test_questions.json`. Each question declares its type
-//! (single_hop, multi_hop, lexical_exact, summary_only, temporal, conceptual,
-//! negation, comparison), expected `doc_ids`, and optional `expected_text_contains`.
+//! Reads `eval/baseline_v1.json` by default (or `EVAL_DATASET` env var path).
+//! Each question declares its `type` (single_hop, multi_hop, lexical_exact,
+//! summary_only, temporal, conceptual, negation, comparison, disambiguation,
+//! bridge) and `difficulty` (easy, medium, hard), plus expected `doc_ids`
+//! and optional `expected_text_contains`.
 //! Empty `expected_doc_ids` falls back to text-only fuzzy evaluation.
 
 use std::collections::HashMap;
@@ -45,7 +51,7 @@ use agent_rs_core::config::Settings;
 use agent_rs_core::types::{CollectionName, RetrievalStrategy};
 use agent_rs_retrieval::Embedder;
 use agent_rs_retrieval::embedder::{FastEmbedder, FastEmbedderConfig};
-use agent_rs_retrieval::hybrid_embedder::HybridEmbedder;
+use agent_rs_retrieval::graph_cot::{GraphCotConfig, GraphCotRetriever};
 use agent_rs_retrieval::ingestion::{
     ChunkSummarizer, ChunkerConfig, IngestionPipeline, IngestionPipelineConfig, LlmGraphExtractor,
 };
@@ -76,11 +82,13 @@ const EVAL_STRATEGIES: &[RetrievalStrategy] = &[
 /// Maximum rank cutoffs for Hit@K / NDCG@K metrics.
 const NDCG_CUTOFF: usize = 5;
 
-/// Directory containing the evaluation dataset.
+/// Directory containing the evaluation dataset — used only for path resolution
+/// when the EVAL_DATASET env var supplies a bare filename without a directory.
 const EVAL_DIR: &str = "eval";
 
-/// Default dataset file name.
-const DATASET_FILE: &str = "test_questions.json";
+/// Default dataset file name (baseline v1 — 15 questions).
+/// Override at runtime with: `EVAL_DATASET=eval/test_questions_v2.json`.
+const DATASET_FILE: &str = "baseline_v1.json";
 
 /// Directory where reports are written.
 const RESULTS_DIR: &str = "test_results";
@@ -103,6 +111,14 @@ struct Dataset {
     #[serde(default)]
     #[allow(dead_code)]
     description: String,
+    /// Optional: allowed enum values for the `type` field.
+    /// When present, the harness validates every question's type against this list.
+    #[serde(default)]
+    allowed_types: Vec<String>,
+    /// Optional: allowed enum values for the `difficulty` field.
+    /// When present, the harness validates every question's difficulty against this list.
+    #[serde(default)]
+    allowed_difficulties: Vec<String>,
     documents: Vec<DatasetDocument>,
     #[serde(default = "default_limit")]
     limit: usize,
@@ -127,6 +143,10 @@ struct DatasetDocument {
 #[derive(Debug, Clone, Deserialize)]
 struct TestQuestion {
     id: String,
+    /// Difficulty tier: easy | medium | hard.
+    /// Defaults to "easy" when absent (backward-compatible with v1 datasets).
+    #[serde(default = "default_difficulty")]
+    difficulty: String,
     #[serde(rename = "type")]
     question_type: String,
     question: String,
@@ -137,6 +157,10 @@ struct TestQuestion {
     #[serde(default)]
     #[allow(dead_code)]
     notes: String,
+}
+
+fn default_difficulty() -> String {
+    "easy".to_owned()
 }
 
 // ---------------------------------------------------------------------------
@@ -197,6 +221,7 @@ impl QuestionStrategyMetrics {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct PerQuestionReport {
     question_id: String,
+    difficulty: String,
     #[serde(rename = "type")]
     question_type: String,
     question: String,
@@ -227,6 +252,17 @@ struct StrategyAggregate {
     fuzzy_only_count: usize,
 }
 
+/// Breakdown of aggregate metrics sliced by a single dimension (tier or type).
+///
+/// Keys in `by_label` are the distinct dimension values (e.g. "easy", "hard",
+/// "single_hop", "conceptual"). Each value is itself a `HashMap<strategy_name,
+/// StrategyAggregate>`, giving full per-strategy numbers for that slice.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct DimensionBreakdown {
+    #[serde(flatten)]
+    by_label: HashMap<String, HashMap<String, StrategyAggregate>>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct EvalReport {
     run_id: String,
@@ -234,6 +270,10 @@ struct EvalReport {
     embedder: String,
     total_questions: usize,
     per_strategy: HashMap<String, StrategyAggregate>,
+    /// Metrics broken down by difficulty tier (easy / medium / hard).
+    per_tier: DimensionBreakdown,
+    /// Metrics broken down by question type (single_hop, conceptual, …).
+    per_type: DimensionBreakdown,
     per_question: Vec<PerQuestionReport>,
 }
 
@@ -242,12 +282,34 @@ struct EvalReport {
 // ---------------------------------------------------------------------------
 
 fn load_dataset() -> Result<(Dataset, PathBuf)> {
-    let dataset_path = PathBuf::from(EVAL_DIR).join(DATASET_FILE);
-    let dataset_path = if dataset_path.exists() {
-        dataset_path
+    // EVAL_DATASET env var overrides the default dataset file.
+    // Accepts either an absolute path or a path relative to the working directory.
+    // Example: EVAL_DATASET=eval/test_questions_v2.json
+    let dataset_path = if let Ok(env_path) = std::env::var("EVAL_DATASET") {
+        let p = PathBuf::from(&env_path);
+        if p.exists() {
+            p
+        } else {
+            // Try relative to the workspace root as a convenience.
+            let alt = PathBuf::from("agent-rs").join(&env_path);
+            if alt.exists() {
+                alt
+            } else {
+                anyhow::bail!(
+                    "EVAL_DATASET path not found: {} (also tried {})",
+                    p.display(),
+                    alt.display()
+                );
+            }
+        }
     } else {
-        // Fallback relative to the example's parent (workspace root).
-        PathBuf::from("agent-rs").join(EVAL_DIR).join(DATASET_FILE)
+        // Default: eval/baseline_v1.json (relative to CWD or workspace root).
+        let default_path = PathBuf::from(EVAL_DIR).join(DATASET_FILE);
+        if default_path.exists() {
+            default_path
+        } else {
+            PathBuf::from("agent-rs").join(EVAL_DIR).join(DATASET_FILE)
+        }
     };
 
     let raw = std::fs::read_to_string(&dataset_path)
@@ -265,6 +327,32 @@ fn load_dataset() -> Result<(Dataset, PathBuf)> {
     );
 
     Ok((dataset, dataset_path))
+}
+
+/// Validate question `type` and `difficulty` against the dataset's declared
+/// allowed values. Logs a warning for each violation but does not abort —
+/// unknown values are still evaluated, just flagged.
+fn validate_question_schema(dataset: &Dataset) {
+    for q in &dataset.questions {
+        if !dataset.allowed_types.is_empty() && !dataset.allowed_types.contains(&q.question_type) {
+            warn!(
+                question_id = %q.id,
+                found = %q.question_type,
+                allowed = ?dataset.allowed_types,
+                "unknown question type — not in allowed_types"
+            );
+        }
+        if !dataset.allowed_difficulties.is_empty()
+            && !dataset.allowed_difficulties.contains(&q.difficulty)
+        {
+            warn!(
+                question_id = %q.id,
+                found = %q.difficulty,
+                allowed = ?dataset.allowed_difficulties,
+                "unknown difficulty — not in allowed_difficulties"
+            );
+        }
+    }
 }
 
 /// Resolve a document path declared in the dataset relative to the dataset file.
@@ -580,6 +668,30 @@ fn aggregate_per_strategy(reports: &[PerQuestionReport]) -> HashMap<String, Stra
     out
 }
 
+/// Aggregate metrics broken down by a single dimension (difficulty tier or
+/// question type). The `label_fn` extracts the dimension value from a report row.
+fn aggregate_by_dimension(
+    reports: &[PerQuestionReport],
+    label_fn: impl Fn(&PerQuestionReport) -> &str,
+) -> DimensionBreakdown {
+    // Group report rows by label, cloning into owned vecs so we can call
+    // aggregate_per_strategy which expects &[PerQuestionReport].
+    let mut groups: HashMap<String, Vec<PerQuestionReport>> = HashMap::new();
+    for r in reports {
+        groups
+            .entry(label_fn(r).to_owned())
+            .or_default()
+            .push(r.clone());
+    }
+
+    let mut by_label: HashMap<String, HashMap<String, StrategyAggregate>> = HashMap::new();
+    for (label, group) in groups {
+        by_label.insert(label, aggregate_per_strategy(&group));
+    }
+
+    DimensionBreakdown { by_label }
+}
+
 // ---------------------------------------------------------------------------
 // Console reporting
 // ---------------------------------------------------------------------------
@@ -620,6 +732,74 @@ fn print_summary_table(report: &EvalReport) {
 
 fn format_pct(v: f64) -> String {
     format!("{:>5.1}%", v * 100.0)
+}
+
+/// Print a breakdown table (per-tier or per-type) for a single strategy.
+///
+/// `strategy_name` is used to look up which aggregate to display for each label.
+/// If the strategy is absent for a given label (e.g. the label has no questions
+/// that ran that strategy) the row is skipped.
+fn print_dimension_table(title: &str, breakdown: &DimensionBreakdown, strategy_name: &str) {
+    if breakdown.by_label.is_empty() {
+        return;
+    }
+
+    // Only show the table if at least one label has data for this strategy.
+    let has_data = breakdown
+        .by_label
+        .values()
+        .any(|m| m.contains_key(strategy_name));
+    if !has_data {
+        return;
+    }
+
+    println!("  {} — strategy: {}", title, strategy_name);
+    println!(
+        "  {:<20} | {:<8} | {:<8} | {:<8} | {:<8} | {:<8}",
+        "Label", "Hit@1", "Hit@3", "Hit@5", "MRR", "NDCG@5"
+    );
+    println!("  {}", "-".repeat(74));
+
+    let mut labels: Vec<&String> = breakdown.by_label.keys().collect();
+    labels.sort();
+
+    for label in labels {
+        let Some(agg) = breakdown.by_label[label].get(strategy_name) else {
+            continue;
+        };
+        println!(
+            "  {:<20} | {:<8} | {:<8} | {:<8} | {:<8} | {:<8}",
+            label,
+            format_pct(agg.hit_at_1),
+            format_pct(agg.hit_at_3),
+            format_pct(agg.hit_at_5),
+            format!("{:.3}", agg.mrr),
+            format!("{:.3}", agg.ndcg_at_5),
+        );
+    }
+    println!();
+}
+
+/// Print per-tier and per-type breakdowns for the best strategy (highest MRR).
+fn print_dimension_breakdowns(report: &EvalReport) {
+    // Pick the strategy with the highest overall MRR to use as the reference
+    // column in the breakdown tables.
+    let best_strategy = report
+        .per_strategy
+        .iter()
+        .max_by(|a, b| {
+            a.1.mrr
+                .partial_cmp(&b.1.mrr)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
+        .map(|(name, _)| name.as_str())
+        .unwrap_or("hybrid");
+
+    println!("=== Per-Difficulty-Tier Breakdown ===");
+    print_dimension_table("Difficulty tiers", &report.per_tier, best_strategy);
+
+    println!("=== Per-Question-Type Breakdown ===");
+    print_dimension_table("Question types", &report.per_type, best_strategy);
 }
 
 fn print_baseline_delta(current: &EvalReport, baseline: &EvalReport) {
@@ -724,6 +904,9 @@ async fn main() -> Result<()> {
         "dataset loaded"
     );
 
+    // Validate question type/difficulty against declared allowed values.
+    validate_question_schema(&dataset);
+
     // Warn for any question missing expected_doc_ids.
     for q in &dataset.questions {
         if q.expected_doc_ids.is_empty() {
@@ -752,8 +935,11 @@ async fn main() -> Result<()> {
     let embedder_type = std::env::var("EMBEDDER_TYPE").unwrap_or_else(|_| "local".to_owned());
     let uses_openai = embedder_type.eq_ignore_ascii_case("openai");
 
+    // Sparse embeddings are no longer computed client-side. Qdrant handles
+    // BM25 inference server-side via the `qdrant/bm25` model. We only need
+    // a dense embedder here.
     let (embedder, embedder_label): (Arc<dyn Embedder + Send + Sync>, String) = if uses_openai {
-        info!("initializing OpenAI dense embedder + local FastEmbedder for sparse...");
+        info!("initializing OpenAI dense embedder (sparse BM25 handled server-side by Qdrant)...");
         let api_key = std::env::var("OPENAI_API_KEY")
             .or_else(|_| std::env::var("LLM_API_KEY"))
             .context("OPENAI_API_KEY or LLM_API_KEY must be set when EMBEDDER_TYPE=openai")?;
@@ -767,15 +953,8 @@ async fn main() -> Result<()> {
             .with_model(model.clone())
             .with_dimensions(dims);
         let dense = OpenAIEmbedder::new(config);
-        let sparse = FastEmbedder::try_new(FastEmbedderConfig {
-            show_download_progress: true,
-            ..Default::default()
-        })
-        .await
-        .context("initialize local fastembed for sparse (OpenAI hybrid mode)")?;
-        let label = format!("hybrid-openai-{}-{}", model, dense.dimensions());
-        let hybrid = HybridEmbedder::new(Arc::new(dense), Arc::new(sparse));
-        (Arc::new(hybrid), label)
+        let label = format!("openai-{}-{}", model, dense.dimensions());
+        (Arc::new(dense) as Arc<dyn Embedder + Send + Sync>, label)
     } else {
         info!("initializing local fastembed embedder...");
         let emb = FastEmbedder::try_new(FastEmbedderConfig {
@@ -958,8 +1137,33 @@ async fn main() -> Result<()> {
         None
     };
 
+    // Optional iterative GraphCoT retriever. Enabled when either
+    // OPENAI_API_KEY or LLM_API_KEY is set and EVAL_SKIP_GRAPH_COT is not "1".
+    let skip_graph_cot = std::env::var("EVAL_SKIP_GRAPH_COT")
+        .ok()
+        .is_some_and(|v| v == "1" || v.eq_ignore_ascii_case("true"));
+    let graph_cot_retriever: Option<Arc<GraphCotRetriever>> = if skip_graph_cot {
+        info!("EVAL_SKIP_GRAPH_COT=1 — iterative GraphCoT disabled");
+        None
+    } else if let Ok(api_key) =
+        std::env::var("OPENAI_API_KEY").or_else(|_| std::env::var("LLM_API_KEY"))
+    {
+        let model = std::env::var("GRAPH_COT_MODEL").unwrap_or_else(|_| "gpt-4o-mini".to_owned());
+        info!(model = %model, "initializing GraphCoT iterative retriever");
+        match GraphCotRetriever::new(GraphCotConfig::new(api_key).with_model(model)) {
+            Ok(r) => Some(Arc::new(r)),
+            Err(e) => {
+                warn!(error = %e, "GraphCotRetriever init failed — GraphCoT will fall back to plain graph search");
+                None
+            }
+        }
+    } else {
+        info!("OPENAI_API_KEY/LLM_API_KEY not set — GraphCoT will fall back to plain graph search");
+        None
+    };
+
     let ranker = ResultRanker::new(settings.ranker.rrf_k);
-    let base_router = RetrievalRouter::new(
+    let mut base_router = RetrievalRouter::new(
         embedder.clone(),
         qdrant_store.clone() as Arc<dyn VectorStore + Send + Sync>,
         neo4j_store.clone() as Arc<dyn GraphStore + Send + Sync>,
@@ -968,6 +1172,10 @@ async fn main() -> Result<()> {
     )
     .with_triplet_collection(triplet_collection.clone())
     .with_summaries_collection(summaries_collection.clone());
+
+    if let Some(cot) = graph_cot_retriever {
+        base_router = base_router.with_graph_cot_retriever(cot);
+    }
 
     let router = Arc::new(if let Some(r) = reranker {
         base_router.with_reranker(r)
@@ -1015,6 +1223,7 @@ async fn main() -> Result<()> {
 
         per_question_reports.push(PerQuestionReport {
             question_id: question.id.clone(),
+            difficulty: question.difficulty.clone(),
             question_type: question.question_type.clone(),
             question: question.question.clone(),
             strategies: strategies_map,
@@ -1023,17 +1232,22 @@ async fn main() -> Result<()> {
 
     // 9. Aggregate and build report.
     let per_strategy = aggregate_per_strategy(&per_question_reports);
+    let per_tier = aggregate_by_dimension(&per_question_reports, |r| r.difficulty.as_str());
+    let per_type = aggregate_by_dimension(&per_question_reports, |r| r.question_type.as_str());
     let report = EvalReport {
         run_id: run_id.clone(),
         timestamp: Utc::now().to_rfc3339(),
         embedder: embedder_label,
         total_questions: dataset.questions.len(),
         per_strategy,
+        per_tier,
+        per_type,
         per_question: per_question_reports,
     };
 
     // 10. Print summary.
     print_summary_table(&report);
+    print_dimension_breakdowns(&report);
 
     // 11. Compare against baseline if present.
     let results_dir = PathBuf::from(RESULTS_DIR);

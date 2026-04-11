@@ -9,7 +9,7 @@ use async_trait::async_trait;
 
 use crate::types::{
     ChatMessage, CollectionConfig, EvidenceItem, GraphEdge, GraphNode, GraphPath, Memory, QueryRun,
-    RelationType, SearchResult, SparseVector, VectorPoint,
+    RelationType, SearchResult, VectorPoint,
 };
 
 // ---- Vector Store ----
@@ -59,12 +59,15 @@ pub trait VectorStore: Send + Sync {
         filter: Option<serde_json::Value>,
     ) -> Result<Vec<SearchResult>, StoreError>;
 
-    /// Hybrid search: dense + sparse vectors fused via prefetch + RRF.
+    /// Hybrid search: dense vector + server-side BM25, fused via prefetch + RRF.
+    ///
+    /// `query_text` is sent to Qdrant as a `Document { model: "qdrant/bm25" }`
+    /// for the sparse prefetch leg so Qdrant handles tokenisation server-side.
     async fn search_hybrid(
         &self,
         collection: &CollectionName,
         dense: &Embedding,
-        sparse: &SparseVector,
+        query_text: &str,
         limit: usize,
     ) -> Result<Vec<SearchResult>, StoreError>;
 

@@ -66,8 +66,7 @@ const PREVIEW_CHARS: usize = 200;
 const SUMMARY_UUID_NAMESPACE: uuid::Uuid = uuid::Uuid::NAMESPACE_OID;
 
 /// System prompt for chunk summarization.
-const SYSTEM_PROMPT: &str =
-    "Summarize the following text in 1-2 sentences, focusing on the key concepts and entities. \
+const SYSTEM_PROMPT: &str = "Summarize the following text in 1-2 sentences, focusing on the key concepts and entities. \
      Be concise and factual. Return only the summary — no preamble, no labels.";
 
 // ---------------------------------------------------------------------------
@@ -246,10 +245,9 @@ impl ChunkSummarizer {
             temperature: 0.0,
         };
 
-        let body_bytes =
-            serde_json::to_vec(&body).map_err(|e| RetrievalError::Ingestion {
-                reason: format!("serialize summarization request: {e}"),
-            })?;
+        let body_bytes = serde_json::to_vec(&body).map_err(|e| RetrievalError::Ingestion {
+            reason: format!("serialize summarization request: {e}"),
+        })?;
 
         let response_bytes = self.call_api_with_retry(body_bytes).await?;
 

@@ -8,12 +8,16 @@
 //! # Variants
 //!
 //! - [`graph_search`] — base graph traversal from seed node IDs.
-//! - [`graph_cot_search`] — chain-of-thought graph search (Phase 3: delegates
-//!   to base; Phase 4 adds LLM-guided step selection).
+//! - [`graph_cot_search`] — chain-of-thought graph search. When no
+//!   [`GraphCotRetriever`] is configured on the router it behaves like
+//!   [`graph_search`]; with a retriever the router wraps the result in the
+//!   iterative CoT loop (see [`crate::graph_cot`]).
 //! - [`graph_constrained_search`] — constraint-filtered graph search (Phase 3:
 //!   delegates to base; Phase 4 adds property-filter pushdown).
 //! - [`graph_rag_context_search`] — context-augmented graph search (Phase 3:
 //!   delegates to base; Phase 4 adds context injection into the Cypher query).
+//!
+//! [`GraphCotRetriever`]: crate::graph_cot::GraphCotRetriever
 
 use std::collections::HashMap;
 
@@ -127,11 +131,17 @@ pub async fn graph_search(
 
 // ---- graph_cot_search ----
 
-/// Graph chain-of-thought search.
+/// Graph chain-of-thought search — initial retrieval pass.
 ///
-/// **Phase 3 stub:** delegates to [`graph_search`]. Phase 4 will interleave
-/// LLM-guided step selection between graph hops to reason over the retrieved
-/// subgraph iteratively.
+/// This function performs the *base* graph traversal used as the starting
+/// pool for the iterative chain-of-thought loop. The iterative refinement
+/// (follow-up question generation + merge) lives in
+/// [`crate::graph_cot::GraphCotRetriever`] and is applied by
+/// [`crate::router::RetrievalRouter`] whenever a CoT retriever is configured.
+///
+/// Calling this function directly (without a retriever) is equivalent to
+/// [`graph_search`]: it returns the nodes reachable from `seed_node_ids`
+/// within `max_depth`, ranked by proximity.
 ///
 /// # Errors
 ///
@@ -148,9 +158,8 @@ pub async fn graph_cot_search(
     max_depth: usize,
     limit: usize,
 ) -> Result<Vec<SearchResult>, RetrievalError> {
-    tracing::debug!(
-        "graph_cot_search: LLM chain-of-thought not yet implemented; using graph_search"
-    );
+    // The CoT iteration is applied by the router after this function returns.
+    // Here we only produce the initial evidence pool.
     graph_search(store, query, seed_node_ids, max_depth, limit).await
 }
 
