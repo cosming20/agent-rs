@@ -47,7 +47,12 @@ use crate::error::RetrievalError;
 // ---------------------------------------------------------------------------
 
 /// Default OpenAI model for graph extraction. Chosen for cost/quality balance.
-const DEFAULT_MODEL: &str = "gpt-4o-mini";
+///
+/// `gpt-5.4-mini-2026-03-17` is the small reasoning-tuned model: better at
+/// structured extraction and coreference than `gpt-4o-mini` while staying
+/// within ~3x the per-token cost. Override per-call via [`LlmGraphExtractor::with_default_model`]
+/// or pass an explicit model to [`LlmGraphExtractor::new`].
+const DEFAULT_MODEL: &str = "gpt-5.4-mini-2026-03-17";
 
 /// OpenAI chat completions endpoint.
 const CHAT_COMPLETIONS_URL: &str = "https://api.openai.com/v1/chat/completions";
@@ -64,27 +69,154 @@ const MAX_CHUNK_CHARS: usize = 12_000;
 
 /// System prompt for knowledge graph extraction.
 ///
-/// Based on Cognee's `generate_graph_prompt.txt` but adapted for JSON-schema
-/// structured outputs: the schema itself enforces the shape, so the prompt
-/// focuses on *what* to extract and *how* to label nodes/relations.
-const SYSTEM_PROMPT: &str = r#"You are extracting a knowledge graph from text.
-Extract entities as nodes and relationships as edges.
+/// Static prefix designed for OpenAI prompt caching:
+/// - All static instructions live here so the prefix is identical across
+///   every chunk extraction call. Combined with the JSON schema (also static)
+///   this gives a stable cacheable prefix above the ~1024 token threshold,
+///   slashing cost on subsequent requests within the same cache window.
+/// - Dynamic content (the chunk text) is injected as the user message,
+///   never inside the system prompt, so it doesn't pollute the cache.
+///
+/// Optimized for multilingual extraction (Romanian, English, French, German,
+/// etc.) with explicit guidance on legal, scientific, business, and narrative
+/// document types. Few-shot examples cover entity normalization, coreference,
+/// implicit relations, and edge case handling.
+const SYSTEM_PROMPT: &str = r#"You are an expert knowledge graph extractor.
+Your task: read a text chunk in any language and emit a typed knowledge graph
+of entities (nodes) and relationships (edges) that captures the salient facts.
 
-Rules:
-- Nodes represent entities and concepts (like Wikipedia pages).
-- Use simple, consistent type labels: Person, Organization, Location, Date, Concept, Event, Document, Law, Article, Product. Avoid overly generic types like "Entity".
-- Node IDs MUST be human-readable lowercase snake_case slugs (e.g. "albert_einstein", "world_war_two"). Never use integers. IDs are used for cross-chunk deduplication, so be consistent.
-- Every node has a "name" field with the most complete human-readable form of the entity as it appears in text.
-- Every node has a 1-sentence description grounded in the source text.
-- Coreference: always use the most complete identifier for an entity. If the text mentions "Einstein" and later "Albert Einstein", use "albert_einstein" for both.
-- Dates should be formatted YYYY-MM-DD when possible; otherwise year or month-year.
-- Relationships use snake_case verbs or verb phrases (e.g. "founded_by", "located_in", "acted_in", "signed_on").
-- Edges must reference node IDs that exist in the nodes list. Do not invent IDs.
-- Focus on meaningful relations; ignore incidental mentions.
-- Never escape quotes inside property values.
-- If the text contains no clear entities, return empty lists.
+# Universal rules
 
-Return ONLY valid JSON matching the provided schema."#;
+1. Nodes represent entities and concepts (like Wikipedia pages or ontology terms).
+2. Edges represent typed, directed relationships between two nodes.
+3. Output strict JSON matching the provided schema. No prose, no markdown fences.
+4. If the text contains no extractable entities or relations, return empty lists.
+
+# Node rules
+
+- **Type labels**: Use specific but reusable categories. Prefer:
+  Person, Organization, Location, Date, Event, Document, Law, Article, Concept,
+  Product, Technology, Discipline, Material, Process, Quantity, Measurement,
+  Crime, Penalty, Right, Obligation, Currency, Title, Role, BodyPart, Disease,
+  Treatment, Chemical, Species, Vehicle, Building, Award, Phenomenon.
+  Avoid generic "Entity", "Thing", "Item".
+- **Node IDs**: Lowercase ASCII snake_case slugs (`albert_einstein`, `world_war_two`,
+  `articolul_170`, `tâlhăria_calificată` → `talharia_calificata`).
+  - Strip diacritics: ă→a, â→a, î→i, ș→s, ț→t, é→e, ü→u, ñ→n, etc.
+  - Replace spaces and punctuation with underscores. Collapse multiple underscores.
+  - Never use integer IDs. IDs are the dedup key across the entire corpus.
+- **Names**: The full canonical name as it appears in the text (preserve diacritics).
+- **Descriptions**: One sentence grounded in the source text, no speculation.
+
+# Coreference and normalization
+
+- If "Einstein" appears, then later "Albert Einstein" appears, use the SAME id
+  `albert_einstein` for both. Always prefer the most complete identifier.
+- Pronouns and anaphora: resolve "he/she/it/they/el/dansul" to the most recent
+  matching entity. Never create a node for a pronoun.
+- Dates: Format `YYYY-MM-DD` when fully specified; otherwise `YYYY-MM` or `YYYY`.
+  Romanian dates: "5 iunie 2014" → `2014-06-05`.
+- Numeric quantities: include the unit in the name (e.g. `5_ani_de_inchisoare`).
+
+# Edge rules
+
+- Use snake_case verb phrases in the present tense or past participle:
+  `founded_by`, `located_in`, `acted_in`, `signed_on`, `pedepsit_cu`,
+  `constituie`, `reglementat_de`, `aplicabil_pentru`, `succeeded_by`.
+- Source and target node IDs MUST appear in the nodes list. Never invent IDs.
+- Capture IMPLICIT relations the text strongly entails. For example:
+  "Furtul savarsit prin violenta devine talharie" implies
+  `furt -[constituie_atunci_cand_violent]-> talharie`.
+- Focus on meaningful, non-trivial relations. Skip incidental mentions
+  ("the document is 5 pages long").
+- For legal/regulatory text: extract `pedepsit_cu` (punished_by),
+  `aplicabil_pentru` (applies_to), `defineste` (defines),
+  `agraveaza` (aggravates), `excepte_de_la` (excludes_from).
+
+# Few-shot examples
+
+EXAMPLE 1 — Scientific text:
+"Marie Curie was awarded the Nobel Prize in Physics in 1903 jointly with her
+husband Pierre Curie and Henri Becquerel for their research on radioactivity."
+
+Expected output:
+{
+  "nodes": [
+    {"id": "marie_curie", "name": "Marie Curie", "type": "Person",
+     "description": "Physicist and chemist who pioneered research on radioactivity."},
+    {"id": "pierre_curie", "name": "Pierre Curie", "type": "Person",
+     "description": "Physicist and husband of Marie Curie."},
+    {"id": "henri_becquerel", "name": "Henri Becquerel", "type": "Person",
+     "description": "Physicist who shared the 1903 Nobel Prize in Physics."},
+    {"id": "nobel_prize_in_physics", "name": "Nobel Prize in Physics", "type": "Award",
+     "description": "Annual prize awarded by the Royal Swedish Academy of Sciences."},
+    {"id": "1903", "name": "1903", "type": "Date",
+     "description": "Year the prize was awarded."},
+    {"id": "radioactivity", "name": "radioactivity", "type": "Phenomenon",
+     "description": "Spontaneous emission of radiation from atomic nuclei."}
+  ],
+  "edges": [
+    {"source_node_id": "marie_curie", "target_node_id": "nobel_prize_in_physics",
+     "relationship_name": "awarded", "description": "Marie Curie received the prize."},
+    {"source_node_id": "pierre_curie", "target_node_id": "nobel_prize_in_physics",
+     "relationship_name": "awarded", "description": "Pierre Curie shared the prize."},
+    {"source_node_id": "henri_becquerel", "target_node_id": "nobel_prize_in_physics",
+     "relationship_name": "awarded", "description": "Henri Becquerel shared the prize."},
+    {"source_node_id": "nobel_prize_in_physics", "target_node_id": "1903",
+     "relationship_name": "awarded_in", "description": "Year of award."},
+    {"source_node_id": "marie_curie", "target_node_id": "pierre_curie",
+     "relationship_name": "married_to", "description": "Marie and Pierre were spouses."},
+    {"source_node_id": "marie_curie", "target_node_id": "radioactivity",
+     "relationship_name": "researched", "description": "Curie's primary research topic."}
+  ]
+}
+
+EXAMPLE 2 — Romanian legal text:
+"Articolul 233. Tâlhăria. Furtul săvârșit prin întrebuințarea de violențe sau
+amenințări ori prin punerea victimei în stare de inconștiență sau neputință de
+a se apăra se pedepsește cu închisoarea de la 2 la 7 ani."
+
+Expected output:
+{
+  "nodes": [
+    {"id": "articolul_233", "name": "Articolul 233", "type": "Article",
+     "description": "Articolul 233 din Codul Penal definește tâlhăria."},
+    {"id": "talharia", "name": "Tâlhăria", "type": "Crime",
+     "description": "Furt savarsit prin violenta sau amenintari."},
+    {"id": "furtul", "name": "Furtul", "type": "Crime",
+     "description": "Luarea unui bun mobil din posesia altuia fara consimtamant."},
+    {"id": "violenta", "name": "violența", "type": "Concept",
+     "description": "Folosirea fortei fizice impotriva victimei."},
+    {"id": "amenintari", "name": "amenințări", "type": "Concept",
+     "description": "Intimidarea victimei pentru a obtine bunul."},
+    {"id": "2_pana_la_7_ani_inchisoare", "name": "închisoarea de la 2 la 7 ani",
+     "type": "Penalty", "description": "Pedeapsa cu inchisoarea intre 2 si 7 ani."}
+  ],
+  "edges": [
+    {"source_node_id": "articolul_233", "target_node_id": "talharia",
+     "relationship_name": "defineste",
+     "description": "Articolul 233 defineste talharia."},
+    {"source_node_id": "talharia", "target_node_id": "furtul",
+     "relationship_name": "constituie_forma_agravata_de",
+     "description": "Talharia este o forma agravata a furtului."},
+    {"source_node_id": "talharia", "target_node_id": "violenta",
+     "relationship_name": "implica",
+     "description": "Talharia presupune folosirea violentei."},
+    {"source_node_id": "talharia", "target_node_id": "amenintari",
+     "relationship_name": "implica",
+     "description": "Talharia poate fi savarsita prin amenintari."},
+    {"source_node_id": "talharia", "target_node_id": "2_pana_la_7_ani_inchisoare",
+     "relationship_name": "pedepsit_cu",
+     "description": "Talharia se pedepseste cu inchisoarea de la 2 la 7 ani."}
+  ]
+}
+
+# Output
+
+Return ONLY valid JSON matching the provided schema. Do not include explanations.
+Do not wrap the JSON in markdown code fences. Do not escape quotes inside property
+values unless required by JSON. If the text contains no clear entities, return
+{"nodes": [], "edges": []}."#;
 
 // ---------------------------------------------------------------------------
 // Data model
@@ -244,6 +376,10 @@ struct ChatRequest<'a> {
     messages: Vec<ChatMessage<'a>>,
     temperature: f32,
     response_format: ResponseFormat,
+    /// OpenAI prompt-cache routing hint. Same key → same cache shard, which
+    /// dramatically improves cache hit rate when many requests share the same
+    /// system prompt + schema prefix.
+    prompt_cache_key: &'static str,
 }
 
 #[derive(Debug, Serialize)]
@@ -269,6 +405,31 @@ struct JsonSchemaWrapper {
 #[derive(Debug, Deserialize)]
 struct ChatResponse {
     choices: Vec<ChatChoice>,
+    /// Token usage breakdown including prompt-cache hit count.
+    /// Only set when the upstream API returns it (always for OpenAI gpt-* models).
+    #[serde(default)]
+    usage: Option<ChatUsage>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct ChatUsage {
+    #[serde(default)]
+    prompt_tokens: u64,
+    #[serde(default)]
+    completion_tokens: u64,
+    #[serde(default)]
+    total_tokens: u64,
+    /// Detailed breakdown of prompt tokens. Contains `cached_tokens` showing
+    /// how many of the prompt tokens were served from the cache.
+    /// Only present for prompts ≥1024 tokens.
+    #[serde(default)]
+    prompt_tokens_details: Option<PromptTokensDetails>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct PromptTokensDetails {
+    #[serde(default)]
+    cached_tokens: u64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -415,6 +576,30 @@ impl LlmGraphExtractor {
                 return Ok(KnowledgeGraph::default());
             }
         };
+
+        // Log token usage and prompt-cache hit ratio so we can verify caching
+        // is actually working. cached_tokens > 0 means we hit OpenAI's
+        // automatic prompt cache (≥1024-token static prefix matched).
+        if let Some(usage) = chat.usage.as_ref() {
+            let cached = usage
+                .prompt_tokens_details
+                .as_ref()
+                .map(|d| d.cached_tokens)
+                .unwrap_or(0);
+            let cache_ratio = if usage.prompt_tokens > 0 {
+                (cached as f64) / (usage.prompt_tokens as f64)
+            } else {
+                0.0
+            };
+            tracing::info!(
+                prompt_tokens = usage.prompt_tokens,
+                completion_tokens = usage.completion_tokens,
+                total_tokens = usage.total_tokens,
+                cached_tokens = cached,
+                cache_hit_ratio = format!("{:.1}%", cache_ratio * 100.0),
+                "graph_extractor token usage"
+            );
+        }
 
         let Some(content) = chat
             .choices
@@ -615,6 +800,11 @@ fn build_request_body<'a>(model: &'a str, chunk_text: &'a str) -> ChatRequest<'a
                 schema: knowledge_graph_schema(),
             },
         },
+        // Stable key shared by every chunk extraction → routes to the same
+        // cache shard so the static prefix (system prompt + schema) hits the
+        // cache after the first call. Different from the chunk text which goes
+        // in the user message and is the only varying part.
+        prompt_cache_key: "agent-rs-graph-extractor-v2",
     }
 }
 
