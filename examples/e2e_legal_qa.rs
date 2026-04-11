@@ -26,6 +26,7 @@ use agent_rs_core::config::Settings;
 use agent_rs_core::types::{CollectionName, Embedding, RetrievalStrategy};
 use agent_rs_retrieval::Embedder;
 use agent_rs_retrieval::embedder::{FastEmbedder, FastEmbedderConfig};
+use agent_rs_retrieval::hybrid_embedder::HybridEmbedder;
 use agent_rs_retrieval::openai_embedder::{OpenAIEmbedder, OpenAIEmbedderConfig};
 use agent_rs_retrieval::ranker::ResultRanker;
 use agent_rs_retrieval::router::RetrievalRouter;
@@ -672,7 +673,7 @@ async fn main() -> Result<()> {
     let uses_openai = embedder_type.eq_ignore_ascii_case("openai");
 
     let embedder: Arc<dyn Embedder + Send + Sync> = if uses_openai {
-        info!("initializing OpenAI embedder...");
+        info!("initializing OpenAI dense embedder + local FastEmbedder for sparse...");
         let api_key = std::env::var("OPENAI_API_KEY")
             .or_else(|_| std::env::var("LLM_API_KEY"))
             .context("OPENAI_API_KEY or LLM_API_KEY must be set when EMBEDDER_TYPE=openai")?;
@@ -685,9 +686,19 @@ async fn main() -> Result<()> {
         let config = OpenAIEmbedderConfig::new(api_key)
             .with_model(model)
             .with_dimensions(dims);
-        let emb = OpenAIEmbedder::new(config);
-        info!(dims = emb.dimensions(), "OpenAI embedder initialized");
-        Arc::new(emb)
+        let dense = OpenAIEmbedder::new(config);
+        let sparse = FastEmbedder::try_new(FastEmbedderConfig {
+            show_download_progress: true,
+            ..Default::default()
+        })
+        .await
+        .context("failed to initialize local fastembed for sparse (OpenAI hybrid mode)")?;
+        info!(
+            dims = dense.dimensions(),
+            "HybridEmbedder (OpenAI dense + local sparse) initialized"
+        );
+        let hybrid = HybridEmbedder::new(Arc::new(dense), Arc::new(sparse));
+        Arc::new(hybrid)
     } else {
         info!("initializing local fastembed embedder (may download ONNX models on first run)...");
         let emb = FastEmbedder::try_new(FastEmbedderConfig {
@@ -732,13 +743,8 @@ async fn main() -> Result<()> {
     // 9. Run queries.
     info!("--- QUERY PHASE ---");
 
-    // Use Semantic (dense-only) for OpenAI since it doesn't support sparse vectors.
-    // Use Hybrid (dense + sparse) for fastembed which supports both.
-    let default_strategy = if uses_openai {
-        RetrievalStrategy::Semantic
-    } else {
-        RetrievalStrategy::Hybrid
-    };
+    // Both OpenAI (via HybridEmbedder) and fastembed now support sparse vectors.
+    let default_strategy = RetrievalStrategy::Hybrid;
 
     let questions: Vec<(&str, RetrievalStrategy)> = vec![
         (

@@ -139,22 +139,81 @@ impl IngestionPipeline {
             });
         }
 
+        // 2b. Attempt sparse embedding for hybrid/keyword search.
+        //
+        // Falls back gracefully when the embedder does not support sparse
+        // (e.g. a bare `OpenAIEmbedder`). In that case ingestion continues
+        // with dense-only vectors and `enable_sparse: false`.
+        let sparse_vectors: Vec<Option<agent_rs_stores::types::SparseVector>> =
+            match self.embedder.embed_sparse_batch(&texts).await {
+                Ok(svecs) => {
+                    tracing::debug!(
+                        count = svecs.len(),
+                        "sparse vectors generated for ingestion"
+                    );
+                    svecs
+                        .into_iter()
+                        .map(|sv| {
+                            Some(agent_rs_stores::types::SparseVector {
+                                indices: sv.indices,
+                                values: sv.values,
+                            })
+                        })
+                        .collect()
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        "embedder does not support sparse vectors; ingesting dense-only"
+                    );
+                    vec![None; chunks.len()]
+                }
+            };
+
+        let has_sparse = sparse_vectors.iter().any(Option::is_some);
+
         // 3. Build VectorPoints with rich payloads.
         let vector_points: Vec<VectorPoint> = chunks
             .iter()
             .zip(embeddings.into_iter())
-            .map(|(chunk, embedding)| {
+            .zip(sparse_vectors.into_iter())
+            .map(|((chunk, embedding), sparse_vector)| {
                 let payload = build_chunk_payload(chunk);
                 VectorPoint {
                     id: chunk.chunk_id.clone(),
                     embedding,
-                    sparse_vector: None, // Sparse vectors can be added in a future phase.
+                    sparse_vector,
                     payload,
                 }
             })
             .collect();
 
-        // 4. Upsert to vector store.
+        // 4. Ensure collection exists, then upsert to vector store.
+        let dims = self.embedder.dimensions();
+        let exists = self
+            .vector_store
+            .collection_exists(&self.collection)
+            .await
+            .map_err(RetrievalError::Store)?;
+        if !exists {
+            let config = agent_rs_stores::types::CollectionConfig {
+                dense_vector_size: dims,
+                enable_sparse: has_sparse,
+                dense_vector_name: "dense".to_owned(),
+                sparse_vector_name: "sparse".to_owned(),
+            };
+            self.vector_store
+                .create_collection(&self.collection, &config)
+                .await
+                .map_err(RetrievalError::Store)?;
+            tracing::info!(
+                collection = %self.collection,
+                dims,
+                enable_sparse = has_sparse,
+                "created collection for ingestion"
+            );
+        }
+
         let vectors_upserted = vector_points.len();
         self.vector_store
             .upsert(&self.collection, vector_points)

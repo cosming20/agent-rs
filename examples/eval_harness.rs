@@ -45,6 +45,7 @@ use agent_rs_core::config::Settings;
 use agent_rs_core::types::{CollectionName, RetrievalStrategy};
 use agent_rs_retrieval::Embedder;
 use agent_rs_retrieval::embedder::{FastEmbedder, FastEmbedderConfig};
+use agent_rs_retrieval::hybrid_embedder::HybridEmbedder;
 use agent_rs_retrieval::ingestion::{ChunkerConfig, IngestionPipeline};
 use agent_rs_retrieval::openai_embedder::{OpenAIEmbedder, OpenAIEmbedderConfig};
 use agent_rs_retrieval::ranker::ResultRanker;
@@ -682,7 +683,7 @@ async fn main() -> Result<()> {
     let uses_openai = embedder_type.eq_ignore_ascii_case("openai");
 
     let (embedder, embedder_label): (Arc<dyn Embedder + Send + Sync>, String) = if uses_openai {
-        info!("initializing OpenAI embedder...");
+        info!("initializing OpenAI dense embedder + local FastEmbedder for sparse...");
         let api_key = std::env::var("OPENAI_API_KEY")
             .or_else(|_| std::env::var("LLM_API_KEY"))
             .context("OPENAI_API_KEY or LLM_API_KEY must be set when EMBEDDER_TYPE=openai")?;
@@ -695,9 +696,16 @@ async fn main() -> Result<()> {
         let config = OpenAIEmbedderConfig::new(api_key)
             .with_model(model.clone())
             .with_dimensions(dims);
-        let emb = OpenAIEmbedder::new(config);
-        let label = format!("openai-{}-{}", model, emb.dimensions());
-        (Arc::new(emb), label)
+        let dense = OpenAIEmbedder::new(config);
+        let sparse = FastEmbedder::try_new(FastEmbedderConfig {
+            show_download_progress: true,
+            ..Default::default()
+        })
+        .await
+        .context("initialize local fastembed for sparse (OpenAI hybrid mode)")?;
+        let label = format!("hybrid-openai-{}-{}", model, dense.dimensions());
+        let hybrid = HybridEmbedder::new(Arc::new(dense), Arc::new(sparse));
+        (Arc::new(hybrid), label)
     } else {
         info!("initializing local fastembed embedder...");
         let emb = FastEmbedder::try_new(FastEmbedderConfig {
