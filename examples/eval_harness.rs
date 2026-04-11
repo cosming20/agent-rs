@@ -837,9 +837,39 @@ async fn main() -> Result<()> {
         info!("LLM_API_KEY / OPENAI_API_KEY not set — falling back to heuristic entity extraction");
     }
 
+    // When LLM_API_KEY is set, also enable chunk summarization so the
+    // Summaries strategy has populated data to search against.
+    let skip_summaries = std::env::var("EVAL_SKIP_SUMMARIES")
+        .ok()
+        .is_some_and(|v| v == "1" || v.eq_ignore_ascii_case("true"));
+
+    let summarizer: Option<Arc<ChunkSummarizer>> = if skip_summaries {
+        info!("EVAL_SKIP_SUMMARIES=1 — skipping chunk summarization");
+        None
+    } else {
+        std::env::var("LLM_API_KEY")
+            .or_else(|_| std::env::var("OPENAI_API_KEY"))
+            .ok()
+            .map(|api_key| {
+                let model = std::env::var("LLM_SUMMARY_MODEL")
+                    .or_else(|_| std::env::var("LLM_MODEL"))
+                    .unwrap_or_else(|_| "gpt-4o-mini".to_owned());
+                info!(model = %model, "ChunkSummarizer enabled for ingestion");
+                Arc::new(ChunkSummarizer::new(api_key, model))
+            })
+    };
+    if summarizer.is_none() && !skip_summaries {
+        info!("LLM_API_KEY / OPENAI_API_KEY not set — chunk summarization disabled");
+    }
+
     let mut pipeline_config = IngestionPipelineConfig::new(ChunkerConfig::default());
     if let Some(extractor) = llm_extractor.clone() {
         pipeline_config = pipeline_config.with_llm_extractor(extractor);
+    }
+    if let Some(s) = summarizer.clone() {
+        pipeline_config = pipeline_config
+            .with_summarizer(s)
+            .with_summaries_collection(summaries_collection.clone());
     }
     // Enable triplet indexing so graph-oriented strategies can score complete
     // (source) -[relation]-> (target) triples against the query embedding.
@@ -889,6 +919,8 @@ async fn main() -> Result<()> {
             vectors = result.vectors_upserted,
             graph_nodes = result.graph_nodes_created,
             graph_edges = result.graph_edges_created,
+            triplets = result.triplets_upserted,
+            summaries = result.summaries_created,
             duration_ms = result.duration_ms,
             "ingestion complete"
         );
@@ -927,7 +959,8 @@ async fn main() -> Result<()> {
         ranker,
         collection.clone(),
     )
-    .with_triplet_collection(triplet_collection.clone());
+    .with_triplet_collection(triplet_collection.clone())
+    .with_summaries_collection(summaries_collection.clone());
 
     let router = Arc::new(if let Some(r) = reranker {
         base_router.with_reranker(r)

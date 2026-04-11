@@ -9,11 +9,13 @@
 //! - [`metadata`] -- automatic metadata extraction from text content
 //! - [`graph_extractor`] -- LLM-based entity/relation extraction (OpenAI structured outputs)
 //! - [`pipeline`] -- end-to-end ingestion pipeline wiring all stages together
+//! - [`summarizer`] -- LLM-based chunk summarization (powers `RetrievalStrategy::Summaries`)
 
 pub mod chunker;
 pub mod graph_extractor;
 pub mod metadata;
 pub mod pipeline;
+pub mod summarizer;
 
 pub use chunker::{ChunkStrategy, ChunkerConfig, DocumentChunk};
 pub use graph_extractor::{
@@ -22,3 +24,4 @@ pub use graph_extractor::{
 };
 pub use metadata::{ChunkExtras, ChunkMetadata};
 pub use pipeline::{IngestionPipeline, IngestionPipelineConfig, IngestionResult};
+pub use summarizer::{ChunkSummary, ChunkSummarizer, DEFAULT_SUMMARIZER_CONCURRENCY};
