@@ -937,18 +937,21 @@ async fn main() -> Result<()> {
     let reranker: Option<Arc<CrossEncoderReranker>> = if skip_reranking {
         info!("EVAL_SKIP_RERANKING=1 — cross-encoder reranking disabled");
         None
-    } else {
-        info!("initializing cross-encoder reranker (BGERerankerBase)...");
-        match CrossEncoderReranker::try_new().await {
+    } else if let Ok(api_key) = std::env::var("JINA_API_KEY") {
+        info!("initializing Jina cross-encoder reranker...");
+        match CrossEncoderReranker::new(api_key) {
             Ok(r) => {
-                info!("cross-encoder reranker ready");
+                info!("Jina cross-encoder reranker ready");
                 Some(Arc::new(r))
             }
             Err(e) => {
-                warn!(error = %e, "cross-encoder reranker init failed — running without reranking");
+                warn!(error = %e, "Jina reranker init failed — running without reranking");
                 None
             }
         }
+    } else {
+        info!("JINA_API_KEY not set — skipping cross-encoder reranking");
+        None
     };
 
     let ranker = ResultRanker::new(settings.ranker.rrf_k);

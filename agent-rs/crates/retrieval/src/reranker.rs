@@ -3,27 +3,23 @@
 //! # Overview
 //!
 //! [`CrossEncoderReranker`] takes the top-N results from RRF fusion and
-//! reranks them against the original query using a local ONNX cross-encoder
-//! model via `fastembed`. Unlike bi-encoder vector similarity (used in the
-//! primary retrieval stage), a cross-encoder scores query+document pairs
-//! jointly, producing more accurate relevance estimates at the cost of
-//! higher latency.
-//!
-//! # Thread-safety contract
-//!
-//! `fastembed`'s [`TextRerank`] is **not** `Send + Sync` because the
-//! underlying ONNX session holds non-`Send` state. It is wrapped in
-//! `Arc<Mutex<TextRerank>>` and every scoring call is offloaded via
-//! [`tokio::task::spawn_blocking`] so the async runtime is never blocked.
+//! reranks them against the original query using Jina's hosted reranker API.
+//! Unlike bi-encoder vector similarity (used in the primary retrieval stage),
+//! a cross-encoder scores query+document pairs jointly, producing more
+//! accurate relevance estimates.
 //!
 //! # Model
 //!
-//! Uses `RerankerModel::BGERerankerV2M3` — a multilingual cross-encoder
-//! (approx. 278 M params) with strong cross-lingual transfer, making it
-//! appropriate for the multilingual retrieval workloads in agent-rs.
+//! Uses Jina's `jina-reranker-v2-base-multilingual` by default — a 278M
+//! parameter cross-encoder with strong cross-lingual transfer. Fully
+//! multilingual, handles Romanian and 100+ other languages.
 //!
-//! Model weights are downloaded on first use to the fastembed cache directory
-//! (`~/.cache/fastembed` by default) and reused on subsequent starts.
+//! # API
+//!
+//! POST https://api.jina.ai/v1/rerank
+//! Headers: Authorization: Bearer {JINA_API_KEY}, Content-Type: application/json
+//! Body: {"model": "...", "query": "...", "documents": ["..."], "top_n": N, "return_documents": false}
+//! Response: {"results": [{"index": 0, "relevance_score": 0.9}], "usage": {...}}
 //!
 //! # Integration
 //!
@@ -31,11 +27,13 @@
 //! configured, `retrieve` passes the top-50 RRF results through
 //! [`CrossEncoderReranker::rerank`] before truncating to the caller's `limit`.
 
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+use std::time::Duration;
 
 use agent_rs_core::Score;
 use agent_rs_stores::types::SearchResult;
-use fastembed::{RerankInitOptions, RerankerModel, TextRerank};
+use backon::{ExponentialBuilder, Retryable};
+use serde::{Deserialize, Serialize};
 use tracing::instrument;
 
 use crate::error::RetrievalError;
@@ -43,93 +41,104 @@ use crate::error::RetrievalError;
 // ---- Constants ----
 
 /// Number of top RRF results forwarded to the cross-encoder.
-///
-/// Taking 50 gives the reranker enough candidates to improve recall while
-/// keeping per-request latency bounded. Values above ~100 provide
-/// diminishing returns for most cross-encoders.
 pub const RERANK_CANDIDATE_COUNT: usize = 50;
 
 /// Payload key that carries the chunk text used as the reranker document body.
 const CHUNK_TEXT_KEY: &str = "chunk_text";
 
+/// Default Jina reranker model (multilingual, 278M params).
+const DEFAULT_MODEL: &str = "jina-reranker-v2-base-multilingual";
+
+/// Jina rerank API endpoint.
+const JINA_RERANK_URL: &str = "https://api.jina.ai/v1/rerank";
+
+// ---- Request/Response types ----
+
+#[derive(Debug, Serialize)]
+struct RerankRequest<'a> {
+    model: &'a str,
+    query: &'a str,
+    documents: Vec<&'a str>,
+    top_n: usize,
+    return_documents: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct RerankResponse {
+    results: Vec<RerankResult>,
+    #[serde(default)]
+    usage: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RerankResult {
+    index: usize,
+    relevance_score: f64,
+}
+
 // ---- CrossEncoderReranker ----
 
-/// Cross-encoder reranker backed by a local fastembed ONNX model.
-///
-/// # Construction
-///
-/// ```rust,no_run
-/// # async fn example() -> anyhow::Result<()> {
-/// use agent_rs_retrieval::reranker::CrossEncoderReranker;
-/// let reranker = CrossEncoderReranker::try_new().await?;
-/// # Ok(())
-/// # }
-/// ```
+/// Cross-encoder reranker backed by Jina's hosted API.
 #[derive(Clone)]
 pub struct CrossEncoderReranker {
-    /// Thread-safe wrapper around the cross-encoder ONNX model.
-    model: Arc<Mutex<TextRerank>>,
+    client: reqwest::Client,
+    api_key: String,
+    model: String,
 }
 
 impl std::fmt::Debug for CrossEncoderReranker {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("CrossEncoderReranker")
-            .field("model", &"TextRerank(BGERerankerV2M3)")
+            .field("model", &self.model)
+            .field("api_key", &"***")
             .finish()
     }
 }
 
 impl CrossEncoderReranker {
-    /// Initialise the cross-encoder model and return a ready reranker.
+    /// Construct a reranker with the given Jina API key and default model.
     ///
-    /// Model weights are downloaded on first use and cached locally.
-    /// Subsequent calls reuse the on-disk cache and require no network access.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`RetrievalError::Embedding`] when the ONNX model fails to
-    /// initialise (e.g. unsupported platform, cache write error).
-    #[instrument]
-    pub async fn try_new() -> Result<Self, RetrievalError> {
-        let model = tokio::task::spawn_blocking(|| {
-            let opts = RerankInitOptions::new(RerankerModel::BGERerankerV2M3)
-                .with_show_download_progress(false);
-            TextRerank::try_new(opts).map_err(|e| RetrievalError::Embedding {
-                reason: format!("cross-encoder model init failed: {e}"),
-            })
-        })
-        .await
-        .map_err(|join_err| RetrievalError::Embedding {
-            reason: format!("cross-encoder model init task panicked: {join_err}"),
-        })??;
+    /// Reads from `JINA_API_KEY` env var if `api_key` is empty.
+    pub fn new(api_key: String) -> Result<Self, RetrievalError> {
+        let api_key = if api_key.is_empty() {
+            std::env::var("JINA_API_KEY").map_err(|_| RetrievalError::Embedding {
+                reason: "JINA_API_KEY not set and no api_key provided".to_owned(),
+            })?
+        } else {
+            api_key
+        };
 
-        tracing::info!("CrossEncoderReranker initialised (BGERerankerV2M3)");
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(60))
+            .build()
+            .map_err(|e| RetrievalError::Embedding {
+                reason: format!("failed to build reqwest client: {e}"),
+            })?;
+
+        tracing::info!(model = %DEFAULT_MODEL, "CrossEncoderReranker initialised (Jina API)");
 
         Ok(Self {
-            model: Arc::new(Mutex::new(model)),
+            client,
+            api_key,
+            model: DEFAULT_MODEL.to_owned(),
         })
+    }
+
+    /// Use a non-default Jina reranker model (e.g. "jina-reranker-v1-turbo-en").
+    pub fn with_model(mut self, model: String) -> Self {
+        self.model = model;
+        self
+    }
+
+    /// Try to create from env var `JINA_API_KEY`. Returns `None` if not set.
+    pub fn try_from_env() -> Option<Result<Self, RetrievalError>> {
+        std::env::var("JINA_API_KEY").ok().map(Self::new)
     }
 
     /// Rerank documents by semantic relevance to `query`.
     ///
-    /// Extracts the `chunk_text` payload field from each [`SearchResult`] as
-    /// the document body. Documents missing `chunk_text` fall back to an
-    /// empty string, which the cross-encoder will score near-zero relative to
-    /// well-populated documents.
-    ///
     /// Returns up to `top_k` results sorted by descending cross-encoder score.
-    /// The [`SearchResult::score`] field is replaced with the cross-encoder
-    /// relevance score on each returned result.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`RetrievalError::Embedding`] when the ONNX session fails or
-    /// the Mutex is poisoned.
-    ///
-    /// # Panics
-    ///
-    /// Does not panic; index out-of-range from the cross-encoder is treated
-    /// as a retrieval error.
+    /// The [`SearchResult::score`] field is replaced with the relevance score.
     #[instrument(skip(self, documents), fields(
         query_len = query.len(),
         candidates = documents.len(),
@@ -145,11 +154,8 @@ impl CrossEncoderReranker {
             return Ok(Vec::new());
         }
 
-        let query_owned = query.to_owned();
-        let model = Arc::clone(&self.model);
-
-        // Extract text bodies for the cross-encoder. We keep the original
-        // documents around so we can map scores back by index.
+        // Extract text bodies for the API. Keep the original documents around
+        // so we can map scores back by index.
         let texts: Vec<String> = documents
             .iter()
             .map(|doc| {
@@ -161,79 +167,110 @@ impl CrossEncoderReranker {
             })
             .collect();
 
-        let rerank_results = tokio::task::spawn_blocking(move || {
-            let mut guard = model.lock().map_err(|_| RetrievalError::Embedding {
-                reason: "cross-encoder model mutex poisoned".to_owned(),
-            })?;
-            // Convert to Vec<&str> within the blocking closure so all string
-            // data lives in the same stack frame — no lifetime issues since
-            // `texts` is owned by this closure.
-            // `return_documents = false` — we keep our original SearchResult
-            // objects and only use the scores; avoids copying text back.
-            // fastembed's `rerank<S>` uses the same `S` for both `query` and
-            // `documents`. Passing `query_owned.as_str()` pins S = &str, which
-            // allows the documents slice to be Vec<&str>.
-            let text_refs: Vec<&str> = texts.iter().map(|s| s.as_str()).collect();
-            guard
-                .rerank(query_owned.as_str(), text_refs, false, None)
+        // Skip the API call if all documents are empty.
+        if texts.iter().all(|t| t.is_empty()) {
+            tracing::warn!("all documents have empty chunk_text; skipping reranker");
+            return Ok(documents.into_iter().take(top_k).collect());
+        }
+
+        let text_refs: Vec<&str> = texts.iter().map(|s| s.as_str()).collect();
+
+        let request = RerankRequest {
+            model: &self.model,
+            query,
+            documents: text_refs,
+            top_n: top_k.min(documents.len()),
+            return_documents: false,
+        };
+
+        let body = serde_json::to_string(&request).map_err(|e| RetrievalError::Embedding {
+            reason: format!("failed to serialize rerank request: {e}"),
+        })?;
+
+        // Retry on transient errors (429, 5xx).
+        let client = self.client.clone();
+        let api_key = self.api_key.clone();
+        let body_ref = body.clone();
+
+        let call = || async {
+            let resp = client
+                .post(JINA_RERANK_URL)
+                .bearer_auth(&api_key)
+                .header("Content-Type", "application/json")
+                .body(body_ref.clone())
+                .send()
+                .await
                 .map_err(|e| RetrievalError::Embedding {
-                    reason: format!("cross-encoder rerank failed: {e}"),
-                })
-        })
-        .await
-        .map_err(|join_err| RetrievalError::Embedding {
-            reason: format!("cross-encoder rerank task panicked: {join_err}"),
-        })??;
+                    reason: format!("jina rerank HTTP request failed: {e}"),
+                })?;
 
-        // Map cross-encoder scores back onto the original SearchResult objects.
-        let n = documents.len();
-        let mut scored: Vec<(f32, usize)> = rerank_results
-            .into_iter()
-            .map(|r| {
-                if r.index >= n {
-                    Err(RetrievalError::Embedding {
-                        reason: format!(
-                            "cross-encoder returned out-of-range index {} (candidates: {n})",
-                            r.index
-                        ),
-                    })
-                } else {
-                    Ok((r.score, r.index))
-                }
+            let status = resp.status();
+            if !status.is_success() {
+                let body_text = resp.text().await.unwrap_or_else(|_| "<no body>".into());
+                return Err(RetrievalError::Embedding {
+                    reason: format!("jina rerank API error (HTTP {status}): {body_text}"),
+                });
+            }
+
+            let parsed: RerankResponse =
+                resp.json().await.map_err(|e| RetrievalError::Embedding {
+                    reason: format!("failed to parse jina rerank response: {e}"),
+                })?;
+
+            Ok::<_, RetrievalError>(parsed)
+        };
+
+        let rerank_response = call
+            .retry(
+                ExponentialBuilder::default()
+                    .with_min_delay(Duration::from_millis(500))
+                    .with_max_delay(Duration::from_secs(30))
+                    .with_max_times(3),
+            )
+            .when(|e| {
+                matches!(e, RetrievalError::Embedding { reason }
+                    if reason.contains("HTTP 429") || reason.contains("HTTP 5"))
             })
-            .collect::<Result<Vec<_>, _>>()?;
+            .await?;
 
-        // Sort descending by cross-encoder score; use original index as
-        // tiebreaker for determinism.
-        scored.sort_unstable_by(|(score_a, idx_a), (score_b, idx_b)| {
-            score_b
-                .partial_cmp(score_a)
-                .unwrap_or(std::cmp::Ordering::Equal)
-                .then_with(|| idx_a.cmp(idx_b))
-        });
-
-        // Reconstruct the result list in reranked order, clamped to top_k.
-        // We need indexed access into `documents`; collect into a Vec<Option<SearchResult>>
-        // so we can move out by index without cloning.
+        // Map results back onto original SearchResult objects.
+        let n = documents.len();
         let mut doc_slots: Vec<Option<SearchResult>> = documents.into_iter().map(Some).collect();
 
-        let reranked: Vec<SearchResult> = scored
-            .into_iter()
-            .take(top_k)
-            .filter_map(|(score, idx)| {
-                doc_slots[idx].take().map(|mut doc| {
-                    doc.score = Score(score as f64);
-                    doc
-                })
-            })
-            .collect();
+        let mut reranked: Vec<SearchResult> = Vec::with_capacity(top_k);
+        for result in rerank_response.results {
+            if result.index >= n {
+                return Err(RetrievalError::Embedding {
+                    reason: format!(
+                        "jina returned out-of-range index {} (candidates: {n})",
+                        result.index
+                    ),
+                });
+            }
+            if let Some(mut doc) = doc_slots[result.index].take() {
+                doc.score = Score(result.relevance_score);
+                reranked.push(doc);
+                if reranked.len() >= top_k {
+                    break;
+                }
+            }
+        }
 
         tracing::debug!(
             input_count = n,
             output_count = reranked.len(),
-            "cross-encoder reranking complete"
+            usage = ?rerank_response.usage,
+            "jina rerank complete"
         );
 
         Ok(reranked)
+    }
+}
+
+// Arc<Self> compatibility is handled at the router level.
+impl CrossEncoderReranker {
+    /// Create an Arc-wrapped reranker — convenience for router integration.
+    pub fn into_arc(self) -> Arc<Self> {
+        Arc::new(self)
     }
 }
