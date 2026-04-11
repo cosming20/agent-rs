@@ -5,6 +5,7 @@
 
 use serde::{Deserialize, Serialize};
 use std::fmt;
+use std::str::FromStr;
 use uuid::Uuid;
 
 // ---- Newtypes ----
@@ -215,6 +216,59 @@ pub enum MessageRole {
     User,
     Assistant,
     System,
+}
+
+// ---- Ingest state machine ----
+
+/// State of a document in the ingestion pipeline.
+///
+/// Stored as TEXT in Postgres with a CHECK constraint.  Use [`IngestStatus::as_str`]
+/// for serialisation and [`IngestStatus::from_str`] for deserialisation —
+/// both are exhaustive and reject unknown values loudly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IngestStatus {
+    /// Ingestion is currently running.
+    InProgress,
+    /// Ingestion started but failed part-way through (rollback performed).
+    PartialFailure,
+    /// Ingestion finished successfully.
+    Complete,
+}
+
+impl IngestStatus {
+    /// Return the canonical lowercase string stored in the database.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::InProgress => "in_progress",
+            Self::PartialFailure => "partial_failure",
+            Self::Complete => "complete",
+        }
+    }
+}
+
+impl fmt::Display for IngestStatus {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Error returned when parsing an [`IngestStatus`] from an unknown string.
+#[derive(Debug, thiserror::Error)]
+#[error("unknown ingest_status value: '{0}'")]
+pub struct InvalidIngestStatus(pub String);
+
+impl FromStr for IngestStatus {
+    type Err = InvalidIngestStatus;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "in_progress" => Ok(Self::InProgress),
+            "partial_failure" => Ok(Self::PartialFailure),
+            "complete" => Ok(Self::Complete),
+            other => Err(InvalidIngestStatus(other.to_string())),
+        }
+    }
 }
 
 // ---- Utilities ----

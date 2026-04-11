@@ -62,6 +62,16 @@ pub enum StoreError {
     Serialization(String),
     #[error("invalid data: {0}")]
     InvalidData(String),
+    #[error("invalid state: row is in an unexpected ingest_status")]
+    InvalidState,
+    /// A batched Neo4j write produced fewer relationships/nodes than the
+    /// batch contained, indicating that one or more source or target nodes
+    /// were missing when the edge MERGE ran.
+    ///
+    /// The ingest coordinator must invoke `rollback_by_run_id` after
+    /// receiving this error.
+    #[error("incomplete batch write: expected {expected} rows, Neo4j reported {created}")]
+    IncompleteBatch { expected: usize, created: i64 },
 }
 
 // ---- Retrieval ----
