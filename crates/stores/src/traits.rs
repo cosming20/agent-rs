@@ -6,10 +6,11 @@
 
 use agent_rs_core::{CollectionName, Embedding, SessionId, StoreError, UserId};
 use async_trait::async_trait;
+use uuid::Uuid;
 
 use crate::types::{
-    ChatMessage, CollectionConfig, EvidenceItem, GraphEdge, GraphNode, GraphPath, Memory, QueryRun,
-    RelationType, SearchResult, VectorPoint,
+    ChatMessage, CollectionConfig, EvidenceItem, FilterSpec, GraphEdge, GraphNode, GraphPath,
+    Memory, QueryRun, RelationType, SearchResult, VectorPoint,
 };
 
 // ---- Vector Store ----
@@ -75,6 +76,23 @@ pub trait VectorStore: Send + Sync {
     async fn delete(&self, collection: &CollectionName, ids: Vec<String>)
     -> Result<(), StoreError>;
 
+    /// Delete all points matching a filter from the given collection.
+    ///
+    /// Returns the count of points deleted by the operation.
+    ///
+    /// Used by the `IngestCoordinator` for rollback-by-run-id: all Qdrant
+    /// points tagged `ingest_run_id = <uuid>` are purged in one call without
+    /// having to enumerate their IDs first.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError`] if the backend call fails.
+    async fn delete_by_filter(
+        &self,
+        collection: &CollectionName,
+        filter: FilterSpec,
+    ) -> Result<u64, StoreError>;
+
     /// Check if a collection exists.
     async fn collection_exists(&self, name: &CollectionName) -> Result<bool, StoreError>;
 }
@@ -122,6 +140,19 @@ pub trait GraphStore: Send + Sync {
 
     /// Delete a node and its edges by ID.
     async fn delete_node(&self, id: &str) -> Result<(), StoreError>;
+
+    /// Delete all graph nodes (and their edges) whose `ingest_run_id` property
+    /// matches `ingest_run_id`.
+    ///
+    /// Used by `IngestCoordinator::cleanup_partial` to roll back a partial
+    /// ingest run without touching nodes created by other runs.
+    ///
+    /// Returns the count of deleted nodes.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError`] if the backend call fails.
+    async fn rollback_by_run_id(&self, ingest_run_id: Uuid) -> Result<u64, StoreError>;
 }
 
 // ---- State Store ----

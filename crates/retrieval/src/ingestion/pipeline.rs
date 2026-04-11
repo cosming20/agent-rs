@@ -1,26 +1,42 @@
 //! End-to-end ingestion pipeline.
 //!
-//! Orchestrates: chunk -> extract metadata -> embed -> upsert to vector store
-//! -> extract entities -> store in graph.
+//! Orchestrates the full ingestion flow for both the Docling sidecar path
+//! and the legacy `pdf-extract` path:
 //!
-//! Works on any document type. PDF text extraction is supported via
-//! `pdf-extract`.
+//! **Docling path** (`ingest_with_docling`):
+//! - sha256 dedup via Postgres
+//! - Docling sidecar gRPC streaming
+//! - Embed + Qdrant upsert (27-field rich payload)
+//! - Neo4j structural upsert
+//! - LLM KG extraction, triplet indexing, chunk summarization
+//! - Postgres `mark_complete` with 3-retry exponential backoff
+//!
+//! **Legacy path** (`ingest_pdf_legacy`, feature-gated):
+//! - `pdf-extract` sync extraction
+//! - Same `ingest_text` pipeline as before
 
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
 
-use agent_rs_core::CollectionName;
+use agent_rs_core::{CollectionName, IngestBackend, NAMESPACE_OID};
+use agent_rs_stores::postgres::PgStore;
+use agent_rs_stores::postgres::documents::HeaderMetadata;
+use agent_rs_stores::postgres::models::{BeginIngestionOutcome, NewIngestedDocument};
 use agent_rs_stores::traits::{GraphStore, VectorStore};
 use agent_rs_stores::types::{GraphEdge, GraphNode, NodeLabel, RelationType, VectorPoint};
+use chrono::Utc;
 use regex::Regex;
 use serde::Serialize;
 use serde_json::json;
+use uuid::Uuid;
 
 use crate::embedder::Embedder;
 use crate::error::RetrievalError;
+use crate::proto::agentic_rag::v1::{Chunk as ProtoChunk, DocumentHeader as ProtoDocumentHeader};
 
 use super::chunker::{self, ChunkerConfig, DocumentChunk};
+use super::docling_client::DoclingSidecarClient;
 use super::graph_extractor::{
     DEFAULT_BATCH_CONCURRENCY, ExtractedNode, KnowledgeGraph, LlmGraphExtractor, Triplet,
     sanitize_relationship,
@@ -57,11 +73,12 @@ pub struct IngestionResult {
 /// Optional extensions for the ingestion pipeline.
 ///
 /// Use this to supply components that are not required for a minimal ingestion
-/// run (e.g. an [`LlmGraphExtractor`] for LLM-based entity extraction).
+/// run (e.g. an [`LlmGraphExtractor`] for LLM-based entity extraction or a
+/// [`DoclingSidecarClient`] for the Docling ingest path).
 ///
 /// Defaults leave all optional extensions disabled; the pipeline then falls
 /// back to its heuristic entity extractor.
-#[derive(Clone, Default)]
+#[derive(Default)]
 pub struct IngestionPipelineConfig {
     /// Chunking configuration used when splitting documents.
     pub chunker: ChunkerConfig,
@@ -96,6 +113,16 @@ pub struct IngestionPipelineConfig {
     /// When `Some` (and [`Self::summarizer`] is also `Some`), summarized
     /// chunk embeddings are upserted here.
     pub summaries_collection: Option<CollectionName>,
+    /// Ingest backend selector.  Default: [`IngestBackend::Docling`].
+    pub ingest_backend: IngestBackend,
+    /// Docling sidecar streaming client.
+    ///
+    /// When `Some`, `ingest_pdf` routes Docling-path calls to this client.
+    /// When `None` and the backend is `Docling` or `DoclingWithLegacyFallback`,
+    /// `ingest_with_docling` returns an error.
+    pub docling_client: Option<DoclingSidecarClient>,
+    /// Postgres store for ingest state machine tracking.
+    pub pg_store: Option<Arc<PgStore>>,
 }
 
 impl IngestionPipelineConfig {
@@ -110,7 +137,28 @@ impl IngestionPipelineConfig {
             summarizer: None,
             summarizer_concurrency: DEFAULT_SUMMARIZER_CONCURRENCY,
             summaries_collection: None,
+            ingest_backend: IngestBackend::default(),
+            docling_client: None,
+            pg_store: None,
         }
+    }
+
+    /// Set the ingest backend.
+    pub fn with_ingest_backend(mut self, backend: IngestBackend) -> Self {
+        self.ingest_backend = backend;
+        self
+    }
+
+    /// Attach a Docling sidecar client.
+    pub fn with_docling_client(mut self, client: DoclingSidecarClient) -> Self {
+        self.docling_client = Some(client);
+        self
+    }
+
+    /// Attach a Postgres store for ingest state machine tracking.
+    pub fn with_pg_store(mut self, pg_store: Arc<PgStore>) -> Self {
+        self.pg_store = Some(pg_store);
+        self
     }
 
     /// Attach an LLM-based graph extractor.
@@ -197,6 +245,21 @@ pub struct IngestionPipeline {
     /// Optional collection for chunk summary embeddings. See
     /// [`IngestionPipelineConfig::summaries_collection`].
     summaries_collection: Option<CollectionName>,
+    /// Selects which ingest backend `ingest_pdf` uses.
+    ///
+    /// Default: [`IngestBackend::Docling`].  Configurable via
+    /// `AGENT_RS__INGEST_BACKEND` and surfaced by [`IngestionPipelineConfig`].
+    ingest_backend: IngestBackend,
+    /// Docling sidecar streaming client.
+    ///
+    /// `None` when the Docling backend is not configured; calling
+    /// `ingest_with_docling` returns an error in that case.
+    docling_client: Option<tokio::sync::Mutex<DoclingSidecarClient>>,
+    /// Postgres store for ingest state machine tracking.
+    ///
+    /// `None` when not configured; the ingest state machine is skipped
+    /// gracefully (dedup and partial-failure tracking are disabled).
+    pg_store: Option<Arc<PgStore>>,
 }
 
 impl IngestionPipeline {
@@ -250,7 +313,22 @@ impl IngestionPipeline {
             summarizer: config.summarizer,
             summarizer_concurrency,
             summaries_collection: config.summaries_collection,
+            ingest_backend: config.ingest_backend,
+            docling_client: config.docling_client.map(tokio::sync::Mutex::new),
+            pg_store: config.pg_store,
         }
+    }
+
+    /// Attach a Docling sidecar client after construction (builder-style).
+    pub fn with_docling_client(mut self, client: DoclingSidecarClient) -> Self {
+        self.docling_client = Some(tokio::sync::Mutex::new(client));
+        self
+    }
+
+    /// Attach a Postgres store after construction (builder-style).
+    pub fn with_pg_store(mut self, pg_store: Arc<PgStore>) -> Self {
+        self.pg_store = Some(pg_store);
+        self
     }
 
     /// Ingest a plain-text document.
@@ -690,13 +768,489 @@ impl IngestionPipeline {
 
     /// Ingest a PDF document from raw bytes.
     ///
-    /// Extracts text using `pdf-extract`, then delegates to [`ingest_text`].
+    /// Routes to the configured [`IngestBackend`]:
+    /// - [`IngestBackend::Docling`] — Docling sidecar gRPC path.
+    /// - [`IngestBackend::DoclingWithLegacyFallback`] — Docling first; falls back
+    ///   to `pdf-extract` when the sidecar reports a retryable or
+    ///   `triggers_legacy_fallback` error.
+    /// - [`IngestBackend::Legacy`] — `pdf-extract` sync extraction, same as the
+    ///   pre-Docling behaviour.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RetrievalError`] from whichever path is taken.
+    #[tracing::instrument(
+        skip(self, pdf_bytes),
+        fields(doc_id = doc_id, source = source, byte_len = pdf_bytes.len())
+    )]
+    pub async fn ingest_pdf(
+        &self,
+        pdf_bytes: &[u8],
+        doc_id: &str,
+        source: &str,
+    ) -> Result<IngestionResult, RetrievalError> {
+        match self.ingest_backend {
+            IngestBackend::Docling => self.ingest_with_docling(pdf_bytes, doc_id, source).await,
+            IngestBackend::DoclingWithLegacyFallback => {
+                match self.ingest_with_docling(pdf_bytes, doc_id, source).await {
+                    Ok(result) => Ok(result),
+                    Err(RetrievalError::DoclingIngestFailed {
+                        triggers_legacy_fallback: true,
+                        ref message,
+                        ..
+                    }) => {
+                        tracing::warn!(
+                            doc_id,
+                            reason = %message,
+                            "Docling ingest failed with legacy-fallback flag; switching to pdf-extract"
+                        );
+                        self.ingest_pdf_legacy(pdf_bytes, doc_id, source).await
+                    }
+                    Err(other) => Err(other),
+                }
+            }
+            IngestBackend::Legacy => self.ingest_pdf_legacy(pdf_bytes, doc_id, source).await,
+        }
+    }
+
+    /// Ingest a document via the Docling sidecar gRPC streaming path.
+    ///
+    /// Full 8-step state machine:
+    ///
+    /// 1. Compute sha256 of the raw bytes.
+    /// 2. Dedup check via Postgres (`begin_ingestion`).
+    /// 3. Call `docling_client.chunk_document()`.
+    /// 4. Embed chunks, build 27-field Qdrant payload tagged with `ingest_run_id`, upsert.
+    /// 5. Neo4j structural upsert (doc node, chunk nodes, entity edges) tagged with `ingest_run_id`.
+    /// 6. LLM KG extraction + triplet indexing (if configured).
+    /// 7. Chunk summarization (if configured).
+    /// 8. Mark Postgres row `complete` (3-retry exponential backoff at 1s, 2s, 4s).
+    ///
+    /// On failure after step 2, the Postgres row is marked `partial_failure` and
+    /// the caller may invoke `IngestCoordinator::cleanup_partial` to roll back
+    /// Qdrant and Neo4j by `ingest_run_id`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RetrievalError::DoclingIngestFailed`] when the sidecar rejects
+    /// the document, or various [`RetrievalError`] variants on embedding /
+    /// store failures.
+    #[tracing::instrument(
+        skip(self, pdf_bytes),
+        fields(doc_id = doc_id, source = source, byte_len = pdf_bytes.len())
+    )]
+    async fn ingest_with_docling(
+        &self,
+        pdf_bytes: &[u8],
+        doc_id: &str,
+        source: &str,
+    ) -> Result<IngestionResult, RetrievalError> {
+        use backon::{ExponentialBuilder, Retryable};
+        use sha2::{Digest, Sha256};
+        use std::time::Duration;
+
+        let start = Instant::now();
+
+        // ---- Step 1: sha256 ----
+        let sha256 = {
+            let mut hasher = Sha256::new();
+            hasher.update(pdf_bytes);
+            format!("{:x}", hasher.finalize())
+        };
+
+        // ---- Step 2: Dedup via Postgres ----
+        //
+        // When no PgStore is configured, skip the state machine entirely.
+        let maybe_run_id: Option<Uuid> = if let Some(pg) = &self.pg_store {
+            let now = Utc::now().naive_utc();
+            let new_doc = NewIngestedDocument {
+                document_id: Uuid::new_v5(&NAMESPACE_OID, sha256.as_bytes()),
+                sha256: sha256.clone(),
+                source: source.to_owned(),
+                ingest_status: agent_rs_core::IngestStatus::InProgress.as_str().to_owned(),
+                ingest_run_id: Uuid::new_v4(),
+                started_at: now,
+                updated_at: now,
+            };
+
+            match pg
+                .begin_ingestion(new_doc)
+                .await
+                .map_err(RetrievalError::Store)?
+            {
+                BeginIngestionOutcome::AlreadyComplete => {
+                    tracing::info!(doc_id, sha256 = %sha256, "document already complete; skipping");
+                    return Ok(IngestionResult {
+                        doc_id: doc_id.to_owned(),
+                        chunks_created: 0,
+                        vectors_upserted: 0,
+                        graph_nodes_created: 0,
+                        graph_edges_created: 0,
+                        triplets_upserted: 0,
+                        summaries_created: 0,
+                        duration_ms: start.elapsed().as_millis() as u64,
+                    });
+                }
+                BeginIngestionOutcome::AlreadyBeingIngested => {
+                    return Err(RetrievalError::IngestInProgress { sha256 });
+                }
+                BeginIngestionOutcome::Started { ingest_run_id }
+                | BeginIngestionOutcome::Resumed { ingest_run_id } => {
+                    tracing::info!(doc_id, %ingest_run_id, "ingestion started/resumed");
+                    Some(ingest_run_id)
+                }
+            }
+        } else {
+            None
+        };
+
+        let ingest_run_id = maybe_run_id.unwrap_or_else(Uuid::new_v4);
+
+        // ---- Step 3: Call Docling sidecar ----
+        let docling_response = {
+            let client_mutex =
+                self.docling_client
+                    .as_ref()
+                    .ok_or_else(|| RetrievalError::Ingestion {
+                        reason: "ingest_backend is Docling but no DoclingSidecarClient configured"
+                            .to_owned(),
+                    })?;
+            let mut client = client_mutex.lock().await;
+            client
+                .chunk_document(pdf_bytes.to_vec(), doc_id, source, "application/pdf")
+                .await
+        };
+
+        let docling_response = match docling_response {
+            Ok(r) => r,
+            Err(e) => {
+                // Best-effort: mark partial failure in Postgres.
+                if let Some(pg) = &self.pg_store {
+                    if let Err(pg_err) =
+                        pg.mark_partial_failure(ingest_run_id, &e.to_string()).await
+                    {
+                        tracing::warn!(
+                            doc_id,
+                            error = %pg_err,
+                            "failed to mark partial failure in Postgres after Docling error"
+                        );
+                    }
+                }
+                return Err(e);
+            }
+        };
+
+        let header = &docling_response.header;
+        tracing::info!(
+            doc_id,
+            chunks = docling_response.chunks.len(),
+            n_pages = header.n_pages,
+            "Docling sidecar response received"
+        );
+
+        // ---- Step 4: Embed + Qdrant upsert (27-field payload, tagged with ingest_run_id) ----
+        let embed_texts: Vec<&str> = docling_response
+            .chunks
+            .iter()
+            .map(|c| c.embed_text.as_str())
+            .collect();
+
+        let embeddings = match self.embedder.embed_documents(&embed_texts).await {
+            Ok(e) => e,
+            Err(e) => {
+                if let Some(pg) = &self.pg_store {
+                    if let Err(pg_err) =
+                        pg.mark_partial_failure(ingest_run_id, &e.to_string()).await
+                    {
+                        tracing::warn!(doc_id, error = %pg_err, "mark_partial_failure failed after embedding error");
+                    }
+                }
+                return Err(e);
+            }
+        };
+
+        if embeddings.len() != docling_response.chunks.len() {
+            let reason = format!(
+                "embedding count mismatch: got {} for {} chunks",
+                embeddings.len(),
+                docling_response.chunks.len()
+            );
+            if let Some(pg) = &self.pg_store {
+                let _ = pg.mark_partial_failure(ingest_run_id, &reason).await;
+            }
+            return Err(RetrievalError::Ingestion { reason });
+        }
+
+        let total_chunks = docling_response.chunks.len();
+
+        let doc_n_tables = docling_response.footer.n_tables;
+        let doc_n_pictures = docling_response.footer.n_pictures;
+
+        let vector_points: Vec<VectorPoint> = docling_response
+            .chunks
+            .iter()
+            .zip(embeddings.into_iter())
+            .map(|(chunk, embedding)| {
+                let payload = build_docling_chunk_payload(
+                    chunk,
+                    header,
+                    doc_id,
+                    source,
+                    ingest_run_id,
+                    doc_n_tables,
+                    doc_n_pictures,
+                );
+                VectorPoint {
+                    id: chunk.chunk_id.clone(),
+                    embedding,
+                    // raw_text is what Qdrant's server-side BM25 tokenises.
+                    text: chunk.raw_text.clone(),
+                    payload,
+                }
+            })
+            .collect();
+
+        // Ensure collection exists.
+        let dims = self.embedder.dimensions();
+        match self.vector_store.collection_exists(&self.collection).await {
+            Ok(false) => {
+                let config = agent_rs_stores::types::CollectionConfig {
+                    dense_vector_size: dims,
+                    enable_sparse: true,
+                    dense_vector_name: "dense".to_owned(),
+                    sparse_vector_name: "sparse".to_owned(),
+                };
+                if let Err(e) = self
+                    .vector_store
+                    .create_collection(&self.collection, &config)
+                    .await
+                {
+                    let reason = e.to_string();
+                    if let Some(pg) = &self.pg_store {
+                        let _ = pg.mark_partial_failure(ingest_run_id, &reason).await;
+                    }
+                    return Err(RetrievalError::Store(e));
+                }
+            }
+            Ok(true) => {}
+            Err(e) => {
+                let reason = e.to_string();
+                if let Some(pg) = &self.pg_store {
+                    let _ = pg.mark_partial_failure(ingest_run_id, &reason).await;
+                }
+                return Err(RetrievalError::Store(e));
+            }
+        }
+
+        let vectors_upserted = vector_points.len();
+        if let Err(e) = self
+            .vector_store
+            .upsert(&self.collection, vector_points)
+            .await
+        {
+            let reason = e.to_string();
+            if let Some(pg) = &self.pg_store {
+                let _ = pg.mark_partial_failure(ingest_run_id, &reason).await;
+            }
+            return Err(RetrievalError::Store(e));
+        }
+        tracing::info!(doc_id, vectors_upserted, "Docling: vector upsert complete");
+
+        // ---- Step 5: Neo4j structural upsert (tagged with ingest_run_id) ----
+        //
+        // Reuse the LLM path if an extractor is configured; otherwise heuristic.
+        // Both paths produce `DocumentChunk`-shaped data, so we convert the proto
+        // chunks first.
+        let pseudo_chunks: Vec<DocumentChunk> = docling_response
+            .chunks
+            .iter()
+            .enumerate()
+            .map(|(i, c)| proto_chunk_to_document_chunk(c, doc_id, source, total_chunks, i))
+            .collect();
+
+        let ingest_run_id_str = ingest_run_id.to_string();
+
+        let (graph_nodes, graph_edges, triplets) = if let Some(extractor) =
+            self.llm_extractor.as_ref()
+        {
+            let text_refs: Vec<&str> = pseudo_chunks.iter().map(|c| c.content.as_str()).collect();
+            let graphs = extractor
+                .extract_batch(&text_refs, self.llm_concurrency)
+                .await;
+            let (mut nodes, edges) =
+                build_llm_graph_structures(doc_id, source, &pseudo_chunks, &graphs)?;
+            let triplets = build_triplets(&pseudo_chunks, &graphs);
+            // Tag every node with ingest_run_id for rollback.
+            for node in &mut nodes {
+                if let Some(obj) = node.properties.as_object_mut() {
+                    obj.insert(
+                        "ingest_run_id".to_owned(),
+                        serde_json::Value::String(ingest_run_id_str.clone()),
+                    );
+                }
+            }
+            (nodes, edges, triplets)
+        } else {
+            let all_entities = extract_entities_from_chunks(&pseudo_chunks);
+            let (mut nodes, edges) =
+                build_graph_structures(doc_id, source, &pseudo_chunks, &all_entities)?;
+            for node in &mut nodes {
+                if let Some(obj) = node.properties.as_object_mut() {
+                    obj.insert(
+                        "ingest_run_id".to_owned(),
+                        serde_json::Value::String(ingest_run_id_str.clone()),
+                    );
+                }
+            }
+            (nodes, edges, Vec::new())
+        };
+
+        let graph_nodes_created = graph_nodes.len();
+        let graph_edges_created = graph_edges.len();
+
+        let graph_result: Result<(), RetrievalError> = async {
+            if !graph_nodes.is_empty() {
+                self.graph_store
+                    .add_nodes(&graph_nodes)
+                    .await
+                    .map_err(RetrievalError::Store)?;
+            }
+            if !graph_edges.is_empty() {
+                self.graph_store
+                    .add_edges(&graph_edges)
+                    .await
+                    .map_err(RetrievalError::Store)?;
+            }
+            Ok(())
+        }
+        .await;
+
+        if let Err(e) = graph_result {
+            let reason = e.to_string();
+            if let Some(pg) = &self.pg_store {
+                let _ = pg.mark_partial_failure(ingest_run_id, &reason).await;
+            }
+            return Err(e);
+        }
+        tracing::info!(
+            doc_id,
+            graph_nodes_created,
+            graph_edges_created,
+            "Docling: graph upsert complete"
+        );
+
+        // ---- Step 6: Triplet indexing (optional) ----
+        let triplets_upserted = match self.upsert_triplets_if_enabled(doc_id, &triplets).await {
+            Ok(n) => n,
+            Err(e) => {
+                let reason = e.to_string();
+                if let Some(pg) = &self.pg_store {
+                    let _ = pg.mark_partial_failure(ingest_run_id, &reason).await;
+                }
+                return Err(e);
+            }
+        };
+
+        // ---- Step 7: Chunk summarization (optional) ----
+        let summaries_created = match self
+            .upsert_summaries_if_enabled(doc_id, &pseudo_chunks)
+            .await
+        {
+            Ok(n) => n,
+            Err(e) => {
+                let reason = e.to_string();
+                if let Some(pg) = &self.pg_store {
+                    let _ = pg.mark_partial_failure(ingest_run_id, &reason).await;
+                }
+                return Err(e);
+            }
+        };
+
+        // ---- Step 8: Mark Postgres row complete (3-retry exponential backoff) ----
+        if let Some(pg) = &self.pg_store {
+            let total_ingest_ms = start.elapsed().as_millis() as i64;
+            let header_meta = HeaderMetadata {
+                docling_version: header.docling_version.clone(),
+                docling_core_version: header.docling_core_version.clone(),
+                schema_version: header.schema_version as i32,
+                n_pages: header.n_pages as i32,
+                n_chunks: docling_response.footer.n_chunks as i32,
+                n_tables: docling_response.footer.n_tables as i32,
+                n_pictures: docling_response.footer.n_pictures as i32,
+                n_formulas: docling_response.footer.n_formulas as i32,
+                language: if header.language.is_empty() {
+                    None
+                } else {
+                    Some(header.language.clone())
+                },
+                title: if header.title.is_empty() {
+                    None
+                } else {
+                    Some(header.title.clone())
+                },
+                mimetype: if header.mimetype.is_empty() {
+                    None
+                } else {
+                    Some(header.mimetype.clone())
+                },
+                parse_latency_ms: Some(header.parse_latency_ms as i64),
+                total_ingest_latency_ms: Some(total_ingest_ms),
+            };
+
+            let pg_ref = Arc::clone(pg);
+            let mark_complete =
+                || async { pg_ref.mark_complete(ingest_run_id, &header_meta).await };
+
+            if let Err(e) = mark_complete
+                .retry(
+                    ExponentialBuilder::default()
+                        .with_min_delay(Duration::from_secs(1))
+                        .with_max_delay(Duration::from_secs(4))
+                        .with_max_times(3),
+                )
+                .await
+            {
+                return Err(RetrievalError::PostgresCommitFailed {
+                    ingest_run_id: ingest_run_id.to_string(),
+                    reason: e.to_string(),
+                });
+            }
+        }
+
+        let duration_ms = start.elapsed().as_millis() as u64;
+        tracing::info!(
+            doc_id,
+            duration_ms,
+            vectors_upserted,
+            graph_nodes_created,
+            "Docling ingestion complete"
+        );
+
+        Ok(IngestionResult {
+            doc_id: doc_id.to_owned(),
+            chunks_created: total_chunks,
+            vectors_upserted,
+            graph_nodes_created,
+            graph_edges_created,
+            triplets_upserted,
+            summaries_created,
+            duration_ms,
+        })
+    }
+
+    /// Ingest a PDF document via the legacy `pdf-extract` path.
+    ///
+    /// Extracts text using `pdf-extract`, then delegates to [`Self::ingest_text`].
     ///
     /// # Errors
     ///
     /// Returns [`RetrievalError::PdfExtraction`] if the PDF cannot be parsed.
-    #[tracing::instrument(skip(self, pdf_bytes), fields(doc_id = doc_id, source = source, byte_len = pdf_bytes.len()))]
-    pub async fn ingest_pdf(
+    #[cfg(feature = "legacy_pdf_extract")]
+    #[tracing::instrument(
+        skip(self, pdf_bytes),
+        fields(doc_id = doc_id, source = source, byte_len = pdf_bytes.len())
+    )]
+    async fn ingest_pdf_legacy(
         &self,
         pdf_bytes: &[u8],
         doc_id: &str,
@@ -717,10 +1271,29 @@ impl IngestionPipeline {
         tracing::info!(
             doc_id,
             extracted_chars = text.len(),
-            "PDF text extraction complete"
+            "PDF text extraction complete (legacy path)"
         );
 
         self.ingest_text(&text, doc_id, source).await
+    }
+
+    /// Stub for the legacy path when the `legacy_pdf_extract` feature is disabled.
+    ///
+    /// Callers that select [`IngestBackend::Legacy`] or
+    /// [`IngestBackend::DoclingWithLegacyFallback`] without enabling the
+    /// feature will receive a clear error rather than a silent no-op.
+    #[cfg(not(feature = "legacy_pdf_extract"))]
+    async fn ingest_pdf_legacy(
+        &self,
+        _pdf_bytes: &[u8],
+        _doc_id: &str,
+        _source: &str,
+    ) -> Result<IngestionResult, RetrievalError> {
+        Err(RetrievalError::Ingestion {
+            reason: "legacy_pdf_extract feature is not enabled; recompile with \
+                     --features legacy_pdf_extract to use the pdf-extract backend"
+                .to_owned(),
+        })
     }
 }
 
@@ -743,6 +1316,118 @@ fn build_chunk_payload(chunk: &DocumentChunk) -> serde_json::Value {
         "char_count": chunk.metadata.char_count,
         "word_count": chunk.metadata.word_count,
     })
+}
+
+/// Build the 27-field JSON payload for a Docling-sourced chunk stored in Qdrant.
+///
+/// The payload carries all filterable/retrievable metadata so downstream
+/// evidence assembly can render citations without a second round-trip.
+/// Every point is also tagged with `ingest_run_id` for rollback.
+///
+/// `doc_n_tables` / `doc_n_pictures` come from the stream footer, which the
+/// caller has already received in full before this function is called.
+#[allow(clippy::too_many_arguments)]
+fn build_docling_chunk_payload(
+    chunk: &ProtoChunk,
+    header: &ProtoDocumentHeader,
+    doc_id: &str,
+    source: &str,
+    ingest_run_id: Uuid,
+    doc_n_tables: u32,
+    doc_n_pictures: u32,
+) -> serde_json::Value {
+    json!({
+        // ---- identity ----
+        "chunk_id":       chunk.chunk_id,
+        "doc_id":         doc_id,
+        "ingest_run_id":  ingest_run_id.to_string(),
+        // ---- content ----
+        "chunk_text":     chunk.embed_text,
+        "raw_text":       chunk.raw_text,
+        // ---- position ----
+        "chunk_index":    chunk.chunk_index,
+        "total_chunks":   chunk.total_chunks,
+        "page_start":     chunk.page_start,
+        "page_end":       chunk.page_end,
+        // ---- provenance ----
+        "source":         source,
+        "title":          header.title,
+        "language":       header.language,
+        "mimetype":       header.mimetype,
+        // ---- structure ----
+        "section_title":  chunk.section_title,
+        "section_id":     chunk.section_id,
+        "heading_path":   chunk.heading_path,
+        // ---- content flags ----
+        "has_table":      chunk.has_table,
+        "has_picture":    chunk.has_picture,
+        "has_code":       chunk.has_code,
+        "has_formula":    chunk.has_formula,
+        // ---- counts ----
+        "char_count":     chunk.char_count,
+        "token_count":    chunk.token_count,
+        // ---- doc-level counts (from footer — available because the full stream
+        //      was received before payload construction begins) ----
+        "doc_n_pages":    header.n_pages,
+        "doc_n_tables":   doc_n_tables,
+        "doc_n_pictures": doc_n_pictures,
+        // ---- sidecar meta ----
+        "docling_version": header.docling_version,
+        "schema_version":  header.schema_version,
+    })
+}
+
+/// Convert a proto [`ProtoChunk`] into the lightweight [`DocumentChunk`] type
+/// used by the graph extraction and summarization helpers.
+///
+/// The `DocumentChunk` was originally designed for the legacy text path;
+/// this conversion maps the proto fields onto the closest equivalents so
+/// existing helpers (`build_llm_graph_structures`, `upsert_summaries_if_enabled`,
+/// etc.) can be reused without modification.
+fn proto_chunk_to_document_chunk(
+    chunk: &ProtoChunk,
+    doc_id: &str,
+    source: &str,
+    total_chunks: usize,
+    index: usize,
+) -> DocumentChunk {
+    use super::metadata::ChunkMetadata;
+
+    let section_title = if chunk.section_title.is_empty() {
+        None
+    } else {
+        Some(chunk.section_title.clone())
+    };
+
+    // heading_path contains the full heading hierarchy root-first.
+    let headings: Vec<String> = chunk.heading_path.clone();
+
+    DocumentChunk {
+        chunk_id: chunk.chunk_id.clone(),
+        doc_id: doc_id.to_owned(),
+        content: chunk.embed_text.clone(),
+        chunk_index: index,
+        total_chunks,
+        metadata: ChunkMetadata {
+            source: source.to_owned(),
+            page_number: if chunk.page_start > 0 {
+                Some(chunk.page_start as usize)
+            } else {
+                None
+            },
+            section_title,
+            headings,
+            has_table: chunk.has_table,
+            has_list: false, // not surfaced by proto
+            language: None,  // language is on DocumentHeader, not per-chunk
+            char_count: chunk.char_count as usize,
+            word_count: 0, // not surfaced by proto directly
+            token_count: chunk.token_count as usize,
+            byte_start: 0,
+            byte_end: 0,
+            paragraph_ids: Vec::new(),
+        },
+    }
 }
 
 /// Build the JSON payload for a summary point stored in the summaries collection.

@@ -7,6 +7,8 @@
 
 use thiserror::Error;
 
+use crate::ingestion::types::IngestErrorCode;
+
 /// Errors that can occur within the retrieval crate.
 #[derive(Debug, Error)]
 pub enum RetrievalError {
@@ -34,13 +36,44 @@ pub enum RetrievalError {
     #[error("ingestion failed: {reason}")]
     Ingestion { reason: String },
 
-    /// PDF text extraction failed.
+    /// PDF text extraction failed (legacy `pdf_extract` path).
     #[error("pdf extraction failed: {reason}")]
     PdfExtraction { reason: String },
 
     /// Feature not yet implemented (used only during phased development).
     #[error("not implemented: {0}")]
     NotImplemented(String),
+
+    // ---- Docling sidecar errors ----
+    /// The Docling sidecar reported a structured ingest error.
+    ///
+    /// `code` identifies the failure class; `retryable` signals whether a
+    /// retry with backoff may succeed; `triggers_legacy_fallback` indicates
+    /// that the `DoclingWithLegacyFallback` backend may attempt the legacy
+    /// `pdf_extract` path.
+    #[error("docling ingest failed [{code:?}]: {message}")]
+    DoclingIngestFailed {
+        code: IngestErrorCode,
+        retryable: bool,
+        triggers_legacy_fallback: bool,
+        message: String,
+    },
+
+    /// Another worker is already ingesting a document with the given sha256.
+    ///
+    /// The caller may wait and retry, or surface the conflict to the user.
+    #[error("ingest already in progress for sha256 {sha256}")]
+    IngestInProgress { sha256: String },
+
+    /// Postgres `mark_complete` failed after exhausting all retries.
+    ///
+    /// Qdrant and Neo4j are in a consistent state (writes succeeded); only
+    /// the Postgres row is inconsistent.  Operator reconciliation is required.
+    #[error("postgres commit failed after retries (ingest_run_id={ingest_run_id}): {reason}")]
+    PostgresCommitFailed {
+        ingest_run_id: String,
+        reason: String,
+    },
 }
 
 impl From<RetrievalError> for agent_rs_core::errors::RetrievalError {
@@ -66,6 +99,22 @@ impl From<RetrievalError> for agent_rs_core::errors::RetrievalError {
             RetrievalError::NotImplemented(msg) => {
                 agent_rs_core::errors::RetrievalError::Ranking(format!("not implemented: {msg}"))
             }
+            RetrievalError::DoclingIngestFailed { code, message, .. } => {
+                agent_rs_core::errors::RetrievalError::Ranking(format!(
+                    "docling ingest failed [{code:?}]: {message}"
+                ))
+            }
+            RetrievalError::IngestInProgress { sha256 } => {
+                agent_rs_core::errors::RetrievalError::Ranking(format!(
+                    "ingest in progress for sha256={sha256}"
+                ))
+            }
+            RetrievalError::PostgresCommitFailed {
+                ingest_run_id,
+                reason,
+            } => agent_rs_core::errors::RetrievalError::Ranking(format!(
+                "postgres commit failed (run={ingest_run_id}): {reason}"
+            )),
         }
     }
 }

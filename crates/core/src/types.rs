@@ -6,7 +6,22 @@
 use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::str::FromStr;
-use uuid::Uuid;
+use uuid::{Uuid, uuid};
+
+// ---- Constants ----
+
+/// UUIDv5 namespace for deterministic document / chunk / ingest IDs.
+///
+/// This is the fixed OID namespace from RFC 4122 Appendix C:
+/// `6ba7b812-9dad-11d1-80b4-00c04fd430c8`.
+///
+/// All stable IDs in the ingest pipeline are derived as:
+/// `Uuid::new_v5(&NAMESPACE_OID, seed_bytes)`.
+///
+/// Defined once here and imported wherever deterministic IDs are needed,
+/// so that any change to the namespace automatically invalidates all
+/// derived IDs (compile-time discovery of all derivation sites).
+pub const NAMESPACE_OID: Uuid = uuid!("6ba7b812-9dad-11d1-80b4-00c04fd430c8");
 
 // ---- Newtypes ----
 
