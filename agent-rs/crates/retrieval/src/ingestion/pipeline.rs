@@ -25,6 +25,7 @@ use super::graph_extractor::{
     DEFAULT_BATCH_CONCURRENCY, ExtractedNode, KnowledgeGraph, LlmGraphExtractor, Triplet,
     sanitize_relationship,
 };
+use super::summarizer::{ChunkSummarizer, DEFAULT_SUMMARIZER_CONCURRENCY};
 
 // ---- Result type ----
 
@@ -44,6 +45,9 @@ pub struct IngestionResult {
     /// Number of linearised triplet vectors upserted to the triplet
     /// collection. Always zero when no triplet collection is configured.
     pub triplets_upserted: usize,
+    /// Number of chunk summary vectors upserted to the summaries collection.
+    /// Always zero when no summarizer or summaries collection is configured.
+    pub summaries_created: usize,
     /// Wall-clock duration in milliseconds.
     pub duration_ms: u64,
 }
@@ -77,6 +81,21 @@ pub struct IngestionPipelineConfig {
     /// retrieval can later score triplets directly against the query.
     /// Has no effect when [`Self::llm_extractor`] is `None`.
     pub triplet_collection: Option<CollectionName>,
+    /// Optional LLM-based chunk summarizer.
+    ///
+    /// When `Some` (and [`Self::summaries_collection`] is also `Some`), the
+    /// pipeline generates a 1-2 sentence summary for every chunk after the
+    /// main chunk upsert and stores the summary embeddings in the summaries
+    /// collection. This powers the [`RetrievalStrategy::Summaries`] search path.
+    pub summarizer: Option<Arc<ChunkSummarizer>>,
+    /// Concurrency for batch summarization. Defaults to
+    /// [`DEFAULT_SUMMARIZER_CONCURRENCY`].
+    pub summarizer_concurrency: usize,
+    /// Optional dedicated collection for storing chunk summary embeddings.
+    ///
+    /// When `Some` (and [`Self::summarizer`] is also `Some`), summarized
+    /// chunk embeddings are upserted here.
+    pub summaries_collection: Option<CollectionName>,
 }
 
 impl IngestionPipelineConfig {
@@ -88,6 +107,9 @@ impl IngestionPipelineConfig {
             llm_extractor: None,
             llm_concurrency: DEFAULT_BATCH_CONCURRENCY,
             triplet_collection: None,
+            summarizer: None,
+            summarizer_concurrency: DEFAULT_SUMMARIZER_CONCURRENCY,
+            summaries_collection: None,
         }
     }
 
@@ -109,6 +131,29 @@ impl IngestionPipelineConfig {
     /// attached — the heuristic extractor does not emit typed relations.
     pub fn with_triplet_collection(mut self, triplet_collection: CollectionName) -> Self {
         self.triplet_collection = Some(triplet_collection);
+        self
+    }
+
+    /// Attach a [`ChunkSummarizer`] for LLM-based chunk summarization.
+    ///
+    /// Summarization only runs when a [`Self::summaries_collection`] is also
+    /// configured.
+    pub fn with_summarizer(mut self, summarizer: Arc<ChunkSummarizer>) -> Self {
+        self.summarizer = Some(summarizer);
+        self
+    }
+
+    /// Override the batch summarization concurrency.
+    pub fn with_summarizer_concurrency(mut self, concurrency: usize) -> Self {
+        self.summarizer_concurrency = concurrency.max(1);
+        self
+    }
+
+    /// Enable summary indexing by setting the destination collection.
+    ///
+    /// Summary indexing only runs when a [`Self::summarizer`] is also attached.
+    pub fn with_summaries_collection(mut self, summaries_collection: CollectionName) -> Self {
+        self.summaries_collection = Some(summaries_collection);
         self
     }
 }
@@ -144,6 +189,14 @@ pub struct IngestionPipeline {
     /// Optional collection for linearised triplet embeddings. See
     /// [`IngestionPipelineConfig::triplet_collection`].
     triplet_collection: Option<CollectionName>,
+    /// Optional LLM-based chunk summarizer. See
+    /// [`IngestionPipelineConfig::summarizer`].
+    summarizer: Option<Arc<ChunkSummarizer>>,
+    /// Concurrency for batch summarization calls.
+    summarizer_concurrency: usize,
+    /// Optional collection for chunk summary embeddings. See
+    /// [`IngestionPipelineConfig::summaries_collection`].
+    summaries_collection: Option<CollectionName>,
 }
 
 impl IngestionPipeline {
@@ -180,6 +233,11 @@ impl IngestionPipeline {
         } else {
             config.llm_concurrency
         };
+        let summarizer_concurrency = if config.summarizer_concurrency == 0 {
+            DEFAULT_SUMMARIZER_CONCURRENCY
+        } else {
+            config.summarizer_concurrency
+        };
         Self {
             embedder,
             vector_store,
@@ -189,6 +247,9 @@ impl IngestionPipeline {
             llm_extractor: config.llm_extractor,
             llm_concurrency,
             triplet_collection: config.triplet_collection,
+            summarizer: config.summarizer,
+            summarizer_concurrency,
+            summaries_collection: config.summaries_collection,
         }
     }
 
@@ -223,6 +284,7 @@ impl IngestionPipeline {
                 graph_nodes_created: 0,
                 graph_edges_created: 0,
                 triplets_upserted: 0,
+                summaries_created: 0,
                 duration_ms: start.elapsed().as_millis() as u64,
             });
         }
@@ -388,8 +450,18 @@ impl IngestionPipeline {
         // brute_force_triplet_search behaviour.
         let triplets_upserted = self.upsert_triplets_if_enabled(doc_id, &triplets).await?;
 
+        // 7. Chunk summarization (optional).
+        //
+        // When a `ChunkSummarizer` and a `summaries_collection` are both
+        // configured, generate a 1-2 sentence LLM summary for every chunk,
+        // embed the summaries, and upsert them into the summaries collection.
+        // This powers the `RetrievalStrategy::Summaries` search path.
+        let summaries_created = self
+            .upsert_summaries_if_enabled(doc_id, &chunks)
+            .await?;
+
         let duration_ms = start.elapsed().as_millis() as u64;
-        tracing::info!(doc_id, duration_ms, "ingestion complete");
+        tracing::info!(doc_id, duration_ms, summaries_created, "ingestion complete");
 
         Ok(IngestionResult {
             doc_id: doc_id.to_owned(),
@@ -398,6 +470,7 @@ impl IngestionPipeline {
             graph_nodes_created,
             graph_edges_created,
             triplets_upserted,
+            summaries_created,
             duration_ms,
         })
     }
@@ -497,6 +570,146 @@ impl IngestionPipeline {
         Ok(count)
     }
 
+    /// Generate chunk summaries and upsert them into the configured summaries
+    /// collection.
+    ///
+    /// Returns `0` when summarization is disabled (no summarizer or no
+    /// collection) or when there are no chunks. LLM failures for individual
+    /// chunks are logged at WARN and silently skipped — the operation is
+    /// best-effort; a partial failure never aborts ingestion.
+    #[tracing::instrument(
+        skip(self, chunks),
+        fields(doc_id, chunk_count = chunks.len())
+    )]
+    async fn upsert_summaries_if_enabled(
+        &self,
+        doc_id: &str,
+        chunks: &[DocumentChunk],
+    ) -> Result<usize, RetrievalError> {
+        let (Some(summarizer), Some(summaries_collection)) = (
+            self.summarizer.as_ref(),
+            self.summaries_collection.as_ref(),
+        ) else {
+            if !chunks.is_empty() && self.summarizer.is_some() {
+                tracing::debug!(
+                    doc_id,
+                    "summarizer configured but no summaries_collection; skipping"
+                );
+            }
+            return Ok(0);
+        };
+
+        if chunks.is_empty() {
+            return Ok(0);
+        }
+
+        // Build (chunk_id, chunk_text) pairs for the batch call.
+        let pairs: Vec<(&str, &str)> = chunks
+            .iter()
+            .map(|c| (c.chunk_id.as_str(), c.content.as_str()))
+            .collect();
+
+        let results = summarizer
+            .summarize_batch(&pairs, self.summarizer_concurrency)
+            .await;
+
+        // Collect successful summaries, skip empty / failed ones.
+        let mut valid_summaries = Vec::with_capacity(results.len());
+        for (idx, result) in results.into_iter().enumerate() {
+            match result {
+                Ok(summary) if !summary.summary_text.is_empty() => {
+                    valid_summaries.push(summary);
+                }
+                Ok(_) => {
+                    tracing::debug!(
+                        doc_id,
+                        chunk_index = idx,
+                        "summarizer returned empty text for chunk; skipping"
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        doc_id,
+                        chunk_index = idx,
+                        error = %e,
+                        "chunk summarization failed; skipping"
+                    );
+                }
+            }
+        }
+
+        if valid_summaries.is_empty() {
+            tracing::debug!(doc_id, "no valid summaries produced; skipping upsert");
+            return Ok(0);
+        }
+
+        // Embed the summary texts via the passage path.
+        let summary_texts: Vec<&str> = valid_summaries
+            .iter()
+            .map(|s| s.summary_text.as_str())
+            .collect();
+        let summary_embeddings = self.embedder.embed_documents(&summary_texts).await?;
+
+        if summary_embeddings.len() != valid_summaries.len() {
+            return Err(RetrievalError::Ingestion {
+                reason: format!(
+                    "summary embedding count mismatch: got {} embeddings for {} summaries",
+                    summary_embeddings.len(),
+                    valid_summaries.len()
+                ),
+            });
+        }
+
+        // Ensure the summaries collection exists.
+        let dims = self.embedder.dimensions();
+        let exists = self
+            .vector_store
+            .collection_exists(summaries_collection)
+            .await
+            .map_err(RetrievalError::Store)?;
+        if !exists {
+            let config = agent_rs_stores::types::CollectionConfig {
+                dense_vector_size: dims,
+                enable_sparse: false,
+                dense_vector_name: "dense".to_owned(),
+                sparse_vector_name: "sparse".to_owned(),
+            };
+            self.vector_store
+                .create_collection(summaries_collection, &config)
+                .await
+                .map_err(RetrievalError::Store)?;
+            tracing::info!(
+                collection = %summaries_collection,
+                dims,
+                "created dedicated summaries collection"
+            );
+        }
+
+        let points: Vec<VectorPoint> = valid_summaries
+            .iter()
+            .zip(summary_embeddings.into_iter())
+            .map(|(summary, embedding)| VectorPoint {
+                id: summary.summary_id.clone(),
+                embedding,
+                sparse_vector: None,
+                payload: build_summary_payload(summary),
+            })
+            .collect();
+
+        let count = points.len();
+        self.vector_store
+            .upsert(summaries_collection, points)
+            .await
+            .map_err(RetrievalError::Store)?;
+        tracing::info!(
+            doc_id,
+            collection = %summaries_collection,
+            summaries_upserted = count,
+            "summary upsert complete"
+        );
+        Ok(count)
+    }
+
     /// Ingest a PDF document from raw bytes.
     ///
     /// Extracts text using `pdf-extract`, then delegates to [`ingest_text`].
@@ -551,6 +764,16 @@ fn build_chunk_payload(chunk: &DocumentChunk) -> serde_json::Value {
         "language": chunk.metadata.language,
         "char_count": chunk.metadata.char_count,
         "word_count": chunk.metadata.word_count,
+    })
+}
+
+/// Build the JSON payload for a summary point stored in the summaries collection.
+fn build_summary_payload(summary: &super::summarizer::ChunkSummary) -> serde_json::Value {
+    json!({
+        "summary_id": summary.summary_id,
+        "chunk_id": summary.chunk_id,
+        "summary_text": summary.summary_text,
+        "chunk_text_preview": summary.chunk_text_preview,
     })
 }
 
