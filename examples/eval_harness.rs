@@ -826,9 +826,11 @@ async fn main() -> Result<()> {
             .or_else(|_| std::env::var("OPENAI_API_KEY"))
             .ok()
             .map(|api_key| {
+                // Default to the reasoning-tuned mini model for KG extraction.
+                // Override with LLM_GRAPH_MODEL=... or LLM_MODEL=...
                 let model = std::env::var("LLM_GRAPH_MODEL")
                     .or_else(|_| std::env::var("LLM_MODEL"))
-                    .unwrap_or_else(|_| "gpt-4o-mini".to_owned());
+                    .unwrap_or_else(|_| "gpt-5.4-mini-2026-03-17".to_owned());
                 info!(model = %model, "LLM graph extractor enabled for ingestion");
                 Arc::new(LlmGraphExtractor::new(api_key, model))
             })
@@ -851,9 +853,11 @@ async fn main() -> Result<()> {
             .or_else(|_| std::env::var("OPENAI_API_KEY"))
             .ok()
             .map(|api_key| {
+                // Summarization can use a cheaper model since output is small.
+                // Override with LLM_SUMMARY_MODEL=...
                 let model = std::env::var("LLM_SUMMARY_MODEL")
                     .or_else(|_| std::env::var("LLM_MODEL"))
-                    .unwrap_or_else(|_| "gpt-4o-mini".to_owned());
+                    .unwrap_or_else(|_| "gpt-5.4-mini-2026-03-17".to_owned());
                 info!(model = %model, "ChunkSummarizer enabled for ingestion");
                 Arc::new(ChunkSummarizer::new(api_key, model))
             })
