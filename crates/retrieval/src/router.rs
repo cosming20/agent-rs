@@ -532,9 +532,11 @@ impl RetrievalRouter {
 
         // Optional cross-encoder reranking stage.
         if let Some(reranker) = self.reranker.as_ref() {
-            // Take ownership of the document list so we can move it into
-            // `rerank` while keeping `evidence` intact for the fallback path.
-            let candidates = std::mem::take(&mut evidence.documents);
+            // Clone the candidates so we can fall back to the RRF-ranked
+            // results if reranking fails. The clone is bounded by RRF_limit
+            // (≤50 documents) so the cost is negligible compared to the
+            // network round-trip to the reranker.
+            let candidates: Vec<_> = evidence.documents.to_vec();
             tracing::debug!(
                 strategy = %strategy,
                 candidates = candidates.len(),
@@ -546,19 +548,16 @@ impl RetrievalRouter {
                     evidence.documents = reranked;
                 }
                 Err(e) => {
-                    // Reranking is best-effort: if the cross-encoder fails
-                    // (e.g. ONNX session error, mutex poison) we log a warning
-                    // and fall back to the RRF-ranked result set truncated to
-                    // `limit`. This preserves retrieval availability under
-                    // transient model failures. Note: candidates was moved into
-                    // rerank so evidence.documents is already empty here; we
-                    // cannot recover the original order. The caller receives
-                    // an empty pack and should treat this as a soft degradation.
+                    // Reranking is best-effort: on failure (rate limit,
+                    // network error, etc.) keep the original RRF-ranked
+                    // results truncated to `limit`. This preserves retrieval
+                    // availability and quality under transient API failures.
                     tracing::warn!(
                         strategy = %strategy,
                         error = %e,
-                        "cross-encoder reranking failed; returning empty evidence pack"
+                        "cross-encoder reranking failed; falling back to RRF-ranked results"
                     );
+                    evidence.documents.truncate(limit);
                 }
             }
         }

@@ -537,7 +537,7 @@ impl LlmGraphExtractor {
         }
 
         // Truncate very large chunks at a character boundary.
-        let payload_text: &str = if trimmed.chars().count() > MAX_CHUNK_CHARS {
+        let bounded: &str = if trimmed.chars().count() > MAX_CHUNK_CHARS {
             let mut end = 0usize;
             for (i, (byte_idx, _)) in trimmed.char_indices().enumerate() {
                 if i == MAX_CHUNK_CHARS {
@@ -554,6 +554,23 @@ impl LlmGraphExtractor {
         } else {
             trimmed
         };
+
+        // Sanitize control chars (form feed, vertical tab, etc.) that some
+        // PDF extractors leave in text and which break OpenAI's JSON parser.
+        // Keep \n, \r, \t — strip everything else below ASCII 0x20.
+        let payload_owned: String = bounded
+            .chars()
+            .map(|c| {
+                if c == '\n' || c == '\r' || c == '\t' {
+                    c
+                } else if (c as u32) < 0x20 || c == '\u{007F}' {
+                    ' '
+                } else {
+                    c
+                }
+            })
+            .collect();
+        let payload_text: &str = &payload_owned;
 
         let body = build_request_body(self.model.as_str(), payload_text);
 
