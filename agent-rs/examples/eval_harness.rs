@@ -721,9 +721,11 @@ async fn main() -> Result<()> {
     };
     info!(embedder = %embedder_label, "embedder ready");
 
-    // 5. Determine collection name and reset.
+    // 5. Determine collection names and reset.
     let collection = CollectionName("eval_harness".into());
+    let triplet_collection = CollectionName("eval_harness_triplets".into());
     reset_collection(&collection, &settings).await?;
+    reset_collection(&triplet_collection, &settings).await?;
 
     // Also clear any leftover graph nodes for our doc_ids from a previous run.
     // We only attempt delete on the top-level doc_id to keep cleanup bounded —
@@ -758,6 +760,9 @@ async fn main() -> Result<()> {
     if let Some(extractor) = llm_extractor.clone() {
         pipeline_config = pipeline_config.with_llm_extractor(extractor);
     }
+    // Enable triplet indexing so graph-oriented strategies can score complete
+    // (source) -[relation]-> (target) triples against the query embedding.
+    pipeline_config = pipeline_config.with_triplet_collection(triplet_collection.clone());
 
     let pipeline = IngestionPipeline::with_config(
         embedder.clone(),
@@ -810,13 +815,16 @@ async fn main() -> Result<()> {
 
     // 7. Build retrieval router.
     let ranker = ResultRanker::new(settings.ranker.rrf_k);
-    let router = Arc::new(RetrievalRouter::new(
-        embedder.clone(),
-        qdrant_store.clone() as Arc<dyn VectorStore + Send + Sync>,
-        neo4j_store.clone() as Arc<dyn GraphStore + Send + Sync>,
-        ranker,
-        collection.clone(),
-    ));
+    let router = Arc::new(
+        RetrievalRouter::new(
+            embedder.clone(),
+            qdrant_store.clone() as Arc<dyn VectorStore + Send + Sync>,
+            neo4j_store.clone() as Arc<dyn GraphStore + Send + Sync>,
+            ranker,
+            collection.clone(),
+        )
+        .with_triplet_collection(triplet_collection.clone()),
+    );
 
     // 8. Run each question through every strategy.
     info!("--- EVAL PHASE ---");

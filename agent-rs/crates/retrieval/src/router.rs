@@ -36,6 +36,7 @@ use crate::{
         },
         hybrid::{GraphHybridParams, graph_hybrid_search, hybrid_search},
         keyword::keyword_search,
+        triplet::triplet_search,
         vector::{summaries_search, temporal_search, vector_search},
     },
     strategy::get_descriptor,
@@ -89,10 +90,17 @@ pub struct RetrievalRouter {
     ranker: ResultRanker,
     /// Default collection to query for vector and keyword searches.
     collection: CollectionName,
+    /// Optional dedicated collection holding linearised triplet embeddings.
+    ///
+    /// When `Some`, strategies whose descriptor sets
+    /// [`StrategyDescriptor::uses_triplets`](crate::strategy::StrategyDescriptor::uses_triplets)
+    /// run [`triplet_search`] in addition to their primary back-ends and
+    /// fuse the triplet hits into the RRF ranking.
+    triplet_collection: Option<CollectionName>,
 }
 
 impl RetrievalRouter {
-    /// Create a new router.
+    /// Create a new router without a dedicated triplet collection.
     ///
     /// # Parameters
     ///
@@ -115,7 +123,20 @@ impl RetrievalRouter {
             graph_store,
             ranker,
             collection,
+            triplet_collection: None,
         }
+    }
+
+    /// Attach an optional triplet collection to this router.
+    ///
+    /// When set, graph-oriented strategies (`Graph`, `GraphHybrid`, `GraphCoT`,
+    /// `GraphConstrained`) will additionally dispatch a triplet vector search
+    /// against `triplet_collection` and fuse the results via RRF.
+    ///
+    /// Returns the router by value to support builder-style construction.
+    pub fn with_triplet_collection(mut self, triplet_collection: CollectionName) -> Self {
+        self.triplet_collection = Some(triplet_collection);
+        self
     }
 
     /// Rewrite a raw user query for improved retrieval quality.
@@ -200,7 +221,7 @@ impl RetrievalRouter {
         };
 
         // Dispatch and collect result lists for the ranker.
-        let result_lists: Vec<Vec<agent_rs_stores::types::SearchResult>> = match strategy {
+        let mut result_lists: Vec<Vec<agent_rs_stores::types::SearchResult>> = match strategy {
             // ---- Single-backend: dense vector ----
             RetrievalStrategy::Semantic => {
                 let results =
@@ -340,6 +361,42 @@ impl RetrievalRouter {
                 vec![graph_result?, vector_result?]
             }
         };
+
+        // Additional triplet search for graph-oriented strategies.
+        //
+        // This mirrors Cognee's brute_force_triplet_search: for strategies
+        // that walk the knowledge graph, we also score complete
+        // (source) -[relation]-> (target) triplets against the query embedding
+        // and fuse them as a separate ranked list.
+        if descriptor.uses_triplets {
+            if let Some(triplet_collection) = self.triplet_collection.as_ref() {
+                match triplet_search(&*self.vector_store, triplet_collection, &dense, limit).await {
+                    Ok(triplet_results) => {
+                        tracing::debug!(
+                            strategy = %strategy,
+                            count = triplet_results.len(),
+                            "triplet search contributed to RRF fusion"
+                        );
+                        result_lists.push(triplet_results);
+                    }
+                    Err(e) => {
+                        // Triplet search is best-effort: a missing or empty
+                        // collection should not fail the overall query. Log
+                        // and continue with the primary back-end results.
+                        tracing::warn!(
+                            strategy = %strategy,
+                            error = %e,
+                            "triplet search failed; continuing without triplet evidence"
+                        );
+                    }
+                }
+            } else {
+                tracing::debug!(
+                    strategy = %strategy,
+                    "triplet search requested but no triplet collection configured"
+                );
+            }
+        }
 
         let evidence = self.ranker.rank(result_lists, query_str, strategy, limit);
         Ok(evidence)

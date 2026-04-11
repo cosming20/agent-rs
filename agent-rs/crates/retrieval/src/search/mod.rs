@@ -6,6 +6,7 @@
 //! - [`keyword`] — BM25 / lexical search via Qdrant sparse vectors
 //! - [`graph`]   — Cypher graph traversal via Neo4j
 //! - [`hybrid`]  — parallel multi-backend dispatch returning unfused results
+//! - [`triplet`] — dense search over a dedicated triplets collection
 //!
 //! # Usage
 //!
@@ -19,6 +20,7 @@
 pub mod graph;
 pub mod hybrid;
 pub mod keyword;
+pub mod triplet;
 pub mod vector;
 
 // Re-export frequently used items at the search module level.
@@ -27,4 +29,5 @@ pub use graph::{
 };
 pub use hybrid::{GraphHybridParams, HybridResults, graph_hybrid_search, hybrid_search};
 pub use keyword::keyword_search;
+pub use triplet::triplet_search;
 pub use vector::{summaries_search, temporal_search, vector_search};
