@@ -323,13 +323,19 @@ services:
       - DOCLING_PARSE_TIMEOUT_S=300
       - DOCLING_STREAM_IDLE_TIMEOUT_S=600
       - DOCLING_MAX_CHUNKS_PER_DOC=10000
+      # fast | accurate — "fast" saves ~3-4 GB peak memory vs ACCURATE.
+      # Required on Docker Desktop VMs <12 GB. Override in a .env to
+      # "accurate" in production where the VM has enough headroom.
+      - DOCLING_TABLEFORMER_MODE=fast
     networks:
       - agentic-ra-net
-    # Docling layout-heron + tableformer + PDF processing spike to ~6-10 GB
-    # on large real-world legal/academic PDFs (penal_code_ro = 2.4 MB =
-    # hundreds of pages hit OOM at 4g). Bumped to 12g with a 6g reservation.
-    mem_limit: 12g
-    mem_reservation: 6g
+    # Memory budget must stay below the Docker Desktop VM total
+    # (typically 7.65-8 GB on default macOS installations).
+    # On layout-heron + tableformer FAST + 2.4 MB legal PDF, peak RSS
+    # measured ~5 GB; 6g leaves headroom for the VM kernel + other
+    # containers sharing the host.
+    mem_limit: 6g
+    mem_reservation: 4g
     cpus: 4.0
     healthcheck:
       test: ["CMD", "/usr/local/bin/grpc_health_probe", "-addr=:1068", "-rpc-timeout=5s"]

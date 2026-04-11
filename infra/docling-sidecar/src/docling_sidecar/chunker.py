@@ -326,19 +326,28 @@ class ChunkerPool:
 
     @staticmethod
     def _build_converter() -> DocumentConverter:
-        """Build a DocumentConverter with ACCURATE table mode, no OCR.
+        """Build a DocumentConverter for production PDF ingestion.
 
-        PdfPipelineOptions in docling 2.86 expects `table_structure_options`
-        to be a TableStructureOptions instance, not a dict.
+        Table structure mode is configurable via `DOCLING_TABLEFORMER_MODE`
+        env var: "accurate" (default in spec) or "fast" (3-4 GB lower peak
+        memory usage — required when Docker Desktop VM is <12 GB).
         """
+        import os
+
         from docling.datamodel.pipeline_options import TableStructureOptions
+
+        mode_env = os.environ.get("DOCLING_TABLEFORMER_MODE", "accurate").lower()
+        mode = (
+            TableFormerMode.ACCURATE
+            if mode_env == "accurate"
+            else TableFormerMode.FAST
+        )
+        logger.info("TableFormer mode: %s", mode.name)
 
         pdf_options = PdfPipelineOptions(
             do_ocr=False,
             do_table_structure=True,
-            table_structure_options=TableStructureOptions(
-                mode=TableFormerMode.ACCURATE,
-            ),
+            table_structure_options=TableStructureOptions(mode=mode),
         )
         return DocumentConverter(
             format_options={
