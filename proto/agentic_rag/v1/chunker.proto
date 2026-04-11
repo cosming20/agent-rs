@@ -1,0 +1,391 @@
+// chunker.proto — Docling sidecar gRPC contract
+//
+// Owned by: W1-arch (architecture). Implemented by: W2 (Python sidecar +
+// tonic-build), consumed by: W3 (Rust ingest pipeline).
+//
+// Versioning policy:
+//   - schema_version (uint32) is the wire-compatibility version. Bump on
+//     any change that is not purely additive at the END of a message.
+//     Adding a new field with a new field number is backward-compatible
+//     and does NOT bump schema_version.
+//   - docling_version / docling_core_version are informational only.
+//
+// Stream protocol (server-streaming RPC ChunkDocument):
+//   1. Server sends EXACTLY ONE ChunkDocumentResponse with payload.header set.
+//   2. Server sends ZERO OR MORE ChunkDocumentResponse with payload.chunk set.
+//   3. Server sends EXACTLY ONE ChunkDocumentResponse with payload.footer set.
+//   4. OR at any point: server sends EXACTLY ONE ChunkDocumentResponse with
+//      payload.error set, then closes the stream. No footer follows an error.
+//
+// The client MUST treat absence of footer (and absence of error) as a
+// transport-level failure and rollback any partial state.
+//
+// Health checking:
+//   This service does NOT define a custom Health RPC. The sidecar MUST implement
+//   the standard `grpc.health.v1.Health/Check` protocol (grpcio-health-checking
+//   package in Python). Docker Compose healthcheck uses grpc_health_probe which
+//   expects the standard service.
+//
+// Server reflection (A4):
+//   The sidecar MUST enable gRPC server reflection via the `grpcio-reflection`
+//   package. This allows `grpcurl` smoke tests without requiring the `-proto`
+//   argument, and supports tooling-based service discovery.
+
+syntax = "proto3";
+
+package agentic_rag.v1;
+
+// =============================================================================
+// Service
+// =============================================================================
+
+service DoclingChunker {
+  // Parse + chunk a document. Server-streaming.
+  //
+  // Stream contract: header → chunk* → footer  OR  header → error
+  // The client MUST treat an EOF with no footer and no error as a transport
+  // failure and roll back any partially ingested state.
+  rpc ChunkDocument(ChunkDocumentRequest) returns (stream ChunkDocumentResponse);
+}
+
+// =============================================================================
+// Request
+// =============================================================================
+
+message ChunkDocumentRequest {
+  // Raw document bytes. The sidecar inspects mimetype and the magic header.
+  // Hard limit (enforced server-side): 100 MiB.
+  bytes content = 1;
+
+  // Originating filename, e.g. "annual_report.pdf". Used for logging,
+  // tracing, and the Document.source field. Not used for parsing.
+  string filename = 2;
+
+  // Optional explicit mimetype hint. If empty, sidecar sniffs from bytes.
+  // Examples: "application/pdf", "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+  string mimetype = 3;
+
+  // Stable client-supplied document_id. The sidecar echoes it in the
+  // DocumentHeader so the Rust caller can correlate.
+  // Format: UUIDv5(NAMESPACE_OID, sha256_hex). See spec section 3.
+  string document_id = 4;
+
+  // sha256 of `content` as lowercase hex (64 chars). Sidecar verifies
+  // and returns INVALID_METADATA if mismatched. Used for cache lookup.
+  string sha256 = 5;
+
+  // Per-request limits override (sidecar enforces a min(server_default,
+  // request_value) so a client cannot raise limits beyond the server cap).
+  // A value of 0 in any field means "use the server default".
+  RequestLimits limits = 6;
+
+  // Reserved for future fields (extraction options, page range, etc.).
+  reserved 7 to 15;
+}
+
+// Per-request resource limits.
+//
+// Zero-value semantics (A1 amendment):
+//   A value of 0 in any field means "use the server default".
+//   Non-zero values override the server default with min(server_default, client_value)
+//   semantics — a client cannot raise limits beyond the server-configured cap.
+//   This prevents the proto3 default-zero from being silently interpreted as
+//   "no limit" (which would allow DoS via unbounded parse timeouts or page counts).
+message RequestLimits {
+  // Maximum document size in bytes. 0 = server default (typically 100 MiB).
+  uint32 max_pdf_bytes = 1;
+
+  // Hard cap on PDF page count. 0 = server default (typically 500).
+  uint32 max_pages = 2;
+
+  // Hard cap on parse wall-clock seconds. 0 = server default (typically 300).
+  uint32 parse_timeout_s = 3;
+
+  // Hard cap on idle time between two stream messages (seconds).
+  // 0 = server default (typically 600).
+  uint32 stream_idle_timeout_s = 4;
+
+  // Hard cap on number of chunks produced per document.
+  // 0 = server default (no cap). Useful for smoke-test requests.
+  uint32 max_chunks_per_doc = 5;
+}
+
+// =============================================================================
+// Response (oneof payload)
+// =============================================================================
+
+message ChunkDocumentResponse {
+  oneof payload {
+    DocumentHeader header = 1;
+    Chunk          chunk  = 2;
+    DocumentFooter footer = 3;
+    IngestError    error  = 4;
+  }
+}
+
+// -----------------------------------------------------------------------------
+// DocumentHeader — sent FIRST. Carries document-level metadata.
+// -----------------------------------------------------------------------------
+message DocumentHeader {
+  // Wire-compat version. Bumped only on breaking proto changes.
+  uint32 schema_version = 1;
+
+  // Echoed from the request. Stable across reingestion of identical bytes.
+  string document_id = 2;
+
+  // Echoed from the request.
+  string sha256 = 3;
+
+  // Echoed from the request.
+  string filename = 4;
+
+  // Detected or supplied mimetype. Always set.
+  string mimetype = 5;
+
+  // Total page count after parse. 0 if not applicable (e.g., HTML).
+  uint32 n_pages = 6;
+
+  // Detected primary language (ISO 639-1). Empty if undetermined.
+  string language = 7;
+
+  // Per-page metadata. Length == n_pages when n_pages > 0.
+  repeated PageInfo pages = 8;
+
+  // Document title from doc metadata, if any.
+  string title = 9;
+
+  // Docling version string, e.g. "2.86.0". Informational.
+  string docling_version = 10;
+
+  // docling-core version string. Informational.
+  string docling_core_version = 11;
+
+  // Sidecar parse wall-clock latency (ms). Useful for SLO monitoring.
+  uint64 parse_latency_ms = 12;
+
+  // Reserved for future fields (e.g. ocr_languages, table_format).
+  reserved 13 to 19;
+}
+
+message PageInfo {
+  // 1-based page number.
+  uint32 page_no = 1;
+  // Page width in points (PDF) or pixels (image).
+  double width = 2;
+  // Page height in same unit as width.
+  double height = 3;
+}
+
+// -----------------------------------------------------------------------------
+// Chunk — sent ZERO OR MORE TIMES. One per HybridChunker output chunk.
+// -----------------------------------------------------------------------------
+//
+// `embed_text` is the field that goes into the embedding model. It comes
+// from `chunker.contextualize(chunk)` (heading-prefixed) and is the canonical
+// surface form for retrieval scoring.
+//
+// `raw_text` is the un-contextualized text (just the chunk content) and is
+// what we send to Qdrant for server-side BM25 inference.
+message Chunk {
+  // 0-based chunk index within the document.
+  uint32 chunk_index = 1;
+
+  // Total number of chunks in the document. Set on every chunk for
+  // convenience (so consumers don't need to wait for footer to compute it).
+  uint32 total_chunks = 2;
+
+  // Stable chunk_id. UUIDv5(NAMESPACE_OID, document_id + ":" + chunk_index +
+  // ":" + blake3(embed_text)). See spec section 3.
+  string chunk_id = 3;
+
+  // Output of HybridChunker.contextualize(chunk). Used for embeddings.
+  string embed_text = 4;
+
+  // Raw concatenated chunk text without heading prefix. Used for BM25.
+  string raw_text = 5;
+
+  // Heading path leading to this chunk, root-first. Empty for chunks
+  // outside any section. Example: ["Chapter 1", "Introduction"].
+  repeated string heading_path = 6;
+
+  // Page range covered by the chunk's doc_items.
+  uint32 page_start = 7;
+  uint32 page_end   = 8;
+
+  // Computed token count using cl100k_base (matches text-embedding-3-large).
+  uint32 token_count = 9;
+
+  // Computed character count of embed_text.
+  uint32 char_count = 10;
+
+  // Doc items contained in this chunk.
+  repeated DocItem doc_items = 11;
+
+  // Convenience flags computed by the sidecar (so the Rust client doesn't
+  // need to walk doc_items to filter at retrieval time).
+  bool has_table   = 12;
+  bool has_picture = 13;
+  bool has_code    = 14;
+  bool has_formula = 15;
+
+  // Section title of the deepest heading in heading_path, or empty.
+  string section_title = 16;
+
+  // Stable section_id derived from heading_path. Empty if no heading.
+  // UUIDv5(NAMESPACE_OID, document_id + ":s:" + heading_path.join(">")).
+  string section_id = 17;
+
+  // Reserved for future fields.
+  reserved 18 to 25;
+}
+
+// -----------------------------------------------------------------------------
+// DocItem — one structural element inside a chunk.
+// -----------------------------------------------------------------------------
+//
+// Mirrors a subset of docling-core's DocItem hierarchy: anything that may
+// be relevant for downstream filtering, citations, or graph nodes.
+message DocItem {
+  // self_ref from docling, e.g. "#/texts/12" or "#/tables/3". Stable across
+  // re-parses of identical bytes. Used to derive doc_item_id (see spec).
+  string self_ref = 1;
+
+  // Stable label from our enum. Use this when present.
+  DocItemLabel label = 2;
+
+  // Raw label string from docling-core when label == DOC_ITEM_LABEL_OTHER.
+  // Always populated; equals the canonical label name when label != OTHER
+  // for forward compatibility / debuggability.
+  string raw_label = 3;
+
+  // Page number this item primarily belongs to. 0 if not page-bound.
+  uint32 page_no = 4;
+
+  // Optional bounding box. Only populated for items with layout info.
+  BBox bbox = 5;
+
+  // Plain text representation of this item.
+  string text = 6;
+
+  // For TABLE items: serialized markdown table. Empty otherwise.
+  string table_markdown = 7;
+
+  // For TABLE items: row/column count.
+  uint32 table_n_rows = 8;
+  uint32 table_n_cols = 9;
+
+  // For PICTURE items: caption text if any. Empty otherwise.
+  string picture_caption = 10;
+
+  // Generic doc_item_id. Sidecar MAY leave empty; Rust client computes
+  // UUIDv5(NAMESPACE_OID, document_id + ":" + self_ref) on receipt.
+  // Including it here is purely an optimization.
+  string doc_item_id = 11;
+
+  reserved 12 to 19;
+}
+
+message BBox {
+  double l = 1;  // left
+  double t = 2;  // top
+  double r = 3;  // right
+  double b = 4;  // bottom
+  // Coordinate origin: TOP-LEFT (matches docling-core CoordOrigin.TOPLEFT).
+}
+
+// -----------------------------------------------------------------------------
+// DocItemLabel — stable enum mirror of docling-core DocItemLabel.
+// -----------------------------------------------------------------------------
+//
+// Source of truth: docling_core.types.doc.labels.DocItemLabel
+// Any value docling emits that we don't recognize is mapped to
+// DOC_ITEM_LABEL_OTHER and the original name goes into Chunk.doc_items[i].raw_label.
+//
+// Field number range convention (A2 amendment — replaces reserved 19 to 99):
+//   0-18:  currently assigned (stable, will never be renumbered)
+//   19-99: reserved for future stable Docling labels — add new values here
+//          as docling-core adds new DocItemLabel variants
+//   100+:  experimental or vendor-specific extensions
+//
+// Do NOT use proto3 `reserved` for 19-99: that would make those numbers
+// permanently unusable even for additive assignments.
+enum DocItemLabel {
+  DOC_ITEM_LABEL_UNSPECIFIED    = 0;
+  DOC_ITEM_LABEL_OTHER          = 1;  // raw_label carries the original string
+
+  DOC_ITEM_LABEL_TITLE          = 2;
+  DOC_ITEM_LABEL_SECTION_HEADER = 3;
+  DOC_ITEM_LABEL_TEXT           = 4;
+  DOC_ITEM_LABEL_PARAGRAPH      = 5;
+  DOC_ITEM_LABEL_LIST_ITEM      = 6;
+  DOC_ITEM_LABEL_CAPTION        = 7;
+  DOC_ITEM_LABEL_FOOTNOTE       = 8;
+  DOC_ITEM_LABEL_PAGE_HEADER    = 9;
+  DOC_ITEM_LABEL_PAGE_FOOTER    = 10;
+  DOC_ITEM_LABEL_TABLE          = 11;
+  DOC_ITEM_LABEL_PICTURE        = 12;
+  DOC_ITEM_LABEL_FORMULA        = 13;
+  DOC_ITEM_LABEL_CODE           = 14;
+  DOC_ITEM_LABEL_FORM           = 15;
+  DOC_ITEM_LABEL_KEY_VALUE      = 16;
+  DOC_ITEM_LABEL_DOCUMENT_INDEX = 17;
+  DOC_ITEM_LABEL_REFERENCE      = 18;
+}
+
+// -----------------------------------------------------------------------------
+// DocumentFooter — sent LAST on success. Marks end-of-stream.
+// -----------------------------------------------------------------------------
+message DocumentFooter {
+  // Total chunks emitted. MUST equal the number of Chunk messages on the wire.
+  uint32 n_chunks = 1;
+
+  // Aggregated counts (computed by the sidecar from doc_items across all chunks).
+  uint32 n_tables   = 2;
+  uint32 n_pictures = 3;
+  uint32 n_formulas = 4;
+  uint32 n_code     = 5;
+
+  // Sidecar total handle wall-clock time (parse + chunk + emit). For SLOs.
+  uint64 total_handle_latency_ms = 6;
+
+  reserved 7 to 15;
+}
+
+// -----------------------------------------------------------------------------
+// IngestError — sent INSTEAD of footer on failure. Stream closes after.
+// -----------------------------------------------------------------------------
+//
+// We use a typed payload error in addition to gRPC `Status` so that
+// observability and the runtime fallback path do not need to depend on
+// the wire-format details of the gRPC trailer.
+message IngestError {
+  IngestErrorCode code = 1;
+
+  // Operator-readable message. Safe to log.
+  string message = 2;
+
+  // True iff the client SHOULD retry with backoff (transient).
+  // False means a retry will deterministically fail with the same error.
+  bool retryable = 3;
+
+  // Optional Python traceback for debugging. May be empty in production.
+  string docling_stack = 4;
+
+  // Optional structured fields (e.g., page that failed, table index, etc.).
+  map<string, string> details = 5;
+
+  reserved 6 to 15;
+}
+
+enum IngestErrorCode {
+  INGEST_ERROR_CODE_UNSPECIFIED               = 0;
+  INGEST_ERROR_CODE_PARSE_ERROR               = 1;   // Corrupted PDF, layout failure. retryable=false.
+  INGEST_ERROR_CODE_UNSUPPORTED_MIMETYPE      = 2;   // retryable=false. Triggers legacy fallback.
+  INGEST_ERROR_CODE_OCR_TIMEOUT               = 3;   // retryable=true with longer timeout.
+  INGEST_ERROR_CODE_MODEL_DOWNLOAD_UNAVAILABLE = 4;  // retryable=true after warm-up.
+  INGEST_ERROR_CODE_CHUNKING_ERROR            = 5;   // HybridChunker raised. retryable=false.
+  INGEST_ERROR_CODE_INVALID_METADATA          = 6;   // sha256 mismatch, missing fields. retryable=false.
+  INGEST_ERROR_CODE_REQUEST_TOO_LARGE         = 7;   // > max_pdf_bytes / max_pages. retryable=false.
+  INGEST_ERROR_CODE_REQUEST_TIMEOUT           = 8;   // parse_timeout_s exceeded. retryable=true.
+  INGEST_ERROR_CODE_INTERNAL_ERROR            = 99;  // Bug. retryable=true (cap at 1 retry).
+}

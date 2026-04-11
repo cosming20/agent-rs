@@ -1,0 +1,166 @@
+{
+  "messages": [
+    {
+      "type": "header",
+      "schema_version": 1,
+      "document_id": "7f3b9c2a-1e4d-5f6b-8a9c-0d1e2f3a4b5c",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "filename": "sample_document.pdf",
+      "mimetype": "application/pdf",
+      "n_pages": 2,
+      "language": "en",
+      "title": "Sample Document for Mock Stream Testing",
+      "docling_version": "2.86.0",
+      "docling_core_version": "2.5.0",
+      "parse_latency_ms": 142,
+      "pages": [
+        { "page_no": 1, "width": 612.0, "height": 792.0 },
+        { "page_no": 2, "width": 612.0, "height": 792.0 }
+      ]
+    },
+    {
+      "type": "chunk",
+      "chunk_index": 0,
+      "total_chunks": 3,
+      "chunk_id": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
+      "embed_text": "Introduction\n\nThis document describes the architecture of the agentic RAG system. The system combines vector search, keyword search, and graph-based retrieval to provide high-quality answers grounded in a knowledge base.",
+      "raw_text": "This document describes the architecture of the agentic RAG system. The system combines vector search, keyword search, and graph-based retrieval to provide high-quality answers grounded in a knowledge base.",
+      "heading_path": ["Introduction"],
+      "page_start": 1,
+      "page_end": 1,
+      "token_count": 47,
+      "char_count": 219,
+      "has_table": false,
+      "has_picture": false,
+      "has_code": false,
+      "has_formula": false,
+      "section_title": "Introduction",
+      "section_id": "b2c3d4e5-f6a7-8901-bcde-f01234567891",
+      "doc_items": [
+        {
+          "self_ref": "#/texts/0",
+          "label": 3,
+          "raw_label": "section_header",
+          "page_no": 1,
+          "text": "Introduction",
+          "table_markdown": "",
+          "table_n_rows": 0,
+          "table_n_cols": 0,
+          "picture_caption": "",
+          "doc_item_id": "c3d4e5f6-a7b8-9012-cdef-012345678912"
+        },
+        {
+          "self_ref": "#/texts/1",
+          "label": 4,
+          "raw_label": "text",
+          "page_no": 1,
+          "text": "This document describes the architecture of the agentic RAG system. The system combines vector search, keyword search, and graph-based retrieval to provide high-quality answers grounded in a knowledge base.",
+          "table_markdown": "",
+          "table_n_rows": 0,
+          "table_n_cols": 0,
+          "picture_caption": "",
+          "doc_item_id": "d4e5f6a7-b8c9-0123-defa-123456789023"
+        }
+      ]
+    },
+    {
+      "type": "chunk",
+      "chunk_index": 1,
+      "total_chunks": 3,
+      "chunk_id": "b2c3d4e5-f6a7-8901-bcde-f01234567891",
+      "embed_text": "Retrieval Strategies\n\nThe retrieval engine supports five strategies: SEMANTIC (dense vector), KEYWORD (BM25 lexical), HYBRID (vector + keyword fused via RRF), GRAPH (graph traversal), and GRAPH_HYBRID (all three combined).",
+      "raw_text": "The retrieval engine supports five strategies: SEMANTIC (dense vector), KEYWORD (BM25 lexical), HYBRID (vector + keyword fused via RRF), GRAPH (graph traversal), and GRAPH_HYBRID (all three combined).",
+      "heading_path": ["Retrieval Strategies"],
+      "page_start": 1,
+      "page_end": 2,
+      "token_count": 52,
+      "char_count": 221,
+      "has_table": false,
+      "has_picture": false,
+      "has_code": false,
+      "has_formula": false,
+      "section_title": "Retrieval Strategies",
+      "section_id": "e5f6a7b8-c9d0-1234-efab-234567890134",
+      "doc_items": [
+        {
+          "self_ref": "#/texts/2",
+          "label": 3,
+          "raw_label": "section_header",
+          "page_no": 1,
+          "text": "Retrieval Strategies",
+          "table_markdown": "",
+          "table_n_rows": 0,
+          "table_n_cols": 0,
+          "picture_caption": "",
+          "doc_item_id": "f6a7b8c9-d0e1-2345-fabc-345678901245"
+        },
+        {
+          "self_ref": "#/texts/3",
+          "label": 4,
+          "raw_label": "text",
+          "page_no": 2,
+          "text": "The retrieval engine supports five strategies: SEMANTIC (dense vector), KEYWORD (BM25 lexical), HYBRID (vector + keyword fused via RRF), GRAPH (graph traversal), and GRAPH_HYBRID (all three combined).",
+          "table_markdown": "",
+          "table_n_rows": 0,
+          "table_n_cols": 0,
+          "picture_caption": "",
+          "doc_item_id": "a7b8c9d0-e1f2-3456-abcd-456789012356"
+        }
+      ]
+    },
+    {
+      "type": "chunk",
+      "chunk_index": 2,
+      "total_chunks": 3,
+      "chunk_id": "c3d4e5f6-a7b8-9012-cdef-012345678912",
+      "embed_text": "Implementation Notes\n\nAll components are implemented in Rust using the tokio async runtime. Cross-encoder reranking via BGE-reranker-v2-m3 is applied after RRF fusion to improve result quality. Embeddings are generated locally using fastembed (ONNX).",
+      "raw_text": "All components are implemented in Rust using the tokio async runtime. Cross-encoder reranking via BGE-reranker-v2-m3 is applied after RRF fusion to improve result quality. Embeddings are generated locally using fastembed (ONNX).",
+      "heading_path": ["Implementation Notes"],
+      "page_start": 2,
+      "page_end": 2,
+      "token_count": 55,
+      "char_count": 249,
+      "has_table": false,
+      "has_picture": false,
+      "has_code": false,
+      "has_formula": false,
+      "section_title": "Implementation Notes",
+      "section_id": "b8c9d0e1-f2a3-4567-bcde-567890123467",
+      "doc_items": [
+        {
+          "self_ref": "#/texts/4",
+          "label": 3,
+          "raw_label": "section_header",
+          "page_no": 2,
+          "text": "Implementation Notes",
+          "table_markdown": "",
+          "table_n_rows": 0,
+          "table_n_cols": 0,
+          "picture_caption": "",
+          "doc_item_id": "c9d0e1f2-a3b4-5678-cdef-678901234578"
+        },
+        {
+          "self_ref": "#/texts/5",
+          "label": 4,
+          "raw_label": "text",
+          "page_no": 2,
+          "text": "All components are implemented in Rust using the tokio async runtime. Cross-encoder reranking via BGE-reranker-v2-m3 is applied after RRF fusion to improve result quality. Embeddings are generated locally using fastembed (ONNX).",
+          "table_markdown": "",
+          "table_n_rows": 0,
+          "table_n_cols": 0,
+          "picture_caption": "",
+          "doc_item_id": "d0e1f2a3-b4c5-6789-defa-789012345689"
+        }
+      ]
+    },
+    {
+      "type": "footer",
+      "n_chunks": 3,
+      "n_tables": 0,
+      "n_pictures": 0,
+      "n_formulas": 0,
+      "n_code": 0,
+      "total_handle_latency_ms": 287
+    }
+  ]
+}

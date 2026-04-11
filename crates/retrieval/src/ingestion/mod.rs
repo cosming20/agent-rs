@@ -8,12 +8,14 @@
 //! - [`chunker`] -- configurable text chunking (recursive, section-based, sliding window, token-aware paragraph)
 //! - [`metadata`] -- automatic metadata extraction from text content
 //! - [`graph_extractor`] -- LLM-based entity/relation extraction (OpenAI structured outputs)
+//! - [`mock_docling`] -- mock Docling sidecar stream for W3 development
 //! - [`pipeline`] -- end-to-end ingestion pipeline wiring all stages together
 //! - [`summarizer`] -- LLM-based chunk summarization (powers `RetrievalStrategy::Summaries`)
 
 pub mod chunker;
 pub mod graph_extractor;
 pub mod metadata;
+pub mod mock_docling;
 pub mod pipeline;
 pub mod summarizer;
 
