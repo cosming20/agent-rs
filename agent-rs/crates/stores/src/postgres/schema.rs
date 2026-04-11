@@ -47,4 +47,37 @@ diesel::table! {
 
 diesel::joinable!(evidence_items -> query_runs (run_id));
 
-diesel::allow_tables_to_appear_in_same_query!(chat_messages, evidence_items, memories, query_runs,);
+diesel::table! {
+    ingested_documents (document_id) {
+        document_id              -> Uuid,
+        sha256                   -> Bpchar,
+        source                   -> Text,
+        ingest_status            -> Text,
+        ingest_run_id            -> Uuid,
+        failure_reason           -> Nullable<Text>,
+        docling_version          -> Nullable<Text>,
+        docling_core_version     -> Nullable<Text>,
+        schema_version           -> Nullable<Integer>,
+        n_pages                  -> Nullable<Integer>,
+        n_chunks                 -> Nullable<Integer>,
+        n_tables                 -> Nullable<Integer>,
+        n_pictures               -> Nullable<Integer>,
+        n_formulas               -> Nullable<Integer>,
+        language                 -> Nullable<Text>,
+        title                    -> Nullable<Text>,
+        mimetype                 -> Nullable<Text>,
+        parse_latency_ms         -> Nullable<BigInt>,
+        total_ingest_latency_ms  -> Nullable<BigInt>,
+        started_at               -> Timestamp,
+        completed_at             -> Nullable<Timestamp>,
+        updated_at               -> Timestamp,
+    }
+}
+
+diesel::allow_tables_to_appear_in_same_query!(
+    chat_messages,
+    evidence_items,
+    ingested_documents,
+    memories,
+    query_runs,
+);

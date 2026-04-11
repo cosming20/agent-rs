@@ -29,8 +29,12 @@ use uuid::Uuid;
 use crate::traits::StateStore;
 use crate::types::{ChatMessage, EvidenceItem, Memory, QueryRun};
 
+pub mod documents;
 pub mod models;
 pub mod schema;
+
+pub use documents::HeaderMetadata;
+pub use models::{BeginIngestionOutcome, IngestedDocumentRow, NewIngestedDocument};
 
 use models::{
     ChatMessageRow, EvidenceItemRow, MemoryRow, NewChatMessage, NewEvidenceItem, NewMemory,
