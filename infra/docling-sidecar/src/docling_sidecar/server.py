@@ -42,18 +42,18 @@ logger = logging.getLogger(__name__)
 # Current wire-compat schema version. Bump only on breaking proto changes.
 _SCHEMA_VERSION: int = 1
 
-# Informational version strings, injected from package at build time.
-try:
-    import docling
-    _DOCLING_VERSION: str = docling.__version__
-except Exception:
-    _DOCLING_VERSION = "unknown"
+# Informational version strings, resolved via package metadata (docling
+# packages do not expose `__version__` attributes directly).
+def _pkg_version(name: str) -> str:
+    try:
+        from importlib.metadata import version
+        return version(name)
+    except Exception:
+        return "unknown"
 
-try:
-    import docling_core
-    _DOCLING_CORE_VERSION: str = docling_core.__version__
-except Exception:
-    _DOCLING_CORE_VERSION = "unknown"
+
+_DOCLING_VERSION: str = _pkg_version("docling")
+_DOCLING_CORE_VERSION: str = _pkg_version("docling-core")
 
 
 # ---------------------------------------------------------------------------
@@ -84,7 +84,8 @@ _LABEL_TO_PROTO: dict[str, int] = {
 def _label_str_to_proto(label_str: str) -> int:
     """Convert a docling label string to its proto enum int value."""
     normalized = label_str.lower().strip()
-    return _LABEL_TO_PROTO.get(normalized, chunker_pb2.DOC_ITEM_LABEL_OTHER)
+    fallback: int = chunker_pb2.DOC_ITEM_LABEL_OTHER
+    return _LABEL_TO_PROTO.get(normalized, fallback)
 
 
 # ---------------------------------------------------------------------------
