@@ -65,6 +65,18 @@ pub struct StrategyDescriptor {
     /// `true` for strategies that build graph subgraphs or summaries that
     /// benefit from being surfaced explicitly in the final answer.
     pub context_augmented: bool,
+
+    /// Whether this strategy should additionally score complete
+    /// `(source) -[relation]-> (target)` triplets against the query
+    /// embedding.
+    ///
+    /// When `true` and the router has a triplet collection configured, the
+    /// router runs [`crate::search::triplet::triplet_search`] in addition to
+    /// the primary back-ends and fuses the triplet hits into the same RRF
+    /// ranking. Graph-oriented strategies (`Graph`, `GraphHybrid`, `GraphCoT`,
+    /// `GraphConstrained`) opt in here because they benefit from direct
+    /// relation-level matching — the core of Cognee's triplet retrieval.
+    pub uses_triplets: bool,
 }
 
 // ---- StrategyRegistry ----
@@ -96,69 +108,79 @@ impl StrategyRegistry {
 ///
 /// # Mapping table
 ///
-/// | Strategy           | Back-ends                | Parallel | Context-augmented |
-/// |--------------------|--------------------------|----------|-------------------|
-/// | `Semantic`         | Vector                   | false    | true              |
-/// | `Keyword`          | Keyword                  | false    | false             |
-/// | `Hybrid`           | Vector + Keyword         | true     | true              |
-/// | `Graph`            | Graph                    | false    | true              |
-/// | `GraphHybrid`      | Vector + Keyword + Graph | true     | true              |
-/// | `RagCompletion`    | Graph                    | false    | false             |
-/// | `Summaries`        | Vector                   | false    | false             |
-/// | `Temporal`         | Vector                   | false    | false             |
-/// | `GraphCoT`         | Graph                    | false    | true              |
-/// | `GraphConstrained` | Graph + Vector           | true     | true              |
+/// | Strategy           | Back-ends                | Parallel | Context-augmented | Uses triplets |
+/// |--------------------|--------------------------|----------|-------------------|---------------|
+/// | `Semantic`         | Vector                   | false    | true              | false         |
+/// | `Keyword`          | Keyword                  | false    | false             | false         |
+/// | `Hybrid`           | Vector + Keyword         | true     | true              | false         |
+/// | `Graph`            | Graph                    | false    | true              | true          |
+/// | `GraphHybrid`      | Vector + Keyword + Graph | true     | true              | true          |
+/// | `RagCompletion`    | Graph                    | false    | false             | false         |
+/// | `Summaries`        | Vector                   | false    | false             | false         |
+/// | `Temporal`         | Vector                   | false    | false             | false         |
+/// | `GraphCoT`         | Graph                    | false    | true              | true          |
+/// | `GraphConstrained` | Graph + Vector           | true     | true              | true          |
 pub fn get_descriptor(strategy: RetrievalStrategy) -> StrategyDescriptor {
     match strategy {
         RetrievalStrategy::Semantic => StrategyDescriptor {
             search_types: vec![SearchType::Vector],
             parallel: false,
             context_augmented: true,
+            uses_triplets: false,
         },
         RetrievalStrategy::Keyword => StrategyDescriptor {
             search_types: vec![SearchType::Keyword],
             parallel: false,
             context_augmented: false,
+            uses_triplets: false,
         },
         RetrievalStrategy::Hybrid => StrategyDescriptor {
             search_types: vec![SearchType::Vector, SearchType::Keyword],
             parallel: true,
             context_augmented: true,
+            uses_triplets: false,
         },
         RetrievalStrategy::Graph => StrategyDescriptor {
             search_types: vec![SearchType::Graph],
             parallel: false,
             context_augmented: true,
+            uses_triplets: true,
         },
         RetrievalStrategy::GraphHybrid => StrategyDescriptor {
             search_types: vec![SearchType::Vector, SearchType::Keyword, SearchType::Graph],
             parallel: true,
             context_augmented: true,
+            uses_triplets: true,
         },
         RetrievalStrategy::RagCompletion => StrategyDescriptor {
             search_types: vec![SearchType::Graph],
             parallel: false,
             context_augmented: false,
+            uses_triplets: false,
         },
         RetrievalStrategy::Summaries => StrategyDescriptor {
             search_types: vec![SearchType::Vector],
             parallel: false,
             context_augmented: false,
+            uses_triplets: false,
         },
         RetrievalStrategy::Temporal => StrategyDescriptor {
             search_types: vec![SearchType::Vector],
             parallel: false,
             context_augmented: false,
+            uses_triplets: false,
         },
         RetrievalStrategy::GraphCoT => StrategyDescriptor {
             search_types: vec![SearchType::Graph],
             parallel: false,
             context_augmented: true,
+            uses_triplets: true,
         },
         RetrievalStrategy::GraphConstrained => StrategyDescriptor {
             search_types: vec![SearchType::Graph, SearchType::Vector],
             parallel: true,
             context_augmented: true,
+            uses_triplets: true,
         },
     }
 }

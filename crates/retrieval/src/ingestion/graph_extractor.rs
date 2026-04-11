@@ -150,6 +150,90 @@ impl KnowledgeGraph {
     }
 }
 
+/// A complete `(source) -[relation]-> (target)` triplet, linearised into a
+/// single vectorisable unit.
+///
+/// Triplets are the atomic retrieval unit used to replicate Cognee's
+/// [`brute_force_triplet_search`](https://github.com/topoteretes/cognee/blob/dev/cognee/modules/retrieval/utils/brute_force_triplet_search.py):
+/// instead of indexing only chunks, the ingestion pipeline also indexes each
+/// edge's source/edge/target triple as an embedded text, so the retriever can
+/// score whole relations against the query embedding rather than only chunk
+/// content.
+///
+/// The full [`Triplet`] — both its projected text and its provenance — is
+/// later stored as the Qdrant payload so the ranker can reassemble the
+/// concrete subject/predicate/object for downstream evidence fusion.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Triplet {
+    /// Deterministic UUID (v5 over `{source_id}|{relation}|{target_id}`).
+    ///
+    /// Used as the Qdrant point id so repeated ingestion of the same edge
+    /// produces an idempotent upsert.
+    pub id: String,
+
+    /// Source node ID as emitted by the LLM extractor (snake_case slug).
+    pub source_node_id: String,
+
+    /// Human-readable name of the source node as it appears in text.
+    pub source_node_name: String,
+
+    /// Sanitised relationship verb / predicate.
+    pub relationship_name: String,
+
+    /// Target node ID as emitted by the LLM extractor (snake_case slug).
+    pub target_node_id: String,
+
+    /// Human-readable name of the target node as it appears in text.
+    pub target_node_name: String,
+
+    /// Chunk ID that generated this triplet (provenance / de-dup key).
+    pub chunk_id: String,
+
+    /// Linearised text used for embedding:
+    /// `"{source_name} -> {relationship_name} -> {target_name}"`.
+    pub triplet_text: String,
+}
+
+impl Triplet {
+    /// Build a [`Triplet`] from the source + target names and the sanitised
+    /// relationship, deriving a deterministic UUID v5 id from the tuple.
+    ///
+    /// The `chunk_id` records the chunk this triplet was extracted from so
+    /// downstream evidence assembly can link back to the original text.
+    pub fn from_parts(
+        source_node_id: impl Into<String>,
+        source_node_name: impl Into<String>,
+        relationship_name: impl Into<String>,
+        target_node_id: impl Into<String>,
+        target_node_name: impl Into<String>,
+        chunk_id: impl Into<String>,
+    ) -> Self {
+        let source_node_id = source_node_id.into();
+        let source_node_name = source_node_name.into();
+        let relationship_name = relationship_name.into();
+        let target_node_id = target_node_id.into();
+        let target_node_name = target_node_name.into();
+        let chunk_id = chunk_id.into();
+
+        let key = format!("{source_node_id}|{relationship_name}|{target_node_id}");
+        let id = uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_OID, key.as_bytes()).to_string();
+
+        let triplet_text =
+            format!("{source_node_name} -> {relationship_name} -> {target_node_name}");
+
+        Self {
+            id,
+            source_node_id,
+            source_node_name,
+            relationship_name,
+            target_node_id,
+            target_node_name,
+            chunk_id,
+            triplet_text,
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // OpenAI wire types
 // ---------------------------------------------------------------------------
