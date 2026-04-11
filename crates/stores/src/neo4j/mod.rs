@@ -11,6 +11,7 @@ use agent_rs_core::{StoreError, config::Neo4jConfig};
 use async_trait::async_trait;
 use neo4rs::{Graph, query};
 use tracing::instrument;
+use uuid::Uuid;
 
 use crate::{
     traits::GraphStore,
@@ -203,6 +204,19 @@ impl GraphStore for Neo4jStore {
             .await
             .map_err(StoreError::from)?;
         Ok(())
+    }
+
+    /// Delete all nodes (and their edges) tagged with the given `ingest_run_id`.
+    ///
+    /// Delegates to the inherent `rollback_by_run_id` method on [`Neo4jStore`]
+    /// implemented in `structural.rs`, so that the [`GraphStore`] trait can be
+    /// used polymorphically for rollback without callers holding a concrete
+    /// `Neo4jStore` reference.
+    async fn rollback_by_run_id(&self, ingest_run_id: Uuid) -> Result<u64, StoreError> {
+        // Explicit UFCS to call the inherent method on Neo4jStore, avoiding
+        // recursion through the trait method of the same name.
+        // SAFETY: this is a plain async fn delegation — no unsafe code.
+        Neo4jStore::rollback_by_run_id(self, ingest_run_id).await
     }
 }
 

@@ -130,3 +130,7 @@ pdf-extract = "0.7"
 
 # Retry with backoff
 backon = "1"
+
+# Hashing — deterministic IDs and document integrity checks
+blake3 = "1"
+sha2 = "0.10"

@@ -88,6 +88,51 @@ pub struct SearchResult {
     pub payload: serde_json::Value,
 }
 
+// ---- Filter types ----
+
+/// Store-layer filter specification.
+///
+/// Abstracts over the concrete filter syntax of each backend
+/// (Qdrant payload filters, Neo4j WHERE clauses, SQL WHERE clauses)
+/// so that callers like [`crate::postgres::documents`] and the
+/// [`IngestCoordinator`] can express filters without depending on
+/// backend-specific types.
+///
+/// # Examples
+///
+/// ```rust,no_run
+/// use agent_rs_stores::types::FilterSpec;
+///
+/// // Delete all Qdrant points for a failed ingest run:
+/// let f = FilterSpec::eq("ingest_run_id", "some-uuid-string");
+/// ```
+#[derive(Debug, Clone)]
+pub enum FilterSpec {
+    /// Exact-match filter: the named payload field must equal the given string.
+    ///
+    /// Maps to a Qdrant `Condition::matches(field, value)` in the `must` list.
+    Eq { field: String, value: String },
+    /// All sub-filters must match (logical AND).
+    And(Vec<FilterSpec>),
+}
+
+impl FilterSpec {
+    /// Construct an exact-string-equality filter.
+    ///
+    /// # Example
+    ///
+    /// ```rust,no_run
+    /// use agent_rs_stores::types::FilterSpec;
+    /// let f = FilterSpec::eq("ingest_run_id", "abc-123");
+    /// ```
+    pub fn eq(field: impl Into<String>, value: impl Into<String>) -> Self {
+        Self::Eq {
+            field: field.into(),
+            value: value.into(),
+        }
+    }
+}
+
 // ---- Graph Store Types ----
 
 /// Validated node label -- only allows ASCII alphanumeric + underscore.

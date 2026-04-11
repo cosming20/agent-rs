@@ -261,6 +261,34 @@ impl PgStore {
         Ok(found)
     }
 
+    /// Fetch the `ingested_documents` row identified by `sha256`.
+    ///
+    /// Returns `None` if no row exists for the given sha256 (i.e., the document
+    /// was never ingested or was already deleted).
+    ///
+    /// Used by `IngestCoordinator::cleanup_partial` (W3) to fetch the
+    /// `ingest_run_id` needed to roll back Qdrant and Neo4j before deleting
+    /// the row itself.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::Postgres`] on any database error.
+    #[instrument(skip(self), fields(sha256 = %sha256))]
+    pub async fn get_ingested_document_by_sha256(
+        &self,
+        sha256: &str,
+    ) -> Result<Option<IngestedDocumentRow>, StoreError> {
+        let mut conn = self.conn().await?;
+
+        ingested_documents::table
+            .filter(ingested_documents::sha256.eq(sha256))
+            .select(IngestedDocumentRow::as_select())
+            .first(&mut conn)
+            .await
+            .optional()
+            .map_err(StoreError::from)
+    }
+
     /// Delete the `ingested_documents` row identified by `ingest_run_id`.
     ///
     /// Used by `IngestCoordinator::cleanup_partial` (W3) to fully purge a
