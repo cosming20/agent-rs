@@ -24,4 +24,4 @@ pub use graph_extractor::{
 };
 pub use metadata::{ChunkExtras, ChunkMetadata};
 pub use pipeline::{IngestionPipeline, IngestionPipelineConfig, IngestionResult};
-pub use summarizer::{ChunkSummary, ChunkSummarizer, DEFAULT_SUMMARIZER_CONCURRENCY};
+pub use summarizer::{ChunkSummarizer, ChunkSummary, DEFAULT_SUMMARIZER_CONCURRENCY};

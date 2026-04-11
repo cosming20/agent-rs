@@ -25,14 +25,20 @@ pub struct SparseVector {
 
 /// A point to upsert into the vector store.
 ///
-/// Supports both dense-only and dense+sparse (hybrid) ingestion.
-/// When `sparse_vector` is `Some`, the point carries both a dense
-/// embedding and a sparse BM25/BM42 vector for hybrid search.
+/// Supports dense-only and hybrid (dense + server-side BM25) ingestion.
+/// When `text` is non-empty, the Qdrant store uses server-side
+/// `qdrant/bm25` inference for the sparse named vector (`"sparse"`),
+/// eliminating the need for a local SPLADE/fastembed sparse model.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VectorPoint {
     pub id: String,
     pub embedding: Embedding,
-    pub sparse_vector: Option<SparseVector>,
+    /// Raw chunk text used for server-side BM25 inference.
+    ///
+    /// When non-empty, the store upserts a `Document { text, model: "qdrant/bm25" }`
+    /// as the sparse named vector so Qdrant handles tokenisation and weighting.
+    /// When empty, the sparse named vector is omitted (dense-only upsert).
+    pub text: String,
     pub payload: serde_json::Value,
 }
 

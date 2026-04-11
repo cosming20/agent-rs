@@ -459,40 +459,19 @@ async fn run_ingestion(
     .await;
     steps.push(trace);
 
-    // Step 3: Embed documents (sparse)
-    let (trace, sparse_vecs) = trace_step(
-        "embed_documents_sparse",
-        serde_json::json!({ "doc_count": docs.len() }),
-        || async {
-            let svs = embedder
-                .embed_sparse_batch(&texts)
-                .await
-                .map_err(|e| anyhow::anyhow!("sparse embedding: {e}"))?;
-            let avg_nnz: f64 =
-                svs.iter().map(|s| s.nnz() as f64).sum::<f64>() / svs.len().max(1) as f64;
-            let out = serde_json::json!({
-                "sparse_vectors_count": svs.len(),
-                "avg_nonzero_components": avg_nnz,
-            });
-            Ok((out, svs))
-        },
-    )
-    .await;
-    steps.push(trace);
+    // Step 3 (skipped): Sparse embeddings are now handled server-side by Qdrant
+    // via the `qdrant/bm25` model. Each VectorPoint carries raw text; no local
+    // SPLADE inference is needed.
 
     // Step 4: Upsert vectors
-    if let (Some(embs), Some(svs)) = (&embeddings, &sparse_vecs) {
+    if let Some(embs) = &embeddings {
         let points: Vec<VectorPoint> = docs
             .iter()
             .zip(embs.iter())
-            .zip(svs.iter())
-            .map(|((doc, emb), sv)| VectorPoint {
+            .map(|(doc, emb)| VectorPoint {
                 id: doc.id.clone(),
                 embedding: Embedding(emb.0.clone()),
-                sparse_vector: Some(agent_rs_stores::types::SparseVector {
-                    indices: sv.indices.clone(),
-                    values: sv.values.clone(),
-                }),
+                text: doc.content.clone(),
                 payload: serde_json::json!({
                     "title": doc.title,
                     "chunk_text": doc.content,

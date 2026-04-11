@@ -7,14 +7,18 @@
 //!
 //! # Functions
 //!
-//! - [`hybrid_search`] — vector + keyword in parallel (HYBRID strategy).
-//! - [`graph_hybrid_search`] — vector + keyword + graph in parallel
+//! - [`hybrid_search`] — vector + BM25 keyword in parallel (HYBRID strategy).
+//! - [`graph_hybrid_search`] — vector + BM25 keyword + graph in parallel
 //!   (GRAPH_HYBRID strategy).
+//!
+//! Server-side BM25 inference is used for the keyword leg: the raw query text
+//! is forwarded to Qdrant as `Document { model: "qdrant/bm25" }` so no local
+//! SPLADE model is required.
 
 use agent_rs_core::{CollectionName, Embedding};
 use agent_rs_stores::{
     traits::{GraphStore, VectorStore},
-    types::{SearchResult, SparseVector},
+    types::SearchResult,
 };
 use tracing::instrument;
 
@@ -42,7 +46,7 @@ pub struct HybridResults {
 
 // ---- hybrid_search ----
 
-/// Dispatch vector and keyword searches in parallel.
+/// Dispatch vector and BM25 keyword searches in parallel.
 ///
 /// Both searches target the same `collection`. Results are returned as
 /// an unfused [`HybridResults`] (graph_results is `None`).
@@ -51,35 +55,28 @@ pub struct HybridResults {
 ///
 /// - `vector_store` — the vector backend.
 /// - `collection` — the target collection (must have both dense and sparse
-///   named vectors for keyword search to be meaningful).
+///   named vectors; sparse must be configured with `Modifier::Idf`).
 /// - `query_embedding` — the dense query vector.
-/// - `sparse_query` — the sparse (BM42 / SPLADE) query vector.
+/// - `query_text` — the raw query string for server-side BM25 inference.
 /// - `limit` — maximum results per back-end.
 ///
 /// # Errors
 ///
 /// Returns the first [`RetrievalError`] encountered across either search arm.
-#[instrument(skip(vector_store, query_embedding, sparse_query), fields(
+#[instrument(skip(vector_store, query_embedding), fields(
     collection = %collection,
-    sparse_nnz = sparse_query.indices.len(),
     limit,
 ))]
 pub async fn hybrid_search(
     vector_store: &(dyn VectorStore + Send + Sync),
     collection: &CollectionName,
     query_embedding: &Embedding,
-    sparse_query: &SparseVector,
+    query_text: &str,
     limit: usize,
 ) -> Result<HybridResults, RetrievalError> {
     let (vector_result, keyword_result) = tokio::join!(
         vector_search(vector_store, collection, query_embedding, limit),
-        keyword_search(
-            vector_store,
-            collection,
-            query_embedding,
-            sparse_query,
-            limit
-        ),
+        keyword_search(vector_store, collection, query_embedding, query_text, limit),
     );
 
     Ok(HybridResults {
@@ -98,8 +95,8 @@ pub async fn hybrid_search(
 pub struct GraphHybridParams<'a> {
     /// Dense query vector for the vector search arm.
     pub query_embedding: &'a Embedding,
-    /// Sparse (BM42 / SPLADE) query vector for the keyword search arm.
-    pub sparse_query: &'a SparseVector,
+    /// Raw query string for the BM25 keyword search arm (server-side inference).
+    pub query_text: &'a str,
     /// Original query string forwarded to graph search for provenance metadata.
     pub query: &'a str,
     /// Starting node IDs for the graph traversal arm.
@@ -112,7 +109,7 @@ pub struct GraphHybridParams<'a> {
 
 // ---- graph_hybrid_search ----
 
-/// Dispatch vector, keyword, and graph searches in parallel.
+/// Dispatch vector, BM25 keyword, and graph searches in parallel.
 ///
 /// All three searches run concurrently. Vector and keyword searches target
 /// `collection`; graph search expands from `params.seed_node_ids`. Results are
@@ -152,7 +149,7 @@ pub async fn graph_hybrid_search(
             vector_store,
             collection,
             params.query_embedding,
-            params.sparse_query,
+            params.query_text,
             params.limit
         ),
         graph_search(
