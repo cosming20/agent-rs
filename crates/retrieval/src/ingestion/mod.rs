@@ -18,6 +18,7 @@ pub mod pipeline;
 pub use chunker::{ChunkStrategy, ChunkerConfig, DocumentChunk};
 pub use graph_extractor::{
     DEFAULT_BATCH_CONCURRENCY, ExtractedEdge, ExtractedNode, KnowledgeGraph, LlmGraphExtractor,
+    Triplet,
 };
 pub use metadata::{ChunkExtras, ChunkMetadata};
 pub use pipeline::{IngestionPipeline, IngestionPipelineConfig, IngestionResult};
