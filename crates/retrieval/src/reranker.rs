@@ -18,7 +18,7 @@
 //!
 //! # Model
 //!
-//! Uses `RerankerModel::BGERerankerBase` — a multilingual cross-encoder
+//! Uses `RerankerModel::BGERerankerV2M3` — a multilingual cross-encoder
 //! (approx. 278 M params) with strong cross-lingual transfer, making it
 //! appropriate for the multilingual retrieval workloads in agent-rs.
 //!
@@ -74,7 +74,7 @@ pub struct CrossEncoderReranker {
 impl std::fmt::Debug for CrossEncoderReranker {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("CrossEncoderReranker")
-            .field("model", &"TextRerank(BGERerankerBase)")
+            .field("model", &"TextRerank(BGERerankerV2M3)")
             .finish()
     }
 }
@@ -92,7 +92,7 @@ impl CrossEncoderReranker {
     #[instrument]
     pub async fn try_new() -> Result<Self, RetrievalError> {
         let model = tokio::task::spawn_blocking(|| {
-            let opts = RerankInitOptions::new(RerankerModel::BGERerankerBase)
+            let opts = RerankInitOptions::new(RerankerModel::BGERerankerV2M3)
                 .with_show_download_progress(false);
             TextRerank::try_new(opts).map_err(|e| RetrievalError::Embedding {
                 reason: format!("cross-encoder model init failed: {e}"),
@@ -103,7 +103,7 @@ impl CrossEncoderReranker {
             reason: format!("cross-encoder model init task panicked: {join_err}"),
         })??;
 
-        tracing::info!("CrossEncoderReranker initialised (BGERerankerBase)");
+        tracing::info!("CrossEncoderReranker initialised (BGERerankerV2M3)");
 
         Ok(Self {
             model: Arc::new(Mutex::new(model)),
