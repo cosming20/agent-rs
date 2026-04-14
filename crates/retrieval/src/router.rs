@@ -378,18 +378,16 @@ impl RetrievalRouter {
     ) -> Result<EvidencePack, RetrievalError> {
         let descriptor = get_descriptor(strategy);
 
-        // ---- Step 1: LLM query rewriting (optional) ----
+        // ---- Steps 1 + 1b + 2: PARALLEL pre-dispatch LLM calls ----
         //
-        // When a QueryRewriter is configured, decompose complex queries into
-        // 2-3 focused sub-queries. Simple queries pass through unchanged as a
-        // single-element sub-query list. On any failure the rewriter returns
-        // the original query verbatim (graceful fallback is internal to rewrite()).
-        // Short queries (< 12 words) are almost certainly single-hop and
-        // don't benefit from LLM decomposition. Skip the rewriter call to
-        // save ~300ms latency + avoid diluting retrieval with unnecessary
-        // sub-queries that hurt graph_hybrid (-6pp observed in testing).
+        // Query rewriting, entity linking, and metadata extraction are
+        // INDEPENDENT — none depends on the other's output. Running them
+        // in parallel via tokio::join! cuts ~900ms → ~300ms per query
+        // (latency = max of the three, not their sum).
         let word_count = query.split_whitespace().count();
-        let sub_queries: Vec<String> =
+
+        // Build futures for each optional LLM call.
+        let rewrite_fut = async {
             if let Some(rewriter) = self.query_rewriter.as_ref().filter(|_| word_count >= 12) {
                 let rewritten = rewriter.rewrite(query).await?;
                 tracing::debug!(
@@ -398,42 +396,36 @@ impl RetrievalRouter {
                     word_count,
                     "query rewriting complete"
                 );
-                rewritten
-                    .sub_queries
-                    .into_iter()
-                    .map(|sq| sq.text)
-                    .collect()
+                Ok::<Vec<String>, RetrievalError>(
+                    rewritten
+                        .sub_queries
+                        .into_iter()
+                        .map(|sq| sq.text)
+                        .collect(),
+                )
             } else {
                 if word_count < 12 && self.query_rewriter.is_some() {
                     tracing::debug!(word_count, "short query — skipping LLM decomposition");
                 }
-                let rewritten = self.rewrite_query(query, strategy);
-                vec![rewritten]
-            };
-
-        // ---- Step 1b: Entity → KG linking (optional, spec B3) ----
-        //
-        // Check if entities mentioned in the query exist as Neo4j nodes.
-        // When linked entities are found, log the hint for diagnostics.
-        // Future: use this to automatically switch to graph-first strategies.
-        if let Some(linker) = self.entity_linker.as_ref() {
-            let link_result = linker.link(query).await;
-            if link_result.prefer_graph {
-                tracing::info!(
-                    linked = link_result.linked_count,
-                    entities = ?link_result.entities.iter().filter(|e| e.is_linked).map(|e| &e.mention).collect::<Vec<_>>(),
-                    "entity linker suggests graph-first strategy"
-                );
+                Ok(vec![self.rewrite_query(query, strategy)])
             }
-            // TODO: use link_result.prefer_graph to auto-switch strategy
-            // (strategy cascade — spec B2, future implementation).
-        }
+        };
 
-        // ---- Step 2: Metadata filter extraction (optional) ----
-        //
-        // Extract structural hints from the *original* query (not sub-queries).
-        // Convert hints to Qdrant filter JSON for use in vector/hybrid searches.
-        let qdrant_filter_json: Option<serde_json::Value> =
+        let entity_link_fut = async {
+            if let Some(linker) = self.entity_linker.as_ref() {
+                let link_result = linker.link(query).await;
+                if link_result.prefer_graph {
+                    tracing::info!(
+                        linked = link_result.linked_count,
+                        entities = ?link_result.entities.iter().filter(|e| e.is_linked).map(|e| &e.mention).collect::<Vec<_>>(),
+                        "entity linker suggests graph-first strategy"
+                    );
+                }
+                // TODO: use link_result.prefer_graph to auto-switch strategy
+            }
+        };
+
+        let metadata_filter_fut = async {
             if let Some(extractor) = self.metadata_filter.as_ref() {
                 let hints = extractor.extract(query).await;
                 if let Some(conditions) = MetadataFilterExtractor::to_qdrant_filter(&hints) {
@@ -441,13 +433,16 @@ impl RetrievalRouter {
                         num_conditions = conditions.len(),
                         "metadata filter conditions will be applied to search"
                     );
-                    Some(filter_conditions_to_json(&conditions))
-                } else {
-                    None
+                    return Some(filter_conditions_to_json(&conditions));
                 }
-            } else {
-                None
-            };
+            }
+            None
+        };
+
+        // Run all three in parallel.
+        let (sub_queries_result, _entity_link, qdrant_filter_json) =
+            tokio::join!(rewrite_fut, entity_link_fut, metadata_filter_fut);
+        let sub_queries = sub_queries_result?;
 
         // ---- Step 3–4: Embed + dispatch per sub-query ----
         //
@@ -694,15 +689,16 @@ impl RetrievalRouter {
     ) -> Result<Vec<Vec<agent_rs_stores::types::SearchResult>>, RetrievalError> {
         match strategy {
             // ---- Single-backend: dense vector ----
+            //
+            // Semantic search relies PURELY on vector similarity — metadata
+            // payload filters are intentionally NOT applied here. Tokenized
+            // text matching on payload fields (like section_title) is a keyword
+            // operation that reduces recall without semantic justification.
+            // The metadata filter is applied to Hybrid/GraphHybrid where
+            // keyword and structural signals complement vector similarity.
             RetrievalStrategy::Semantic => {
-                let results = if let Some(f) = filter {
-                    self.vector_store
-                        .search_with_filter(&self.collection, dense, limit, Some(f.clone()))
-                        .await
-                        .map_err(RetrievalError::Store)?
-                } else {
-                    vector_search(&*self.vector_store, &self.collection, dense, limit).await?
-                };
+                let results =
+                    vector_search(&*self.vector_store, &self.collection, dense, limit).await?;
                 Ok(vec![results])
             }
 
