@@ -865,9 +865,20 @@ impl IngestionPipeline {
             format!("{:x}", hasher.finalize())
         };
 
-        // ---- Step 2: Dedup via Postgres ----
+        // ---- Precondition: PgStore required for Docling path ----
         //
-        // When no PgStore is configured, skip the state machine entirely.
+        // Without PgStore, orphan ingest_run_id tags accumulate in Qdrant/Neo4j
+        // with no way to clean them up, and the dedup / partial-failure state
+        // machine is silently skipped.
+        if self.pg_store.is_none() {
+            return Err(RetrievalError::Ingestion {
+                reason: "Docling ingest path requires PgStore for state machine — \
+                         wire with_pg_store() on IngestionPipelineConfig"
+                    .to_owned(),
+            });
+        }
+
+        // ---- Step 2: Dedup via Postgres ----
         let maybe_run_id: Option<Uuid> = if let Some(pg) = &self.pg_store {
             let now = Utc::now().naive_utc();
             let new_doc = NewIngestedDocument {
@@ -983,7 +994,9 @@ impl IngestionPipeline {
                 docling_response.chunks.len()
             );
             if let Some(pg) = &self.pg_store {
-                let _ = pg.mark_partial_failure(ingest_run_id, &reason).await;
+                if let Err(pg_err) = pg.mark_partial_failure(ingest_run_id, &reason).await {
+                    tracing::warn!(error = %pg_err, %ingest_run_id, "mark_partial_failure failed — row may be stuck in_progress");
+                }
             }
             return Err(RetrievalError::Ingestion { reason });
         }
@@ -1034,7 +1047,9 @@ impl IngestionPipeline {
                 {
                     let reason = e.to_string();
                     if let Some(pg) = &self.pg_store {
-                        let _ = pg.mark_partial_failure(ingest_run_id, &reason).await;
+                        if let Err(pg_err) = pg.mark_partial_failure(ingest_run_id, &reason).await {
+                            tracing::warn!(error = %pg_err, %ingest_run_id, "mark_partial_failure failed — row may be stuck in_progress");
+                        }
                     }
                     return Err(RetrievalError::Store(e));
                 }
@@ -1043,7 +1058,9 @@ impl IngestionPipeline {
             Err(e) => {
                 let reason = e.to_string();
                 if let Some(pg) = &self.pg_store {
-                    let _ = pg.mark_partial_failure(ingest_run_id, &reason).await;
+                    if let Err(pg_err) = pg.mark_partial_failure(ingest_run_id, &reason).await {
+                        tracing::warn!(error = %pg_err, %ingest_run_id, "mark_partial_failure failed — row may be stuck in_progress");
+                    }
                 }
                 return Err(RetrievalError::Store(e));
             }
@@ -1057,7 +1074,9 @@ impl IngestionPipeline {
         {
             let reason = e.to_string();
             if let Some(pg) = &self.pg_store {
-                let _ = pg.mark_partial_failure(ingest_run_id, &reason).await;
+                if let Err(pg_err) = pg.mark_partial_failure(ingest_run_id, &reason).await {
+                    tracing::warn!(error = %pg_err, %ingest_run_id, "mark_partial_failure failed — row may be stuck in_progress");
+                }
             }
             return Err(RetrievalError::Store(e));
         }
@@ -1134,6 +1153,8 @@ impl IngestionPipeline {
 
         if let Err(e) = graph_result {
             let reason = e.to_string();
+            // Rollback: Qdrant has data from step 4, Neo4j may have partial entity data.
+            self.try_rollback_stores(doc_id, ingest_run_id).await;
             if let Some(pg) = &self.pg_store {
                 if let Err(me) = pg.mark_partial_failure(ingest_run_id, &reason).await {
                     tracing::warn!(?me, ingest_run_id = %ingest_run_id, "failed to mark partial failure");
@@ -1188,6 +1209,8 @@ impl IngestionPipeline {
 
         if let Err(e) = structural_result {
             let reason = e.to_string();
+            // Rollback: Qdrant has step 4 data + Neo4j has entity data from step 5.
+            self.try_rollback_stores(doc_id, ingest_run_id).await;
             if let Some(pg) = &self.pg_store {
                 if let Err(me) = pg.mark_partial_failure(ingest_run_id, &reason).await {
                     tracing::warn!(?me, ingest_run_id = %ingest_run_id, "failed to mark partial failure");
@@ -1203,7 +1226,9 @@ impl IngestionPipeline {
             Err(e) => {
                 let reason = e.to_string();
                 if let Some(pg) = &self.pg_store {
-                    let _ = pg.mark_partial_failure(ingest_run_id, &reason).await;
+                    if let Err(pg_err) = pg.mark_partial_failure(ingest_run_id, &reason).await {
+                        tracing::warn!(error = %pg_err, %ingest_run_id, "mark_partial_failure failed — row may be stuck in_progress");
+                    }
                 }
                 return Err(e);
             }
@@ -1218,7 +1243,9 @@ impl IngestionPipeline {
             Err(e) => {
                 let reason = e.to_string();
                 if let Some(pg) = &self.pg_store {
-                    let _ = pg.mark_partial_failure(ingest_run_id, &reason).await;
+                    if let Err(pg_err) = pg.mark_partial_failure(ingest_run_id, &reason).await {
+                        tracing::warn!(error = %pg_err, %ingest_run_id, "mark_partial_failure failed — row may be stuck in_progress");
+                    }
                 }
                 return Err(e);
             }
@@ -1352,6 +1379,40 @@ impl IngestionPipeline {
                      --features legacy_pdf_extract to use the pdf-extract backend"
                 .to_owned(),
         })
+    }
+
+    /// Best-effort rollback of Qdrant + Neo4j data tagged with `ingest_run_id`.
+    ///
+    /// Called in failure paths after Qdrant/Neo4j writes have occurred.  Logs
+    /// warnings on individual rollback failures but never propagates errors —
+    /// the caller's original error takes priority.
+    async fn try_rollback_stores(&self, doc_id: &str, ingest_run_id: Uuid) {
+        let run_id_str = ingest_run_id.to_string();
+
+        // Qdrant: delete points by ingest_run_id payload filter.
+        let filter = agent_rs_stores::types::FilterSpec::eq("ingest_run_id", &run_id_str);
+        match self
+            .vector_store
+            .delete_by_filter(&self.collection, filter)
+            .await
+        {
+            Ok(n) => {
+                tracing::info!(doc_id, %ingest_run_id, qdrant_deleted = n, "rollback: Qdrant points deleted")
+            }
+            Err(e) => {
+                tracing::warn!(doc_id, %ingest_run_id, error = %e, "rollback: Qdrant delete_by_filter failed")
+            }
+        }
+
+        // Neo4j: delete structural + entity nodes by ingest_run_id.
+        match self.graph_store.rollback_by_run_id(ingest_run_id).await {
+            Ok(n) => {
+                tracing::info!(doc_id, %ingest_run_id, neo4j_deleted = n, "rollback: Neo4j nodes deleted")
+            }
+            Err(e) => {
+                tracing::warn!(doc_id, %ingest_run_id, error = %e, "rollback: Neo4j rollback_by_run_id failed")
+            }
+        }
     }
 }
 

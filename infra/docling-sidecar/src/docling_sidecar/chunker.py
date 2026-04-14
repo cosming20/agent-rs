@@ -200,7 +200,13 @@ class ChunkerPool:
         # better embedding quality.
         try:
             embed_text: str = self._chunker.contextualize(chunk)
-        except Exception:
+        except Exception as ctx_exc:
+            # W7 fix #9: log when contextualize() fails — silent fallback to
+            # raw_text means embed_text loses heading hierarchy context, which
+            # degrades retrieval quality silently.
+            logger.warning(
+                "contextualize() failed, using raw_text: %s", ctx_exc
+            )
             embed_text = raw_text
 
         # Heading path

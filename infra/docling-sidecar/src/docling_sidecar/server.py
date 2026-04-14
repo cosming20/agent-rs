@@ -222,11 +222,13 @@ class DoclingChunkerServicer(chunker_pb2_grpc.DoclingChunkerServicer):
             )
             return
         finally:
-            # Always clean up temp file
+            # Always clean up temp file (W7 fix #8: log on failure, not silent).
             try:
                 tmp_path.unlink(missing_ok=True)
-            except Exception:
-                pass
+            except OSError as cleanup_exc:
+                logger.warning(
+                    "Failed to unlink temp file %s: %s", tmp_path, cleanup_exc
+                )
 
         parse_latency_ms = (time.monotonic_ns() - parse_start_ns) // 1_000_000
 

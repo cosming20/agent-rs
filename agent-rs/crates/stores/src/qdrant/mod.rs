@@ -310,9 +310,22 @@ impl VectorStore for QdrantStore {
     ) -> Result<u64, StoreError> {
         let qdrant_filter = filter_spec_to_qdrant(filter)?;
 
-        // Pass the Filter directly — qdrant-client implements
-        // `From<Filter> for PointsSelectorOneOf`, so this satisfies the
-        // `Into<PointsSelectorOneOf>` bound on `DeletePointsBuilder::points`.
+        // Pre-count: Qdrant's delete API does not return the number of
+        // deleted points, so we count matching points BEFORE deletion.
+        // This is a race-free approximation (no concurrent deletes expected
+        // for a specific ingest_run_id).
+        let count = self
+            .client
+            .count(
+                qdrant_client::qdrant::CountPointsBuilder::new(collection.as_str())
+                    .filter(qdrant_filter.clone())
+                    .exact(true),
+            )
+            .await
+            .map(|r| r.result.map(|c| c.count).unwrap_or(0))
+            .unwrap_or(0);
+
+        // Delete all matching points.
         self.client
             .delete_points(
                 DeletePointsBuilder::new(collection.as_str())
@@ -322,15 +335,12 @@ impl VectorStore for QdrantStore {
             .await
             .map_err(StoreError::from)?;
 
-        // The Qdrant delete API returns an UpdateResult (operation_id + status)
-        // but does NOT return the number of deleted points.  We return 0 as a
-        // sentinel; callers that need an exact count should issue a count query
-        // before deletion.
-        tracing::debug!(
+        tracing::info!(
             collection = %collection,
-            "delete_by_filter complete (exact count not available from Qdrant API)"
+            deleted = count,
+            "delete_by_filter complete"
         );
-        Ok(0)
+        Ok(count)
     }
 
     /// Check whether a Qdrant collection exists.
