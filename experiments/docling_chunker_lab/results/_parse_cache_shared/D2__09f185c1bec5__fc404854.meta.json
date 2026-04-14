@@ -1,0 +1,11 @@
+{
+  "cache_version": "1",
+  "doc_id": "D2",
+  "source_path": "/Users/cosmingagea/workspace/agentic-rag/agent-rs/experiments/docling_chunker_lab/fixtures/D2_apd2_websocket.pdf",
+  "source_sha256": "09f185c1bec566279e27acfb79cd5bdc34fdca7d32834afaf1e00c4c9509082f",
+  "pipeline_digest": "fc404854310b8f790a0bf1b0eb533bfd8bddcf5a6ce9feb42a9578c6c2583e44",
+  "docling_version": "2.86.0",
+  "docling_core_version": "2.73.0",
+  "parse_latency_ms": 9501,
+  "markdown_len": 16208
+}

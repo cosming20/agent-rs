@@ -546,21 +546,21 @@ impl Neo4jStore {
         let run_id_str = ingest_run_id.to_string();
 
         // E2: always pass ingest_run_id as String, never as Uuid directly.
-        let mut result = self
+        //
+        // Two-step approach: count first, then delete.  The prior single-query
+        // `WITH n, count(n) AS total DETACH DELETE n RETURN total` grouped
+        // per-row and always returned 1 or 0, regardless of how many nodes
+        // were actually deleted (W7 finding #5).
+        let mut count_result = self
             .graph
             .execute(
-                query(
-                    "MATCH (n {ingest_run_id: $run_id}) \
-                     WITH n, count(n) AS total \
-                     DETACH DELETE n \
-                     RETURN total",
-                )
-                .param("run_id", run_id_str.clone()),
+                query("MATCH (n {ingest_run_id: $run_id}) RETURN count(n) AS total")
+                    .param("run_id", run_id_str.clone()),
             )
             .await
             .map_err(StoreError::from)?;
 
-        let deleted: u64 = match result.next().await.map_err(StoreError::from)? {
+        let deleted: u64 = match count_result.next().await.map_err(StoreError::from)? {
             Some(row) => {
                 let n: i64 = row.get("total").map_err(|e| {
                     StoreError::QueryFailed(format!("rollback count deserialize: {e}"))
@@ -569,6 +569,17 @@ impl Neo4jStore {
             }
             None => 0,
         };
+
+        // Now actually delete.
+        if deleted > 0 {
+            self.graph
+                .run(
+                    query("MATCH (n {ingest_run_id: $run_id}) DETACH DELETE n")
+                        .param("run_id", run_id_str.clone()),
+                )
+                .await
+                .map_err(StoreError::from)?;
+        }
 
         tracing::info!(run_id = %run_id_str, deleted_nodes = deleted, "rollback complete");
         Ok(deleted)

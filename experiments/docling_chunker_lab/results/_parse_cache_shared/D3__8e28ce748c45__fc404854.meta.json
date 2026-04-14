@@ -1,0 +1,11 @@
+{
+  "cache_version": "1",
+  "doc_id": "D3",
+  "source_path": "/Users/cosmingagea/workspace/agentic-rag/agent-rs/experiments/docling_chunker_lab/fixtures/D3_lucrarea4_so.pdf",
+  "source_sha256": "8e28ce748c455ced1ec5ca0c1c94d8438d0d98732cecfde30af002a4bb04dc28",
+  "pipeline_digest": "fc404854310b8f790a0bf1b0eb533bfd8bddcf5a6ce9feb42a9578c6c2583e44",
+  "docling_version": "2.86.0",
+  "docling_core_version": "2.73.0",
+  "parse_latency_ms": 3629,
+  "markdown_len": 8265
+}

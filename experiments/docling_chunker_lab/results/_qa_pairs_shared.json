@@ -1,0 +1,952 @@
+[
+  {
+    "qa_id": "D1_w0_q00",
+    "doc_id": "D1",
+    "window_index": 0,
+    "question": "Când a fost publicat Codul penal menționat în notă?",
+    "answer_span": "24 iulie 2009",
+    "normalized_span": "24 iulie 2009",
+    "question_type": "factoid",
+    "difficulty": "easy"
+  },
+  {
+    "qa_id": "D1_w0_q01",
+    "doc_id": "D1",
+    "window_index": 0,
+    "question": "Care este numărul legii Codului penal din titlu?",
+    "answer_span": "nr. 286/2009",
+    "normalized_span": "nr. 286/2009",
+    "question_type": "lookup",
+    "difficulty": "easy"
+  },
+  {
+    "qa_id": "D1_w0_q02",
+    "doc_id": "D1",
+    "window_index": 0,
+    "question": "Ce articol prevede legalitatea incriminării?",
+    "answer_span": "Articolul 1",
+    "normalized_span": "articolul 1",
+    "question_type": "lookup",
+    "difficulty": "medium"
+  },
+  {
+    "qa_id": "D1_w0_q03",
+    "doc_id": "D1",
+    "window_index": 0,
+    "question": "Care este intervalul de închisoare prevăzut la art. 60?",
+    "answer_span": "între 15 zile și 30 de ani",
+    "normalized_span": "intre 15 zile si 30 de ani",
+    "question_type": "factoid",
+    "difficulty": "medium"
+  },
+  {
+    "qa_id": "D1_w0_q04",
+    "doc_id": "D1",
+    "window_index": 0,
+    "question": "Ce formulare apare la art. 15 alin. (2) despre temeiul răspunderii penale?",
+    "answer_span": "Infracțiunea este singurul temei al răspunderii penale.",
+    "normalized_span": "infractiunea este singurul temei al raspunderii penale.",
+    "question_type": "exact_match",
+    "difficulty": "hard"
+  },
+  {
+    "qa_id": "D1_w1_q00",
+    "doc_id": "D1",
+    "window_index": 1,
+    "question": "Ce se întâmplă dacă, pe parcursul termenului de supraveghere, se descoperă că persoana condamnată mai săvârșise o infracțiune până la acordarea liberării?",
+    "answer_span": "liberarea se anulează",
+    "normalized_span": "liberarea se anuleaza",
+    "question_type": "factoid",
+    "difficulty": "easy"
+  },
+  {
+    "qa_id": "D1_w1_q01",
+    "doc_id": "D1",
+    "window_index": 1,
+    "question": "Care este termenul de supraveghere calculat de la data acordării primei liberări?",
+    "answer_span": "termenul de supraveghere",
+    "normalized_span": "termenul de supraveghere",
+    "question_type": "lookup",
+    "difficulty": "easy"
+  },
+  {
+    "qa_id": "D1_w1_q02",
+    "doc_id": "D1",
+    "window_index": 1,
+    "question": "Care este scopul măsurilor de siguranță?",
+    "answer_span": "înlăturarea unei stări de pericol și preîntâmpinarea săvârșirii faptelor prevăzute de legea penală",
+    "normalized_span": "inlaturarea unei stari de pericol si preintampinarea savarsirii faptelor prevazute de legea penala",
+    "question_type": "exact_match",
+    "difficulty": "medium"
+  },
+  {
+    "qa_id": "D1_w1_q03",
+    "doc_id": "D1",
+    "window_index": 1,
+    "question": "Câte categorii de măsuri de siguranță sunt enumerate la articolul 108?",
+    "answer_span": "a) obligarea la tratament medical; b) internarea medicală; c) interzicerea ocupării unei funcții sau a exercitării unei profesii; d) confiscarea specială. e) confiscarea extinsă.",
+    "normalized_span": "a) obligarea la tratament medical; b) internarea medicala; c) interzicerea ocuparii unei functii sau a exercitarii unei profesii; d) confiscarea speciala. e) confiscarea extinsa.",
+    "question_type": "factoid",
+    "difficulty": "medium"
+  },
+  {
+    "qa_id": "D1_w1_q04",
+    "doc_id": "D1",
+    "window_index": 1,
+    "question": "Care este pedeapsa pentru omorul calificat?",
+    "answer_span": "detențiune pe viață sau închisoare de la 15 la 25 de ani",
+    "normalized_span": "detentiune pe viata sau inchisoare de la 15 la 25 de ani",
+    "question_type": "lookup",
+    "difficulty": "hard"
+  },
+  {
+    "qa_id": "D1_w2_q00",
+    "doc_id": "D1",
+    "window_index": 2,
+    "question": "Ce se pedepsește cu închisoarea de la 6 la 12 ani și interzicerea exercitării unor drepturi dacă faptele sunt comise în anumite împrejurări?",
+    "answer_span": "Pedeapsa este închisoarea de la 6 la 12 ani și interzicerea exercitării unor drepturi",
+    "normalized_span": "pedeapsa este inchisoarea de la 6 la 12 ani si interzicerea exercitarii unor drepturi",
+    "question_type": "factoid",
+    "difficulty": "easy"
+  },
+  {
+    "qa_id": "D1_w2_q01",
+    "doc_id": "D1",
+    "window_index": 2,
+    "question": "Care este pedeapsa pentru fapta majorului care determină comiterea oricărui act de natură sexuală, altul decât cele prevăzute la alin. (1), între minori care nu au împlinit vârsta de 16 ani?",
+    "answer_span": "cu închisoarea de la 2 la 7 ani",
+    "normalized_span": "cu inchisoarea de la 2 la 7 ani",
+    "question_type": "factoid",
+    "difficulty": "easy"
+  },
+  {
+    "qa_id": "D1_w2_q02",
+    "doc_id": "D1",
+    "window_index": 2,
+    "question": "În ce articol este reglementată racolarea minorilor în scopuri sexuale?",
+    "answer_span": "Articolul 222",
+    "normalized_span": "articolul 222",
+    "question_type": "lookup",
+    "difficulty": "medium"
+  },
+  {
+    "qa_id": "D1_w2_q03",
+    "doc_id": "D1",
+    "window_index": 2,
+    "question": "Care este formularea exactă a condiției pentru care faptele prevăzute la alin. (1) și (1^1) nu se sancționează?",
+    "answer_span": "dacă diferența de vârstă între făptuitor și victimă nu depășește 5 ani",
+    "normalized_span": "daca diferenta de varsta intre faptuitor si victima nu depaseste 5 ani",
+    "question_type": "exact_match",
+    "difficulty": "medium"
+  },
+  {
+    "qa_id": "D1_w2_q04",
+    "doc_id": "D1",
+    "window_index": 2,
+    "question": "Ce se pedepsește cu închisoarea de la 3 luni la 2 ani sau cu amendă, dacă fapta este săvârșită de custode?",
+    "answer_span": "Sustragerea unui bun care este legal sechestrat",
+    "normalized_span": "sustragerea unui bun care este legal sechestrat",
+    "question_type": "factoid",
+    "difficulty": "hard"
+  },
+  {
+    "qa_id": "D1_w3_q00",
+    "doc_id": "D1",
+    "window_index": 3,
+    "question": "Care este pedeapsa pentru falsificarea de monedă cu valoare circulatorie?",
+    "answer_span": "închisoarea de la 3 la 10 ani și interzicerea exercitării unor drepturi",
+    "normalized_span": "inchisoarea de la 3 la 10 ani si interzicerea exercitarii unor drepturi",
+    "question_type": "factoid",
+    "difficulty": "easy"
+  },
+  {
+    "qa_id": "D1_w3_q01",
+    "doc_id": "D1",
+    "window_index": 3,
+    "question": "Ce articol incriminează falsul informatic?",
+    "answer_span": "Articolul 325",
+    "normalized_span": "articolul 325",
+    "question_type": "lookup",
+    "difficulty": "easy"
+  },
+  {
+    "qa_id": "D1_w3_q02",
+    "doc_id": "D1",
+    "window_index": 3,
+    "question": "Ce formulare apare pentru fapta de a introduce, modifica sau șterge date informatice fără drept?",
+    "answer_span": "Fapta de a introduce, modifica sau șterge, fără drept, date informatice",
+    "normalized_span": "fapta de a introduce, modifica sau sterge, fara drept, date informatice",
+    "question_type": "exact_match",
+    "difficulty": "medium"
+  },
+  {
+    "qa_id": "D1_w3_q03",
+    "doc_id": "D1",
+    "window_index": 3,
+    "question": "Care este pedeapsa pentru conducerea pe drumurile publice a unui vehicul fără permis de conducere?",
+    "answer_span": "închisoare de la unu la 5 ani",
+    "normalized_span": "inchisoare de la unu la 5 ani",
+    "question_type": "factoid",
+    "difficulty": "medium"
+  },
+  {
+    "qa_id": "D1_w3_q04",
+    "doc_id": "D1",
+    "window_index": 3,
+    "question": "Ce condiție trebuie să îndeplinească persoana pentru ca încredințarea unui vehicul să fie sancționată potrivit art. 335 alin. (3)?",
+    "answer_span": "despre care știe că se află în una dintre situațiile prevăzute în alin. (1) sau alin. (2) sau sub influența alcoolului ori a unor substanțe psihoactive",
+    "normalized_span": "despre care stie ca se afla in una dintre situatiile prevazute in alin. (1) sau alin. (2) sau sub influenta alcoolului ori a unor substante psihoactive",
+    "question_type": "exact_match",
+    "difficulty": "hard"
+  },
+  {
+    "qa_id": "D2_w0_q00",
+    "doc_id": "D2",
+    "window_index": 0,
+    "question": "Ce tehnologie web standard simplifică comunicarea şi managementul conexiunii dintre client şi server?",
+    "answer_span": "protocolul WebSocket",
+    "normalized_span": "protocolul websocket",
+    "question_type": "factoid",
+    "difficulty": "easy"
+  },
+  {
+    "qa_id": "D2_w0_q01",
+    "doc_id": "D2",
+    "window_index": 0,
+    "question": "Prin ce antet îşi exprimă clientul dorinţa de a trece de la protocolul HTTP la protocolul WebSocket?",
+    "answer_span": "antetul Upgrade",
+    "normalized_span": "antetul upgrade",
+    "question_type": "lookup",
+    "difficulty": "easy"
+  },
+  {
+    "qa_id": "D2_w0_q02",
+    "doc_id": "D2",
+    "window_index": 0,
+    "question": "Cum este numit comutatorul protocolului de la HTTP la WebSockets?",
+    "answer_span": "WebSocket handshake",
+    "normalized_span": "websocket handshake",
+    "question_type": "exact_match",
+    "difficulty": "medium"
+  },
+  {
+    "qa_id": "D2_w0_q03",
+    "doc_id": "D2",
+    "window_index": 0,
+    "question": "Pe ce tip de conexiune este bazat protocolul WebSocket?",
+    "answer_span": "bazat pe conexiune TCP/IP",
+    "normalized_span": "bazat pe conexiune tcp/ip",
+    "question_type": "factoid",
+    "difficulty": "medium"
+  },
+  {
+    "qa_id": "D2_w0_q04",
+    "doc_id": "D2",
+    "window_index": 0,
+    "question": "Ce permite comunicarea bidirecţională simultană între client şi server?",
+    "answer_span": "full-duplex",
+    "normalized_span": "full-duplex",
+    "question_type": "factoid",
+    "difficulty": "hard"
+  },
+  {
+    "qa_id": "D2_w1_q00",
+    "doc_id": "D2",
+    "window_index": 1,
+    "question": "Ce server se alege în pasul trei?",
+    "answer_span": "GlassFish Server 4.1.1.",
+    "normalized_span": "glassfish server 4.1.1.",
+    "question_type": "factoid",
+    "difficulty": "easy"
+  },
+  {
+    "qa_id": "D2_w1_q01",
+    "doc_id": "D2",
+    "window_index": 1,
+    "question": "În ce câmp se scrie WebsocketHome?",
+    "answer_span": "context  path",
+    "normalized_span": "context path",
+    "question_type": "lookup",
+    "difficulty": "easy"
+  },
+  {
+    "qa_id": "D2_w1_q02",
+    "doc_id": "D2",
+    "window_index": 1,
+    "question": "Care este numele modelului creat într-o clasă Java nouă?",
+    "answer_span": "Device",
+    "normalized_span": "device",
+    "question_type": "factoid",
+    "difficulty": "medium"
+  },
+  {
+    "qa_id": "D2_w1_q03",
+    "doc_id": "D2",
+    "window_index": 1,
+    "question": "În ce package se plasează clasa DeviceWebSocketServer?",
+    "answer_span": "org.example.websocket",
+    "normalized_span": "org.example.websocket",
+    "question_type": "lookup",
+    "difficulty": "medium"
+  },
+  {
+    "qa_id": "D2_w1_q04",
+    "doc_id": "D2",
+    "window_index": 1,
+    "question": "Ce opțiune se alege pentru a testa funcţionarea proiectului şi a serverului Web GlassFish?",
+    "answer_span": "Run",
+    "normalized_span": "run",
+    "question_type": "exact_match",
+    "difficulty": "hard"
+  },
+  {
+    "qa_id": "D2_w2_q00",
+    "doc_id": "D2",
+    "window_index": 2,
+    "question": "Ce metodă trimite mesajul către toate sesiunile conectate?",
+    "answer_span": "sendToAllConnectedSessions",
+    "normalized_span": "sendtoallconnectedsessions",
+    "question_type": "factoid",
+    "difficulty": "easy"
+  },
+  {
+    "qa_id": "D2_w2_q01",
+    "doc_id": "D2",
+    "window_index": 2,
+    "question": "Care este valoarea adăugată la câmpul \"action\" în mesajul de actualizare?",
+    "answer_span": "\"toggle\"",
+    "normalized_span": "\"toggle\"",
+    "question_type": "lookup",
+    "difficulty": "easy"
+  },
+  {
+    "qa_id": "D2_w2_q02",
+    "doc_id": "D2",
+    "window_index": 2,
+    "question": "Ce metodă returnează dispozitivul găsit după id?",
+    "answer_span": "private Device getDeviceById(int id)",
+    "normalized_span": "private device getdevicebyid(int id)",
+    "question_type": "factoid",
+    "difficulty": "medium"
+  },
+  {
+    "qa_id": "D2_w2_q03",
+    "doc_id": "D2",
+    "window_index": 2,
+    "question": "Ce titlu apare în pagina HTML?",
+    "answer_span": "Java Websocket Home",
+    "normalized_span": "java websocket home",
+    "question_type": "exact_match",
+    "difficulty": "medium"
+  },
+  {
+    "qa_id": "D2_w2_q04",
+    "doc_id": "D2",
+    "window_index": 2,
+    "question": "Care este culoarea de fundal pentru body în style.css?",
+    "answer_span": "#1f1f1f",
+    "normalized_span": "#1f1f1f",
+    "question_type": "lookup",
+    "difficulty": "hard"
+  },
+  {
+    "qa_id": "D2_w3_q00",
+    "doc_id": "D2",
+    "window_index": 3,
+    "question": "Ce fișier se va crea în continuare?",
+    "answer_span": "fişierul websocket.js",
+    "normalized_span": "fisierul websocket.js",
+    "question_type": "factoid",
+    "difficulty": "easy"
+  },
+  {
+    "qa_id": "D2_w3_q01",
+    "doc_id": "D2",
+    "window_index": 3,
+    "question": "Ce conține websocket.js?",
+    "answer_span": "implementarea client ( Client Endpoint ) folosind JavaScript",
+    "normalized_span": "implementarea client ( client endpoint ) folosind javascript",
+    "question_type": "factoid",
+    "difficulty": "easy"
+  },
+  {
+    "qa_id": "D2_w3_q02",
+    "doc_id": "D2",
+    "window_index": 3,
+    "question": "Care este adresa WebSocket folosită în cod?",
+    "answer_span": "ws://localhost:8080/WebsocketHome/actions",
+    "normalized_span": "ws://localhost:8080/websockethome/actions",
+    "question_type": "lookup",
+    "difficulty": "medium"
+  },
+  {
+    "qa_id": "D2_w3_q03",
+    "doc_id": "D2",
+    "window_index": 3,
+    "question": "Ce funcție este apelată la încărcarea paginii?",
+    "answer_span": "window.onload = init;",
+    "normalized_span": "window.onload = init;",
+    "question_type": "exact_match",
+    "difficulty": "medium"
+  },
+  {
+    "qa_id": "D2_w3_q04",
+    "doc_id": "D2",
+    "window_index": 3,
+    "question": "Ce trebuie observat după adăugarea unui Device în altă fereastră a browserului?",
+    "answer_span": "apariţia noului element în toate browserele conectate la aplicaţie",
+    "normalized_span": "aparitia noului element in toate browserele conectate la aplicatie",
+    "question_type": "factoid",
+    "difficulty": "hard"
+  },
+  {
+    "qa_id": "D3_w0_q00",
+    "doc_id": "D3",
+    "window_index": 0,
+    "question": "Ce tehnologie permite crearea unei abstractizări a resurselor?",
+    "answer_span": "Virtualizarea",
+    "normalized_span": "virtualizarea",
+    "question_type": "factoid",
+    "difficulty": "easy"
+  },
+  {
+    "qa_id": "D3_w0_q01",
+    "doc_id": "D3",
+    "window_index": 0,
+    "question": "Ce soluție Microsoft de virtualizare este menționată în text?",
+    "answer_span": "HyperV",
+    "normalized_span": "hyperv",
+    "question_type": "lookup",
+    "difficulty": "easy"
+  },
+  {
+    "qa_id": "D3_w0_q02",
+    "doc_id": "D3",
+    "window_index": 0,
+    "question": "Pe ce platforme poate rula/virtualiza HyperV sisteme de operare?",
+    "answer_span": "platforme x86 și x64",
+    "normalized_span": "platforme x86 si x64",
+    "question_type": "factoid",
+    "difficulty": "medium"
+  },
+  {
+    "qa_id": "D3_w0_q03",
+    "doc_id": "D3",
+    "window_index": 0,
+    "question": "Ce sisteme de operare poate gestiona HyperV, pe lângă Windows?",
+    "answer_span": "sisteme Linux (Red Hat, Ubuntu, Debian, CentOS, FreeBSD, SUSE, Oracle Linux)",
+    "normalized_span": "sisteme linux (red hat, ubuntu, debian, centos, freebsd, suse, oracle linux)",
+    "question_type": "lookup",
+    "difficulty": "medium"
+  },
+  {
+    "qa_id": "D3_w0_q04",
+    "doc_id": "D3",
+    "window_index": 0,
+    "question": "Cât spațiu disponibil pe disk este necesar minim înainte de parcurgerea pașilor din lucrare?",
+    "answer_span": "minim 20GB",
+    "normalized_span": "minim 20gb",
+    "question_type": "factoid",
+    "difficulty": "hard"
+  },
+  {
+    "qa_id": "D3_w1_q00",
+    "doc_id": "D3",
+    "window_index": 1,
+    "question": "Ce trebuie verificat în managerul de activități înainte de instalarea HyperV?",
+    "answer_span": "dacă sistemul permite virtualizare",
+    "normalized_span": "daca sistemul permite virtualizare",
+    "question_type": "factoid",
+    "difficulty": "easy"
+  },
+  {
+    "qa_id": "D3_w1_q01",
+    "doc_id": "D3",
+    "window_index": 1,
+    "question": "Unde se activează virtualizarea dacă nu este activată?",
+    "answer_span": "în BIOS",
+    "normalized_span": "in bios",
+    "question_type": "lookup",
+    "difficulty": "easy"
+  },
+  {
+    "qa_id": "D3_w1_q02",
+    "doc_id": "D3",
+    "window_index": 1,
+    "question": "Ce este necesar după activarea HyperV?",
+    "answer_span": "repornirea calculatorului",
+    "normalized_span": "repornirea calculatorului",
+    "question_type": "factoid",
+    "difficulty": "medium"
+  },
+  {
+    "qa_id": "D3_w1_q03",
+    "doc_id": "D3",
+    "window_index": 1,
+    "question": "Ce trebuie verificat în managerul de activități înainte de activarea virtualizării?",
+    "answer_span": "dacă sistemul permite virtualizare",
+    "normalized_span": "daca sistemul permite virtualizare",
+    "question_type": "factoid",
+    "difficulty": "easy"
+  },
+  {
+    "qa_id": "D3_w1_q04",
+    "doc_id": "D3",
+    "window_index": 1,
+    "question": "Ce trebuie verificat în managerul de activități înainte de activarea virtualizării?",
+    "answer_span": "dacă sistemul permite virtualizare",
+    "normalized_span": "daca sistemul permite virtualizare",
+    "question_type": "factoid",
+    "difficulty": "easy"
+  },
+  {
+    "qa_id": "D3_w2_q00",
+    "doc_id": "D3",
+    "window_index": 2,
+    "question": "Ce manager se utilizează pentru a crea mașina virtuală Windows 10?",
+    "answer_span": "managerul HyperV",
+    "normalized_span": "managerul hyperv",
+    "question_type": "factoid",
+    "difficulty": "easy"
+  },
+  {
+    "qa_id": "D3_w2_q01",
+    "doc_id": "D3",
+    "window_index": 2,
+    "question": "Ce sistem de operare va rula în mașina virtuală creată?",
+    "answer_span": "Windows 10",
+    "normalized_span": "windows 10",
+    "question_type": "factoid",
+    "difficulty": "easy"
+  },
+  {
+    "qa_id": "D3_w2_q02",
+    "doc_id": "D3",
+    "window_index": 2,
+    "question": "Care sunt resursele minime necesare pentru Windows 10 64 bit?",
+    "answer_span": "2GB RAM, 1CPU 1GHz, 20GB disk",
+    "normalized_span": "2gb ram, 1cpu 1ghz, 20gb disk",
+    "question_type": "lookup",
+    "difficulty": "medium"
+  },
+  {
+    "qa_id": "D3_w2_q03",
+    "doc_id": "D3",
+    "window_index": 2,
+    "question": "Prin ce opțiune se face conectarea la noua mașină virtuală?",
+    "answer_span": "Connect",
+    "normalized_span": "connect",
+    "question_type": "lookup",
+    "difficulty": "medium"
+  },
+  {
+    "qa_id": "D3_w2_q04",
+    "doc_id": "D3",
+    "window_index": 2,
+    "question": "Ce avantaje ale virtualizării sunt menționate în text?",
+    "answer_span": "backup, restaurare, multiplicare (clonare), administrare centralizată, alocarea resurselor în mod dinamic",
+    "normalized_span": "backup, restaurare, multiplicare (clonare), administrare centralizata, alocarea resurselor in mod dinamic",
+    "question_type": "exact_match",
+    "difficulty": "hard"
+  },
+  {
+    "qa_id": "D3_w3_q00",
+    "doc_id": "D3",
+    "window_index": 3,
+    "question": "Ce trebuie făcut din consola de management HyperV înainte de exportul mașinii virtuale?",
+    "answer_span": "opriți mașina virtuala",
+    "normalized_span": "opriti masina virtuala",
+    "question_type": "factoid",
+    "difficulty": "easy"
+  },
+  {
+    "qa_id": "D3_w3_q01",
+    "doc_id": "D3",
+    "window_index": 3,
+    "question": "Cât spațiu pe disk ocupă aproximativ operațiile cu mașini virtuale (export/import)?",
+    "answer_span": "aprox. 10GB spațiu pe disk",
+    "normalized_span": "aprox. 10gb spatiu pe disk",
+    "question_type": "factoid",
+    "difficulty": "easy"
+  },
+  {
+    "qa_id": "D3_w3_q02",
+    "doc_id": "D3",
+    "window_index": 3,
+    "question": "După finalizarea cu succes a importului, ce se poate face cu noua clonă?",
+    "answer_span": "se poate redenumi noua clonă",
+    "normalized_span": "se poate redenumi noua clona",
+    "question_type": "lookup",
+    "difficulty": "medium"
+  },
+  {
+    "qa_id": "D3_w3_q03",
+    "doc_id": "D3",
+    "window_index": 3,
+    "question": "Ce instrumental de virtualizare trebuie folosit în exercițiul opțional?",
+    "answer_span": "Oracle VM VirtualBox",
+    "normalized_span": "oracle vm virtualbox",
+    "question_type": "factoid",
+    "difficulty": "medium"
+  },
+  {
+    "qa_id": "D3_w3_q04",
+    "doc_id": "D3",
+    "window_index": 3,
+    "question": "Ce trebuie dezinstalat înainte de instalarea VirtualBox?",
+    "answer_span": "HyperV",
+    "normalized_span": "hyperv",
+    "question_type": "exact_match",
+    "difficulty": "hard"
+  },
+  {
+    "qa_id": "D4_w0_q00",
+    "doc_id": "D4",
+    "window_index": 0,
+    "question": "Unde este disponibilă ridicarea personală?",
+    "answer_span": "Str. Prelungire Ghencea nr 65B, parter, sector 6, Bucuresti",
+    "normalized_span": "str. prelungire ghencea nr 65b, parter, sector 6, bucuresti",
+    "question_type": "factoid",
+    "difficulty": "easy"
+  },
+  {
+    "qa_id": "D4_w0_q01",
+    "doc_id": "D4",
+    "window_index": 0,
+    "question": "Ce metodă de plată este menționată în magazin?",
+    "answer_span": "Numerar sau card in magazin",
+    "normalized_span": "numerar sau card in magazin",
+    "question_type": "lookup",
+    "difficulty": "easy"
+  },
+  {
+    "qa_id": "D4_w0_q02",
+    "doc_id": "D4",
+    "window_index": 0,
+    "question": "Ce trebuie să faci pentru finalizarea comenzii?",
+    "answer_span": "Continua ț i pentru finalizarea comenzii",
+    "normalized_span": "continua t i pentru finalizarea comenzii",
+    "question_type": "exact_match",
+    "difficulty": "medium"
+  },
+  {
+    "qa_id": "D4_w0_q03",
+    "doc_id": "D4",
+    "window_index": 0,
+    "question": "Care este codul de reducere afișat?",
+    "answer_span": "EXTRA3",
+    "normalized_span": "extra3",
+    "question_type": "factoid",
+    "difficulty": "medium"
+  },
+  {
+    "qa_id": "D4_w0_q04",
+    "doc_id": "D4",
+    "window_index": 0,
+    "question": "Ce procent de reducere este asociat codului EXTRA3?",
+    "answer_span": "-3 %",
+    "normalized_span": "-3 %",
+    "question_type": "factoid",
+    "difficulty": "hard"
+  },
+  {
+    "qa_id": "D4_w1_q00",
+    "doc_id": "D4",
+    "window_index": 1,
+    "question": "Ce text apare ca titlu în fereastră?",
+    "answer_span": "Cod de reducere",
+    "normalized_span": "cod de reducere",
+    "question_type": "factoid",
+    "difficulty": "easy"
+  },
+  {
+    "qa_id": "D4_w1_q01",
+    "doc_id": "D4",
+    "window_index": 1,
+    "question": "Care este textul linkului pentru autentificare?",
+    "answer_span": "Autentificare",
+    "normalized_span": "autentificare",
+    "question_type": "lookup",
+    "difficulty": "easy"
+  },
+  {
+    "qa_id": "D4_w1_q02",
+    "doc_id": "D4",
+    "window_index": 1,
+    "question": "Ce text apare între paranteze pătrate ca opțiune pentru utilizatorii deja înregistrați?",
+    "answer_span": "Sunt înregistrat",
+    "normalized_span": "sunt inregistrat",
+    "question_type": "exact_match",
+    "difficulty": "medium"
+  },
+  {
+    "qa_id": "D4_w1_q03",
+    "doc_id": "D4",
+    "window_index": 1,
+    "question": "Care este textul linkului către crearea contului?",
+    "answer_span": "Vreau s ă imi creez cont",
+    "normalized_span": "vreau s a imi creez cont",
+    "question_type": "lookup",
+    "difficulty": "medium"
+  },
+  {
+    "qa_id": "D4_w1_q04",
+    "doc_id": "D4",
+    "window_index": 1,
+    "question": "Ce text apare ca alternativă pentru crearea contului?",
+    "answer_span": "Accesa ț i crearea contului",
+    "normalized_span": "accesa t i crearea contului",
+    "question_type": "exact_match",
+    "difficulty": "hard"
+  },
+  {
+    "qa_id": "D4_w2_q00",
+    "doc_id": "D4",
+    "window_index": 2,
+    "question": "Care este reducerea pentru vizitatorii CUPONVOUCHER?",
+    "answer_span": "3%",
+    "normalized_span": "3%",
+    "question_type": "factoid",
+    "difficulty": "easy"
+  },
+  {
+    "qa_id": "D4_w2_q01",
+    "doc_id": "D4",
+    "window_index": 2,
+    "question": "Care este prețul afișat după reducere?",
+    "answer_span": "2.871,07 RON",
+    "normalized_span": "2.871,07 ron",
+    "question_type": "lookup",
+    "difficulty": "medium"
+  },
+  {
+    "qa_id": "D4_w2_q02",
+    "doc_id": "D4",
+    "window_index": 2,
+    "question": "Care este prețul inițial afișat?",
+    "answer_span": "3.195,68 RON",
+    "normalized_span": "3.195,68 ron",
+    "question_type": "lookup",
+    "difficulty": "medium"
+  },
+  {
+    "qa_id": "D4_w2_q03",
+    "doc_id": "D4",
+    "window_index": 2,
+    "question": "Ce este gratuit?",
+    "answer_span": "Gratuit",
+    "normalized_span": "gratuit",
+    "question_type": "factoid",
+    "difficulty": "hard"
+  },
+  {
+    "qa_id": "D4_w2_q04",
+    "doc_id": "D4",
+    "window_index": 2,
+    "question": "Care este reducerea pentru vizitatorii CUPONVOUCHER?",
+    "answer_span": "3%",
+    "normalized_span": "3%",
+    "question_type": "factoid",
+    "difficulty": "easy"
+  },
+  {
+    "qa_id": "D4_w3_q00",
+    "doc_id": "D4",
+    "window_index": 3,
+    "question": "Care este prețul afișat fără TVA?",
+    "answer_span": "2.372,79 RON f ă r ă TVA",
+    "normalized_span": "2.372,79 ron f a r a tva",
+    "question_type": "factoid",
+    "difficulty": "easy"
+  },
+  {
+    "qa_id": "D4_w3_q01",
+    "doc_id": "D4",
+    "window_index": 3,
+    "question": "Cât economisești?",
+    "answer_span": "324,61 RON",
+    "normalized_span": "324,61 ron",
+    "question_type": "factoid",
+    "difficulty": "easy"
+  },
+  {
+    "qa_id": "D4_w3_q02",
+    "doc_id": "D4",
+    "window_index": 3,
+    "question": "Ce acțiune este sugerată pentru coș?",
+    "answer_span": "Goli ț i c ă ruciorul",
+    "normalized_span": "goli t i c a ruciorul",
+    "question_type": "lookup",
+    "difficulty": "medium"
+  },
+  {
+    "qa_id": "D4_w3_q03",
+    "doc_id": "D4",
+    "window_index": 3,
+    "question": "Care este textul de sub suma economisită?",
+    "answer_span": "Tu salvezi",
+    "normalized_span": "tu salvezi",
+    "question_type": "exact_match",
+    "difficulty": "medium"
+  },
+  {
+    "qa_id": "D4_w3_q04",
+    "doc_id": "D4",
+    "window_index": 3,
+    "question": "Ce buton apare la final?",
+    "answer_span": "Aplica",
+    "normalized_span": "aplica",
+    "question_type": "lookup",
+    "difficulty": "hard"
+  },
+  {
+    "qa_id": "D5_w0_q00",
+    "doc_id": "D5",
+    "window_index": 0,
+    "question": "What is the invoice number?",
+    "answer_span": "ONXXDAN60001",
+    "normalized_span": "onxxdan60001",
+    "question_type": "factoid",
+    "difficulty": "easy"
+  },
+  {
+    "qa_id": "D5_w0_q01",
+    "doc_id": "D5",
+    "window_index": 0,
+    "question": "When is the date of issue?",
+    "answer_span": "April 1, 2026",
+    "normalized_span": "april 1, 2026",
+    "question_type": "factoid",
+    "difficulty": "easy"
+  },
+  {
+    "qa_id": "D5_w0_q02",
+    "doc_id": "D5",
+    "window_index": 0,
+    "question": "What is the OpenAI VAT number?",
+    "answer_span": "EU372041333",
+    "normalized_span": "eu372041333",
+    "question_type": "lookup",
+    "difficulty": "medium"
+  },
+  {
+    "qa_id": "D5_w0_q03",
+    "doc_id": "D5",
+    "window_index": 0,
+    "question": "What amount is due?",
+    "answer_span": "$50.00 USD due April 1, 2026",
+    "normalized_span": "$50.00 usd due april 1, 2026",
+    "question_type": "factoid",
+    "difficulty": "medium"
+  },
+  {
+    "qa_id": "D5_w0_q04",
+    "doc_id": "D5",
+    "window_index": 0,
+    "question": "Which company name appears above the address?",
+    "answer_span": "OpenAI OpCo, LLC",
+    "normalized_span": "openai opco, llc",
+    "question_type": "exact_match",
+    "difficulty": "hard"
+  },
+  {
+    "qa_id": "D5_w1_q00",
+    "doc_id": "D5",
+    "window_index": 1,
+    "question": "What is the unit price for OpenAI API usage credit?",
+    "answer_span": "$50.00",
+    "normalized_span": "$50.00",
+    "question_type": "factoid",
+    "difficulty": "easy"
+  },
+  {
+    "qa_id": "D5_w1_q01",
+    "doc_id": "D5",
+    "window_index": 1,
+    "question": "What is the amount due?",
+    "answer_span": "$50.00 USD",
+    "normalized_span": "$50.00 usd",
+    "question_type": "factoid",
+    "difficulty": "easy"
+  },
+  {
+    "qa_id": "D5_w1_q02",
+    "doc_id": "D5",
+    "window_index": 1,
+    "question": "What is the subtotal?",
+    "answer_span": "$50.00",
+    "normalized_span": "$50.00",
+    "question_type": "lookup",
+    "difficulty": "medium"
+  },
+  {
+    "qa_id": "D5_w1_q03",
+    "doc_id": "D5",
+    "window_index": 1,
+    "question": "What is the total?",
+    "answer_span": "$50.00",
+    "normalized_span": "$50.00",
+    "question_type": "lookup",
+    "difficulty": "medium"
+  },
+  {
+    "qa_id": "D5_w1_q04",
+    "doc_id": "D5",
+    "window_index": 1,
+    "question": "What tax rate is listed for OpenAI API usage credit?",
+    "answer_span": "0% 1",
+    "normalized_span": "0% 1",
+    "question_type": "factoid",
+    "difficulty": "hard"
+  },
+  {
+    "qa_id": "D5_w2_q00",
+    "doc_id": "D5",
+    "window_index": 2,
+    "question": "What is the bill-to company name?",
+    "answer_span": "Romflex Sistem",
+    "normalized_span": "romflex sistem",
+    "question_type": "factoid",
+    "difficulty": "easy"
+  },
+  {
+    "qa_id": "D5_w2_q01",
+    "doc_id": "D5",
+    "window_index": 2,
+    "question": "What is the street address in the Bill to section?",
+    "answer_span": "Street Bilciuresti no 9A",
+    "normalized_span": "street bilciuresti no 9a",
+    "question_type": "lookup",
+    "difficulty": "easy"
+  },
+  {
+    "qa_id": "D5_w2_q02",
+    "doc_id": "D5",
+    "window_index": 2,
+    "question": "What city is listed in the Bill to section?",
+    "answer_span": "Bucharest",
+    "normalized_span": "bucharest",
+    "question_type": "factoid",
+    "difficulty": "medium"
+  },
+  {
+    "qa_id": "D5_w2_q03",
+    "doc_id": "D5",
+    "window_index": 2,
+    "question": "What is the VAT number shown in the Bill to section?",
+    "answer_span": "RO16277637",
+    "normalized_span": "ro16277637",
+    "question_type": "lookup",
+    "difficulty": "medium"
+  },
+  {
+    "qa_id": "D5_w2_q04",
+    "doc_id": "D5",
+    "window_index": 2,
+    "question": "What phrase appears at the top of the document?",
+    "answer_span": "Tax to be paid on reverse charge basis",
+    "normalized_span": "tax to be paid on reverse charge basis",
+    "question_type": "exact_match",
+    "difficulty": "hard"
+  }
+]
