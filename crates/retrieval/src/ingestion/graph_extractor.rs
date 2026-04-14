@@ -706,8 +706,26 @@ impl LlmGraphExtractor {
                         // weird unicode, lone surrogates, etc. that break the JSON body.
                         let sanitized: String = text
                             .chars()
-                            .filter(|c| c.is_alphanumeric() || c.is_whitespace()
-                                || matches!(*c, '.' | ',' | ';' | ':' | '!' | '?' | '-' | '(' | ')' | '[' | ']' | '/' | '\'' | '"'))
+                            .filter(|c| {
+                                c.is_alphanumeric()
+                                    || c.is_whitespace()
+                                    || matches!(
+                                        *c,
+                                        '.' | ','
+                                            | ';'
+                                            | ':'
+                                            | '!'
+                                            | '?'
+                                            | '-'
+                                            | '('
+                                            | ')'
+                                            | '['
+                                            | ']'
+                                            | '/'
+                                            | '\''
+                                            | '"'
+                                    )
+                            })
                             .take(2000)
                             .collect();
                         match extractor.extract_from_chunk(&sanitized).await {
