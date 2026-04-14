@@ -699,9 +699,35 @@ impl LlmGraphExtractor {
                         tracing::warn!(
                             chunk_index = idx,
                             error = %e,
-                            "graph extraction failed for chunk; using empty graph"
+                            "graph extraction failed; retrying with aggressive sanitization"
                         );
-                        (idx, KnowledgeGraph::default())
+                        // Fallback: strip ALL non-letter/digit/space/basic-punct chars
+                        // and truncate to 2000 chars. This handles PDF artifacts,
+                        // weird unicode, lone surrogates, etc. that break the JSON body.
+                        let sanitized: String = text
+                            .chars()
+                            .filter(|c| c.is_alphanumeric() || c.is_whitespace()
+                                || matches!(*c, '.' | ',' | ';' | ':' | '!' | '?' | '-' | '(' | ')' | '[' | ']' | '/' | '\'' | '"'))
+                            .take(2000)
+                            .collect();
+                        match extractor.extract_from_chunk(&sanitized).await {
+                            Ok(graph) => {
+                                tracing::info!(
+                                    chunk_index = idx,
+                                    nodes = graph.nodes.len(),
+                                    "fallback extraction succeeded after sanitization"
+                                );
+                                (idx, graph)
+                            }
+                            Err(e2) => {
+                                tracing::warn!(
+                                    chunk_index = idx,
+                                    error = %e2,
+                                    "fallback extraction also failed; using empty graph"
+                                );
+                                (idx, KnowledgeGraph::default())
+                            }
+                        }
                     }
                 }
             });
