@@ -1298,6 +1298,25 @@ async fn main() -> Result<()> {
         base_router = base_router.with_context_expander(ce);
     }
 
+    // Entity linker: link query entities to Neo4j nodes (spec B3).
+    if std::env::var("EVAL_SKIP_ENTITY_LINKER").is_err() {
+        if let Ok(el_api_key) =
+            std::env::var("OPENAI_API_KEY").or_else(|_| std::env::var("LLM_API_KEY"))
+        {
+            let el_config = agent_rs_retrieval::entity_linker::EntityLinkerConfig {
+                api_key: el_api_key,
+                model: "gpt-5.4-mini-2026-03-17".to_owned(),
+                max_entities: 5,
+            };
+            let el = Arc::new(agent_rs_retrieval::EntityLinker::new(
+                neo4j_store.clone() as Arc<dyn GraphStore + Send + Sync>,
+                el_config,
+            ));
+            base_router = base_router.with_entity_linker(el);
+            info!("EntityLinker enabled (entity → KG linking before dispatch)");
+        }
+    }
+
     let router = Arc::new(if let Some(r) = reranker {
         base_router.with_reranker(r)
     } else {

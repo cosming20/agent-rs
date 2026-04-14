@@ -29,8 +29,8 @@ use agent_rs_core::{CollectionName, Embedding, RetrievalStrategy};
 use tracing::instrument;
 
 use crate::{
-    ContextExpander, Embedder, EvidencePack, MetadataFilterExtractor, QueryRewriter, ResultRanker,
-    RetrievalError,
+    ContextExpander, Embedder, EntityLinker, EvidencePack, MetadataFilterExtractor, QueryRewriter,
+    ResultRanker, RetrievalError,
     graph_cot::GraphCotRetriever,
     metadata_filter::FilterCondition,
     reranker::{CrossEncoderReranker, RERANK_CANDIDATE_COUNT},
@@ -130,6 +130,13 @@ pub struct RetrievalRouter {
     /// neighbors and same-section siblings. The expanded context text is
     /// appended to each document's content in the returned [`EvidencePack`].
     context_expander: Option<Arc<ContextExpander>>,
+
+    /// Optional entity → KG linker (spec B3).
+    ///
+    /// When `Some`, before retrieval dispatch the router calls
+    /// [`EntityLinker::link`] to check if query entities exist in Neo4j.
+    /// If linked entities are found, graph-based strategies are preferred.
+    entity_linker: Option<Arc<EntityLinker>>,
 }
 
 impl RetrievalRouter {
@@ -163,6 +170,7 @@ impl RetrievalRouter {
             query_rewriter: None,
             metadata_filter: None,
             context_expander: None,
+            entity_linker: None,
         }
     }
 
@@ -247,6 +255,12 @@ impl RetrievalRouter {
     /// [`EvidencePack`].
     ///
     /// Returns the router by value to support builder-style construction.
+    /// Attach an entity → KG linker (spec B3).
+    pub fn with_entity_linker(mut self, linker: Arc<EntityLinker>) -> Self {
+        self.entity_linker = Some(linker);
+        self
+    }
+
     pub fn with_context_expander(mut self, expander: Arc<ContextExpander>) -> Self {
         self.context_expander = Some(expander);
         self
@@ -388,6 +402,24 @@ impl RetrievalRouter {
             vec![rewritten]
         };
 
+        // ---- Step 1b: Entity → KG linking (optional, spec B3) ----
+        //
+        // Check if entities mentioned in the query exist as Neo4j nodes.
+        // When linked entities are found, log the hint for diagnostics.
+        // Future: use this to automatically switch to graph-first strategies.
+        if let Some(linker) = self.entity_linker.as_ref() {
+            let link_result = linker.link(query).await;
+            if link_result.prefer_graph {
+                tracing::info!(
+                    linked = link_result.linked_count,
+                    entities = ?link_result.entities.iter().filter(|e| e.is_linked).map(|e| &e.mention).collect::<Vec<_>>(),
+                    "entity linker suggests graph-first strategy"
+                );
+            }
+            // TODO: use link_result.prefer_graph to auto-switch strategy
+            // (strategy cascade — spec B2, future implementation).
+        }
+
         // ---- Step 2: Metadata filter extraction (optional) ----
         //
         // Extract structural hints from the *original* query (not sub-queries).
@@ -416,11 +448,30 @@ impl RetrievalRouter {
         let mut all_result_lists: Vec<Vec<agent_rs_stores::types::SearchResult>> = Vec::new();
 
         for query_str in &sub_queries {
+            // HyDE (Hypothetical Document Embedding): if the query rewriter is
+            // available, generate a hypothetical answer passage and embed THAT
+            // instead of the raw question.  The vector of an answer-like text
+            // has much higher cosine similarity to real document chunks than the
+            // vector of a question.  Falls back to the raw query on any error.
+            let embed_text = if let Some(rewriter) = &self.query_rewriter {
+                let hyde = rewriter.hyde_rewrite(query_str).await;
+                if hyde != query_str.trim() {
+                    tracing::debug!(
+                        original_len = query_str.len(),
+                        hyde_len = hyde.len(),
+                        "using HyDE text for embedding"
+                    );
+                }
+                hyde
+            } else {
+                query_str.to_string()
+            };
+
             // Always embed dense — every strategy needs at minimum a dense vector.
             // Sparse embeddings are no longer computed client-side: the store layer
             // sends the raw query text as `Document { model: "qdrant/bm25" }` and
             // Qdrant performs BM25 inference server-side.
-            let dense = self.embedder.embed_text(query_str).await?;
+            let dense = self.embedder.embed_text(&embed_text).await?;
 
             let per_sub_lists = self
                 .dispatch_single(
