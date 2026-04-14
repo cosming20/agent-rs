@@ -35,7 +35,7 @@ pub mod strategy;
 pub use context_expander::{ContextChunk, ContextExpander, ContextExpanderConfig, ExpandedChunk};
 pub use embedder::{Embedder, FastEmbedder, FastEmbedderConfig, SparseVector};
 pub use error::RetrievalError;
-pub use graph_cot::{GraphCotConfig, GraphCotRetriever};
+pub use graph_cot::{GraphCotConfig, GraphCotRetriever, IterationLog, SufficiencyCheck};
 pub use ingestion::{
     ChunkStrategy, ChunkerConfig, DocumentChunk, ExtractedEdge, ExtractedNode, IngestionPipeline,
     IngestionPipelineConfig, IngestionResult, KnowledgeGraph, LlmGraphExtractor, Triplet,
