@@ -64,13 +64,37 @@ impl GroundingGate {
                 "grounding failed, retrying"
             );
 
+            // Spec A2: build a DIAGNOSTIC retry prompt that targets the
+            // specific evidence gaps rather than a generic "try harder".
+            // `ungrounded_claims` is populated by the verifier but was
+            // previously ignored — now it drives targeted re-search.
+            let gap_analysis = if !verification.ungrounded_claims.is_empty() {
+                let claims = verification
+                    .ungrounded_claims
+                    .iter()
+                    .enumerate()
+                    .map(|(i, c)| format!("  {}. {}", i + 1, c))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                format!(
+                    "The following claims in your previous answer were NOT supported \
+                     by the retrieved evidence:\n{}\n\n\
+                     Search SPECIFICALLY for information to support or refute these \
+                     claims. Use targeted queries for each unsupported claim. \
+                     If you cannot find evidence for a claim, REMOVE it from your \
+                     answer rather than keeping it ungrounded.",
+                    claims
+                )
+            } else {
+                "Your previous answer was not well-grounded in the evidence. \
+                 The confidence score was too low. Search with broader terms \
+                 and provide an answer that directly cites retrieved evidence."
+                    .to_owned()
+            };
+
             let retry_prompt = format!(
-                "{}\n\n\
-                 Your previous answer was not well-grounded in the evidence. \
-                 Please search again with a broader strategy (try 'graph_hybrid') \
-                 and provide a more evidence-based answer.\n\n\
-                 Previous answer: {}",
-                ctx.query, ctx.answer
+                "{}\n\n{}\n\nPrevious answer (revise based on the above): {}",
+                ctx.query, gap_analysis, ctx.answer
             );
 
             match agent_runner.rerun(ctx, &retry_prompt).await {
@@ -107,6 +131,7 @@ impl GroundingGate {
                         })?,
                         reasoning: format!("Retry {} failed: {err}", ctx.retries),
                         ungrounded_claims: Vec::new(),
+                        claim_confidences: Vec::new(),
                     });
                     break;
                 }
