@@ -101,8 +101,36 @@ impl ResponseSynthesizer {
         let confidence = Confidence::new(answer_confidence.clamp(0.0, 1.0))
             .map_err(|e| AgentError::Synthesis(format!("confidence error: {e}")))?;
 
+        // #7 "I don't know" boundary: when evidence is empty or confidence
+        // is near zero AND the answer is ungrounded, replace the synthesized
+        // answer with an honest admission rather than risking hallucination.
+        let final_answer = if evidence.is_empty() && !verification.is_grounded {
+            tracing::warn!(
+                query,
+                "no evidence found and answer is ungrounded — returning 'I don't know'"
+            );
+            "I don't have enough information in my knowledge base to answer \
+             this question reliably. The retrieved evidence was insufficient \
+             to support a grounded answer."
+                .to_owned()
+        } else if answer_confidence < 0.15 && !verification.is_grounded {
+            tracing::warn!(
+                query,
+                confidence = answer_confidence,
+                "very low confidence + ungrounded — returning partial admission"
+            );
+            format!(
+                "I found some potentially relevant information, but I'm not \
+                 confident it fully answers your question. Here's what I found, \
+                 but please verify independently:\n\n{}",
+                answer
+            )
+        } else {
+            answer.to_owned()
+        };
+
         Ok(SynthesizedResponse {
-            answer: answer.to_owned(),
+            answer: final_answer,
             citations,
             query: query.to_owned(),
             confidence,
