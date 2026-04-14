@@ -61,7 +61,12 @@ const CHAT_COMPLETIONS_URL: &str = "https://api.openai.com/v1/chat/completions";
 const DEFAULT_MAX_RETRIES: u32 = 3;
 
 /// Default concurrency for batch extraction.
-pub const DEFAULT_BATCH_CONCURRENCY: usize = 5;
+///
+/// Bumped from 5 to 20 — gpt-5.4-mini supports thousands of req/min.
+/// At 20 concurrent calls × ~3500 tokens each = ~140K tok/min, well
+/// within standard tier limits. Reduces KG extraction from ~164s to ~42s
+/// for a 412-chunk document.
+pub const DEFAULT_BATCH_CONCURRENCY: usize = 20;
 
 /// Maximum characters of a chunk we forward to the LLM. Very large chunks are
 /// truncated at the character boundary to keep request size predictable.
