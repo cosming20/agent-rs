@@ -481,33 +481,53 @@ fn json_to_qdrant_filter(
             .ok_or_else(|| StoreError::InvalidData("filter condition missing 'key'".into()))?
             .to_string();
 
-        let match_value = cond
-            .get("match")
-            .and_then(|m| m.get("value"))
-            .ok_or_else(|| {
-                StoreError::InvalidData("filter condition missing 'match.value'".into())
-            })?;
-
-        let condition = match match_value {
-            serde_json::Value::String(s) => Condition::matches(key, s.clone()),
-            serde_json::Value::Number(n) => {
-                if let Some(i) = n.as_i64() {
-                    Condition::matches(key, i)
-                } else {
-                    return Err(StoreError::InvalidData(format!(
-                        "filter match value must be string, integer, or bool; got: {n}"
-                    )));
-                }
+        // Dispatch on condition type: match (exact or text) vs range.
+        if let Some(match_obj) = cond.get("match") {
+            if let Some(text_val) = match_obj.get("text").and_then(|v| v.as_str()) {
+                // Full-text tokenized substring match (e.g., "188" matches
+                // "Articolul 188 - Omorul").  Uses Qdrant's MatchText.
+                must.push(Condition::matches_text(key, text_val));
+            } else if let Some(match_value) = match_obj.get("value") {
+                // Exact value match.
+                let condition = match match_value {
+                    serde_json::Value::String(s) => Condition::matches(key, s.clone()),
+                    serde_json::Value::Number(n) => {
+                        if let Some(i) = n.as_i64() {
+                            Condition::matches(key, i)
+                        } else {
+                            return Err(StoreError::InvalidData(format!(
+                                "filter match value must be string, integer, or bool; got: {n}"
+                            )));
+                        }
+                    }
+                    serde_json::Value::Bool(b) => Condition::matches(key, *b),
+                    other => {
+                        return Err(StoreError::InvalidData(format!(
+                            "unsupported filter match value type: {other}"
+                        )));
+                    }
+                };
+                must.push(condition);
+            } else {
+                return Err(StoreError::InvalidData(
+                    "filter match object must contain 'value' or 'text'".into(),
+                ));
             }
-            serde_json::Value::Bool(b) => Condition::matches(key, *b),
-            other => {
-                return Err(StoreError::InvalidData(format!(
-                    "unsupported filter match value type: {other}"
-                )));
+        } else if let Some(range_obj) = cond.get("range") {
+            // Numeric range condition.
+            let mut range = qdrant_client::qdrant::Range::default();
+            if let Some(gte) = range_obj.get("gte").and_then(|v| v.as_f64()) {
+                range.gte = Some(gte);
             }
-        };
-
-        must.push(condition);
+            if let Some(lte) = range_obj.get("lte").and_then(|v| v.as_f64()) {
+                range.lte = Some(lte);
+            }
+            must.push(Condition::range(key, range));
+        } else {
+            return Err(StoreError::InvalidData(format!(
+                "filter condition for key '{key}' has neither 'match' nor 'range'"
+            )));
+        }
     }
 
     Ok(Filter {
