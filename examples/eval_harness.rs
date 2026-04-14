@@ -1317,22 +1317,6 @@ async fn main() -> Result<()> {
         }
     }
 
-    // Query analyzer: intent classification + augmented queries (spec B1).
-    if std::env::var("EVAL_SKIP_QUERY_ANALYZER").is_err() {
-        if let Ok(qa_api_key) =
-            std::env::var("OPENAI_API_KEY").or_else(|_| std::env::var("LLM_API_KEY"))
-        {
-            let qa_config = agent_rs_retrieval::query_analyzer::QueryAnalyzerConfig {
-                api_key: qa_api_key,
-                model: "gpt-5.4-mini-2026-03-17".to_owned(),
-                temperature: 0.1,
-            };
-            let qa = Arc::new(agent_rs_retrieval::QueryAnalyzer::new(qa_config));
-            base_router = base_router.with_query_analyzer(qa);
-            info!("QueryAnalyzer enabled (intent classification + query augmentation)");
-        }
-    }
-
     let router = Arc::new(if let Some(r) = reranker {
         base_router.with_reranker(r)
     } else {

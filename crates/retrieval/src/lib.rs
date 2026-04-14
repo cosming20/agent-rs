@@ -26,7 +26,6 @@ pub mod ingestion;
 pub mod metadata_filter;
 pub mod openai_embedder;
 pub mod proto;
-pub mod query_analyzer;
 pub mod query_rewriter;
 pub mod ranker;
 pub mod reranker;
@@ -47,7 +46,6 @@ pub use metadata_filter::{
     FilterCondition, MetadataFilterConfig, MetadataFilterExtractor, QueryMetadataHints,
 };
 pub use openai_embedder::{OpenAIEmbedder, OpenAIEmbedderConfig};
-pub use query_analyzer::{QueryAnalysis, QueryAnalyzer, QueryAnalyzerConfig, QueryIntent};
 pub use query_rewriter::{
     QueryRewriter, QueryRewriterConfig, RewrittenQuery, SubQuery, SubQueryType,
 };
