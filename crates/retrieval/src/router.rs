@@ -29,8 +29,8 @@ use agent_rs_core::{CollectionName, Embedding, RetrievalStrategy};
 use tracing::instrument;
 
 use crate::{
-    ContextExpander, Embedder, EntityLinker, EvidencePack, MetadataFilterExtractor, QueryRewriter,
-    ResultRanker, RetrievalError,
+    ContextExpander, Embedder, EntityLinker, EvidencePack, MetadataFilterExtractor, QueryAnalyzer,
+    QueryRewriter, ResultRanker, RetrievalError,
     graph_cot::GraphCotRetriever,
     metadata_filter::FilterCondition,
     reranker::{CrossEncoderReranker, RERANK_CANDIDATE_COUNT},
@@ -132,11 +132,15 @@ pub struct RetrievalRouter {
     context_expander: Option<Arc<ContextExpander>>,
 
     /// Optional entity → KG linker (spec B3).
-    ///
-    /// When `Some`, before retrieval dispatch the router calls
-    /// [`EntityLinker::link`] to check if query entities exist in Neo4j.
-    /// If linked entities are found, graph-based strategies are preferred.
     entity_linker: Option<Arc<EntityLinker>>,
+
+    /// Optional query analyzer (spec B1).
+    ///
+    /// Intent classification + augmented query generation. For conceptual,
+    /// negation, and disambiguation intents, generates additional search
+    /// queries that target the specific retrieval need (synonym expansion,
+    /// positive+exception split, multiple interpretations).
+    query_analyzer: Option<Arc<QueryAnalyzer>>,
 }
 
 impl RetrievalRouter {
@@ -171,6 +175,7 @@ impl RetrievalRouter {
             metadata_filter: None,
             context_expander: None,
             entity_linker: None,
+            query_analyzer: None,
         }
     }
 
@@ -258,6 +263,13 @@ impl RetrievalRouter {
     /// Attach an entity → KG linker (spec B3).
     pub fn with_entity_linker(mut self, linker: Arc<EntityLinker>) -> Self {
         self.entity_linker = Some(linker);
+        self
+    }
+
+    /// Attach a query analyzer (spec B1) for intent classification +
+    /// augmented query generation.
+    pub fn with_query_analyzer(mut self, analyzer: Arc<QueryAnalyzer>) -> Self {
+        self.query_analyzer = Some(analyzer);
         self
     }
 
@@ -439,10 +451,44 @@ impl RetrievalRouter {
             None
         };
 
-        // Run all three in parallel.
-        let (sub_queries_result, _entity_link, qdrant_filter_json) =
-            tokio::join!(rewrite_fut, entity_link_fut, metadata_filter_fut);
-        let sub_queries = sub_queries_result?;
+        // Query analyzer: intent classification + augmented queries.
+        let analyze_fut = async {
+            if let Some(analyzer) = self.query_analyzer.as_ref() {
+                Some(analyzer.analyze(query).await)
+            } else {
+                None
+            }
+        };
+
+        // Run all four in parallel.
+        let (sub_queries_result, _entity_link, qdrant_filter_json, analysis_opt) = tokio::join!(
+            rewrite_fut,
+            entity_link_fut,
+            metadata_filter_fut,
+            analyze_fut
+        );
+        let mut sub_queries = sub_queries_result?;
+
+        // Merge augmented queries from analyzer into sub_queries.
+        // Analyzer generates intent-specific queries (synonym expansions for
+        // conceptual, positive+exception for negation, interpretations for
+        // disambiguation) that complement the rewriter's decomposition.
+        if let Some(analysis) = analysis_opt {
+            tracing::info!(
+                intent = ?analysis.intent,
+                augmented = analysis.augmented_queries.len(),
+                "query analyzer: intent classified"
+            );
+            // Add augmented queries that aren't already present.
+            for aug in &analysis.augmented_queries {
+                let trimmed = aug.trim();
+                if !trimmed.is_empty() && !sub_queries.iter().any(|sq| sq.trim() == trimmed) {
+                    sub_queries.push(trimmed.to_owned());
+                }
+            }
+            // Cap total sub-queries to prevent explosion.
+            sub_queries.truncate(5);
+        }
 
         // ---- Step 3–4: Embed + dispatch per sub-query ----
         //
