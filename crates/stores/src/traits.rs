@@ -138,6 +138,25 @@ pub trait GraphStore: Send + Sync {
     /// Execute a raw Cypher query, returning nodes.
     async fn query_nodes(&self, cypher: &str) -> Result<Vec<GraphNode>, StoreError>;
 
+    /// Execute a raw Cypher query with named string parameters and return each
+    /// row as a map of column name → [`serde_json::Value`].
+    ///
+    /// Unlike [`query_nodes`], this method does not assume any particular column
+    /// alias or that results are graph nodes.  It is suited for queries that
+    /// return scalar projections such as
+    /// `RETURN n.id AS id, n.chunk_text AS text`.
+    ///
+    /// The caller supplies `columns` — the list of column aliases expected in
+    /// the `RETURN` clause.  Columns that cannot be deserialised as JSON are
+    /// silently skipped per row.  This is required because `neo4rs::Row` does
+    /// not expose a `keys()` iterator; column names must be known at call time.
+    async fn query_raw(
+        &self,
+        cypher: &str,
+        params: std::collections::HashMap<String, String>,
+        columns: &[&str],
+    ) -> Result<Vec<std::collections::HashMap<String, serde_json::Value>>, StoreError>;
+
     /// Delete a node and its edges by ID.
     async fn delete_node(&self, id: &str) -> Result<(), StoreError>;
 
