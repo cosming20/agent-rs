@@ -18,6 +18,10 @@ rust-version = "1.85"
 license = "MIT"
 description = "Agentic RAG system -- gRPC server with LLM agents, retrieval, and tools."
 
+[lib]
+name = "agent_rs"
+path = "src/lib.rs"
+
 [[bin]]
 name = "agent-rs"
 path = "src/main.rs"
