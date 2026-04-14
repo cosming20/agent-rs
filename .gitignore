@@ -19,6 +19,9 @@ env/
 *.swp
 *.swo
 
+# Claude Code
+.claude/
+
 # Environment
 .env
 .env.local
