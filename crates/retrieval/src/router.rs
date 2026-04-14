@@ -998,11 +998,12 @@ fn filter_conditions_to_json(conditions: &[FilterCondition]) -> serde_json::Valu
                 serde_json::json!({ "key": field, "range": range })
             }
             FilterCondition::Contains { field, text } => {
-                // Map to exact match on the field value — approximation for
-                // short strings like article numbers and section keywords.
+                // Use Qdrant's full-text `match.text` (tokenized substring
+                // search within the field value) rather than exact `match.value`.
+                // "188" will match "Articolul 188 - Omorul" via token overlap.
                 serde_json::json!({
                     "key": field,
-                    "match": { "value": text }
+                    "match": { "text": text }
                 })
             }
         })
