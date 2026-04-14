@@ -90,6 +90,12 @@ pub const DEFAULT_MODEL: &str = "gpt-4o-mini";
 /// Default LLM output token cap per iteration.
 pub const DEFAULT_MAX_TOKENS: u32 = 2_000;
 
+/// Default confidence threshold above which evidence is considered sufficient.
+///
+/// When the sufficiency check returns a confidence >= this value the loop exits
+/// early without consuming the remaining iteration budget.
+pub const DEFAULT_SUFFICIENCY_CONFIDENCE_THRESHOLD: f64 = 0.8;
+
 /// OpenAI Chat Completions endpoint.
 const OPENAI_CHAT_URL: &str = "https://api.openai.com/v1/chat/completions";
 
@@ -116,6 +122,47 @@ follow-up must be a short natural-language query suitable for a graph/vector ret
 system. If no further retrieval could plausibly help, return `answered=false` with \
 `follow_up_question=null`.";
 
+/// System prompt for the evidence sufficiency evaluation stage.
+///
+/// This prompt is designed to produce a structured JSON assessment of whether
+/// the retrieved evidence is sufficient to fully answer the user's query.
+/// It handles several common hard cases explicitly:
+///
+/// - **Comparative queries**: both sides of the comparison must be present.
+/// - **Negation / exception queries**: the rule AND its exceptions must appear.
+/// - **Multi-hop reasoning**: the full reasoning chain must be traceable.
+///
+/// The `refined_query` field must be a targeted retrieval query (not a
+/// conversational follow-up) aimed at filling the exact gap identified.
+const SUFFICIENCY_SYSTEM_PROMPT: &str = "\
+You are an expert evidence evaluator for a retrieval-augmented generation system. \
+Your task is to assess whether a set of retrieved evidence chunks provides \
+sufficient information to fully and accurately answer the user's original query.\n\
+\n\
+Evaluation guidelines:\n\
+1. COMPLETENESS: The evidence must cover ALL aspects of the query, not just part of it.\n\
+2. COMPARATIVE QUERIES: Both (or all) sides of any comparison must be present in the evidence. \
+   If the query asks 'compare X and Y', evidence about only X is insufficient.\n\
+3. NEGATION & EXCEPTIONS: If the query involves a rule, the evidence must include both \
+   the rule and any relevant exceptions mentioned in the query.\n\
+4. MULTI-HOP REASONING: For queries requiring a chain of reasoning (A → B → C), \
+   ALL steps in the chain must be supported by evidence.\n\
+5. SPECIFICITY: Generic background information is not sufficient if the query asks \
+   for specific facts, numbers, dates, or named entities.\n\
+6. CONFIDENCE SCORING: Score 0.0 (no useful evidence) to 1.0 (complete, unambiguous answer). \
+   Use 0.8+ only if the evidence fully covers the query with no material gaps.\n\
+\n\
+Return a JSON object with these exact fields:\n\
+- sufficient (boolean): true only if confidence >= 0.8 and no material gaps remain.\n\
+- confidence (number 0.0-1.0): your confidence that the evidence answers the query fully.\n\
+- missing_info (string): describe specifically what information is still needed, \
+  or 'none' if sufficient.\n\
+- refined_query (string or null): if not sufficient, provide a SPECIFIC retrieval query \
+  that targets the exact missing information. This must be a search query for a \
+  vector/graph retrieval system, not a conversational question. Return null if sufficient.\n\
+- reasoning (string): one to two sentences explaining why the evidence is or is not \
+  sufficient, referencing specific gaps or coverage.";
+
 // ---- Config ----
 
 /// Configuration for [`GraphCotRetriever`].
@@ -131,6 +178,18 @@ pub struct GraphCotConfig {
     pub llm_model: String,
     /// Maximum completion tokens per LLM call.
     pub llm_max_tokens: u32,
+    /// Confidence threshold (0.0–1.0) above which the loop exits early.
+    ///
+    /// When `evaluate_sufficiency` returns a confidence >= this value the
+    /// retrieval loop terminates without consuming the remaining iteration
+    /// budget. Defaults to [`DEFAULT_SUFFICIENCY_CONFIDENCE_THRESHOLD`].
+    pub sufficiency_confidence_threshold: f64,
+    /// Whether to run the sufficiency check after each retrieval pass.
+    ///
+    /// When `false` the loop always runs all `max_iterations` and returns
+    /// the merged pool without LLM sufficiency checks, which is equivalent
+    /// to the original follow-up-question-only behaviour.
+    pub enable_sufficiency_check: bool,
 }
 
 impl GraphCotConfig {
@@ -142,6 +201,8 @@ impl GraphCotConfig {
             llm_api_key: api_key,
             llm_model: DEFAULT_MODEL.to_owned(),
             llm_max_tokens: DEFAULT_MAX_TOKENS,
+            sufficiency_confidence_threshold: DEFAULT_SUFFICIENCY_CONFIDENCE_THRESHOLD,
+            enable_sufficiency_check: true,
         }
     }
 
@@ -172,6 +233,77 @@ impl GraphCotConfig {
         self.llm_max_tokens = n;
         self
     }
+
+    /// Override the sufficiency confidence threshold.
+    ///
+    /// The value is clamped to `[0.0, 1.0]`.
+    #[must_use]
+    pub fn with_sufficiency_confidence_threshold(mut self, threshold: f64) -> Self {
+        self.sufficiency_confidence_threshold = threshold.clamp(0.0, 1.0);
+        self
+    }
+
+    /// Disable LLM-based sufficiency checks.
+    ///
+    /// When disabled the loop always runs all `max_iterations` using
+    /// follow-up questions only (original behaviour).
+    #[must_use]
+    pub fn with_sufficiency_check_disabled(mut self) -> Self {
+        self.enable_sufficiency_check = false;
+        self
+    }
+}
+
+// ---- Public sufficiency types ----
+
+/// Structured result of an LLM evidence sufficiency check.
+///
+/// Returned by [`GraphCotRetriever::evaluate_sufficiency`] and embedded in
+/// each [`IterationLog`] produced by the enhanced `retrieve` loop.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SufficiencyCheck {
+    /// `true` if the evidence is considered sufficient to answer the query.
+    pub sufficient: bool,
+    /// Confidence in the sufficiency assessment (0.0 = none, 1.0 = certain).
+    pub confidence: f64,
+    /// Description of what information is still needed, or `"none"` if sufficient.
+    pub missing_info: String,
+    /// A targeted retrieval query that would obtain the missing information,
+    /// or `None` if the evidence is already sufficient.
+    pub refined_query: Option<String>,
+    /// Short explanation of the assessment.
+    pub reasoning: String,
+}
+
+impl SufficiencyCheck {
+    /// Fallback instance used when the LLM call fails.
+    ///
+    /// Assumes the evidence is sufficient at moderate confidence so the
+    /// caller is never blocked by an LLM outage.
+    fn fallback() -> Self {
+        Self {
+            sufficient: true,
+            confidence: 0.5,
+            missing_info: "unknown — sufficiency check failed".to_owned(),
+            refined_query: None,
+            reasoning:
+                "LLM sufficiency check failed; assuming sufficient to avoid blocking the caller."
+                    .to_owned(),
+        }
+    }
+}
+
+/// Per-iteration diagnostics logged by the enhanced `retrieve` loop.
+#[derive(Debug, Clone)]
+pub struct IterationLog {
+    /// 1-based iteration index.
+    pub iteration: usize,
+    /// The query submitted to the retrieval function this iteration.
+    pub query_used: String,
+    /// Number of new (deduplicated) chunks returned.
+    pub chunks_added: usize,
+    /// Sufficiency assessment for this iteration, if the check was enabled.
+    pub sufficiency: Option<SufficiencyCheck>,
 }
 
 // ---- Retriever ----
@@ -238,6 +370,117 @@ impl GraphCotRetriever {
             .map(|k| Self::new(GraphCotConfig::new(k)))
     }
 
+    /// Evaluate whether the retrieved evidence is sufficient to answer the query.
+    ///
+    /// Calls the OpenAI Chat Completions API with a structured JSON schema
+    /// designed for sufficiency assessment. The check handles comparative
+    /// queries, negation/exception queries, and multi-hop reasoning chains.
+    ///
+    /// # Arguments
+    ///
+    /// - `original_query` — the user's original query.
+    /// - `evidence_texts` — the evidence text snippets to evaluate.
+    ///
+    /// # Returns
+    ///
+    /// A [`SufficiencyCheck`] with confidence, missing-info description, and
+    /// an optional refined retrieval query. On any LLM failure, returns a
+    /// fallback instance that assumes sufficiency at moderate confidence so
+    /// the caller is never blocked by an outage.
+    #[instrument(skip(self, evidence_texts), fields(query_len = original_query.len(), evidence_count = evidence_texts.len()))]
+    pub async fn evaluate_sufficiency(
+        &self,
+        original_query: &str,
+        evidence_texts: &[&str],
+    ) -> Result<SufficiencyCheck, RetrievalError> {
+        let evidence_block = evidence_texts
+            .iter()
+            .enumerate()
+            .map(|(i, t)| format!("[{}] {}", i + 1, t))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        // Guard against excessively large prompts by truncating the evidence block.
+        let truncated: &str = if evidence_block.len() > MAX_CONTEXT_CHARS {
+            let cut = evidence_block
+                .char_indices()
+                .map(|(i, _)| i)
+                .take_while(|&i| i <= MAX_CONTEXT_CHARS)
+                .last()
+                .unwrap_or(MAX_CONTEXT_CHARS);
+            &evidence_block[..cut]
+        } else {
+            &evidence_block
+        };
+
+        let user_content = format!(
+            "Original query:\n{original_query}\n\nRetrieved evidence:\n{truncated}\n\n\
+             Evaluate whether this evidence is sufficient to fully answer the query."
+        );
+
+        let request = ChatRequest {
+            model: &self.config.llm_model,
+            messages: vec![
+                ChatMessage {
+                    role: "system",
+                    content: SUFFICIENCY_SYSTEM_PROMPT,
+                },
+                ChatMessage {
+                    role: "user",
+                    content: &user_content,
+                },
+            ],
+            max_tokens: self.config.llm_max_tokens,
+            temperature: 0.0,
+            response_format: ResponseFormat::sufficiency_schema(),
+        };
+
+        let resp = self
+            .client
+            .post(OPENAI_CHAT_URL)
+            .bearer_auth(&self.config.llm_api_key)
+            .header("Content-Type", "application/json")
+            .json(&request)
+            .send()
+            .await
+            .map_err(|e| RetrievalError::Embedding {
+                reason: format!("sufficiency check HTTP request failed: {e}"),
+            })?;
+
+        let status = resp.status();
+        if !status.is_success() {
+            let body_text = resp.text().await.unwrap_or_else(|_| "<no body>".into());
+            return Err(RetrievalError::Embedding {
+                reason: format!("sufficiency check API error (HTTP {status}): {body_text}"),
+            });
+        }
+
+        let parsed: ChatResponse = resp.json().await.map_err(|e| RetrievalError::Embedding {
+            reason: format!("failed to parse sufficiency check response: {e}"),
+        })?;
+
+        let content_str = parsed
+            .choices
+            .first()
+            .and_then(|c| c.message.content.as_deref())
+            .ok_or_else(|| RetrievalError::Embedding {
+                reason: "sufficiency check response missing choices[0].message.content".to_owned(),
+            })?;
+
+        let payload: SufficiencySchemaPayload =
+            serde_json::from_str(content_str).map_err(|e| RetrievalError::Embedding {
+                reason: format!("failed to parse sufficiency structured output: {e}"),
+            })?;
+
+        Ok(SufficiencyCheck {
+            sufficient: payload.sufficient,
+            confidence: payload.confidence.clamp(0.0, 1.0),
+            missing_info: payload.missing_info,
+            refined_query: payload.refined_query.filter(|q| !q.trim().is_empty()),
+            reasoning: payload.reasoning,
+        })
+    }
+
     /// Run the chain-of-thought retrieval loop.
     ///
     /// # Arguments
@@ -254,6 +497,18 @@ impl GraphCotRetriever {
     /// A merged, deduplicated list of [`SearchResult`]s. On any LLM failure or
     /// fallback condition, returns the `initial_results` unchanged. This
     /// method never returns an error — observability is handled via `tracing`.
+    ///
+    /// # Sufficiency checks
+    ///
+    /// When [`GraphCotConfig::enable_sufficiency_check`] is `true` (default),
+    /// after each retrieval pass the LLM evaluates whether the accumulated
+    /// evidence is sufficient:
+    ///
+    /// - If `sufficient == true` **or** `confidence >= sufficiency_confidence_threshold`:
+    ///   the loop exits immediately.
+    /// - Otherwise, the `refined_query` from the sufficiency check (if present)
+    ///   is used as the next iteration's query instead of the follow-up question
+    ///   from the CoT validator, targeting the exact information gap.
     #[instrument(
         skip(self, initial_results, retrieve_fn),
         fields(
@@ -292,6 +547,9 @@ impl GraphCotRetriever {
         }
         let mut merged: Vec<SearchResult> = initial_results.clone();
 
+        // Per-iteration diagnostics, exposed via debug logging.
+        let mut iteration_logs: Vec<IterationLog> = Vec::with_capacity(self.config.max_iterations);
+
         for iteration in 1..=self.config.max_iterations {
             // Budget check before starting a new iteration.
             if Instant::now() >= deadline {
@@ -304,7 +562,74 @@ impl GraphCotRetriever {
                 return merged;
             }
 
-            // Ask the LLM whether the question is answered and what to ask next.
+            // ---- Sufficiency check (pre-iteration) ----
+            //
+            // Evaluate after the initial retrieval pass (or after each
+            // additional pass) before deciding whether to issue another query.
+            // We run this BEFORE calling the CoT validator so that if the
+            // evidence is already sufficient we skip the follow-up entirely.
+            let sufficiency = if self.config.enable_sufficiency_check {
+                let evidence_texts: Vec<&str> = merged
+                    .iter()
+                    .filter_map(|r| r.payload.get(CHUNK_TEXT_KEY).and_then(|v| v.as_str()))
+                    .collect();
+
+                let check = match self.evaluate_sufficiency(question, &evidence_texts).await {
+                    Ok(c) => c,
+                    Err(e) => {
+                        warn!(
+                            iteration = iteration,
+                            error = %e,
+                            "GraphCoT: sufficiency check failed; using fallback (assume sufficient)"
+                        );
+                        SufficiencyCheck::fallback()
+                    }
+                };
+
+                debug!(
+                    iteration = iteration,
+                    sufficient = check.sufficient,
+                    confidence = check.confidence,
+                    missing_info = %check.missing_info,
+                    refined_query = ?check.refined_query,
+                    "GraphCoT: sufficiency check result"
+                );
+
+                let is_sufficient = check.sufficient
+                    || check.confidence >= self.config.sufficiency_confidence_threshold;
+
+                if is_sufficient {
+                    debug!(
+                        iteration = iteration,
+                        stop_reason = "sufficient",
+                        confidence = check.confidence,
+                        merged_count = merged.len(),
+                        "GraphCoT: evidence deemed sufficient; exiting loop early"
+                    );
+                    // Record the log entry before returning.
+                    iteration_logs.push(IterationLog {
+                        iteration,
+                        query_used: question.to_owned(),
+                        chunks_added: 0,
+                        sufficiency: Some(check),
+                    });
+                    debug!(
+                        total_iterations = iteration_logs.len(),
+                        "GraphCoT: iteration history"
+                    );
+                    return merged;
+                }
+
+                Some(check)
+            } else {
+                None
+            };
+
+            // ---- CoT validator ----
+            //
+            // Ask the LLM whether the question is answered and what follow-up
+            // question to pose next. If a sufficiency check produced a
+            // `refined_query`, we prefer that over the CoT follow-up.
             let context_text = join_context(&merged);
             let llm_result = self.call_llm_validator(question, &context_text).await;
 
@@ -347,34 +672,72 @@ impl GraphCotRetriever {
                     tokens_used = decision.tokens_used,
                     "GraphCoT: LLM reports question answered"
                 );
+                iteration_logs.push(IterationLog {
+                    iteration,
+                    query_used: question.to_owned(),
+                    chunks_added: 0,
+                    sufficiency,
+                });
+                debug!(
+                    total_iterations = iteration_logs.len(),
+                    "GraphCoT: iteration history"
+                );
                 return merged;
             }
 
-            // Stop if there is no follow-up question to ask.
-            let Some(follow_up) = decision
-                .follow_up_question
-                .as_deref()
-                .map(str::trim)
-                .filter(|q| !q.is_empty())
-            else {
+            // Determine the next query: prefer the sufficiency check's
+            // `refined_query` (targets the exact gap) over the CoT follow-up.
+            let next_query: Option<String> = sufficiency
+                .as_ref()
+                .and_then(|s| s.refined_query.clone())
+                .filter(|q| !q.trim().is_empty())
+                .or_else(|| {
+                    decision
+                        .follow_up_question
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|q| !q.is_empty())
+                        .map(str::to_owned)
+                });
+
+            let Some(next_query) = next_query else {
                 debug!(
                     iteration = iteration,
                     stop_reason = "no_followup",
                     merged_count = merged.len(),
                     tokens_used = decision.tokens_used,
-                    "GraphCoT: LLM returned no follow-up"
+                    "GraphCoT: no refined query or follow-up available"
                 );
+                iteration_logs.push(IterationLog {
+                    iteration,
+                    query_used: question.to_owned(),
+                    chunks_added: 0,
+                    sufficiency,
+                });
                 return merged;
             };
 
+            let used_refined = sufficiency
+                .as_ref()
+                .and_then(|s| s.refined_query.as_deref())
+                .map(|rq| rq == next_query.as_str())
+                .unwrap_or(false);
+
+            debug!(
+                iteration = iteration,
+                next_query = %next_query,
+                used_refined_query = used_refined,
+                "GraphCoT: selected next query for follow-up retrieval"
+            );
+
             // Issue the follow-up retrieval. Errors are logged and the iteration
             // is treated as a no-op rather than failing the whole loop.
-            let new_results = match retrieve_fn(follow_up.to_owned()).await {
+            let new_results = match retrieve_fn(next_query.clone()).await {
                 Ok(r) => r,
                 Err(e) => {
                     warn!(
                         iteration = iteration,
-                        follow_up_question = %follow_up,
+                        next_query = %next_query,
                         error = %e,
                         "GraphCoT: follow-up retrieval failed; stopping loop"
                     );
@@ -387,11 +750,19 @@ impl GraphCotRetriever {
 
             debug!(
                 iteration = iteration,
-                follow_up_question = %follow_up,
+                next_query = %next_query,
+                used_refined_query = used_refined,
                 candidates_added = added,
                 tokens_used = decision.tokens_used,
                 "GraphCoT: iteration complete"
             );
+
+            iteration_logs.push(IterationLog {
+                iteration,
+                query_used: next_query,
+                chunks_added: added,
+                sufficiency,
+            });
 
             // Convergence: no new info this round — further iterations would
             // only reuse the same evidence pool, so stop early.
@@ -408,6 +779,7 @@ impl GraphCotRetriever {
 
         debug!(
             stop_reason = "max_iter",
+            total_iterations = iteration_logs.len(),
             merged_count = merged.len(),
             "GraphCoT: reached max_iterations"
         );
@@ -600,6 +972,17 @@ impl ResponseFormat {
             },
         }
     }
+
+    fn sufficiency_schema() -> Self {
+        Self {
+            kind: "json_schema",
+            json_schema: JsonSchemaSpec {
+                name: "sufficiency_check",
+                strict: true,
+                schema: sufficiency_check_schema(),
+            },
+        }
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -635,10 +1018,53 @@ fn cot_decision_schema() -> serde_json::Value {
     })
 }
 
+/// JSON schema for the structured sufficiency-check response.
+///
+/// Matches [`SufficiencySchemaPayload`] exactly.
+fn sufficiency_check_schema() -> serde_json::Value {
+    serde_json::json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["sufficient", "confidence", "missing_info", "refined_query", "reasoning"],
+        "properties": {
+            "sufficient": {
+                "type": "boolean",
+                "description": "True only if confidence >= 0.8 and the evidence fully covers all aspects of the query."
+            },
+            "confidence": {
+                "type": "number",
+                "description": "Confidence score from 0.0 (no useful evidence) to 1.0 (complete, unambiguous answer)."
+            },
+            "missing_info": {
+                "type": "string",
+                "description": "Specific description of what information is still needed, or 'none' if sufficient."
+            },
+            "refined_query": {
+                "type": ["string", "null"],
+                "description": "A targeted retrieval query for a vector/graph search system that would obtain the missing information. Must be a search query, not a conversational question. Null if sufficient."
+            },
+            "reasoning": {
+                "type": "string",
+                "description": "One to two sentences explaining why the evidence is or is not sufficient, referencing specific gaps or coverage."
+            }
+        }
+    })
+}
+
 #[derive(Debug, Deserialize)]
 struct CotSchemaPayload {
     answered: bool,
     follow_up_question: Option<String>,
+    reasoning: String,
+}
+
+/// Deserialization target for the sufficiency check structured output.
+#[derive(Debug, Deserialize)]
+struct SufficiencySchemaPayload {
+    sufficient: bool,
+    confidence: f64,
+    missing_info: String,
+    refined_query: Option<String>,
     reasoning: String,
 }
 
