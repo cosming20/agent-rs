@@ -13,6 +13,7 @@
 //! - [`search`] — concrete search back-ends (vector, keyword, graph, hybrid)
 //! - [`ingestion`] — universal document ingestion pipeline (chunking, metadata, embedding, graph)
 //! - [`proto`] — generated protobuf types for the Docling sidecar gRPC contract
+//! - [`query_rewriter`] — LLM-based query decomposition into focused sub-queries
 
 pub mod embedder;
 pub mod error;
@@ -20,6 +21,7 @@ pub mod graph_cot;
 pub mod ingestion;
 pub mod openai_embedder;
 pub mod proto;
+pub mod query_rewriter;
 pub mod ranker;
 pub mod reranker;
 pub mod router;
@@ -34,6 +36,9 @@ pub use ingestion::{
     IngestionPipelineConfig, IngestionResult, KnowledgeGraph, LlmGraphExtractor, Triplet,
 };
 pub use openai_embedder::{OpenAIEmbedder, OpenAIEmbedderConfig};
+pub use query_rewriter::{
+    QueryRewriter, QueryRewriterConfig, RewrittenQuery, SubQuery, SubQueryType,
+};
 pub use ranker::{EvidencePack, ResultRanker};
 pub use reranker::CrossEncoderReranker;
 pub use router::RetrievalRouter;
