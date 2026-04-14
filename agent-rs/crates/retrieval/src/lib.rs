@@ -19,6 +19,7 @@
 
 pub mod context_expander;
 pub mod embedder;
+pub mod entity_linker;
 pub mod error;
 pub mod graph_cot;
 pub mod ingestion;
@@ -34,6 +35,7 @@ pub mod strategy;
 
 pub use context_expander::{ContextChunk, ContextExpander, ContextExpanderConfig, ExpandedChunk};
 pub use embedder::{Embedder, FastEmbedder, FastEmbedderConfig, SparseVector};
+pub use entity_linker::{EntityLinkResult, EntityLinker, EntityLinkerConfig, LinkedEntity};
 pub use error::RetrievalError;
 pub use graph_cot::{GraphCotConfig, GraphCotRetriever, IterationLog, SufficiencyCheck};
 pub use ingestion::{

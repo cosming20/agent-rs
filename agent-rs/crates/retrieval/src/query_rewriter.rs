@@ -696,7 +696,128 @@ impl QueryRewriter {
         .when(is_retryable_error)
         .await
     }
+
+    /// **HyDE — Hypothetical Document Embedding.**
+    ///
+    /// Instead of embedding the *question*, generate a short *hypothetical
+    /// answer* and return it for embedding.  The embedding of an answer-like
+    /// text is much closer in vector space to the actual document chunks than
+    /// the embedding of a question.
+    ///
+    /// Returns the hypothetical text on success, or the original query on
+    /// any failure (graceful degradation — never blocks the pipeline).
+    ///
+    /// Reference: Gao et al., "Precise Zero-Shot Dense Retrieval without
+    /// Relevance Labels" (HyDE), 2022.
+    #[instrument(skip(self), fields(query_len = query.len()))]
+    pub async fn hyde_rewrite(&self, query: &str) -> String {
+        let trimmed = query.trim();
+        if trimmed.is_empty() {
+            return String::new();
+        }
+
+        let start = std::time::Instant::now();
+
+        let body = serde_json::json!({
+            "model": self.model.as_str(),
+            "messages": [
+                {
+                    "role": "system",
+                    "content": HYDE_SYSTEM_PROMPT,
+                },
+                {
+                    "role": "user",
+                    "content": trimmed,
+                }
+            ],
+            "temperature": 0.3_f32,
+            "max_tokens": 300_u32,
+        });
+
+        let body_bytes = match serde_json::to_vec(&body) {
+            Ok(b) => b,
+            Err(e) => {
+                tracing::warn!(error = %e, "HyDE serialize failed — using original query");
+                return trimmed.to_owned();
+            }
+        };
+
+        let response = match self.call_api_with_retry(body_bytes).await {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::warn!(error = %e, "HyDE API call failed — using original query");
+                return trimmed.to_owned();
+            }
+        };
+
+        let chat: ChatResponse = match serde_json::from_slice(&response) {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::warn!(error = %e, "HyDE response parse failed — using original query");
+                return trimmed.to_owned();
+            }
+        };
+
+        let hyde_text = chat
+            .choices
+            .into_iter()
+            .next()
+            .and_then(|c| c.message.content)
+            .unwrap_or_default()
+            .trim()
+            .to_owned();
+
+        if hyde_text.is_empty() {
+            tracing::warn!("HyDE returned empty text — using original query");
+            return trimmed.to_owned();
+        }
+
+        let elapsed = start.elapsed();
+        tracing::info!(
+            hyde_len = hyde_text.len(),
+            latency_ms = elapsed.as_millis(),
+            "HyDE hypothetical document generated"
+        );
+
+        hyde_text
+    }
 }
+
+// ---------------------------------------------------------------------------
+// HyDE system prompt
+// ---------------------------------------------------------------------------
+
+/// System prompt for Hypothetical Document Embedding (HyDE).
+///
+/// Instructs the LLM to generate a short passage that LOOKS like a real
+/// document chunk answering the query.  The embedding of this hypothetical
+/// passage is then used for dense vector retrieval instead of embedding the
+/// raw question.
+const HYDE_SYSTEM_PROMPT: &str = "\
+You are a document generator for a retrieval system. Given a user question, \
+write a short passage (3-5 sentences) that looks like it could be a real \
+paragraph from a document that answers the question.
+
+Rules:
+- Write in the SAME LANGUAGE as the question (Romanian for Romanian, English \
+  for English).
+- Use a formal, factual tone — as if quoting from a legal code, textbook, or \
+  official document.
+- Include specific terminology, article numbers, or technical terms that \
+  would appear in the real source document.
+- Do NOT say \"the answer is\" or \"according to\". Write AS IF you are the \
+  document itself.
+- Keep it concise: 3-5 sentences maximum.
+- For legal queries: mimic the style of the Romanian Penal Code (articol, \
+  alineat, pedeapsă, infracțiune).
+- For technical queries: mimic technical documentation style.
+
+Example:
+  Question: \"Ce prevede articolul 188 din Codul Penal?\"
+  Output: \"Articolul 188 - Omorul. (1) Uciderea unei persoane se pedepsește \
+  cu închisoare de la 10 la 20 de ani și interzicerea exercitării unor drepturi. \
+  (2) Tentativa se pedepsește.\"\
+";
 
 // ---------------------------------------------------------------------------
 // Helpers
