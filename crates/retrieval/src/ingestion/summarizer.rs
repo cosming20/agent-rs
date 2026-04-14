@@ -52,7 +52,10 @@ const CHAT_COMPLETIONS_URL: &str = "https://api.openai.com/v1/chat/completions";
 const DEFAULT_MAX_RETRIES: u32 = 3;
 
 /// Default concurrency for batch summarization calls.
-pub const DEFAULT_SUMMARIZER_CONCURRENCY: usize = 5;
+///
+/// Bumped from 5 to 20 — matches KG extraction concurrency. Reduces
+/// chunk summarization from ~164s to ~42s for 412 chunks.
+pub const DEFAULT_SUMMARIZER_CONCURRENCY: usize = 20;
 
 /// Maximum characters forwarded to the LLM for summarization.
 /// Very large chunks are truncated at a character boundary.
