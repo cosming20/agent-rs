@@ -192,44 +192,62 @@ impl CrossEncoderReranker {
         let api_key = self.api_key.clone();
         let body_ref = body.clone();
 
-        let call = || async {
-            let resp = client
-                .post(JINA_RERANK_URL)
-                .bearer_auth(&api_key)
-                .header("Content-Type", "application/json")
-                .body(body_ref.clone())
-                .send()
-                .await
-                .map_err(|e| RetrievalError::Embedding {
-                    reason: format!("jina rerank HTTP request failed: {e}"),
-                })?;
+        let call = || {
+            let client = client.clone();
+            let api_key = api_key.clone();
+            let body_ref = body_ref.clone();
+            async move {
+                let resp = client
+                    .post(JINA_RERANK_URL)
+                    .bearer_auth(&api_key)
+                    .header("Content-Type", "application/json")
+                    .body(body_ref)
+                    .send()
+                    .await
+                    .map_err(|e| RetrievalError::Embedding {
+                        reason: format!("jina rerank HTTP request failed: {e}"),
+                    })?;
 
-            let status = resp.status();
-            if !status.is_success() {
-                let body_text = resp.text().await.unwrap_or_else(|_| "<no body>".into());
-                return Err(RetrievalError::Embedding {
-                    reason: format!("jina rerank API error (HTTP {status}): {body_text}"),
-                });
+                let status = resp.status();
+                if !status.is_success() {
+                    let body_text = resp.text().await.unwrap_or_else(|_| "<no body>".into());
+                    let reason = format!("jina rerank API error (HTTP {status}): {body_text}");
+                    if status.as_u16() == 429 || status.is_server_error() {
+                        tracing::warn!(
+                            status = %status,
+                            attempt_will_retry = true,
+                            "jina rerank retryable error"
+                        );
+                    }
+                    return Err(RetrievalError::Embedding { reason });
+                }
+
+                let parsed: RerankResponse =
+                    resp.json().await.map_err(|e| RetrievalError::Embedding {
+                        reason: format!("failed to parse jina rerank response: {e}"),
+                    })?;
+
+                Ok::<_, RetrievalError>(parsed)
             }
-
-            let parsed: RerankResponse =
-                resp.json().await.map_err(|e| RetrievalError::Embedding {
-                    reason: format!("failed to parse jina rerank response: {e}"),
-                })?;
-
-            Ok::<_, RetrievalError>(parsed)
         };
 
         let rerank_response = call
             .retry(
                 ExponentialBuilder::default()
-                    .with_min_delay(Duration::from_millis(500))
-                    .with_max_delay(Duration::from_secs(30))
+                    .with_min_delay(Duration::from_secs(2))
+                    .with_max_delay(Duration::from_secs(8))
                     .with_max_times(3),
             )
             .when(|e| {
                 matches!(e, RetrievalError::Embedding { reason }
                     if reason.contains("HTTP 429") || reason.contains("HTTP 5"))
+            })
+            .notify(|e, dur| {
+                tracing::warn!(
+                    error = %e,
+                    retry_after = ?dur,
+                    "jina reranker rate-limited; retrying after backoff"
+                );
             })
             .await?;
 

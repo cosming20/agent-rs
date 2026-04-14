@@ -50,13 +50,16 @@ use uuid::Uuid;
 use agent_rs_core::config::{IngestBackend, Settings};
 use agent_rs_core::types::{CollectionName, RetrievalStrategy};
 use agent_rs_retrieval::Embedder;
+use agent_rs_retrieval::context_expander::{ContextExpander, ContextExpanderConfig};
 use agent_rs_retrieval::embedder::{FastEmbedder, FastEmbedderConfig};
 use agent_rs_retrieval::graph_cot::{GraphCotConfig, GraphCotRetriever};
 use agent_rs_retrieval::ingestion::docling_client::DoclingSidecarClient;
 use agent_rs_retrieval::ingestion::{
     ChunkSummarizer, ChunkerConfig, IngestionPipeline, IngestionPipelineConfig, LlmGraphExtractor,
 };
+use agent_rs_retrieval::metadata_filter::{MetadataFilterConfig, MetadataFilterExtractor};
 use agent_rs_retrieval::openai_embedder::{OpenAIEmbedder, OpenAIEmbedderConfig};
+use agent_rs_retrieval::query_rewriter::{QueryRewriter, QueryRewriterConfig};
 use agent_rs_retrieval::ranker::ResultRanker;
 use agent_rs_retrieval::reranker::CrossEncoderReranker;
 use agent_rs_retrieval::router::RetrievalRouter;
@@ -1198,6 +1201,79 @@ async fn main() -> Result<()> {
         None
     };
 
+    // Optional query rewriter — enabled when OPENAI_API_KEY / LLM_API_KEY is set
+    // and EVAL_SKIP_QUERY_REWRITER is not "1".
+    let skip_query_rewriter = std::env::var("EVAL_SKIP_QUERY_REWRITER")
+        .ok()
+        .is_some_and(|v| v == "1" || v.eq_ignore_ascii_case("true"));
+    let query_rewriter: Option<Arc<QueryRewriter>> = if skip_query_rewriter {
+        info!("EVAL_SKIP_QUERY_REWRITER=1 — LLM query rewriting disabled");
+        None
+    } else if let Ok(api_key) =
+        std::env::var("OPENAI_API_KEY").or_else(|_| std::env::var("LLM_API_KEY"))
+    {
+        let model = std::env::var("QUERY_REWRITER_MODEL")
+            .unwrap_or_else(|_| "gpt-5.4-mini-2026-03-17".to_owned());
+        info!(model = %model, "initializing QueryRewriter");
+        let config = QueryRewriterConfig {
+            api_key,
+            model,
+            max_sub_queries: 3,
+            temperature: 0.1,
+        };
+        Some(Arc::new(QueryRewriter::new(config)))
+    } else {
+        info!("OPENAI_API_KEY/LLM_API_KEY not set — QueryRewriter disabled");
+        None
+    };
+
+    // Optional metadata filter extractor — enabled when OPENAI_API_KEY /
+    // LLM_API_KEY is set and EVAL_SKIP_METADATA_FILTER is not "1".
+    let skip_metadata_filter = std::env::var("EVAL_SKIP_METADATA_FILTER")
+        .ok()
+        .is_some_and(|v| v == "1" || v.eq_ignore_ascii_case("true"));
+    let metadata_filter: Option<Arc<MetadataFilterExtractor>> = if skip_metadata_filter {
+        info!("EVAL_SKIP_METADATA_FILTER=1 — LLM metadata filtering disabled");
+        None
+    } else if let Ok(api_key) =
+        std::env::var("OPENAI_API_KEY").or_else(|_| std::env::var("LLM_API_KEY"))
+    {
+        let model =
+            std::env::var("METADATA_FILTER_MODEL").unwrap_or_else(|_| "gpt-4o-mini".to_owned());
+        info!(model = %model, "initializing MetadataFilterExtractor");
+        let config = MetadataFilterConfig {
+            api_key,
+            model,
+            temperature: 0.0,
+        };
+        match MetadataFilterExtractor::new(config) {
+            Ok(extractor) => Some(Arc::new(extractor)),
+            Err(e) => {
+                warn!(error = %e, "MetadataFilterExtractor init failed — running without metadata filtering");
+                None
+            }
+        }
+    } else {
+        info!("OPENAI_API_KEY/LLM_API_KEY not set — MetadataFilterExtractor disabled");
+        None
+    };
+
+    // Optional context expander — enabled by default when Neo4j is reachable.
+    // Disable with EVAL_SKIP_CONTEXT_EXPANDER=1.
+    let skip_context_expander = std::env::var("EVAL_SKIP_CONTEXT_EXPANDER")
+        .ok()
+        .is_some_and(|v| v == "1" || v.eq_ignore_ascii_case("true"));
+    let context_expander: Option<Arc<ContextExpander>> = if skip_context_expander {
+        info!("EVAL_SKIP_CONTEXT_EXPANDER=1 — post-retrieval context expansion disabled");
+        None
+    } else {
+        info!("initializing ContextExpander (Neo4j FOLLOWS / IN_SECTION expansion)");
+        Some(Arc::new(ContextExpander::new(
+            neo4j_store.clone() as Arc<dyn GraphStore + Send + Sync>,
+            ContextExpanderConfig::default(),
+        )))
+    };
+
     let ranker = ResultRanker::new(settings.ranker.rrf_k);
     let mut base_router = RetrievalRouter::new(
         embedder.clone(),
@@ -1211,6 +1287,15 @@ async fn main() -> Result<()> {
 
     if let Some(cot) = graph_cot_retriever {
         base_router = base_router.with_graph_cot_retriever(cot);
+    }
+    if let Some(rw) = query_rewriter {
+        base_router = base_router.with_query_rewriter(rw);
+    }
+    if let Some(mf) = metadata_filter {
+        base_router = base_router.with_metadata_filter(mf);
+    }
+    if let Some(ce) = context_expander {
+        base_router = base_router.with_context_expander(ce);
     }
 
     let router = Arc::new(if let Some(r) = reranker {

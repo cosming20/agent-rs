@@ -25,12 +25,14 @@
 
 use std::sync::Arc;
 
-use agent_rs_core::{CollectionName, RetrievalStrategy};
+use agent_rs_core::{CollectionName, Embedding, RetrievalStrategy};
 use tracing::instrument;
 
 use crate::{
-    Embedder, EvidencePack, ResultRanker, RetrievalError,
+    ContextExpander, Embedder, EvidencePack, MetadataFilterExtractor, QueryRewriter, ResultRanker,
+    RetrievalError,
     graph_cot::GraphCotRetriever,
+    metadata_filter::FilterCondition,
     reranker::{CrossEncoderReranker, RERANK_CANDIDATE_COUNT},
     search::{
         graph::{
@@ -104,6 +106,30 @@ pub struct RetrievalRouter {
     /// questions and merge additional evidence. When `None`, `GraphCoT`
     /// behaves identically to a plain [`RetrievalStrategy::Graph`] search.
     graph_cot_retriever: Option<Arc<GraphCotRetriever>>,
+
+    /// Optional LLM-based query decomposition engine.
+    ///
+    /// When `Some`, the router calls [`QueryRewriter::rewrite`] before
+    /// dispatching to search back-ends. Complex queries are decomposed into
+    /// up to 3 focused sub-queries; each is retrieved independently and the
+    /// results are fused by RRF. Simple queries pass through unchanged.
+    query_rewriter: Option<Arc<QueryRewriter>>,
+
+    /// Optional LLM-based metadata hint extractor for Qdrant filter narrowing.
+    ///
+    /// When `Some`, [`MetadataFilterExtractor::extract`] is called on the
+    /// original query before dispatch. Extracted hints (page range, article
+    /// number, content-type flags) are translated to Qdrant `must` conditions
+    /// and pushed down to the vector/hybrid search calls.
+    metadata_filter: Option<Arc<MetadataFilterExtractor>>,
+
+    /// Optional post-retrieval context expander using Neo4j structural edges.
+    ///
+    /// When `Some`, after retrieval and reranking the router calls
+    /// [`ContextExpander::expand`] on the top hits to fetch their FOLLOWS
+    /// neighbors and same-section siblings. The expanded context text is
+    /// appended to each document's content in the returned [`EvidencePack`].
+    context_expander: Option<Arc<ContextExpander>>,
 }
 
 impl RetrievalRouter {
@@ -134,6 +160,9 @@ impl RetrievalRouter {
             summaries_collection: None,
             reranker: None,
             graph_cot_retriever: None,
+            query_rewriter: None,
+            metadata_filter: None,
+            context_expander: None,
         }
     }
 
@@ -183,6 +212,43 @@ impl RetrievalRouter {
     /// Returns the router by value to support builder-style construction.
     pub fn with_graph_cot_retriever(mut self, retriever: Arc<GraphCotRetriever>) -> Self {
         self.graph_cot_retriever = Some(retriever);
+        self
+    }
+
+    /// Attach an optional LLM-based query rewriter.
+    ///
+    /// When set, complex queries are decomposed into up to 3 focused sub-queries
+    /// before dispatch. Each sub-query is retrieved independently and the results
+    /// are fused by RRF. Simple queries pass through unchanged.
+    ///
+    /// Returns the router by value to support builder-style construction.
+    pub fn with_query_rewriter(mut self, rewriter: Arc<QueryRewriter>) -> Self {
+        self.query_rewriter = Some(rewriter);
+        self
+    }
+
+    /// Attach an optional LLM-based metadata filter extractor.
+    ///
+    /// When set, structural hints (page range, article number, content-type
+    /// flags) are extracted from the query and translated to Qdrant payload
+    /// filter conditions applied to vector and hybrid search calls.
+    ///
+    /// Returns the router by value to support builder-style construction.
+    pub fn with_metadata_filter(mut self, extractor: Arc<MetadataFilterExtractor>) -> Self {
+        self.metadata_filter = Some(extractor);
+        self
+    }
+
+    /// Attach an optional post-retrieval context expander.
+    ///
+    /// When set, after retrieval and reranking the expander fetches FOLLOWS
+    /// neighbors and same-section siblings from Neo4j for each top hit and
+    /// appends their text to the document content in the returned
+    /// [`EvidencePack`].
+    ///
+    /// Returns the router by value to support builder-style construction.
+    pub fn with_context_expander(mut self, expander: Arc<ContextExpander>) -> Self {
+        self.context_expander = Some(expander);
         self
     }
 
@@ -275,11 +341,15 @@ impl RetrievalRouter {
     ///
     /// # Algorithm
     ///
-    /// 1. Rewrite query (Phase 3: no-op).
-    /// 2. Embed dense (always required).
-    /// 3. Embed sparse if the strategy touches the keyword back-end.
-    /// 4. Dispatch to the correct search function(s) based on strategy.
-    /// 5. Fuse result lists via RRF and return an [`EvidencePack`].
+    /// 1. LLM query rewriting (if [`QueryRewriter`] configured): decompose into sub-queries.
+    /// 2. Extract metadata filter hints (if [`MetadataFilterExtractor`] configured).
+    /// 3. Embed dense (always required).
+    /// 4. For each sub-query (1 when not decomposed, 2-3 when decomposed):
+    ///    a. Dispatch to the correct search function(s) based on strategy.
+    /// 5. Fuse all result lists (across sub-queries) via RRF.
+    /// 6. Optional cross-encoder reranking.
+    /// 7. Optional post-retrieval context expansion (if [`ContextExpander`] configured).
+    /// 8. Return the assembled [`EvidencePack`].
     ///
     /// # Errors
     ///
@@ -294,41 +364,319 @@ impl RetrievalRouter {
     ) -> Result<EvidencePack, RetrievalError> {
         let descriptor = get_descriptor(strategy);
 
-        let rewritten = self.rewrite_query(query, strategy);
-        let query_str: &str = &rewritten;
+        // ---- Step 1: LLM query rewriting (optional) ----
+        //
+        // When a QueryRewriter is configured, decompose complex queries into
+        // 2-3 focused sub-queries. Simple queries pass through unchanged as a
+        // single-element sub-query list. On any failure the rewriter returns
+        // the original query verbatim (graceful fallback is internal to rewrite()).
+        let sub_queries: Vec<String> = if let Some(rewriter) = self.query_rewriter.as_ref() {
+            let rewritten = rewriter.rewrite(query).await?;
+            tracing::debug!(
+                sub_query_count = rewritten.sub_queries.len(),
+                was_decomposed = rewritten.was_decomposed,
+                "query rewriting complete"
+            );
+            rewritten
+                .sub_queries
+                .into_iter()
+                .map(|sq| sq.text)
+                .collect()
+        } else {
+            // Phase 3 no-op: fall through to the existing rewrite_query stub.
+            let rewritten = self.rewrite_query(query, strategy);
+            vec![rewritten]
+        };
 
-        // Always embed dense — every strategy needs at minimum a dense vector.
-        // Sparse embeddings are no longer computed client-side: the store layer
-        // sends the raw query text as `Document { model: "qdrant/bm25" }` and
-        // Qdrant performs BM25 inference server-side.
-        let dense = self.embedder.embed_text(query_str).await?;
+        // ---- Step 2: Metadata filter extraction (optional) ----
+        //
+        // Extract structural hints from the *original* query (not sub-queries).
+        // Convert hints to Qdrant filter JSON for use in vector/hybrid searches.
+        let qdrant_filter_json: Option<serde_json::Value> =
+            if let Some(extractor) = self.metadata_filter.as_ref() {
+                let hints = extractor.extract(query).await;
+                if let Some(conditions) = MetadataFilterExtractor::to_qdrant_filter(&hints) {
+                    tracing::debug!(
+                        num_conditions = conditions.len(),
+                        "metadata filter conditions will be applied to search"
+                    );
+                    Some(filter_conditions_to_json(&conditions))
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
 
-        // Dispatch and collect result lists for the ranker.
-        let mut result_lists: Vec<Vec<agent_rs_stores::types::SearchResult>> = match strategy {
+        // ---- Step 3–4: Embed + dispatch per sub-query ----
+        //
+        // Each sub-query is embedded independently and dispatched to the search
+        // back-ends. Result lists from all sub-queries are pooled together for
+        // RRF fusion in step 5.
+        let mut all_result_lists: Vec<Vec<agent_rs_stores::types::SearchResult>> = Vec::new();
+
+        for query_str in &sub_queries {
+            // Always embed dense — every strategy needs at minimum a dense vector.
+            // Sparse embeddings are no longer computed client-side: the store layer
+            // sends the raw query text as `Document { model: "qdrant/bm25" }` and
+            // Qdrant performs BM25 inference server-side.
+            let dense = self.embedder.embed_text(query_str).await?;
+
+            let per_sub_lists = self
+                .dispatch_single(
+                    query_str,
+                    strategy,
+                    &dense,
+                    limit,
+                    qdrant_filter_json.as_ref(),
+                )
+                .await?;
+
+            all_result_lists.extend(per_sub_lists);
+
+            // Triplet search for graph-oriented strategies (same logic as before,
+            // run once per sub-query and merged into all_result_lists).
+            if descriptor.uses_triplets {
+                if let Some(triplet_collection) = self.triplet_collection.as_ref() {
+                    match triplet_search(&*self.vector_store, triplet_collection, &dense, limit)
+                        .await
+                    {
+                        Ok(triplet_results) => {
+                            let chunk_ids: Vec<String> = triplet_results
+                                .iter()
+                                .filter_map(|r| {
+                                    r.payload
+                                        .get("chunk_id")
+                                        .and_then(|v| v.as_str())
+                                        .map(String::from)
+                                })
+                                .collect();
+
+                            if !chunk_ids.is_empty() {
+                                let hydrated = self
+                                    .hydrate_chunks_from_triplets(&chunk_ids, &dense, limit)
+                                    .await;
+                                if !hydrated.is_empty() {
+                                    all_result_lists.push(hydrated);
+                                }
+                            }
+
+                            tracing::debug!(
+                                strategy = %strategy,
+                                count = triplet_results.len(),
+                                "triplet search contributed to RRF fusion"
+                            );
+                            all_result_lists.push(triplet_results);
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                strategy = %strategy,
+                                error = %e,
+                                "triplet search failed; continuing without triplet evidence"
+                            );
+                        }
+                    }
+                } else {
+                    tracing::debug!(
+                        strategy = %strategy,
+                        "triplet search requested but no triplet collection configured"
+                    );
+                }
+            }
+        }
+
+        // Use the original query string for RRF ranking / reranking labels.
+        // When the query was not decomposed, sub_queries[0] == original query.
+        let primary_query = sub_queries.first().map(String::as_str).unwrap_or(query);
+
+        // ---- Step 5: RRF fusion ----
+        // When reranking is enabled we request more candidates
+        // (RERANK_CANDIDATE_COUNT) so the cross-encoder has a richer pool to
+        // score; the final truncation to `limit` happens after reranking.
+        let rrf_limit = if self.reranker.is_some() {
+            RERANK_CANDIDATE_COUNT.max(limit)
+        } else {
+            limit
+        };
+
+        let mut evidence = self
+            .ranker
+            .rank(all_result_lists, primary_query, strategy, rrf_limit);
+
+        // ---- Step 6: Optional cross-encoder reranking ----
+        if let Some(reranker) = self.reranker.as_ref() {
+            // Clone the candidates so we can fall back to the RRF-ranked
+            // results if reranking fails. The clone is bounded by rrf_limit
+            // (≤50 documents) so the cost is negligible compared to the
+            // network round-trip to the reranker.
+            let candidates: Vec<_> = evidence.documents.to_vec();
+            tracing::debug!(
+                strategy = %strategy,
+                candidates = candidates.len(),
+                top_k = limit,
+                "cross-encoder reranking"
+            );
+            match reranker.rerank(primary_query, candidates, limit).await {
+                Ok(reranked) => {
+                    evidence.documents = reranked;
+                }
+                Err(e) => {
+                    // Reranking is best-effort: on failure (rate limit,
+                    // network error, etc.) keep the original RRF-ranked
+                    // results truncated to `limit`. This preserves retrieval
+                    // availability and quality under transient API failures.
+                    tracing::warn!(
+                        strategy = %strategy,
+                        error = %e,
+                        "cross-encoder reranking failed; falling back to RRF-ranked results"
+                    );
+                    evidence.documents.truncate(limit);
+                }
+            }
+        }
+
+        // ---- Step 7: Optional post-retrieval context expansion ----
+        //
+        // For each top hit, fetch FOLLOWS neighbors and same-section siblings
+        // from Neo4j. The expanded context text is appended to each document's
+        // `chunk_text` payload field so the caller's synthesis step has richer
+        // surrounding text available.
+        if let Some(expander) = self.context_expander.as_ref() {
+            let before_count = evidence.documents.len();
+
+            // Build (chunk_id, original_text) pairs from the evidence documents.
+            let hit_chunks: Vec<(String, String)> = evidence
+                .documents
+                .iter()
+                .map(|doc| {
+                    let text = doc
+                        .payload
+                        .get("chunk_text")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_owned();
+                    (doc.id.clone(), text)
+                })
+                .collect();
+
+            match expander.expand(&hit_chunks).await {
+                Ok(expanded) => {
+                    // Merge expanded context into the evidence document payloads.
+                    // For each hit, collect context_before + context_after + siblings
+                    // and append their text to chunk_text with a separator.
+                    for (doc, expanded_chunk) in evidence.documents.iter_mut().zip(expanded.iter())
+                    {
+                        let mut extra_parts: Vec<&str> = Vec::new();
+
+                        for ctx in &expanded_chunk.context_before {
+                            if !ctx.text.is_empty() {
+                                extra_parts.push(ctx.text.as_str());
+                            }
+                        }
+                        for ctx in &expanded_chunk.context_after {
+                            if !ctx.text.is_empty() {
+                                extra_parts.push(ctx.text.as_str());
+                            }
+                        }
+                        for sibling in &expanded_chunk.section_siblings {
+                            if !sibling.text.is_empty() {
+                                extra_parts.push(sibling.text.as_str());
+                            }
+                        }
+
+                        if !extra_parts.is_empty() {
+                            let original = doc
+                                .payload
+                                .get("chunk_text")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("")
+                                .to_owned();
+                            let appended = format!("{}\n\n{}", original, extra_parts.join("\n\n"));
+                            if let Some(payload_obj) = doc.payload.as_object_mut() {
+                                payload_obj.insert(
+                                    "chunk_text".to_owned(),
+                                    serde_json::Value::String(appended),
+                                );
+                            }
+                        }
+                    }
+
+                    let after_count: usize = expanded
+                        .iter()
+                        .map(|e| {
+                            1 + e.context_before.len()
+                                + e.context_after.len()
+                                + e.section_siblings.len()
+                        })
+                        .sum();
+                    tracing::info!(
+                        before = before_count,
+                        after = after_count,
+                        "context expansion merged into evidence pack"
+                    );
+                }
+                Err(e) => {
+                    // Context expansion is best-effort: on failure keep the
+                    // original evidence unchanged.
+                    tracing::warn!(
+                        strategy = %strategy,
+                        error = %e,
+                        "context expansion failed; returning unexpanded evidence"
+                    );
+                }
+            }
+        }
+
+        Ok(evidence)
+    }
+
+    /// Dispatch a single (sub-)query to the appropriate search back-ends for
+    /// the given `strategy`.
+    ///
+    /// Returns the raw per-backend result lists to be pooled and fused by the
+    /// caller. The `filter` JSON is pushed down to Qdrant vector/hybrid calls
+    /// when provided.
+    async fn dispatch_single(
+        &self,
+        query_str: &str,
+        strategy: RetrievalStrategy,
+        dense: &Embedding,
+        limit: usize,
+        filter: Option<&serde_json::Value>,
+    ) -> Result<Vec<Vec<agent_rs_stores::types::SearchResult>>, RetrievalError> {
+        match strategy {
             // ---- Single-backend: dense vector ----
             RetrievalStrategy::Semantic => {
-                let results =
-                    vector_search(&*self.vector_store, &self.collection, &dense, limit).await?;
-                vec![results]
+                let results = if let Some(f) = filter {
+                    self.vector_store
+                        .search_with_filter(&self.collection, dense, limit, Some(f.clone()))
+                        .await
+                        .map_err(RetrievalError::Store)?
+                } else {
+                    vector_search(&*self.vector_store, &self.collection, dense, limit).await?
+                };
+                Ok(vec![results])
             }
 
             // ---- Single-backend: summaries vector ----
             RetrievalStrategy::Summaries => {
                 // Use the dedicated summaries collection when available;
                 // fall back to the main collection otherwise.
+                // Metadata filters are not applied to summaries (they may not
+                // carry the same payload schema as chunk collections).
                 let target = self
                     .summaries_collection
                     .as_ref()
                     .unwrap_or(&self.collection);
-                let results = summaries_search(&*self.vector_store, target, &dense, limit).await?;
-                vec![results]
+                let results = summaries_search(&*self.vector_store, target, dense, limit).await?;
+                Ok(vec![results])
             }
 
             // ---- Single-backend: temporal vector ----
             RetrievalStrategy::Temporal => {
                 let results =
-                    temporal_search(&*self.vector_store, &self.collection, &dense, limit).await?;
-                vec![results]
+                    temporal_search(&*self.vector_store, &self.collection, dense, limit).await?;
+                Ok(vec![results])
             }
 
             // ---- Single-backend: keyword ----
@@ -338,18 +686,19 @@ impl RetrievalRouter {
                 let results = keyword_search(
                     &*self.vector_store,
                     &self.collection,
-                    &dense,
+                    dense,
                     query_str,
                     limit,
                 )
                 .await?;
-                vec![results]
+                Ok(vec![results])
             }
 
             // ---- Single-backend: graph (base traversal) ----
-            // Seed graph traversal from vector search nearest neighbors
+            // Seed graph traversal from vector search nearest neighbors.
+            // Metadata filter is applied to the seed derivation vector search.
             RetrievalStrategy::Graph => {
-                let seeds = self.derive_seed_ids(query_str, &dense, limit).await?;
+                let seeds = self.derive_seed_ids(query_str, dense, limit).await?;
                 let results = graph_search(
                     &*self.graph_store,
                     query_str,
@@ -358,12 +707,12 @@ impl RetrievalRouter {
                     limit,
                 )
                 .await?;
-                vec![results]
+                Ok(vec![results])
             }
 
             // ---- Single-backend: graph RAG completion ----
             RetrievalStrategy::RagCompletion => {
-                let seeds = self.derive_seed_ids(query_str, &dense, limit).await?;
+                let seeds = self.derive_seed_ids(query_str, dense, limit).await?;
                 let results = graph_rag_context_search(
                     &*self.graph_store,
                     query_str,
@@ -372,7 +721,7 @@ impl RetrievalRouter {
                     limit,
                 )
                 .await?;
-                vec![results]
+                Ok(vec![results])
             }
 
             // ---- Single-backend: graph chain-of-thought ----
@@ -389,7 +738,7 @@ impl RetrievalRouter {
             //   3. If no retriever is configured, the initial pool is returned
             //      unchanged (equivalent to plain graph search).
             RetrievalStrategy::GraphCoT => {
-                let seeds = self.derive_seed_ids(query_str, &dense, limit).await?;
+                let seeds = self.derive_seed_ids(query_str, dense, limit).await?;
                 let initial = graph_cot_search(
                     &*self.graph_store,
                     query_str,
@@ -428,180 +777,188 @@ impl RetrievalRouter {
                     initial
                 };
 
-                vec![final_results]
+                Ok(vec![final_results])
             }
 
             // ---- Parallel: vector + keyword (HYBRID) ----
             RetrievalStrategy::Hybrid => {
-                let hybrid_results = hybrid_search(
-                    &*self.vector_store,
-                    &self.collection,
-                    &dense,
-                    query_str,
-                    limit,
-                )
-                .await?;
-                vec![
-                    hybrid_results.vector_results,
-                    hybrid_results.keyword_results,
-                ]
+                // When a metadata filter is present, use separate filtered vector
+                // and keyword searches rather than the combined hybrid path (which
+                // does not yet accept a filter parameter).
+                if let Some(f) = filter {
+                    let (vector_result, keyword_result) = tokio::join!(
+                        self.vector_store.search_with_filter(
+                            &self.collection,
+                            dense,
+                            limit,
+                            Some(f.clone())
+                        ),
+                        keyword_search(
+                            &*self.vector_store,
+                            &self.collection,
+                            dense,
+                            query_str,
+                            limit
+                        ),
+                    );
+                    Ok(vec![
+                        vector_result.map_err(RetrievalError::Store)?,
+                        keyword_result?,
+                    ])
+                } else {
+                    let hybrid_results = hybrid_search(
+                        &*self.vector_store,
+                        &self.collection,
+                        dense,
+                        query_str,
+                        limit,
+                    )
+                    .await?;
+                    Ok(vec![
+                        hybrid_results.vector_results,
+                        hybrid_results.keyword_results,
+                    ])
+                }
             }
 
             // ---- Parallel: vector + keyword + graph (GRAPH_HYBRID) ----
             RetrievalStrategy::GraphHybrid => {
-                let seeds = self.derive_seed_ids(query_str, &dense, limit).await?;
-                let params = GraphHybridParams {
-                    query_embedding: &dense,
-                    query_text: query_str,
-                    query: query_str,
-                    seed_node_ids: &seeds,
-                    max_depth: DEFAULT_GRAPH_DEPTH,
-                    limit,
-                };
-                let hybrid_results = graph_hybrid_search(
-                    &*self.vector_store,
-                    &*self.graph_store,
-                    &self.collection,
-                    params,
-                )
-                .await?;
-                let mut lists = vec![
-                    hybrid_results.vector_results,
-                    hybrid_results.keyword_results,
-                ];
-                if let Some(graph_res) = hybrid_results.graph_results {
-                    lists.push(graph_res);
+                let seeds = self.derive_seed_ids(query_str, dense, limit).await?;
+                if let Some(f) = filter {
+                    let (vector_result, keyword_result, graph_result) = tokio::join!(
+                        self.vector_store.search_with_filter(
+                            &self.collection,
+                            dense,
+                            limit,
+                            Some(f.clone())
+                        ),
+                        keyword_search(
+                            &*self.vector_store,
+                            &self.collection,
+                            dense,
+                            query_str,
+                            limit
+                        ),
+                        graph_search(
+                            &*self.graph_store,
+                            query_str,
+                            &seeds,
+                            DEFAULT_GRAPH_DEPTH,
+                            limit
+                        ),
+                    );
+                    Ok(vec![
+                        vector_result.map_err(RetrievalError::Store)?,
+                        keyword_result?,
+                        graph_result?,
+                    ])
+                } else {
+                    let params = GraphHybridParams {
+                        query_embedding: dense,
+                        query_text: query_str,
+                        query: query_str,
+                        seed_node_ids: &seeds,
+                        max_depth: DEFAULT_GRAPH_DEPTH,
+                        limit,
+                    };
+                    let hybrid_results = graph_hybrid_search(
+                        &*self.vector_store,
+                        &*self.graph_store,
+                        &self.collection,
+                        params,
+                    )
+                    .await?;
+                    let mut lists = vec![
+                        hybrid_results.vector_results,
+                        hybrid_results.keyword_results,
+                    ];
+                    if let Some(graph_res) = hybrid_results.graph_results {
+                        lists.push(graph_res);
+                    }
+                    Ok(lists)
                 }
-                lists
             }
 
             // ---- Parallel: graph + vector (GRAPH_CONSTRAINED) ----
             RetrievalStrategy::GraphConstrained => {
-                let seeds = self.derive_seed_ids(query_str, &dense, limit).await?;
-                let (graph_result, vector_result) = tokio::join!(
-                    graph_constrained_search(
-                        &*self.graph_store,
-                        query_str,
-                        &seeds,
-                        DEFAULT_GRAPH_DEPTH,
-                        limit,
-                    ),
-                    vector_search(&*self.vector_store, &self.collection, &dense, limit),
-                );
-                vec![graph_result?, vector_result?]
-            }
-        };
-
-        // Additional triplet search for graph-oriented strategies.
-        //
-        // This mirrors Cognee's brute_force_triplet_search: for strategies
-        // that walk the knowledge graph, we also score complete
-        // (source) -[relation]-> (target) triplets against the query embedding
-        // and fuse them as a separate ranked list.
-        if descriptor.uses_triplets {
-            if let Some(triplet_collection) = self.triplet_collection.as_ref() {
-                match triplet_search(&*self.vector_store, triplet_collection, &dense, limit).await {
-                    Ok(triplet_results) => {
-                        // Hydrate triplet results with their source chunks.
-                        // Each triplet payload carries a chunk_id pointing to
-                        // the chunk that generated it. We fetch those chunks
-                        // from the main collection so the fused result list
-                        // contains real chunk_text for ranking and evidence.
-                        let chunk_ids: Vec<String> = triplet_results
-                            .iter()
-                            .filter_map(|r| {
-                                r.payload
-                                    .get("chunk_id")
-                                    .and_then(|v| v.as_str())
-                                    .map(String::from)
-                            })
-                            .collect();
-
-                        if !chunk_ids.is_empty() {
-                            // Retrieve the actual chunk documents via a filtered
-                            // scroll on the main collection. For each chunk_id,
-                            // run a filtered search with a dummy vector and take
-                            // the first match. This is a simple approach; a
-                            // proper scroll-by-id would be faster.
-                            let hydrated = self
-                                .hydrate_chunks_from_triplets(&chunk_ids, &dense, limit)
-                                .await;
-                            if !hydrated.is_empty() {
-                                result_lists.push(hydrated);
-                            }
-                        }
-
-                        tracing::debug!(
-                            strategy = %strategy,
-                            count = triplet_results.len(),
-                            "triplet search contributed to RRF fusion"
-                        );
-                        result_lists.push(triplet_results);
-                    }
-                    Err(e) => {
-                        // Triplet search is best-effort: a missing or empty
-                        // collection should not fail the overall query. Log
-                        // and continue with the primary back-end results.
-                        tracing::warn!(
-                            strategy = %strategy,
-                            error = %e,
-                            "triplet search failed; continuing without triplet evidence"
-                        );
-                    }
-                }
-            } else {
-                tracing::debug!(
-                    strategy = %strategy,
-                    "triplet search requested but no triplet collection configured"
-                );
-            }
-        }
-
-        // RRF fusion. When reranking is enabled we request more candidates
-        // (RERANK_CANDIDATE_COUNT) so the cross-encoder has a richer pool to
-        // score; the final truncation to `limit` happens after reranking.
-        let rrf_limit = if self.reranker.is_some() {
-            RERANK_CANDIDATE_COUNT.max(limit)
-        } else {
-            limit
-        };
-
-        let mut evidence = self
-            .ranker
-            .rank(result_lists, query_str, strategy, rrf_limit);
-
-        // Optional cross-encoder reranking stage.
-        if let Some(reranker) = self.reranker.as_ref() {
-            // Clone the candidates so we can fall back to the RRF-ranked
-            // results if reranking fails. The clone is bounded by RRF_limit
-            // (≤50 documents) so the cost is negligible compared to the
-            // network round-trip to the reranker.
-            let candidates: Vec<_> = evidence.documents.to_vec();
-            tracing::debug!(
-                strategy = %strategy,
-                candidates = candidates.len(),
-                top_k = limit,
-                "cross-encoder reranking"
-            );
-            match reranker.rerank(query_str, candidates, limit).await {
-                Ok(reranked) => {
-                    evidence.documents = reranked;
-                }
-                Err(e) => {
-                    // Reranking is best-effort: on failure (rate limit,
-                    // network error, etc.) keep the original RRF-ranked
-                    // results truncated to `limit`. This preserves retrieval
-                    // availability and quality under transient API failures.
-                    tracing::warn!(
-                        strategy = %strategy,
-                        error = %e,
-                        "cross-encoder reranking failed; falling back to RRF-ranked results"
+                let seeds = self.derive_seed_ids(query_str, dense, limit).await?;
+                if let Some(f) = filter {
+                    let (graph_result, vector_result) = tokio::join!(
+                        graph_constrained_search(
+                            &*self.graph_store,
+                            query_str,
+                            &seeds,
+                            DEFAULT_GRAPH_DEPTH,
+                            limit,
+                        ),
+                        self.vector_store.search_with_filter(
+                            &self.collection,
+                            dense,
+                            limit,
+                            Some(f.clone())
+                        ),
                     );
-                    evidence.documents.truncate(limit);
+                    Ok(vec![
+                        graph_result?,
+                        vector_result.map_err(RetrievalError::Store)?,
+                    ])
+                } else {
+                    let (graph_result, vector_result) = tokio::join!(
+                        graph_constrained_search(
+                            &*self.graph_store,
+                            query_str,
+                            &seeds,
+                            DEFAULT_GRAPH_DEPTH,
+                            limit,
+                        ),
+                        vector_search(&*self.vector_store, &self.collection, dense, limit),
+                    );
+                    Ok(vec![graph_result?, vector_result?])
                 }
             }
         }
-
-        Ok(evidence)
     }
+}
+
+// ---------------------------------------------------------------------------
+// Private helpers
+// ---------------------------------------------------------------------------
+
+/// Convert a slice of [`FilterCondition`] into the `serde_json::Value` format
+/// that the Qdrant store's `search_with_filter` understands.
+///
+/// Produces a `{"must": [...]}` object where each element encodes one condition.
+/// The `json_to_qdrant_filter` function in the stores crate handles this format.
+fn filter_conditions_to_json(conditions: &[FilterCondition]) -> serde_json::Value {
+    let must: Vec<serde_json::Value> = conditions
+        .iter()
+        .map(|c| match c {
+            FilterCondition::Match { field, value } => {
+                serde_json::json!({
+                    "key": field,
+                    "match": { "value": value }
+                })
+            }
+            FilterCondition::Range { field, gte, lte } => {
+                let mut range = serde_json::Map::new();
+                if let Some(v) = gte {
+                    range.insert("gte".to_owned(), serde_json::json!(v));
+                }
+                if let Some(v) = lte {
+                    range.insert("lte".to_owned(), serde_json::json!(v));
+                }
+                serde_json::json!({ "key": field, "range": range })
+            }
+            FilterCondition::Contains { field, text } => {
+                // Map to exact match on the field value — approximation for
+                // short strings like article numbers and section keywords.
+                serde_json::json!({
+                    "key": field,
+                    "match": { "value": text }
+                })
+            }
+        })
+        .collect();
+
+    serde_json::json!({ "must": must })
 }
