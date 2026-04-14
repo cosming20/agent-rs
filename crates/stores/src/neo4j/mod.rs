@@ -196,6 +196,49 @@ impl GraphStore for Neo4jStore {
         Ok(nodes)
     }
 
+    /// Execute a raw Cypher query with string parameters and return scalar rows.
+    ///
+    /// Each row is materialised as a `HashMap<String, serde_json::Value>` by
+    /// extracting the caller-supplied `columns`.  Column values that cannot be
+    /// deserialised as JSON are silently skipped per row.
+    ///
+    /// `neo4rs::Row` does not expose a `keys()` iterator, so the caller must
+    /// enumerate the expected column aliases explicitly.
+    #[instrument(
+        name = "neo4j_store.query_raw",
+        skip(self, params, columns),
+        fields(cypher_len = cypher.len(), param_count = params.len(), col_count = columns.len())
+    )]
+    async fn query_raw(
+        &self,
+        cypher: &str,
+        params: std::collections::HashMap<String, String>,
+        columns: &[&str],
+    ) -> Result<Vec<std::collections::HashMap<String, serde_json::Value>>, StoreError> {
+        let mut q = query(cypher);
+        for (k, v) in params {
+            q = q.param(k.as_str(), v);
+        }
+        let mut result = self.graph.execute(q).await.map_err(StoreError::from)?;
+
+        let mut rows = Vec::new();
+        while let Some(row) = result.next().await.map_err(StoreError::from)? {
+            let mut map = std::collections::HashMap::new();
+            for &col in columns {
+                match row.get::<serde_json::Value>(col) {
+                    Ok(val) => {
+                        map.insert(col.to_owned(), val);
+                    }
+                    Err(e) => {
+                        tracing::warn!(column = %col, error = %e, "failed to deserialise query_raw column; skipping");
+                    }
+                }
+            }
+            rows.push(map);
+        }
+        Ok(rows)
+    }
+
     /// Delete a node and all its incident edges by domain `id`.
     #[instrument(name = "neo4j_store.delete_node", skip(self), fields(node_id = %id))]
     async fn delete_node(&self, id: &str) -> Result<(), StoreError> {

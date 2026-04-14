@@ -14,11 +14,15 @@
 //! - [`ingestion`] — universal document ingestion pipeline (chunking, metadata, embedding, graph)
 //! - [`proto`] — generated protobuf types for the Docling sidecar gRPC contract
 //! - [`query_rewriter`] — LLM-based query decomposition into focused sub-queries
+//! - [`context_expander`] — post-retrieval context expansion via Neo4j FOLLOWS / IN_SECTION edges
+//! - [`metadata_filter`] — LLM-based metadata hint extraction for query-time Qdrant filtering
 
+pub mod context_expander;
 pub mod embedder;
 pub mod error;
 pub mod graph_cot;
 pub mod ingestion;
+pub mod metadata_filter;
 pub mod openai_embedder;
 pub mod proto;
 pub mod query_rewriter;
@@ -28,12 +32,16 @@ pub mod router;
 pub mod search;
 pub mod strategy;
 
+pub use context_expander::{ContextChunk, ContextExpander, ContextExpanderConfig, ExpandedChunk};
 pub use embedder::{Embedder, FastEmbedder, FastEmbedderConfig, SparseVector};
 pub use error::RetrievalError;
 pub use graph_cot::{GraphCotConfig, GraphCotRetriever};
 pub use ingestion::{
     ChunkStrategy, ChunkerConfig, DocumentChunk, ExtractedEdge, ExtractedNode, IngestionPipeline,
     IngestionPipelineConfig, IngestionResult, KnowledgeGraph, LlmGraphExtractor, Triplet,
+};
+pub use metadata_filter::{
+    FilterCondition, MetadataFilterConfig, MetadataFilterExtractor, QueryMetadataHints,
 };
 pub use openai_embedder::{OpenAIEmbedder, OpenAIEmbedderConfig};
 pub use query_rewriter::{
