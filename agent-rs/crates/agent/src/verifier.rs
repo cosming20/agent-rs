@@ -25,6 +25,48 @@ pub struct VerificationResult {
     pub reasoning: String,
     /// Claims in the answer not supported by evidence.
     pub ungrounded_claims: Vec<String>,
+    /// Per-claim confidence breakdown (spec C3).
+    ///
+    /// When populated, each individual claim in the answer has its own
+    /// confidence score and source citation list.  Clients can display
+    /// this to users so they see exactly which parts to trust.
+    #[serde(default)]
+    pub claim_confidences: Vec<ClaimConfidence>,
+}
+
+/// Per-claim confidence tracking (spec C3).
+///
+/// Each claim extracted from the answer is scored independently against
+/// the evidence, letting users see exactly which parts are trustworthy.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ClaimConfidence {
+    /// The claim text (a single statement from the answer).
+    pub claim: String,
+    /// Confidence score for this specific claim (0.0 – 1.0).
+    pub confidence: f64,
+    /// Whether this claim is grounded in evidence.
+    pub grounded: bool,
+    /// Citation indices (1-based) from the evidence pack that support this claim.
+    pub source_indices: Vec<usize>,
+}
+
+/// Structured uncertainty types (spec Layer 4c).
+///
+/// When the verifier detects specific types of uncertainty, it reports
+/// them here so the synthesis layer can generate appropriate caveats.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum UncertaintyType {
+    /// Evidence exists but is ambiguous or contradictory.
+    EvidenceConflict { conflict: String },
+    /// Evidence partially addresses the question.
+    PartialCoverage {
+        covered: Vec<String>,
+        missing: Vec<String>,
+    },
+    /// No relevant evidence found at all.
+    NoEvidence,
+    /// Evidence found but relevance scores are low.
+    LowRelevance { best_score: f64 },
 }
 
 /// Raw JSON structure expected from the LLM verifier response.
@@ -115,6 +157,7 @@ impl GroundingVerifier {
                     .map_err(|e| AgentError::Verification(format!("confidence error: {e}")))?,
                 reasoning: "Empty answer cannot be verified.".into(),
                 ungrounded_claims: Vec::new(),
+                claim_confidences: Vec::new(),
             });
         }
 
@@ -125,6 +168,7 @@ impl GroundingVerifier {
                     .map_err(|e| AgentError::Verification(format!("confidence error: {e}")))?,
                 reasoning: "No evidence provided for grounding check.".into(),
                 ungrounded_claims: Vec::new(),
+                claim_confidences: Vec::new(),
             });
         }
 
@@ -200,6 +244,7 @@ impl GroundingVerifier {
             confidence,
             reasoning: parsed.reasoning,
             ungrounded_claims: parsed.ungrounded_claims,
+            claim_confidences: Vec::new(), // TODO: populate from LLM structured output
         })
     }
 
@@ -225,6 +270,7 @@ impl GroundingVerifier {
                     .map_err(|e| AgentError::Verification(format!("confidence error: {e}")))?,
                 reasoning: "Answer contains no meaningful tokens.".into(),
                 ungrounded_claims: Vec::new(),
+                claim_confidences: Vec::new(),
             });
         }
 
@@ -268,6 +314,7 @@ impl GroundingVerifier {
                 self.confidence_threshold * 100.0,
             ),
             ungrounded_claims: Vec::new(),
+            claim_confidences: Vec::new(),
         })
     }
 }
