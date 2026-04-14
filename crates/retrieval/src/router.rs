@@ -384,23 +384,32 @@ impl RetrievalRouter {
         // 2-3 focused sub-queries. Simple queries pass through unchanged as a
         // single-element sub-query list. On any failure the rewriter returns
         // the original query verbatim (graceful fallback is internal to rewrite()).
-        let sub_queries: Vec<String> = if let Some(rewriter) = self.query_rewriter.as_ref() {
-            let rewritten = rewriter.rewrite(query).await?;
-            tracing::debug!(
-                sub_query_count = rewritten.sub_queries.len(),
-                was_decomposed = rewritten.was_decomposed,
-                "query rewriting complete"
-            );
-            rewritten
-                .sub_queries
-                .into_iter()
-                .map(|sq| sq.text)
-                .collect()
-        } else {
-            // Phase 3 no-op: fall through to the existing rewrite_query stub.
-            let rewritten = self.rewrite_query(query, strategy);
-            vec![rewritten]
-        };
+        // Short queries (< 12 words) are almost certainly single-hop and
+        // don't benefit from LLM decomposition. Skip the rewriter call to
+        // save ~300ms latency + avoid diluting retrieval with unnecessary
+        // sub-queries that hurt graph_hybrid (-6pp observed in testing).
+        let word_count = query.split_whitespace().count();
+        let sub_queries: Vec<String> =
+            if let Some(rewriter) = self.query_rewriter.as_ref().filter(|_| word_count >= 12) {
+                let rewritten = rewriter.rewrite(query).await?;
+                tracing::debug!(
+                    sub_query_count = rewritten.sub_queries.len(),
+                    was_decomposed = rewritten.was_decomposed,
+                    word_count,
+                    "query rewriting complete"
+                );
+                rewritten
+                    .sub_queries
+                    .into_iter()
+                    .map(|sq| sq.text)
+                    .collect()
+            } else {
+                if word_count < 12 && self.query_rewriter.is_some() {
+                    tracing::debug!(word_count, "short query — skipping LLM decomposition");
+                }
+                let rewritten = self.rewrite_query(query, strategy);
+                vec![rewritten]
+            };
 
         // ---- Step 1b: Entity → KG linking (optional, spec B3) ----
         //
@@ -448,24 +457,12 @@ impl RetrievalRouter {
         let mut all_result_lists: Vec<Vec<agent_rs_stores::types::SearchResult>> = Vec::new();
 
         for query_str in &sub_queries {
-            // HyDE (Hypothetical Document Embedding): if the query rewriter is
-            // available, generate a hypothetical answer passage and embed THAT
-            // instead of the raw question.  The vector of an answer-like text
-            // has much higher cosine similarity to real document chunks than the
-            // vector of a question.  Falls back to the raw query on any error.
-            let embed_text = if let Some(rewriter) = &self.query_rewriter {
-                let hyde = rewriter.hyde_rewrite(query_str).await;
-                if hyde != query_str.trim() {
-                    tracing::debug!(
-                        original_len = query_str.len(),
-                        hyde_len = hyde.len(),
-                        "using HyDE text for embedding"
-                    );
-                }
-                hyde
-            } else {
-                query_str.to_string()
-            };
+            // HyDE DISABLED — caused -48pp regression on semantic search.
+            // The hypothetical answer is too specific for Romanian legal text
+            // and mismatches with the actual chunk embeddings. Raw query
+            // embedding + Docling heading-prefixed chunks works better.
+            // TODO: re-enable selectively for Conceptual queries only.
+            let embed_text = query_str.to_string();
 
             // Always embed dense — every strategy needs at minimum a dense vector.
             // Sparse embeddings are no longer computed client-side: the store layer
