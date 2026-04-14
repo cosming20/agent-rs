@@ -26,6 +26,7 @@
 //! external MCP servers via `rust-mcp-sdk`.
 
 pub mod budget;
+pub mod document_info;
 pub mod fetch;
 pub mod ingest;
 pub mod knowledge;
