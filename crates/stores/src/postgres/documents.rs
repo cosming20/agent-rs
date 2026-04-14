@@ -342,4 +342,17 @@ impl PgStore {
 
         Ok(())
     }
+
+    /// List all ingested documents (for the `document_info` tool).
+    #[instrument(skip(self))]
+    pub async fn list_ingested_documents(&self) -> Result<Vec<IngestedDocumentRow>, StoreError> {
+        let mut conn = self.conn().await?;
+
+        ingested_documents::table
+            .select(IngestedDocumentRow::as_select())
+            .order(ingested_documents::started_at.desc())
+            .load(&mut conn)
+            .await
+            .map_err(StoreError::from)
+    }
 }

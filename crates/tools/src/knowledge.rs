@@ -166,11 +166,42 @@ impl Tool for SearchKnowledgeTool {
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
 
+            // Expose structural metadata so the agent can cite page numbers,
+            // section titles, and content type in its answer.
+            let page_start = doc.payload.get("page_start").and_then(|v| v.as_u64());
+            let page_end = doc.payload.get("page_end").and_then(|v| v.as_u64());
+            let section = doc
+                .payload
+                .get("section_title")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let has_table = doc
+                .payload
+                .get("has_table")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+
+            let page_info = match (page_start, page_end) {
+                (Some(s), Some(e)) if s == e => format!(", page: {s}"),
+                (Some(s), Some(e)) => format!(", pages: {s}-{e}"),
+                (Some(s), None) => format!(", page: {s}"),
+                _ => String::new(),
+            };
+            let section_info = if section.is_empty() {
+                String::new()
+            } else {
+                format!(", section: \"{section}\"")
+            };
+            let table_info = if has_table { ", contains_table" } else { "" };
+
             output.push_str(&format!(
-                "[{}] (score: {:.4}, source: {})\n{}\n\n",
+                "[{}] (score: {:.4}, source: {}{}{}{})\n{}\n\n",
                 i + 1,
                 doc.score.0,
                 source,
+                page_info,
+                section_info,
+                table_info,
                 content,
             ));
         }
