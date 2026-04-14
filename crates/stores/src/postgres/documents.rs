@@ -128,7 +128,39 @@ impl PgStore {
                 match existing.parse_status()? {
                     IngestStatus::Complete => Ok(BeginIngestionOutcome::AlreadyComplete),
 
-                    IngestStatus::InProgress => Ok(BeginIngestionOutcome::AlreadyBeingIngested),
+                    IngestStatus::InProgress => {
+                        // W7 fix #7: If the row has been stuck in_progress for
+                        // more than 15 minutes, treat it as abandoned by a crashed
+                        // worker — reset to in_progress with a fresh run_id so
+                        // the current caller can proceed.  Without this, a single
+                        // crash during mark_complete leaves the document bricked.
+                        let age_minutes =
+                            (Utc::now().naive_utc() - existing.updated_at).num_minutes();
+                        if age_minutes >= 15 {
+                            tracing::warn!(
+                                sha256 = %existing.sha256,
+                                age_minutes,
+                                old_run_id = %existing.ingest_run_id,
+                                "in_progress row older than 15 min — treating as abandoned"
+                            );
+                            let new_run_id = Uuid::new_v4();
+                            let now = Utc::now().naive_utc();
+                            diesel::update(ingested_documents::table)
+                                .filter(ingested_documents::sha256.eq(&new_doc.sha256))
+                                .set((
+                                    ingested_documents::ingest_run_id.eq(new_run_id),
+                                    ingested_documents::updated_at.eq(now),
+                                ))
+                                .execute(&mut conn)
+                                .await
+                                .map_err(StoreError::from)?;
+                            Ok(BeginIngestionOutcome::Resumed {
+                                ingest_run_id: new_run_id,
+                            })
+                        } else {
+                            Ok(BeginIngestionOutcome::AlreadyBeingIngested)
+                        }
+                    }
 
                     IngestStatus::PartialFailure => {
                         // Reuse the row: issue a new run_id and reset to in_progress.

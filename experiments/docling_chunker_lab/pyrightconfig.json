@@ -1,0 +1,10 @@
+{
+  "venv": ".venv",
+  "venvPath": ".",
+  "include": ["."],
+  "extraPaths": ["."],
+  "reportMissingImports": "none",
+  "reportMissingModuleSource": "none",
+  "reportUnknownMemberType": "none",
+  "reportUnknownVariableType": "none"
+}

@@ -1,0 +1,11 @@
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+results/per_doc/
+results/qa_pairs.json
+results/retrieval_scores.csv
+# Keep the final summary + winner docs in git once written.
+!results/summary.md
+!results/winner.md
+# Docling model cache lands in ~/.cache/docling, not here — safe.

@@ -1,0 +1,11 @@
+{
+  "cache_version": "1",
+  "doc_id": "D4",
+  "source_path": "/Users/cosmingagea/workspace/agentic-rag/agent-rs/experiments/docling_chunker_lab/fixtures/D4_automobilus_cart.pdf",
+  "source_sha256": "03a0b77b50dd1a537cbed39b310c1136d58c84fea7f2563932d3ddddc043ee5a",
+  "pipeline_digest": "fc404854310b8f790a0bf1b0eb533bfd8bddcf5a6ce9feb42a9578c6c2583e44",
+  "docling_version": "2.86.0",
+  "docling_core_version": "2.73.0",
+  "parse_latency_ms": 2169,
+  "markdown_len": 842
+}

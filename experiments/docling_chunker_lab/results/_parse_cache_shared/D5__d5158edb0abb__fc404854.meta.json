@@ -1,0 +1,11 @@
+{
+  "cache_version": "1",
+  "doc_id": "D5",
+  "source_path": "/Users/cosmingagea/workspace/agentic-rag/agent-rs/experiments/docling_chunker_lab/fixtures/D5_invoice.pdf",
+  "source_sha256": "d5158edb0abb5d8d32a994e282ec19716f1f2a01e87506ed5e1d86c5b8e9a25f",
+  "pipeline_digest": "fc404854310b8f790a0bf1b0eb533bfd8bddcf5a6ce9feb42a9578c6c2583e44",
+  "docling_version": "2.86.0",
+  "docling_core_version": "2.73.0",
+  "parse_latency_ms": 1976,
+  "markdown_len": 1222
+}

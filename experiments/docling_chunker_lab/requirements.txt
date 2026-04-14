@@ -1,0 +1,34 @@
+# Docling chunker feedback-loop experiment — Python dependencies.
+#
+# Pinned upper bounds to guard against Docling 3.x API drift.  This
+# experiment is isolated from the main agent-rs workspace and does NOT
+# share a venv with anything else.
+
+# --- Docling stack ---
+docling>=2.20,<3
+# chunking-openai extra brings in tiktoken and wires OpenAITokenizer.
+docling-core[chunking,chunking-openai]>=2.10,<3
+
+# --- Tokenizers ---
+tiktoken>=0.7
+transformers>=4.44
+sentencepiece>=0.2
+# HuggingFaceTokenizer path (C7 config) needs a local model snapshot.
+huggingface-hub>=0.25
+
+# --- Retrieval eval stack ---
+qdrant-client>=1.12
+openai>=1.50
+rapidfuzz>=3.10          # fuzzy answer_span matching
+
+# --- Legacy chunker (C9) ---
+nltk>=3.9
+
+# --- Utilities ---
+pydantic>=2.8
+pyyaml>=6.0
+numpy>=1.26
+python-dotenv>=1.0
+
+# --- Optional instrumentation ---
+# Keep light — no tracing, no async frameworks, no servers.
