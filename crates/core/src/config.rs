@@ -384,15 +384,15 @@ impl Default for Settings {
                 system_prompt_file: String::new(),
             },
             context: ContextConfig {
-                max_messages: 4,
-                max_chars_per_msg: 150,
+                max_messages: 10,
+                max_chars_per_msg: 2000,
             },
             evidence: EvidenceConfig {
-                max_evidence_chars: 16000,
-                max_context_chars: 300,
+                max_evidence_chars: 60000,
+                max_context_chars: 3000,
             },
             synthesis: SynthesisConfig {
-                max_snippet_length: 200,
+                max_snippet_length: 5000,
             },
             ranker: RankerConfig { rrf_k: 60 },
             verifier: VerifierConfig {
@@ -411,8 +411,8 @@ impl Default for Settings {
                 timeout_s: 15,
             },
             fetch: FetchConfig {
-                max_length: 5000,
-                max_bytes: 2_000_000,
+                max_length: 30000,
+                max_bytes: 5_000_000,
                 timeout: 30,
                 max_redirects: 3,
             },

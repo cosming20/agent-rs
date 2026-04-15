@@ -59,7 +59,10 @@ pub const DEFAULT_SUMMARIZER_CONCURRENCY: usize = 20;
 
 /// Maximum characters forwarded to the LLM for summarization.
 /// Very large chunks are truncated at a character boundary.
-const MAX_CHUNK_CHARS: usize = 8_000;
+///
+/// Sized well above the chunker's default (~4K chars per chunk) so this
+/// bound almost never fires in practice. gpt-5.4-mini handles 200K context.
+const MAX_CHUNK_CHARS: usize = 40_000;
 
 /// Preview length stored in the payload for debugging / display.
 const PREVIEW_CHARS: usize = 200;

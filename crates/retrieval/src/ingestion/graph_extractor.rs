@@ -70,7 +70,16 @@ pub const DEFAULT_BATCH_CONCURRENCY: usize = 20;
 
 /// Maximum characters of a chunk we forward to the LLM. Very large chunks are
 /// truncated at the character boundary to keep request size predictable.
-const MAX_CHUNK_CHARS: usize = 12_000;
+///
+/// Sized well above the chunker's default (~4K chars per chunk) so this
+/// bound almost never fires in practice. gpt-5.4-mini handles 200K context.
+const MAX_CHUNK_CHARS: usize = 40_000;
+
+/// Fallback size when the primary extraction attempt fails and we retry
+/// with aggressive character sanitization (strips weird unicode, PDF
+/// artifacts). Kept smaller than MAX_CHUNK_CHARS because the failure
+/// implies the chunk already had payload issues.
+const MAX_SANITIZED_FALLBACK_CHARS: usize = 10_000;
 
 /// System prompt for knowledge graph extraction.
 ///
@@ -707,7 +716,7 @@ impl LlmGraphExtractor {
                             "graph extraction failed; retrying with aggressive sanitization"
                         );
                         // Fallback: strip ALL non-letter/digit/space/basic-punct chars
-                        // and truncate to 2000 chars. This handles PDF artifacts,
+                        // and cap at MAX_SANITIZED_FALLBACK_CHARS. Handles PDF artifacts,
                         // weird unicode, lone surrogates, etc. that break the JSON body.
                         let sanitized: String = text
                             .chars()
@@ -731,7 +740,7 @@ impl LlmGraphExtractor {
                                             | '"'
                                     )
                             })
-                            .take(2000)
+                            .take(MAX_SANITIZED_FALLBACK_CHARS)
                             .collect();
                         match extractor.extract_from_chunk(&sanitized).await {
                             Ok(graph) => {
