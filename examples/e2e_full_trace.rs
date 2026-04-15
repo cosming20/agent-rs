@@ -20,15 +20,13 @@ use serde::Serialize;
 use tracing::info;
 use uuid::Uuid;
 
+use agent_rs::stores::connect_stores;
 use agent_rs_core::config::Settings;
 use agent_rs_core::types::{CollectionName, Embedding, RetrievalStrategy};
 use agent_rs_retrieval::Embedder;
 use agent_rs_retrieval::embedder::{FastEmbedder, FastEmbedderConfig};
 use agent_rs_retrieval::ranker::ResultRanker;
 use agent_rs_retrieval::router::RetrievalRouter;
-use agent_rs_stores::neo4j::Neo4jStore;
-use agent_rs_stores::postgres::PgStore;
-use agent_rs_stores::qdrant::QdrantStore;
 use agent_rs_stores::traits::{GraphStore, VectorStore};
 use agent_rs_stores::types::{
     CollectionConfig, GraphEdge, GraphNode, NodeLabel, RelationType, VectorPoint,
@@ -904,24 +902,10 @@ async fn main() -> Result<()> {
     );
 
     // 3. Connect to storage backends
-    info!("connecting to Qdrant...");
-    let qdrant_store =
-        QdrantStore::new(&settings.qdrant).context("failed to create Qdrant client")?;
-    let qdrant_store = Arc::new(qdrant_store);
-
-    info!("connecting to Neo4j...");
-    let neo4j_store = Neo4jStore::connect(&settings.neo4j)
-        .await
-        .context("failed to connect to Neo4j")?;
-    let neo4j_store = Arc::new(neo4j_store);
-
-    info!("connecting to PostgreSQL...");
-    let pg_store = PgStore::new(&settings.postgres.dsn())
-        .await
-        .context("failed to connect to PostgreSQL")?;
-    let _pg_store = Arc::new(pg_store);
-
-    info!("all storage backends connected");
+    let stores = connect_stores(&settings).await?;
+    let qdrant_store = stores.qdrant;
+    let neo4j_store = stores.neo4j;
+    // stores.postgres intentionally unused — this trace bypasses the ingest state machine.
 
     // 4. Initialize embedder
     info!("initializing embedder (this may download ONNX models on first run)...");
