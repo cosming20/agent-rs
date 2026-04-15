@@ -38,8 +38,7 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use anyhow::{Context, Result};
 use chrono::Utc;
@@ -47,26 +46,13 @@ use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 use uuid::Uuid;
 
-use agent_rs_core::config::{IngestBackend, Settings};
+use agent_rs::embedder::build_embedder;
+use agent_rs::ingest::{IngestFeatures, build_ingestion_pipeline};
+use agent_rs::router::{RouterFeatures, build_router};
+use agent_rs::stores::connect_stores;
+use agent_rs_core::config::Settings;
 use agent_rs_core::types::{CollectionName, RetrievalStrategy};
-use agent_rs_retrieval::Embedder;
-use agent_rs_retrieval::context_expander::{ContextExpander, ContextExpanderConfig};
-use agent_rs_retrieval::embedder::{FastEmbedder, FastEmbedderConfig};
-use agent_rs_retrieval::graph_cot::{GraphCotConfig, GraphCotRetriever};
-use agent_rs_retrieval::ingestion::docling_client::DoclingSidecarClient;
-use agent_rs_retrieval::ingestion::{
-    ChunkSummarizer, ChunkerConfig, IngestionPipeline, IngestionPipelineConfig, LlmGraphExtractor,
-};
-use agent_rs_retrieval::metadata_filter::{MetadataFilterConfig, MetadataFilterExtractor};
-use agent_rs_retrieval::openai_embedder::{OpenAIEmbedder, OpenAIEmbedderConfig};
-use agent_rs_retrieval::query_rewriter::{QueryRewriter, QueryRewriterConfig};
-use agent_rs_retrieval::ranker::ResultRanker;
-use agent_rs_retrieval::reranker::CrossEncoderReranker;
-use agent_rs_retrieval::router::RetrievalRouter;
-use agent_rs_stores::neo4j::Neo4jStore;
-use agent_rs_stores::postgres::PgStore;
-use agent_rs_stores::qdrant::QdrantStore;
-use agent_rs_stores::traits::{GraphStore, VectorStore};
+use agent_rs_stores::traits::GraphStore;
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -889,18 +875,16 @@ async fn reset_collection(collection: &CollectionName, settings: &Settings) -> R
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // 0. Load .env from parent directory for API keys.
     let _ = dotenvy::from_filename("../.env");
     let _ = dotenvy::dotenv();
 
-    // 1. Load configuration.
     let settings = Settings::load().context("failed to load configuration")?;
     agent_rs_core::logging::init_logging(false);
 
     let run_id = Uuid::new_v4().to_string();
     info!(run_id = %run_id, "eval harness starting");
 
-    // 2. Load dataset.
+    // 1. Load dataset.
     let (dataset, dataset_path) = load_dataset().context("load test dataset")?;
     info!(
         questions = dataset.questions.len(),
@@ -908,11 +892,7 @@ async fn main() -> Result<()> {
         dataset = %dataset_path.display(),
         "dataset loaded"
     );
-
-    // Validate question type/difficulty against declared allowed values.
     validate_question_schema(&dataset);
-
-    // Warn for any question missing expected_doc_ids.
     for q in &dataset.questions {
         if q.expected_doc_ids.is_empty() {
             warn!(
@@ -922,197 +902,40 @@ async fn main() -> Result<()> {
         }
     }
 
-    // 3. Connect to storage backends.
-    info!("connecting to Qdrant...");
-    let qdrant_store =
-        QdrantStore::new(&settings.qdrant).context("failed to create Qdrant client")?;
-    let qdrant_store = Arc::new(qdrant_store);
-
-    info!("connecting to Neo4j...");
-    let neo4j_store = Neo4jStore::connect(&settings.neo4j)
-        .await
-        .context("failed to connect to Neo4j")?;
-    let neo4j_store = Arc::new(neo4j_store);
-
-    info!("storage backends ready");
-
-    // 4. Initialize embedder.
-    let embedder_type = std::env::var("EMBEDDER_TYPE").unwrap_or_else(|_| "local".to_owned());
-    let uses_openai = embedder_type.eq_ignore_ascii_case("openai");
-
-    // Sparse embeddings are no longer computed client-side. Qdrant handles
-    // BM25 inference server-side via the `qdrant/bm25` model. We only need
-    // a dense embedder here.
-    let (embedder, embedder_label): (Arc<dyn Embedder + Send + Sync>, String) = if uses_openai {
-        info!("initializing OpenAI dense embedder (sparse BM25 handled server-side by Qdrant)...");
-        let api_key = std::env::var("OPENAI_API_KEY")
-            .or_else(|_| std::env::var("LLM_API_KEY"))
-            .context("OPENAI_API_KEY or LLM_API_KEY must be set when EMBEDDER_TYPE=openai")?;
-        let model = std::env::var("OPENAI_EMBEDDING_MODEL")
-            .unwrap_or_else(|_| "text-embedding-3-large".to_owned());
-        let dims: usize = std::env::var("OPENAI_EMBEDDING_DIMS")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(3072);
-        let config = OpenAIEmbedderConfig::new(api_key)
-            .with_model(model.clone())
-            .with_dimensions(dims);
-        let dense = OpenAIEmbedder::new(config);
-        let label = format!("openai-{}-{}", model, dense.dimensions());
-        (Arc::new(dense) as Arc<dyn Embedder + Send + Sync>, label)
-    } else {
-        info!("initializing local fastembed embedder...");
-        let emb = FastEmbedder::try_new(FastEmbedderConfig {
-            show_download_progress: true,
-            ..Default::default()
-        })
-        .await
-        .context("initialize fastembed")?;
-        let label = format!("fastembed-{}", emb.dimensions());
-        (Arc::new(emb), label)
-    };
+    // 2. Connect stores + build embedder.
+    let stores = connect_stores(&settings).await?;
+    let (embedder, embedder_label) = build_embedder().await?;
     info!(embedder = %embedder_label, "embedder ready");
 
-    // 5. Determine collection names and reset.
+    // 3. Collection names + pre-run reset (eval-specific: each run starts clean).
     let collection = CollectionName("eval_harness".into());
     let triplet_collection = CollectionName("eval_harness_triplets".into());
     let summaries_collection = CollectionName("eval_harness_summaries".into());
     reset_collection(&collection, &settings).await?;
     reset_collection(&triplet_collection, &settings).await?;
     reset_collection(&summaries_collection, &settings).await?;
-
-    // Also clear any leftover graph nodes for our doc_ids from a previous run.
-    // We only attempt delete on the top-level doc_id to keep cleanup bounded —
-    // chunk/entity nodes are recreated on each run with fresh UUIDs anyway.
     for doc in &dataset.documents {
-        if let Err(e) = neo4j_store.delete_node(&doc.doc_id).await {
+        if let Err(e) = stores.neo4j.delete_node(&doc.doc_id).await {
             warn!(doc_id = %doc.doc_id, error = %e, "pre-run graph node cleanup failed (ignored)");
         }
     }
 
-    // 6. Ingest each document via IngestionPipeline.
-    //
-    // When `LLM_API_KEY` (or `OPENAI_API_KEY`) is set, enable LLM-based
-    // knowledge graph extraction for every chunk. This mirrors Cognee's
-    // cognify step. Without a key we fall back to heuristic entity extraction
-    // so the harness still runs end-to-end without external LLM access.
-    // Allow disabling LLM KG extraction for fast iteration runs:
-    //   EVAL_SKIP_KG_EXTRACTION=1
-    let skip_kg = std::env::var("EVAL_SKIP_KG_EXTRACTION")
-        .ok()
-        .is_some_and(|v| v == "1" || v.eq_ignore_ascii_case("true"));
-
-    let llm_extractor = if skip_kg {
-        info!("EVAL_SKIP_KG_EXTRACTION=1 — skipping LLM knowledge graph extraction");
-        None
-    } else {
-        std::env::var("LLM_API_KEY")
-            .or_else(|_| std::env::var("OPENAI_API_KEY"))
-            .ok()
-            .map(|api_key| {
-                // Default to the reasoning-tuned mini model for KG extraction.
-                // Override with LLM_GRAPH_MODEL=... or LLM_MODEL=...
-                let model = std::env::var("LLM_GRAPH_MODEL")
-                    .or_else(|_| std::env::var("LLM_MODEL"))
-                    .unwrap_or_else(|_| "gpt-5.4-mini-2026-03-17".to_owned());
-                info!(model = %model, "LLM graph extractor enabled for ingestion");
-                Arc::new(LlmGraphExtractor::new(api_key, model))
-            })
-    };
-    if llm_extractor.is_none() && !skip_kg {
-        info!("LLM_API_KEY / OPENAI_API_KEY not set — falling back to heuristic entity extraction");
-    }
-
-    // When LLM_API_KEY is set, also enable chunk summarization so the
-    // Summaries strategy has populated data to search against.
-    let skip_summaries = std::env::var("EVAL_SKIP_SUMMARIES")
-        .ok()
-        .is_some_and(|v| v == "1" || v.eq_ignore_ascii_case("true"));
-
-    let summarizer: Option<Arc<ChunkSummarizer>> = if skip_summaries {
-        info!("EVAL_SKIP_SUMMARIES=1 — skipping chunk summarization");
-        None
-    } else {
-        std::env::var("LLM_API_KEY")
-            .or_else(|_| std::env::var("OPENAI_API_KEY"))
-            .ok()
-            .map(|api_key| {
-                // Summarization can use a cheaper model since output is small.
-                // Override with LLM_SUMMARY_MODEL=...
-                let model = std::env::var("LLM_SUMMARY_MODEL")
-                    .or_else(|_| std::env::var("LLM_MODEL"))
-                    .unwrap_or_else(|_| "gpt-5.4-mini-2026-03-17".to_owned());
-                info!(model = %model, "ChunkSummarizer enabled for ingestion");
-                Arc::new(ChunkSummarizer::new(api_key, model))
-            })
-    };
-    if summarizer.is_none() && !skip_summaries {
-        info!("LLM_API_KEY / OPENAI_API_KEY not set — chunk summarization disabled");
-    }
-
-    let mut pipeline_config = IngestionPipelineConfig::new(ChunkerConfig::default());
-    if let Some(extractor) = llm_extractor.clone() {
-        pipeline_config = pipeline_config.with_llm_extractor(extractor);
-    }
-    if let Some(s) = summarizer.clone() {
-        pipeline_config = pipeline_config
-            .with_summarizer(s)
-            .with_summaries_collection(summaries_collection.clone());
-    }
-    // Enable triplet indexing so graph-oriented strategies can score complete
-    // (source) -[relation]-> (target) triples against the query embedding.
-    pipeline_config = pipeline_config.with_triplet_collection(triplet_collection.clone());
-
-    // Wire the runtime ingest backend + Docling sidecar client when Docling
-    // is selected. Default (from Settings) is `IngestBackend::Docling`, which
-    // requires the sidecar to be reachable at `settings.docling.endpoint`.
-    pipeline_config = pipeline_config.with_ingest_backend(settings.ingest_backend);
-    if matches!(
-        settings.ingest_backend,
-        IngestBackend::Docling | IngestBackend::DoclingWithLegacyFallback
-    ) {
-        info!(
-            endpoint = %settings.docling.endpoint,
-            "connecting to Docling sidecar"
-        );
-        let sidecar = DoclingSidecarClient::connect(
-            settings.docling.endpoint.clone(),
-            Duration::from_secs(settings.docling.connect_timeout_s),
-            Duration::from_secs(settings.docling.stream_idle_timeout_s),
-        )
-        .await
-        .context("connect to Docling sidecar")?;
-        pipeline_config = pipeline_config.with_docling_client(sidecar);
-        info!("Docling sidecar client ready");
-
-        // Wire the PgStore so the ingest state machine (begin_ingestion ->
-        // mark_partial_failure / mark_complete) can persist `ingested_documents`
-        // rows. Without this, the Docling pipeline runs in best-effort mode
-        // and skips dedup + observability.
-        info!(dsn_host = %settings.postgres.host, dsn_port = settings.postgres.port, "connecting PgStore for ingest state machine");
-        let pg_store = PgStore::new(&settings.postgres.dsn())
-            .await
-            .context("connect PgStore for Docling ingest state machine")?;
-        pipeline_config = pipeline_config.with_pg_store(Arc::new(pg_store));
-        info!("PgStore wired into ingestion pipeline");
-    }
-
-    let pipeline = IngestionPipeline::with_config(
+    // 4. Build ingestion pipeline + ingest all dataset documents.
+    let pipeline = build_ingestion_pipeline(
+        &settings,
+        &stores,
         embedder.clone(),
-        qdrant_store.clone() as Arc<dyn VectorStore + Send + Sync>,
-        neo4j_store.clone() as Arc<dyn GraphStore + Send + Sync>,
-        collection.clone(),
-        pipeline_config,
-    );
+        &collection,
+        &triplet_collection,
+        &summaries_collection,
+        &IngestFeatures::from_env(),
+    )
+    .await?;
 
     for doc in &dataset.documents {
         let doc_path = resolve_doc_path(&dataset_path, &doc.path)
             .with_context(|| format!("resolve document path {}", doc.path))?;
-        info!(
-            path = %doc_path.display(),
-            doc_id = %doc.doc_id,
-            "ingesting document"
-        );
+        info!(path = %doc_path.display(), doc_id = %doc.doc_id, "ingesting document");
 
         let is_pdf = doc_path
             .extension()
@@ -1148,192 +971,25 @@ async fn main() -> Result<()> {
         );
     }
 
-    // 7. Build retrieval router (with optional cross-encoder reranker).
-    //
-    // Reranking is enabled by default; set EVAL_SKIP_RERANKING=1 to bypass
-    // it for fast iteration runs where ONNX inference latency is undesirable.
-    let skip_reranking = std::env::var("EVAL_SKIP_RERANKING")
-        .ok()
-        .is_some_and(|v| v == "1" || v.eq_ignore_ascii_case("true"));
-
-    let reranker: Option<Arc<CrossEncoderReranker>> = if skip_reranking {
-        info!("EVAL_SKIP_RERANKING=1 — cross-encoder reranking disabled");
-        None
-    } else if let Ok(api_key) = std::env::var("JINA_API_KEY") {
-        info!("initializing Jina cross-encoder reranker...");
-        match CrossEncoderReranker::new(api_key) {
-            Ok(r) => {
-                info!("Jina cross-encoder reranker ready");
-                Some(Arc::new(r))
-            }
-            Err(e) => {
-                warn!(error = %e, "Jina reranker init failed — running without reranking");
-                None
-            }
-        }
-    } else {
-        info!("JINA_API_KEY not set — skipping cross-encoder reranking");
-        None
-    };
-
-    // Optional iterative GraphCoT retriever. Enabled when either
-    // OPENAI_API_KEY or LLM_API_KEY is set and EVAL_SKIP_GRAPH_COT is not "1".
-    let skip_graph_cot = std::env::var("EVAL_SKIP_GRAPH_COT")
-        .ok()
-        .is_some_and(|v| v == "1" || v.eq_ignore_ascii_case("true"));
-    let graph_cot_retriever: Option<Arc<GraphCotRetriever>> = if skip_graph_cot {
-        info!("EVAL_SKIP_GRAPH_COT=1 — iterative GraphCoT disabled");
-        None
-    } else if let Ok(api_key) =
-        std::env::var("OPENAI_API_KEY").or_else(|_| std::env::var("LLM_API_KEY"))
-    {
-        let model = std::env::var("GRAPH_COT_MODEL").unwrap_or_else(|_| "gpt-4o-mini".to_owned());
-        info!(model = %model, "initializing GraphCoT iterative retriever");
-        match GraphCotRetriever::new(GraphCotConfig::new(api_key).with_model(model)) {
-            Ok(r) => Some(Arc::new(r)),
-            Err(e) => {
-                warn!(error = %e, "GraphCotRetriever init failed — GraphCoT will fall back to plain graph search");
-                None
-            }
-        }
-    } else {
-        info!("OPENAI_API_KEY/LLM_API_KEY not set — GraphCoT will fall back to plain graph search");
-        None
-    };
-
-    // Optional query rewriter — enabled when OPENAI_API_KEY / LLM_API_KEY is set
-    // and EVAL_SKIP_QUERY_REWRITER is not "1".
-    let skip_query_rewriter = std::env::var("EVAL_SKIP_QUERY_REWRITER")
-        .ok()
-        .is_some_and(|v| v == "1" || v.eq_ignore_ascii_case("true"));
-    let query_rewriter: Option<Arc<QueryRewriter>> = if skip_query_rewriter {
-        info!("EVAL_SKIP_QUERY_REWRITER=1 — LLM query rewriting disabled");
-        None
-    } else if let Ok(api_key) =
-        std::env::var("OPENAI_API_KEY").or_else(|_| std::env::var("LLM_API_KEY"))
-    {
-        let model = std::env::var("QUERY_REWRITER_MODEL")
-            .unwrap_or_else(|_| "gpt-5.4-mini-2026-03-17".to_owned());
-        info!(model = %model, "initializing QueryRewriter");
-        let config = QueryRewriterConfig {
-            api_key,
-            model,
-            max_sub_queries: 3,
-            temperature: 0.1,
-        };
-        Some(Arc::new(QueryRewriter::new(config)))
-    } else {
-        info!("OPENAI_API_KEY/LLM_API_KEY not set — QueryRewriter disabled");
-        None
-    };
-
-    // Optional metadata filter extractor — enabled when OPENAI_API_KEY /
-    // LLM_API_KEY is set and EVAL_SKIP_METADATA_FILTER is not "1".
-    let skip_metadata_filter = std::env::var("EVAL_SKIP_METADATA_FILTER")
-        .ok()
-        .is_some_and(|v| v == "1" || v.eq_ignore_ascii_case("true"));
-    let metadata_filter: Option<Arc<MetadataFilterExtractor>> = if skip_metadata_filter {
-        info!("EVAL_SKIP_METADATA_FILTER=1 — LLM metadata filtering disabled");
-        None
-    } else if let Ok(api_key) =
-        std::env::var("OPENAI_API_KEY").or_else(|_| std::env::var("LLM_API_KEY"))
-    {
-        let model =
-            std::env::var("METADATA_FILTER_MODEL").unwrap_or_else(|_| "gpt-4o-mini".to_owned());
-        info!(model = %model, "initializing MetadataFilterExtractor");
-        let config = MetadataFilterConfig {
-            api_key,
-            model,
-            temperature: 0.0,
-        };
-        match MetadataFilterExtractor::new(config) {
-            Ok(extractor) => Some(Arc::new(extractor)),
-            Err(e) => {
-                warn!(error = %e, "MetadataFilterExtractor init failed — running without metadata filtering");
-                None
-            }
-        }
-    } else {
-        info!("OPENAI_API_KEY/LLM_API_KEY not set — MetadataFilterExtractor disabled");
-        None
-    };
-
-    // Optional context expander — enabled by default when Neo4j is reachable.
-    // Disable with EVAL_SKIP_CONTEXT_EXPANDER=1.
-    let skip_context_expander = std::env::var("EVAL_SKIP_CONTEXT_EXPANDER")
-        .ok()
-        .is_some_and(|v| v == "1" || v.eq_ignore_ascii_case("true"));
-    let context_expander: Option<Arc<ContextExpander>> = if skip_context_expander {
-        info!("EVAL_SKIP_CONTEXT_EXPANDER=1 — post-retrieval context expansion disabled");
-        None
-    } else {
-        info!("initializing ContextExpander (Neo4j FOLLOWS / IN_SECTION expansion)");
-        Some(Arc::new(ContextExpander::new(
-            neo4j_store.clone() as Arc<dyn GraphStore + Send + Sync>,
-            ContextExpanderConfig::default(),
-        )))
-    };
-
-    let ranker = ResultRanker::new(settings.ranker.rrf_k);
-    let mut base_router = RetrievalRouter::new(
-        embedder.clone(),
-        qdrant_store.clone() as Arc<dyn VectorStore + Send + Sync>,
-        neo4j_store.clone() as Arc<dyn GraphStore + Send + Sync>,
-        ranker,
-        collection.clone(),
+    // 5. Build retrieval router (features gated by EVAL_SKIP_* env vars).
+    let router = build_router(
+        &settings,
+        &stores,
+        embedder,
+        &collection,
+        &triplet_collection,
+        &summaries_collection,
+        &RouterFeatures::from_env(),
     )
-    .with_triplet_collection(triplet_collection.clone())
-    .with_summaries_collection(summaries_collection.clone());
+    .await?;
 
-    if let Some(cot) = graph_cot_retriever {
-        base_router = base_router.with_graph_cot_retriever(cot);
-    }
-    if let Some(rw) = query_rewriter {
-        base_router = base_router.with_query_rewriter(rw);
-    }
-    if let Some(mf) = metadata_filter {
-        base_router = base_router.with_metadata_filter(mf);
-    }
-    if let Some(ce) = context_expander {
-        base_router = base_router.with_context_expander(ce);
-    }
-
-    // Entity linker: link query entities to Neo4j nodes (spec B3).
-    if std::env::var("EVAL_SKIP_ENTITY_LINKER").is_err() {
-        if let Ok(el_api_key) =
-            std::env::var("OPENAI_API_KEY").or_else(|_| std::env::var("LLM_API_KEY"))
-        {
-            let el_config = agent_rs_retrieval::entity_linker::EntityLinkerConfig {
-                api_key: el_api_key,
-                model: "gpt-5.4-mini-2026-03-17".to_owned(),
-                max_entities: 5,
-            };
-            let el = Arc::new(agent_rs_retrieval::EntityLinker::new(
-                neo4j_store.clone() as Arc<dyn GraphStore + Send + Sync>,
-                el_config,
-            ));
-            base_router = base_router.with_entity_linker(el);
-            info!("EntityLinker enabled (entity → KG linking before dispatch)");
-        }
-    }
-
-    let router = Arc::new(if let Some(r) = reranker {
-        base_router.with_reranker(r)
-    } else {
-        base_router
-    });
-
-    // 8. Run each question through every strategy.
+    // 6. Run each question through every strategy.
     info!("--- EVAL PHASE ---");
     let mut per_question_reports: Vec<PerQuestionReport> =
         Vec::with_capacity(dataset.questions.len());
 
     for question in &dataset.questions {
-        info!(
-            id = %question.id,
-            q_type = %question.question_type,
-            "evaluating question"
-        );
+        info!(id = %question.id, q_type = %question.question_type, "evaluating question");
 
         let mut strategies_map: HashMap<String, QuestionStrategyMetrics> = HashMap::new();
 
@@ -1350,9 +1006,7 @@ async fn main() -> Result<()> {
                 Err(e) => {
                     let latency = started.elapsed().as_millis() as u64;
                     warn!(
-                        id = %question.id,
-                        strategy = %strategy,
-                        error = %e,
+                        id = %question.id, strategy = %strategy, error = %e,
                         "strategy failed"
                     );
                     QuestionStrategyMetrics::failed(e.to_string(), latency)
@@ -1370,7 +1024,7 @@ async fn main() -> Result<()> {
         });
     }
 
-    // 9. Aggregate and build report.
+    // 7. Aggregate + build report.
     let per_strategy = aggregate_per_strategy(&per_question_reports);
     let per_tier = aggregate_by_dimension(&per_question_reports, |r| r.difficulty.as_str());
     let per_type = aggregate_by_dimension(&per_question_reports, |r| r.question_type.as_str());
@@ -1385,11 +1039,10 @@ async fn main() -> Result<()> {
         per_question: per_question_reports,
     };
 
-    // 10. Print summary.
     print_summary_table(&report);
     print_dimension_breakdowns(&report);
 
-    // 11. Compare against baseline if present.
+    // 8. Compare against baseline if present.
     let results_dir = PathBuf::from(RESULTS_DIR);
     std::fs::create_dir_all(&results_dir).context("create test_results directory")?;
 
@@ -1409,7 +1062,7 @@ async fn main() -> Result<()> {
         );
     }
 
-    // 12. Write timestamped report.
+    // 9. Write timestamped report.
     let ts = Utc::now().format("%Y%m%dT%H%M%S");
     let report_path = results_dir.join(format!("eval_report_{ts}.json"));
     let json = serde_json::to_string_pretty(&report).context("serialize report")?;
@@ -1418,7 +1071,7 @@ async fn main() -> Result<()> {
     info!(path = %report_path.display(), "eval report written");
     println!("Report written to: {}", report_path.display());
 
-    // 13. Optionally save as baseline.
+    // 10. Optionally save as baseline.
     let save_baseline = std::env::var("EVAL_SAVE_BASELINE")
         .map(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "yes"))
         .unwrap_or(false);
@@ -1429,12 +1082,12 @@ async fn main() -> Result<()> {
         println!("Baseline saved to: {}", baseline_path.display());
     }
 
-    // 14. Post-run cleanup: drop the vector collection so repeated runs stay clean.
+    // 11. Post-run cleanup so repeated runs stay clean.
     if let Err(e) = reset_collection(&collection, &settings).await {
         warn!(error = %e, "post-run collection cleanup failed (non-fatal)");
     }
     for doc in &dataset.documents {
-        if let Err(e) = neo4j_store.delete_node(&doc.doc_id).await {
+        if let Err(e) = stores.neo4j.delete_node(&doc.doc_id).await {
             warn!(doc_id = %doc.doc_id, error = %e, "post-run graph node cleanup failed");
         }
     }

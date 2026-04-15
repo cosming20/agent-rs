@@ -22,16 +22,13 @@ use serde::Serialize;
 use tracing::info;
 use uuid::Uuid;
 
+use agent_rs::embedder::build_embedder;
+use agent_rs::stores::connect_stores;
 use agent_rs_core::config::Settings;
 use agent_rs_core::types::{CollectionName, Embedding, RetrievalStrategy};
 use agent_rs_retrieval::Embedder;
-use agent_rs_retrieval::embedder::{FastEmbedder, FastEmbedderConfig};
-use agent_rs_retrieval::openai_embedder::{OpenAIEmbedder, OpenAIEmbedderConfig};
 use agent_rs_retrieval::ranker::ResultRanker;
 use agent_rs_retrieval::router::RetrievalRouter;
-use agent_rs_stores::neo4j::Neo4jStore;
-use agent_rs_stores::postgres::PgStore;
-use agent_rs_stores::qdrant::QdrantStore;
 use agent_rs_stores::traits::{GraphStore, VectorStore};
 use agent_rs_stores::types::{
     CollectionConfig, GraphEdge, GraphNode, NodeLabel, RelationType, VectorPoint,
@@ -623,67 +620,15 @@ async fn main() -> Result<()> {
     }
 
     // 4. Connect to storage backends.
-    info!("connecting to Qdrant...");
-    let qdrant_store =
-        QdrantStore::new(&settings.qdrant).context("failed to create Qdrant client")?;
-    let qdrant_store = Arc::new(qdrant_store);
+    let stores = connect_stores(&settings).await?;
+    let qdrant_store = stores.qdrant;
+    let neo4j_store = stores.neo4j;
+    // stores.postgres intentionally unused — this test bypasses the ingest state machine.
 
-    info!("connecting to Neo4j...");
-    let neo4j_store = Neo4jStore::connect(&settings.neo4j)
-        .await
-        .context("failed to connect to Neo4j")?;
-    let neo4j_store = Arc::new(neo4j_store);
-
-    info!("connecting to PostgreSQL...");
-    let pg_store = PgStore::new(&settings.postgres.dsn())
-        .await
-        .context("failed to connect to PostgreSQL")?;
-    let _pg_store = Arc::new(pg_store);
-
-    info!("all storage backends connected");
-
-    // 5. Initialize embedder.
-    //
-    // Set `EMBEDDER_TYPE=openai` to use the OpenAI Embeddings API instead of
-    // local fastembed ONNX models. When using OpenAI, `OPENAI_API_KEY` must
-    // also be set. Default is `local` (fastembed) for offline use.
-    let embedder_type = std::env::var("EMBEDDER_TYPE").unwrap_or_else(|_| "local".to_owned());
-    let uses_openai = embedder_type.eq_ignore_ascii_case("openai");
-
-    // Sparse BM25 inference is handled server-side by Qdrant — no local sparse model needed.
-    let embedder: Arc<dyn Embedder + Send + Sync> = if uses_openai {
-        info!("initializing OpenAI dense embedder (sparse BM25 handled server-side by Qdrant)...");
-        let api_key = std::env::var("OPENAI_API_KEY")
-            .or_else(|_| std::env::var("LLM_API_KEY"))
-            .context("OPENAI_API_KEY or LLM_API_KEY must be set when EMBEDDER_TYPE=openai")?;
-        let model = std::env::var("OPENAI_EMBEDDING_MODEL")
-            .unwrap_or_else(|_| "text-embedding-3-large".to_owned());
-        let dims: usize = std::env::var("OPENAI_EMBEDDING_DIMS")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(3072);
-        let config = OpenAIEmbedderConfig::new(api_key)
-            .with_model(model)
-            .with_dimensions(dims);
-        let dense = OpenAIEmbedder::new(config);
-        info!(
-            dims = dense.dimensions(),
-            "OpenAI dense embedder initialized"
-        );
-        Arc::new(dense)
-    } else {
-        info!("initializing local fastembed embedder (may download ONNX models on first run)...");
-        let emb = FastEmbedder::try_new(FastEmbedderConfig {
-            show_download_progress: true,
-            ..Default::default()
-        })
-        .await
-        .context("failed to initialize embedding models")?;
-        info!(dims = emb.dimensions(), "fastembed embedder initialized");
-        Arc::new(emb)
-    };
+    // 5. Initialize embedder (OpenAI when EMBEDDER_TYPE=openai, else fastembed).
+    let (embedder, embedder_label) = build_embedder().await?;
     let dims = embedder.dimensions();
-    info!(dims = dims, embedder_type = %embedder_type, "embedder ready");
+    info!(dims = dims, embedder = %embedder_label, "embedder ready");
 
     // 6. Set up collection.
     let collection = CollectionName("legal_code_ro".into());
