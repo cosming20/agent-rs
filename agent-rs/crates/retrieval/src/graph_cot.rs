@@ -104,10 +104,9 @@ const CHUNK_TEXT_KEY: &str = "chunk_text";
 
 /// Maximum context characters embedded in the LLM prompt.
 ///
-/// We truncate the joined evidence text to this length before asking the LLM
-/// whether the question is answered; longer contexts rarely help and make the
-/// call slower and more expensive.
-const MAX_CONTEXT_CHARS: usize = 6_000;
+/// Sized for gpt-5.4-mini (200K token context). We pass the full reranked
+/// evidence so the LLM has complete context for grounding decisions.
+const MAX_CONTEXT_CHARS: usize = 60_000;
 
 /// HTTP timeout applied to every LLM call.
 const HTTP_TIMEOUT: Duration = Duration::from_secs(20);
