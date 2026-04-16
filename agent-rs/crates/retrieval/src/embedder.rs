@@ -42,15 +42,29 @@ use crate::error::RetrievalError;
 ///
 /// Non-zero dimensions are identified by `indices`; corresponding activation
 /// magnitudes are stored in `values`. Both slices are always the same length.
+///
+/// Fields are private to enforce the length invariant at construction.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SparseVector {
-    /// Non-zero dimension indices (vocabulary token IDs for SPLADE models).
-    pub indices: Vec<u32>,
-    /// Activation magnitude for each non-zero index.
-    pub values: Vec<f32>,
+    indices: Vec<u32>,
+    values: Vec<f32>,
 }
 
 impl SparseVector {
+    /// Create a new `SparseVector`, validating length invariant.
+    pub fn new(indices: Vec<u32>, values: Vec<f32>) -> Result<Self, RetrievalError> {
+        if indices.len() != values.len() {
+            return Err(RetrievalError::Embedding {
+                reason: format!(
+                    "SparseVector indices ({}) and values ({}) must have same length",
+                    indices.len(),
+                    values.len()
+                ),
+            });
+        }
+        Ok(Self { indices, values })
+    }
+
     /// Return the number of non-zero components.
     pub fn nnz(&self) -> usize {
         self.indices.len()
@@ -59,6 +73,16 @@ impl SparseVector {
     /// Return `true` when all components are zero (empty sparse vector).
     pub fn is_empty(&self) -> bool {
         self.indices.is_empty()
+    }
+
+    /// Accessor for indices.
+    pub fn indices(&self) -> &[u32] {
+        &self.indices
+    }
+
+    /// Accessor for values.
+    pub fn values(&self) -> &[f32] {
+        &self.values
     }
 }
 
@@ -356,7 +380,7 @@ impl Embedder for FastEmbedder {
             reason: format!("embed_batch task panicked: {join_err}"),
         })??;
 
-        Ok(raw_vecs.into_iter().map(Embedding).collect())
+        Ok(raw_vecs.into_iter().map(Embedding::from_vec).collect())
     }
 
     #[instrument(skip(self, texts), fields(batch_size = texts.len()))]
@@ -386,7 +410,7 @@ impl Embedder for FastEmbedder {
             reason: format!("embed_documents task panicked: {join_err}"),
         })??;
 
-        Ok(raw_vecs.into_iter().map(Embedding).collect())
+        Ok(raw_vecs.into_iter().map(Embedding::from_vec).collect())
     }
 
     #[instrument(skip(self, text), fields(text_len = text.len()))]
@@ -426,18 +450,16 @@ impl Embedder for FastEmbedder {
                 })?
                 .into_iter()
                 .map(|se| {
-                    Ok(SparseVector {
-                        indices: se
-                            .indices
-                            .into_iter()
-                            .map(|i| {
-                                u32::try_from(i).map_err(|_| RetrievalError::Embedding {
-                                    reason: format!("sparse index {i} exceeds u32::MAX"),
-                                })
+                    let indices: Vec<u32> = se
+                        .indices
+                        .into_iter()
+                        .map(|i| {
+                            u32::try_from(i).map_err(|_| RetrievalError::Embedding {
+                                reason: format!("sparse index {i} exceeds u32::MAX"),
                             })
-                            .collect::<Result<Vec<u32>, _>>()?,
-                        values: se.values,
-                    })
+                        })
+                        .collect::<Result<Vec<u32>, _>>()?;
+                    SparseVector::new(indices, se.values)
                 })
                 .collect::<Result<Vec<SparseVector>, RetrievalError>>()
         })

@@ -57,8 +57,12 @@ impl ContextBuilder {
             .store_message(&ctx.session_id, MessageRole::User, &ctx.query)
             .await?;
 
-        // 2. Load conversation history
-        let history = self.memory.load_history(&ctx.session_id, 10).await?;
+        // 2. Load conversation history (single query, reused for both
+        //    chat formatting and conversation context).
+        let history = self
+            .memory
+            .load_history(&ctx.session_id, self.max_messages)
+            .await?;
 
         let mut chat_messages: Vec<String> = Vec::new();
 
@@ -81,17 +85,16 @@ impl ContextBuilder {
                 }
             }
             Err(err) => {
-                warn!(error = %err, "failed to load long-term memories");
+                warn!(error = %err, "failed to load long-term memories, continuing without");
+                ctx.conversation_context.push_str(
+                    "\n[System: Long-term memory unavailable for this query.]",
+                );
             }
         }
 
-        // 4. Build conversation context for search augmentation
-        let db_messages = self
-            .memory
-            .load_history(&ctx.session_id, self.max_messages)
-            .await?;
+        // 4. Build conversation context for search augmentation (reuse history)
         ctx.conversation_context = self.memory.build_conversation_context(
-            &db_messages,
+            &history,
             self.max_messages,
             self.max_chars_per_msg,
         );

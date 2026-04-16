@@ -93,6 +93,14 @@ pub enum RetrievalError {
     Ingestion { reason: String },
     #[error("pdf extraction failed: {reason}")]
     PdfExtraction { reason: String },
+    #[error("not implemented: {0}")]
+    NotImplemented(String),
+    #[error("docling ingest failed: {0}")]
+    DoclingIngestFailed(String),
+    #[error("ingest already in progress: {0}")]
+    IngestInProgress(String),
+    #[error("postgres commit failed: {0}")]
+    PostgresCommitFailed(String),
 }
 
 // ---- Agent ----

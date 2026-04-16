@@ -332,7 +332,7 @@ impl OpenAIEmbedder {
             );
 
             let raw_vecs = self.call_api(chunk).await?;
-            all_embeddings.extend(raw_vecs.into_iter().map(Embedding));
+            all_embeddings.extend(raw_vecs.into_iter().map(Embedding::from_vec));
         }
 
         Ok(all_embeddings)

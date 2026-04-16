@@ -132,6 +132,7 @@ impl GroundingGate {
                         reasoning: format!("Retry {} failed: {err}", ctx.retries),
                         ungrounded_claims: Vec::new(),
                         claim_confidences: Vec::new(),
+                        method: "retry_failed".to_string(),
                     });
                     break;
                 }

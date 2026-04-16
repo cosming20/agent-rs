@@ -3,7 +3,8 @@
 //! Accepts shared references to the retrieval router, state store, and
 //! configuration, then constructs concrete tool instances for each request.
 
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+use tokio::sync::Mutex;
 
 use agent_rs_core::config::{BraveConfig, FetchConfig, WebBudgetConfig};
 use agent_rs_core::types::UserId;
@@ -30,6 +31,12 @@ pub struct ToolFactory {
     brave_config: BraveConfig,
     fetch_config: FetchConfig,
     web_budget_config: WebBudgetConfig,
+    /// Shared HTTP client for web/news search tools.
+    ///
+    /// `reqwest::Client` is internally `Arc`-backed, so cloning is cheap.
+    /// Sharing one client enables HTTP/2 connection reuse and avoids
+    /// per-request TLS/DNS overhead.
+    http_client: reqwest::Client,
 }
 
 impl ToolFactory {
@@ -49,12 +56,17 @@ impl ToolFactory {
         fetch_config: FetchConfig,
         web_budget_config: WebBudgetConfig,
     ) -> Self {
+        let http_client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(brave_config.timeout_s))
+            .build()
+            .expect("failed to build shared HTTP client");
         Self {
             router,
             store,
             brave_config,
             fetch_config,
             web_budget_config,
+            http_client,
         }
     }
 
@@ -82,10 +94,12 @@ impl ToolFactory {
             Box::new(SearchWebTool::new(
                 Arc::clone(&budget),
                 self.brave_config.clone(),
+                self.http_client.clone(),
             )),
             Box::new(SearchNewsTool::new(
                 Arc::clone(&budget),
                 self.brave_config.clone(),
+                self.http_client.clone(),
             )),
             Box::new(FetchUrlTool::new(
                 self.fetch_config.clone(),

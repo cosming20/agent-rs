@@ -770,9 +770,10 @@ async fn upsert_nodes_batch(
     let row_values: Vec<Value> = rows
         .iter()
         .map(|r| {
-            serde_json::to_value(r).expect("NodeRow serialization is infallible for valid JSON")
+            serde_json::to_value(r)
+                .map_err(|e| StoreError::Serialization(format!("NodeRow: {e}")))
         })
-        .collect();
+        .collect::<Result<_, _>>()?;
 
     for batch in row_values.chunks(BATCH_SIZE) {
         let batch_val = Value::Array(batch.to_vec());
@@ -823,9 +824,10 @@ async fn upsert_edges_batch(
     let row_values: Vec<Value> = rows
         .iter()
         .map(|r| {
-            serde_json::to_value(r).expect("EdgeRow serialization is infallible for valid JSON")
+            serde_json::to_value(r)
+                .map_err(|e| StoreError::Serialization(format!("EdgeRow: {e}")))
         })
-        .collect();
+        .collect::<Result<_, _>>()?;
 
     for batch in row_values.chunks(BATCH_SIZE) {
         let expected = batch.len();

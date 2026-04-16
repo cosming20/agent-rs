@@ -60,8 +60,17 @@ pub(crate) fn get_node_by_id(id: &str) -> neo4rs::Query {
 ///
 /// Returns distinct neighbor nodes (excludes the start node).
 pub(crate) fn get_neighbors(node_id: &str, depth: usize) -> neo4rs::Query {
+    const MAX_GRAPH_DEPTH: usize = 5;
+    let clamped = depth.min(MAX_GRAPH_DEPTH);
+    if depth > MAX_GRAPH_DEPTH {
+        tracing::warn!(
+            requested = depth,
+            clamped = clamped,
+            "graph traversal depth clamped to MAX_GRAPH_DEPTH"
+        );
+    }
     let cypher = format!(
-        "MATCH (start {{id: $id}})-[*1..{depth}]-(neighbor) \
+        "MATCH (start {{id: $id}})-[*1..{clamped}]-(neighbor) \
          WHERE neighbor.id <> $id \
          RETURN DISTINCT neighbor"
     );

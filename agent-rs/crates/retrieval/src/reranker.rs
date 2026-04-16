@@ -266,7 +266,7 @@ impl CrossEncoderReranker {
                 });
             }
             if let Some(mut doc) = doc_slots[result.index].take() {
-                doc.score = Score(result.relevance_score);
+                doc.score = Score::new(result.relevance_score);
                 reranked.push(doc);
                 if reranked.len() >= top_k {
                     break;

@@ -5,7 +5,8 @@
 //! runs it with multi-turn tool calling, and extracts the text answer
 //! and accumulated evidence.
 
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+use tokio::sync::Mutex;
 use std::time::Instant;
 
 use agent_rs_core::errors::AgentError;
@@ -116,7 +117,7 @@ impl AgentRunner {
         );
 
         // Drain accumulated evidence from the search_knowledge tool.
-        drain_evidence(&evidence_collector, &mut ctx.kb_evidence)?;
+        drain_evidence(&evidence_collector, &mut ctx.kb_evidence).await;
 
         ctx.agent_latency_ms = start.elapsed().as_millis() as u64;
         Ok(())
@@ -134,8 +135,9 @@ impl AgentRunner {
         ctx: &mut QueryContext,
         retry_prompt: &str,
     ) -> Result<(), AgentError> {
-        ctx.kb_evidence.clear();
-        ctx.web_evidence.clear();
+        // NOTE: Do NOT clear ctx.kb_evidence / ctx.web_evidence here.
+        // Unlike `run()`, retries must ACCUMULATE evidence from all rounds.
+        // `drain_evidence` uses `append`, so new evidence merges with existing.
 
         // Build per-request tools and evidence collector for the retry.
         let (tools, evidence_collector) = self.tool_factory.build(&ctx.user_id);
@@ -159,7 +161,7 @@ impl AgentRunner {
         }
 
         // Drain accumulated evidence from the retry.
-        drain_evidence(&evidence_collector, &mut ctx.kb_evidence)?;
+        drain_evidence(&evidence_collector, &mut ctx.kb_evidence).await;
 
         Ok(())
     }
@@ -192,20 +194,12 @@ impl AgentRunner {
 
 /// Drain accumulated evidence from the shared collector into the context.
 ///
-/// # Errors
-///
-/// Returns `AgentError::Orchestrator` if the mutex is poisoned, which
-/// indicates a prior panic in a tool call. Evidence must not be silently
-/// dropped because downstream verification depends on it.
-fn drain_evidence(
+/// Uses `tokio::sync::Mutex` which is safe to hold across `.await` points
+/// and cannot be poisoned (unlike `std::sync::Mutex`).
+async fn drain_evidence(
     collector: &Arc<Mutex<Vec<SearchResult>>>,
     target: &mut Vec<SearchResult>,
-) -> Result<(), AgentError> {
-    let mut collected = collector.lock().map_err(|_| {
-        AgentError::Orchestrator(
-            "evidence collector mutex poisoned; cannot drain evidence".to_string(),
-        )
-    })?;
+) {
+    let mut collected = collector.lock().await;
     target.append(&mut collected);
-    Ok(())
 }

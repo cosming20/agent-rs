@@ -43,9 +43,18 @@ fn is_internal_ip(addr: &IpAddr) -> bool {
     }
 }
 
+/// SSRF-validated host: carries the hostname and a validated public socket address.
+///
+/// The caller MUST use `reqwest::ClientBuilder::resolve()` to pin the
+/// returned address, eliminating the DNS-rebinding TOCTOU window.
+struct SsrfValidated {
+    host: String,
+    addr: std::net::SocketAddr,
+}
+
 /// Resolve the hostname from a URL and check all resulting IP addresses
-/// for SSRF. Returns `Ok(())` if all addresses are public.
-async fn validate_url_ssrf(url: &str) -> Result<(), ToolError> {
+/// for SSRF. Returns a validated host+address pair pinned for the HTTP client.
+async fn validate_url_ssrf(url: &str) -> Result<SsrfValidated, ToolError> {
     let parsed = url::Url::parse(url).map_err(|e| ToolError::FetchFailed {
         url: url.to_string(),
         reason: format!("invalid URL: {e}"),
@@ -70,14 +79,16 @@ async fn validate_url_ssrf(url: &str) -> Result<(), ToolError> {
     let addr_str = format!("{host}:{port}");
 
     // Resolve DNS to check all returned IPs.
-    let addrs = tokio::net::lookup_host(&addr_str)
+    let addrs: Vec<std::net::SocketAddr> = tokio::net::lookup_host(&addr_str)
         .await
         .map_err(|e| ToolError::FetchFailed {
             url: url.to_string(),
             reason: format!("DNS resolution failed: {e}"),
-        })?;
+        })?
+        .collect();
 
-    for socket_addr in addrs {
+    let mut first_public: Option<std::net::SocketAddr> = None;
+    for socket_addr in &addrs {
         if is_internal_ip(&socket_addr.ip()) {
             tracing::warn!(
                 url = %url,
@@ -88,9 +99,20 @@ async fn validate_url_ssrf(url: &str) -> Result<(), ToolError> {
                 url: url.to_string(),
             });
         }
+        if first_public.is_none() {
+            first_public = Some(*socket_addr);
+        }
     }
 
-    Ok(())
+    let addr = first_public.ok_or_else(|| ToolError::FetchFailed {
+        url: url.to_string(),
+        reason: "DNS resolution returned no addresses".into(),
+    })?;
+
+    Ok(SsrfValidated {
+        host: host.to_string(),
+        addr,
+    })
 }
 
 // ---- Args ----
@@ -171,15 +193,16 @@ impl Tool for FetchUrlTool {
         // Check and record budget.
         budget.record_fetch()?;
 
-        // SSRF validation: resolve DNS and check all IPs.
-        validate_url_ssrf(&args.url).await?;
+        // SSRF validation: resolve DNS, check all IPs, return pinned address.
+        let validated = validate_url_ssrf(&args.url).await?;
 
-        tracing::info!(url = %args.url, "fetching URL content");
+        tracing::info!(url = %args.url, pinned_ip = %validated.addr.ip(), "fetching URL content");
 
-        // Build a one-shot reqwest client with the configured limits.
+        // Build per-request client with DNS pinning to eliminate rebinding TOCTOU.
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(config.timeout))
             .redirect(reqwest::redirect::Policy::limited(config.max_redirects))
+            .resolve(&validated.host, validated.addr)
             .build()
             .map_err(|e| ToolError::FetchFailed {
                 url: args.url.clone(),
@@ -217,22 +240,27 @@ impl Tool for FetchUrlTool {
             }
         }
 
-        // Read body with size limit (fallback for when Content-Length is absent).
-        let bytes = response.bytes().await.map_err(|e| ToolError::FetchFailed {
+        // Stream body in chunks to enforce size limit without buffering the
+        // entire response (protects against OOM when Content-Length is absent).
+        let max_bytes = config.max_bytes;
+        let mut body = Vec::new();
+        let mut response = response;
+        while let Some(chunk) = response.chunk().await.map_err(|e| ToolError::FetchFailed {
             url: args.url.clone(),
-            reason: format!("failed to read response body: {e}"),
-        })?;
-
-        if bytes.len() > config.max_bytes {
-            return Err(ToolError::FetchFailed {
-                url: args.url,
-                reason: format!(
-                    "response body too large: {} bytes (max: {})",
-                    bytes.len(),
-                    config.max_bytes
-                ),
-            });
+            reason: format!("failed to read response chunk: {e}"),
+        })? {
+            body.extend_from_slice(&chunk);
+            if body.len() > max_bytes {
+                return Err(ToolError::FetchFailed {
+                    url: args.url,
+                    reason: format!(
+                        "response body exceeded {} bytes during streaming",
+                        max_bytes
+                    ),
+                });
+            }
         }
+        let bytes = body;
 
         // Convert to text. For HTML, a full parser would be better, but
         // for now we return the raw text content.
