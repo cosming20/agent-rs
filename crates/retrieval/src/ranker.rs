@@ -188,7 +188,7 @@ impl ResultRanker {
             .take(limit)
             .filter_map(|(id, fused_score)| match doc_index.remove(&id) {
                 Some(mut doc) => {
-                    doc.score = Score(fused_score);
+                    doc.score = Score::new(fused_score);
                     Some(doc)
                 }
                 None => {
@@ -236,9 +236,8 @@ impl ResultRanker {
         web_results: Vec<SearchResult>,
         query: &str,
         strategy: RetrievalStrategy,
+        limit: usize,
     ) -> EvidencePack {
-        let limit = kb_results.len().max(web_results.len()).max(1);
-
         let weighted_kb = apply_source_weight(kb_results, KB_SOURCE_WEIGHT);
         let weighted_web = apply_source_weight(web_results, WEB_SOURCE_WEIGHT);
 
@@ -256,7 +255,7 @@ fn apply_source_weight(results: Vec<SearchResult>, weight: f64) -> Vec<SearchRes
     results
         .into_iter()
         .map(|mut r| {
-            r.score = Score(r.score.0 * weight);
+            r.score = Score::new(r.score.value() * weight);
             r
         })
         .collect()

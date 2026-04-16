@@ -7,7 +7,6 @@
 //! News searches use the Brave News API (GET /news/search).
 
 use std::sync::Arc;
-use std::time::Duration;
 
 use agent_rs_core::ToolError;
 use agent_rs_core::config::BraveConfig;
@@ -69,18 +68,23 @@ pub struct SearchWebArgs {
 /// Returns formatted results with titles, URLs, and descriptions.
 #[derive(Serialize, Deserialize)]
 pub struct SearchWebTool {
+    // INVARIANT: Always `Some` after construction via `new()`.
+    // `Option` required by rig's `Deserialize` bound on `Tool`.
     #[serde(skip)]
     budget: Option<Arc<WebBudgetTracker>>,
     #[serde(skip)]
     config: Option<BraveConfig>,
+    #[serde(skip)]
+    http_client: Option<reqwest::Client>,
 }
 
 impl SearchWebTool {
-    /// Create a new `SearchWebTool` with the given budget tracker and config.
-    pub fn new(budget: Arc<WebBudgetTracker>, config: BraveConfig) -> Self {
+    /// Create a new `SearchWebTool` with the given budget tracker, config, and shared HTTP client.
+    pub fn new(budget: Arc<WebBudgetTracker>, config: BraveConfig, http_client: reqwest::Client) -> Self {
         Self {
             budget: Some(budget),
             config: Some(config),
+            http_client: Some(http_client),
         }
     }
 }
@@ -135,10 +139,9 @@ impl Tool for SearchWebTool {
 
         let url = format!("{}/web/search", config.base_url);
 
-        let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(config.timeout_s))
-            .build()
-            .map_err(|e| ToolError::WebSearch(format!("HTTP client build error: {e}")))?;
+        let client = self.http_client.as_ref().ok_or_else(|| {
+            ToolError::McpClient("search_web: http_client not initialized".into())
+        })?;
 
         let response = client
             .get(&url)
@@ -212,18 +215,23 @@ pub struct SearchNewsArgs {
 /// Returns formatted results with titles, URLs, and descriptions.
 #[derive(Serialize, Deserialize)]
 pub struct SearchNewsTool {
+    // INVARIANT: Always `Some` after construction via `new()`.
+    // `Option` required by rig's `Deserialize` bound on `Tool`.
     #[serde(skip)]
     budget: Option<Arc<WebBudgetTracker>>,
     #[serde(skip)]
     config: Option<BraveConfig>,
+    #[serde(skip)]
+    http_client: Option<reqwest::Client>,
 }
 
 impl SearchNewsTool {
-    /// Create a new `SearchNewsTool` with the given budget tracker and config.
-    pub fn new(budget: Arc<WebBudgetTracker>, config: BraveConfig) -> Self {
+    /// Create a new `SearchNewsTool` with the given budget tracker, config, and shared HTTP client.
+    pub fn new(budget: Arc<WebBudgetTracker>, config: BraveConfig, http_client: reqwest::Client) -> Self {
         Self {
             budget: Some(budget),
             config: Some(config),
+            http_client: Some(http_client),
         }
     }
 }
@@ -278,10 +286,9 @@ impl Tool for SearchNewsTool {
 
         let url = format!("{}/news/search", config.base_url);
 
-        let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(config.timeout_s))
-            .build()
-            .map_err(|e| ToolError::WebSearch(format!("HTTP client build error: {e}")))?;
+        let client = self.http_client.as_ref().ok_or_else(|| {
+            ToolError::McpClient("search_news: http_client not initialized".into())
+        })?;
 
         let response = client
             .get(&url)

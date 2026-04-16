@@ -77,9 +77,10 @@ impl ResultPersister {
             created_at: Utc::now().naive_utc(),
         };
 
-        if let Err(err) = self.store.persist_run(&run).await {
-            error!(error = %err, "failed to persist query run");
-        }
+        self.store.persist_run(&run).await.map_err(|err| {
+            error!(error = %err, "failed to persist query run — audit trail lost");
+            AgentError::Orchestrator(format!("failed to persist query run: {err}"))
+        })?;
 
         // Persist evidence items
         let evidence_items: Vec<agent_rs_stores::types::EvidenceItem> = ctx
@@ -100,7 +101,7 @@ impl ResultPersister {
                     .and_then(|v| v.as_str())
                     .unwrap_or("unknown")
                     .to_owned(),
-                score: doc.score.0,
+                score: doc.score.value(),
                 created_at: Utc::now().naive_utc(),
             })
             .collect();

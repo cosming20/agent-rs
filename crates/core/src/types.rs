@@ -27,12 +27,22 @@ pub const NAMESPACE_OID: Uuid = uuid!("6ba7b812-9dad-11d1-80b4-00c04fd430c8");
 
 /// Unique identifier for a conversation session.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct SessionId(pub Uuid);
+pub struct SessionId(Uuid);
 
 impl SessionId {
     /// Create a new random session ID.
     pub fn new() -> Self {
         Self(Uuid::new_v4())
+    }
+
+    /// Create a session ID from an existing UUID.
+    pub fn from_uuid(id: Uuid) -> Self {
+        Self(id)
+    }
+
+    /// Return the inner UUID.
+    pub fn inner(&self) -> &Uuid {
+        &self.0
     }
 }
 
@@ -50,7 +60,19 @@ impl fmt::Display for SessionId {
 
 /// Unique identifier for a user.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct UserId(pub String);
+pub struct UserId(String);
+
+impl UserId {
+    /// Create a user ID from a string.
+    pub fn from_string(id: String) -> Self {
+        Self(id)
+    }
+
+    /// Borrow the inner string.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
 
 impl fmt::Display for UserId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -107,11 +129,35 @@ impl TryFrom<f64> for Confidence {
 
 /// A numeric score (e.g., search relevance, RRF rank).
 #[derive(Debug, Clone, Copy, PartialEq, PartialOrd, Serialize, Deserialize)]
-pub struct Score(pub f64);
+pub struct Score(f64);
+
+impl Score {
+    /// Create a new score.
+    pub fn new(value: f64) -> Self {
+        Self(value)
+    }
+
+    /// Return the inner f64 value.
+    pub fn value(&self) -> f64 {
+        self.0
+    }
+}
 
 /// A dense embedding vector.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Embedding(pub Vec<f32>);
+pub struct Embedding(Vec<f32>);
+
+impl Embedding {
+    /// Create an embedding from raw float data.
+    pub fn from_vec(data: Vec<f32>) -> Self {
+        Self(data)
+    }
+
+    /// Return the inner float slice.
+    pub fn as_slice(&self) -> &[f32] {
+        &self.0
+    }
+}
 
 impl Embedding {
     /// Return the number of dimensions in this embedding.
@@ -122,7 +168,19 @@ impl Embedding {
 
 /// The name of a dataset used for retrieval routing.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct DatasetName(pub String);
+pub struct DatasetName(String);
+
+impl DatasetName {
+    /// Create a dataset name from a string.
+    pub fn from_string(name: String) -> Self {
+        Self(name)
+    }
+
+    /// Borrow the inner string.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
 
 impl fmt::Display for DatasetName {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -134,9 +192,14 @@ impl fmt::Display for DatasetName {
 ///
 /// Implements [`AsRef<str>`] for easy interop with APIs expecting `&str`.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct CollectionName(pub String);
+pub struct CollectionName(String);
 
 impl CollectionName {
+    /// Create a collection name from a string.
+    pub fn from_string(name: String) -> Self {
+        Self(name)
+    }
+
     /// Borrow the inner string slice.
     pub fn as_str(&self) -> &str {
         &self.0
@@ -294,13 +357,10 @@ impl FromStr for IngestStatus {
 /// This is safe for multi-byte UTF-8 content -- unlike `&s[..n]` which
 /// panics when `n` falls inside a multi-byte character.
 pub fn truncate_to_char_boundary(s: &str, max_chars: usize) -> &str {
-    if s.chars().count() <= max_chars {
-        return s;
+    // Single-pass: char_indices().nth() returns None if the string is
+    // shorter than max_chars, in which case we return the full string.
+    match s.char_indices().nth(max_chars) {
+        Some((byte_idx, _)) => &s[..byte_idx],
+        None => s,
     }
-    let byte_idx = s
-        .char_indices()
-        .nth(max_chars)
-        .map(|(i, _)| i)
-        .unwrap_or(s.len());
-    &s[..byte_idx]
 }

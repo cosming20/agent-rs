@@ -69,8 +69,8 @@ impl QueryService for QueryServiceImpl {
             ))
         })?;
 
-        let session_id = SessionId(session_uuid);
-        let user_id = UserId(req.user_id.clone());
+        let session_id = SessionId::from_uuid(session_uuid);
+        let user_id = UserId::from_string(req.user_id.clone());
         let strategy = proto_strategy_to_domain(req.strategy);
         let limit = if req.limit > 0 {
             req.limit as usize

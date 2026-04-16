@@ -90,7 +90,7 @@ impl ChatMessageRow {
         let role = str_to_role(&self.role)?;
         Ok(ChatMessage {
             id: self.id,
-            session_id: SessionId(self.session_id),
+            session_id: SessionId::from_uuid(self.session_id),
             role,
             content: self.content,
             created_at: self.created_at,
@@ -114,7 +114,7 @@ impl<'a> NewChatMessage<'a> {
     pub fn from_domain(msg: &'a ChatMessage) -> Self {
         Self {
             id: msg.id,
-            session_id: msg.session_id.0,
+            session_id: *msg.session_id.inner(),
             role: role_to_str(msg.role),
             content: &msg.content,
             created_at: msg.created_at,
@@ -142,7 +142,7 @@ impl MemoryRow {
     pub fn into_domain(self) -> Result<Memory, StoreError> {
         Ok(Memory {
             id: self.id,
-            user_id: UserId(self.user_id),
+            user_id: UserId::from_string(self.user_id),
             content: self.content,
             created_at: self.created_at,
         })
@@ -164,7 +164,7 @@ impl<'a> NewMemory<'a> {
     pub fn from_domain(mem: &'a Memory) -> Self {
         Self {
             id: mem.id,
-            user_id: &mem.user_id.0,
+            user_id: mem.user_id.as_str(),
             content: &mem.content,
             created_at: mem.created_at,
         }
@@ -203,8 +203,8 @@ impl QueryRunRow {
             .map_err(|e| StoreError::InvalidData(format!("confidence out of range in DB: {e}")))?;
         Ok(QueryRun {
             id: self.id,
-            session_id: SessionId(self.session_id),
-            user_id: UserId(self.user_id),
+            session_id: SessionId::from_uuid(self.session_id),
+            user_id: UserId::from_string(self.user_id),
             query: self.query,
             answer: self.answer,
             strategy,
@@ -235,8 +235,8 @@ impl<'a> NewQueryRun<'a> {
     pub fn from_domain(run: &'a QueryRun) -> Self {
         Self {
             id: run.id,
-            session_id: run.session_id.0,
-            user_id: &run.user_id.0,
+            session_id: *run.session_id.inner(),
+            user_id: run.user_id.as_str(),
             query: &run.query,
             answer: &run.answer,
             strategy: strategy_to_str(run.strategy),

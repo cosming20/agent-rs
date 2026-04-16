@@ -82,10 +82,12 @@ pub async fn graph_search(
             .await
             .map_err(RetrievalError::Store)?;
 
-        for (depth_0based, node) in neighbors.iter().enumerate() {
-            // Shift to 1-based depth so the seed's immediate neighbours are depth 1.
-            let depth = depth_0based + 1;
-            let score = BASE_DEPTH_SCORE / depth as f64;
+        for node in neighbors.iter() {
+            // Uniform scoring: `get_neighbors` returns a flat unordered list
+            // without depth information. The enumerate index is NOT traversal
+            // depth. Depth-aware scoring requires a GraphStore API change to
+            // return `(GraphNode, usize)`. RRF fusion handles relative ranking.
+            let score = BASE_DEPTH_SCORE;
 
             let entry = best_score.entry(node.id.clone()).or_insert(0.0);
             if score > *entry {
@@ -98,7 +100,7 @@ pub async fn graph_search(
                         "properties": node.properties,
                         "source": "neo4j",
                         "query": query,
-                        "depth": depth,
+                        "depth": max_depth,
                     }),
                 );
             }
@@ -120,7 +122,7 @@ pub async fn graph_search(
         .filter_map(|(id, score)| {
             node_payload.remove(&id).map(|payload| SearchResult {
                 id,
-                score: Score(score),
+                score: Score::new(score),
                 payload,
             })
         })

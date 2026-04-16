@@ -104,7 +104,7 @@ impl StateStore for PgStore {
 
         // Subquery trick: select the N most-recent rows, then reverse for ASC order.
         let rows: Vec<ChatMessageRow> = chat_messages::table
-            .filter(chat_messages::session_id.eq(session_id.0))
+            .filter(chat_messages::session_id.eq(*session_id.inner()))
             .order(chat_messages::created_at.desc())
             .limit(raw_limit)
             .select(ChatMessageRow::as_select())
@@ -139,7 +139,7 @@ impl StateStore for PgStore {
     async fn get_memories(&self, user_id: &UserId) -> Result<Vec<Memory>, StoreError> {
         let mut conn = self.conn().await?;
         let rows: Vec<MemoryRow> = memories::table
-            .filter(memories::user_id.eq(&user_id.0))
+            .filter(memories::user_id.eq(user_id.as_str()))
             .order(memories::created_at.asc())
             .select(MemoryRow::as_select())
             .load(&mut conn)

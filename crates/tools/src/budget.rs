@@ -58,48 +58,72 @@ impl WebBudgetTracker {
 
     /// Record a web search invocation. Returns `Ok(())` if within budget,
     /// or `Err(ToolError::WebBudgetExhausted)` if the limit has been reached.
+    ///
+    /// Uses `compare_exchange_weak` to atomically increment only when below
+    /// the limit, eliminating the TOCTOU window of the previous
+    /// `fetch_add` + rollback pattern.
     pub fn record_search(&self) -> Result<(), ToolError> {
-        let prev = self.searches.fetch_add(1, Ordering::Relaxed);
-        if prev >= self.max_searches {
-            // Roll back the increment so the counter stays at max.
-            self.searches.fetch_sub(1, Ordering::Relaxed);
-            return Err(ToolError::WebBudgetExhausted {
-                resource: "web_searches".into(),
-                used: self.max_searches,
-                max: self.max_searches,
-            });
+        loop {
+            let current = self.searches.load(Ordering::Relaxed);
+            if current >= self.max_searches {
+                return Err(ToolError::WebBudgetExhausted {
+                    resource: "web_searches".into(),
+                    used: current,
+                    max: self.max_searches,
+                });
+            }
+            if self
+                .searches
+                .compare_exchange_weak(current, current + 1, Ordering::Relaxed, Ordering::Relaxed)
+                .is_ok()
+            {
+                return Ok(());
+            }
         }
-        Ok(())
     }
 
     /// Record a news search invocation. Returns `Ok(())` if within budget,
     /// or `Err(ToolError::WebBudgetExhausted)` if the limit has been reached.
     pub fn record_news(&self) -> Result<(), ToolError> {
-        let prev = self.news.fetch_add(1, Ordering::Relaxed);
-        if prev >= self.max_news {
-            self.news.fetch_sub(1, Ordering::Relaxed);
-            return Err(ToolError::WebBudgetExhausted {
-                resource: "news_searches".into(),
-                used: self.max_news,
-                max: self.max_news,
-            });
+        loop {
+            let current = self.news.load(Ordering::Relaxed);
+            if current >= self.max_news {
+                return Err(ToolError::WebBudgetExhausted {
+                    resource: "news_searches".into(),
+                    used: current,
+                    max: self.max_news,
+                });
+            }
+            if self
+                .news
+                .compare_exchange_weak(current, current + 1, Ordering::Relaxed, Ordering::Relaxed)
+                .is_ok()
+            {
+                return Ok(());
+            }
         }
-        Ok(())
     }
 
     /// Record a URL fetch invocation. Returns `Ok(())` if within budget,
     /// or `Err(ToolError::WebBudgetExhausted)` if the limit has been reached.
     pub fn record_fetch(&self) -> Result<(), ToolError> {
-        let prev = self.fetches.fetch_add(1, Ordering::Relaxed);
-        if prev >= self.max_fetches {
-            self.fetches.fetch_sub(1, Ordering::Relaxed);
-            return Err(ToolError::WebBudgetExhausted {
-                resource: "url_fetches".into(),
-                used: self.max_fetches,
-                max: self.max_fetches,
-            });
+        loop {
+            let current = self.fetches.load(Ordering::Relaxed);
+            if current >= self.max_fetches {
+                return Err(ToolError::WebBudgetExhausted {
+                    resource: "url_fetches".into(),
+                    used: current,
+                    max: self.max_fetches,
+                });
+            }
+            if self
+                .fetches
+                .compare_exchange_weak(current, current + 1, Ordering::Relaxed, Ordering::Relaxed)
+                .is_ok()
+            {
+                return Ok(());
+            }
         }
-        Ok(())
     }
 
     /// Return the current number of web searches used.

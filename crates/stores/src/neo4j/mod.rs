@@ -67,13 +67,42 @@ impl GraphStore for Neo4jStore {
         Ok(())
     }
 
-    /// Add multiple nodes in a batch, each MERGE'd by id.
+    /// Add multiple nodes in a batch, grouped by label and UNWIND'd.
+    ///
+    /// Reduces O(n) round-trips to O(labels) by batching nodes with the
+    /// same label into a single `UNWIND $rows` Cypher statement.
     #[instrument(name = "neo4j_store.add_nodes", skip(self, nodes), fields(count = nodes.len()))]
     async fn add_nodes(&self, nodes: &[GraphNode]) -> Result<(), StoreError> {
-        for node in nodes {
-            let q = queries::upsert_node(node).map_err(StoreError::from)?;
-            self.graph.run(q).await.map_err(StoreError::from)?;
+        use std::collections::HashMap;
+
+        if nodes.is_empty() {
+            return Ok(());
         }
+
+        // Group nodes by label for batched UNWIND.
+        let mut by_label: HashMap<&str, Vec<serde_json::Value>> = HashMap::new();
+        for node in nodes {
+            let row = serde_json::json!({
+                "id": node.id,
+                "props": node.properties,
+            });
+            by_label.entry(node.label.as_str()).or_default().push(row);
+        }
+
+        for (label, rows) in &by_label {
+            let cypher = format!(
+                "UNWIND $rows AS row MERGE (n:{label} {{id: row.id}}) SET n += row.props"
+            );
+            let batch_val = serde_json::Value::Array(rows.clone());
+            let bolt = neo4rs::BoltType::try_from(batch_val)
+                .map_err(|e| StoreError::Serialization(format!("node batch for {label}: {e}")))?;
+            self.graph
+                .run(neo4rs::query(&cypher).param("rows", bolt))
+                .await
+                .map_err(StoreError::from)?;
+        }
+
+        tracing::debug!(labels = by_label.len(), total = nodes.len(), "batch upserted nodes");
         Ok(())
     }
 
@@ -89,13 +118,45 @@ impl GraphStore for Neo4jStore {
         Ok(())
     }
 
-    /// Add multiple edges in a batch.
+    /// Add multiple edges in a batch, grouped by relationship type and UNWIND'd.
+    ///
+    /// Reduces O(n) round-trips to O(rel_types) by batching edges with the
+    /// same relationship type into a single `UNWIND $rows` Cypher statement.
     #[instrument(name = "neo4j_store.add_edges", skip(self, edges), fields(count = edges.len()))]
     async fn add_edges(&self, edges: &[GraphEdge]) -> Result<(), StoreError> {
-        for edge in edges {
-            let q = queries::create_edge(edge).map_err(StoreError::from)?;
-            self.graph.run(q).await.map_err(StoreError::from)?;
+        use std::collections::HashMap;
+
+        if edges.is_empty() {
+            return Ok(());
         }
+
+        // Group edges by relationship type for batched UNWIND.
+        let mut by_rel: HashMap<&str, Vec<serde_json::Value>> = HashMap::new();
+        for edge in edges {
+            let row = serde_json::json!({
+                "src": edge.source_id,
+                "dst": edge.target_id,
+                "props": edge.properties,
+            });
+            by_rel.entry(edge.relation_type.as_str()).or_default().push(row);
+        }
+
+        for (rel_type, rows) in &by_rel {
+            let cypher = format!(
+                "UNWIND $rows AS row \
+                 MATCH (a {{id: row.src}}), (b {{id: row.dst}}) \
+                 MERGE (a)-[r:{rel_type}]->(b) SET r += row.props"
+            );
+            let batch_val = serde_json::Value::Array(rows.clone());
+            let bolt = neo4rs::BoltType::try_from(batch_val)
+                .map_err(|e| StoreError::Serialization(format!("edge batch for {rel_type}: {e}")))?;
+            self.graph
+                .run(neo4rs::query(&cypher).param("rows", bolt))
+                .await
+                .map_err(StoreError::from)?;
+        }
+
+        tracing::debug!(rel_types = by_rel.len(), total = edges.len(), "batch upserted edges");
         Ok(())
     }
 

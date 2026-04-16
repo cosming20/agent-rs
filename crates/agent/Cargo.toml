@@ -35,3 +35,6 @@ chrono = { workspace = true }
 
 # Citation extraction
 regex = { workspace = true }
+
+# HTTP client (shared across web tools)
+reqwest = { workspace = true }

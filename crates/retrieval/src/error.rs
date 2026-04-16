@@ -91,29 +91,27 @@ impl From<RetrievalError> for agent_rs_core::errors::RetrievalError {
             }
             RetrievalError::Store(e) => agent_rs_core::errors::RetrievalError::Store(e),
             RetrievalError::Ingestion { reason } => {
-                agent_rs_core::errors::RetrievalError::Ranking(format!("ingestion: {reason}"))
+                agent_rs_core::errors::RetrievalError::Ingestion { reason }
             }
             RetrievalError::PdfExtraction { reason } => {
-                agent_rs_core::errors::RetrievalError::Ranking(format!("pdf extraction: {reason}"))
+                agent_rs_core::errors::RetrievalError::PdfExtraction { reason }
             }
             RetrievalError::NotImplemented(msg) => {
-                agent_rs_core::errors::RetrievalError::Ranking(format!("not implemented: {msg}"))
+                agent_rs_core::errors::RetrievalError::NotImplemented(msg)
             }
             RetrievalError::DoclingIngestFailed { code, message, .. } => {
-                agent_rs_core::errors::RetrievalError::Ranking(format!(
-                    "docling ingest failed [{code:?}]: {message}"
+                agent_rs_core::errors::RetrievalError::DoclingIngestFailed(format!(
+                    "[{code:?}]: {message}"
                 ))
             }
             RetrievalError::IngestInProgress { sha256 } => {
-                agent_rs_core::errors::RetrievalError::Ranking(format!(
-                    "ingest in progress for sha256={sha256}"
-                ))
+                agent_rs_core::errors::RetrievalError::IngestInProgress(sha256)
             }
             RetrievalError::PostgresCommitFailed {
                 ingest_run_id,
                 reason,
-            } => agent_rs_core::errors::RetrievalError::Ranking(format!(
-                "postgres commit failed (run={ingest_run_id}): {reason}"
+            } => agent_rs_core::errors::RetrievalError::PostgresCommitFailed(format!(
+                "run={ingest_run_id}: {reason}"
             )),
         }
     }

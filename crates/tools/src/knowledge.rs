@@ -5,7 +5,8 @@
 //! formats the resulting evidence documents, and accumulates raw
 //! [`SearchResult`]s in a shared collector for downstream fusion.
 
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+use tokio::sync::Mutex;
 
 use agent_rs_core::{RetrievalStrategy, ToolError};
 use agent_rs_retrieval::RetrievalRouter;
@@ -115,7 +116,7 @@ impl Tool for SearchKnowledgeTool {
 
         let strategy = match args.strategy.as_deref() {
             Some(s) => RetrievalStrategy::from_db_str(s)
-                .map_err(|e| ToolError::WebSearch(format!("invalid retrieval strategy: {e}")))?,
+                .map_err(|e| ToolError::McpClient(format!("invalid retrieval strategy: {e}")))?,
             None => RetrievalStrategy::Hybrid,
         };
 
@@ -131,15 +132,11 @@ impl Tool for SearchKnowledgeTool {
         let evidence_pack = router
             .retrieve(&args.query, strategy, limit)
             .await
-            .map_err(|e| ToolError::WebSearch(format!("retrieval failed: {e}")))?;
+            .map_err(|e| ToolError::McpClient(format!("knowledge retrieval failed: {e}")))?;
 
         // Accumulate raw results for downstream evidence fusion.
         if let Some(collector) = &self.evidence_collector {
-            let mut collected = collector.lock().map_err(|_| {
-                ToolError::McpClient(
-                    "evidence collector mutex poisoned; cannot accumulate evidence".to_string(),
-                )
-            })?;
+            let mut collected = collector.lock().await;
             collected.extend(evidence_pack.documents.iter().cloned());
         }
 
@@ -197,7 +194,7 @@ impl Tool for SearchKnowledgeTool {
             output.push_str(&format!(
                 "[{}] (score: {:.4}, source: {}{}{}{})\n{}\n\n",
                 i + 1,
-                doc.score.0,
+                doc.score.value(),
                 source,
                 page_info,
                 section_info,

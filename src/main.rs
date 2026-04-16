@@ -33,9 +33,9 @@ async fn main() -> Result<()> {
     info!(embedder = %label, "embedder ready");
 
     // 3. Build retrieval router with all cognitive features enabled.
-    let collection = CollectionName(settings.retrieval.dataset.clone());
-    let triplet_collection = CollectionName(format!("{}_triplets", collection.0));
-    let summaries_collection = CollectionName(format!("{}_summaries", collection.0));
+    let collection = CollectionName::from_string(settings.retrieval.dataset.clone());
+    let triplet_collection = CollectionName::from_string(format!("{}_triplets", collection.as_str()));
+    let summaries_collection = CollectionName::from_string(format!("{}_summaries", collection.as_str()));
 
     let router = agent_rs::router::build_router(
         &settings,
