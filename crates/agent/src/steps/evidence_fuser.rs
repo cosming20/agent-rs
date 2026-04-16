@@ -31,6 +31,7 @@ impl EvidenceFuser {
             ctx.web_evidence.clone(),
             &ctx.query,
             ctx.strategy,
+            ctx.limit,
         );
 
         let fused_count = fused_pack.documents.len();

@@ -17,10 +17,37 @@ use uuid::Uuid;
 ///
 /// Indices and values must have the same length. Each index identifies
 /// a vocabulary term; the value is its weight.
+///
+/// Fields are private to enforce the length invariant at construction.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SparseVector {
-    pub indices: Vec<u32>,
-    pub values: Vec<f32>,
+    indices: Vec<u32>,
+    values: Vec<f32>,
+}
+
+impl SparseVector {
+    /// Create a new `SparseVector`, validating that indices and values
+    /// have the same length.
+    pub fn new(indices: Vec<u32>, values: Vec<f32>) -> Result<Self, agent_rs_core::StoreError> {
+        if indices.len() != values.len() {
+            return Err(agent_rs_core::StoreError::InvalidData(format!(
+                "SparseVector indices ({}) and values ({}) must have same length",
+                indices.len(),
+                values.len()
+            )));
+        }
+        Ok(Self { indices, values })
+    }
+
+    /// Accessor for indices.
+    pub fn indices(&self) -> &[u32] {
+        &self.indices
+    }
+
+    /// Accessor for values.
+    pub fn values(&self) -> &[f32] {
+        &self.values
+    }
 }
 
 /// A point to upsert into the vector store.

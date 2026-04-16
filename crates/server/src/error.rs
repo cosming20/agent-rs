@@ -26,32 +26,54 @@ pub enum ServerError {
 ///
 /// Each variant maps to the most appropriate gRPC status code.
 pub(crate) fn agent_error_to_status(err: AgentError) -> Status {
+    // Generate a correlation ID for cross-referencing client errors with
+    // server logs.  The full error detail stays in structured logs only —
+    // never exposed to the gRPC client.
+    let correlation_id = uuid::Uuid::new_v4();
+
     use AgentError::*;
     match err {
-        MaxRetriesExceeded { .. } => Status::resource_exhausted(err.to_string()),
+        MaxRetriesExceeded { max } => {
+            tracing::warn!(correlation_id = %correlation_id, max, "max retries exceeded");
+            Status::resource_exhausted(format!(
+                "Query exceeded maximum retry attempts. Correlation ID: {correlation_id}"
+            ))
+        }
         Retrieval(ref inner) => {
-            tracing::warn!(error = %inner, "retrieval error during query");
-            Status::unavailable(err.to_string())
+            tracing::warn!(correlation_id = %correlation_id, error = %inner, "retrieval error during query");
+            Status::unavailable(format!(
+                "Retrieval service temporarily unavailable. Correlation ID: {correlation_id}"
+            ))
         }
         Store(ref inner) => {
-            tracing::error!(error = %inner, "store error during query");
-            Status::internal(err.to_string())
+            tracing::error!(correlation_id = %correlation_id, error = %inner, "store error during query");
+            Status::internal(format!(
+                "An internal error occurred. Correlation ID: {correlation_id}"
+            ))
         }
         Orchestrator(ref msg) => {
-            tracing::error!(error = %msg, "orchestrator error");
-            Status::internal(err.to_string())
+            tracing::error!(correlation_id = %correlation_id, error = %msg, "orchestrator error");
+            Status::internal(format!(
+                "An internal error occurred. Correlation ID: {correlation_id}"
+            ))
         }
         Verification(ref msg) => {
-            tracing::warn!(error = %msg, "verification error");
-            Status::internal(err.to_string())
+            tracing::warn!(correlation_id = %correlation_id, error = %msg, "verification error");
+            Status::internal(format!(
+                "An internal error occurred. Correlation ID: {correlation_id}"
+            ))
         }
         Synthesis(ref msg) => {
-            tracing::error!(error = %msg, "synthesis error");
-            Status::internal(err.to_string())
+            tracing::error!(correlation_id = %correlation_id, error = %msg, "synthesis error");
+            Status::internal(format!(
+                "An internal error occurred. Correlation ID: {correlation_id}"
+            ))
         }
         MemoryStore(ref msg) => {
-            tracing::error!(error = %msg, "memory store error");
-            Status::internal(err.to_string())
+            tracing::error!(correlation_id = %correlation_id, error = %msg, "memory store error");
+            Status::internal(format!(
+                "An internal error occurred. Correlation ID: {correlation_id}"
+            ))
         }
     }
 }

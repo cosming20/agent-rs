@@ -93,7 +93,7 @@ impl VectorStore for QdrantStore {
                 // Dense vector under the named vector key "dense".
                 // `DenseVector` implements `Into<Vector>` (non-deprecated path).
                 let dense_vector: Vector = DenseVector {
-                    data: p.embedding.0,
+                    data: p.embedding.as_slice().to_vec(),
                 }
                 .into();
                 vectors.insert("dense".into(), dense_vector);
@@ -160,7 +160,7 @@ impl VectorStore for QdrantStore {
             .client
             .query(
                 QueryPointsBuilder::new(collection.as_str())
-                    .query(qdrant_client::qdrant::Query::from(query.0.clone()))
+                    .query(qdrant_client::qdrant::Query::from(query.as_slice().to_vec()))
                     .using("dense")
                     .limit(limit as u64)
                     .with_payload(true),
@@ -193,7 +193,7 @@ impl VectorStore for QdrantStore {
         limit: usize,
     ) -> Result<Vec<SearchResult>, StoreError> {
         let prefetch_dense = PrefetchQueryBuilder::default()
-            .query(qdrant_client::qdrant::Query::from(dense.0.clone()))
+            .query(qdrant_client::qdrant::Query::from(dense.as_slice().to_vec()))
             .using("dense")
             .limit(limit as u64)
             .build();
@@ -246,7 +246,7 @@ impl VectorStore for QdrantStore {
         filter: Option<serde_json::Value>,
     ) -> Result<Vec<SearchResult>, StoreError> {
         let mut builder = QueryPointsBuilder::new(collection.as_str())
-            .query(qdrant_client::qdrant::Query::from(query.0.clone()))
+            .query(qdrant_client::qdrant::Query::from(query.as_slice().to_vec()))
             .using("dense")
             .limit(limit as u64)
             .with_payload(true);
@@ -314,7 +314,7 @@ impl VectorStore for QdrantStore {
         // deleted points, so we count matching points BEFORE deletion.
         // This is a race-free approximation (no concurrent deletes expected
         // for a specific ingest_run_id).
-        let count = self
+        let count = match self
             .client
             .count(
                 qdrant_client::qdrant::CountPointsBuilder::new(collection.as_str())
@@ -322,8 +322,17 @@ impl VectorStore for QdrantStore {
                     .exact(true),
             )
             .await
-            .map(|r| r.result.map(|c| c.count).unwrap_or(0))
-            .unwrap_or(0);
+        {
+            Ok(r) => r.result.map(|c| c.count).unwrap_or(0),
+            Err(e) => {
+                tracing::warn!(
+                    collection = %collection,
+                    error = %e,
+                    "pre-delete count failed; proceeding with delete anyway"
+                );
+                0
+            }
+        };
 
         // Delete all matching points.
         self.client
@@ -436,7 +445,7 @@ fn scored_point_to_result(
 
     Ok(SearchResult {
         id,
-        score: Score(point.score as f64),
+        score: Score::new(point.score as f64),
         payload,
     })
 }

@@ -1858,12 +1858,14 @@ struct ExtractedEntity {
 /// Phase 1 implementation: detects capitalised multi-word phrases and
 /// acronyms. Phase 2 will add LLM-based extraction.
 fn extract_entities_from_chunks(chunks: &[DocumentChunk]) -> Vec<Vec<ExtractedEntity>> {
-    // Pre-compile regex patterns once.
-    // Capitalised multi-word phrase: "United States", "Machine Learning", etc.
-    let cap_phrase_re =
-        Regex::new(r"\b([A-Z][a-z]+(?:\s+[A-Z][a-z]+)+)\b").expect("valid regex: cap_phrase");
-    // Acronyms: 2+ uppercase letters, optionally with dots.
-    let acronym_re = Regex::new(r"\b([A-Z]{2,}(?:\.[A-Z]+)*)\b").expect("valid regex: acronym");
+    // Module-level lazy-compiled regexes (compiled once, reused across calls).
+    static CAP_PHRASE_RE: std::sync::LazyLock<Regex> = std::sync::LazyLock::new(|| {
+        Regex::new(r"\b([A-Z][a-z]+(?:\s+[A-Z][a-z]+)+)\b").unwrap()
+    });
+    static ACRONYM_RE: std::sync::LazyLock<Regex> =
+        std::sync::LazyLock::new(|| Regex::new(r"\b([A-Z]{2,}(?:\.[A-Z]+)*)\b").unwrap());
+    let cap_phrase_re = &*CAP_PHRASE_RE;
+    let acronym_re = &*ACRONYM_RE;
 
     chunks
         .iter()

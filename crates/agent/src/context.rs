@@ -34,31 +34,31 @@ pub struct QueryContext {
 
     // ---- Accumulated by ContextBuilder ----
     /// Chat history messages for the Rig agent.
-    pub chat_messages: Vec<String>,
+    pub(crate) chat_messages: Vec<String>,
     /// Conversation context string for search augmentation.
-    pub conversation_context: String,
+    pub(crate) conversation_context: String,
 
     // ---- Accumulated by AgentRunner ----
     /// Knowledge-base evidence accumulated by tool calls.
-    pub kb_evidence: Vec<SearchResult>,
+    pub(crate) kb_evidence: Vec<SearchResult>,
     /// Web evidence accumulated by tool calls.
-    pub web_evidence: Vec<SearchResult>,
+    pub(crate) web_evidence: Vec<SearchResult>,
     /// Raw answer text from the Rig agent.
-    pub answer: String,
+    pub(crate) answer: String,
     /// Latency of the agent execution in milliseconds.
-    pub agent_latency_ms: u64,
+    pub(crate) agent_latency_ms: u64,
 
     // ---- Accumulated by EvidenceFuser ----
     /// Fused and ranked evidence documents.
-    pub evidence: Vec<SearchResult>,
+    pub(crate) evidence: Vec<SearchResult>,
     /// The full evidence pack with provenance metadata.
-    pub fused_pack: Option<EvidencePack>,
+    pub(crate) fused_pack: Option<EvidencePack>,
 
     // ---- Accumulated by GroundingGate ----
     /// Verification result from the grounding check.
-    pub verification: Option<VerificationResult>,
+    pub(crate) verification: Option<VerificationResult>,
     /// Number of retry attempts performed.
-    pub retries: usize,
+    pub(crate) retries: usize,
 }
 
 impl QueryContext {

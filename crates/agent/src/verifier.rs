@@ -10,7 +10,7 @@ use agent_rs_core::errors::AgentError;
 use agent_rs_core::types::Confidence;
 use agent_rs_stores::types::SearchResult;
 use serde::{Deserialize, Serialize};
-use tracing::{info, instrument, warn};
+use tracing::{info, instrument};
 
 use crate::prompts::VERIFICATION_PROMPT;
 
@@ -32,6 +32,16 @@ pub struct VerificationResult {
     /// this to users so they see exactly which parts to trust.
     #[serde(default)]
     pub claim_confidences: Vec<ClaimConfidence>,
+    /// Verification method used: "llm", "heuristic", or "heuristic_fallback".
+    ///
+    /// "heuristic_fallback" indicates the LLM verifier was configured but
+    /// failed, so results are from the lower-quality heuristic path.
+    #[serde(default = "default_method")]
+    pub method: String,
+}
+
+fn default_method() -> String {
+    "heuristic".to_string()
 }
 
 /// Per-claim confidence tracking (spec C3).
@@ -48,25 +58,6 @@ pub struct ClaimConfidence {
     pub grounded: bool,
     /// Citation indices (1-based) from the evidence pack that support this claim.
     pub source_indices: Vec<usize>,
-}
-
-/// Structured uncertainty types (spec Layer 4c).
-///
-/// When the verifier detects specific types of uncertainty, it reports
-/// them here so the synthesis layer can generate appropriate caveats.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum UncertaintyType {
-    /// Evidence exists but is ambiguous or contradictory.
-    EvidenceConflict { conflict: String },
-    /// Evidence partially addresses the question.
-    PartialCoverage {
-        covered: Vec<String>,
-        missing: Vec<String>,
-    },
-    /// No relevant evidence found at all.
-    NoEvidence,
-    /// Evidence found but relevance scores are low.
-    LowRelevance { best_score: f64 },
 }
 
 /// Raw JSON structure expected from the LLM verifier response.
@@ -125,7 +116,7 @@ impl GroundingVerifier {
             match rig::providers::openai::Client::new(api_key) {
                 Ok(client) => Some(client),
                 Err(err) => {
-                    tracing::warn!(
+                    tracing::error!(
                         error = %err,
                         "failed to create OpenAI client for verifier, using heuristic only"
                     );
@@ -158,6 +149,7 @@ impl GroundingVerifier {
                 reasoning: "Empty answer cannot be verified.".into(),
                 ungrounded_claims: Vec::new(),
                 claim_confidences: Vec::new(),
+                method: "none".to_string(),
             });
         }
 
@@ -169,6 +161,7 @@ impl GroundingVerifier {
                 reasoning: "No evidence provided for grounding check.".into(),
                 ungrounded_claims: Vec::new(),
                 claim_confidences: Vec::new(),
+                method: "none".to_string(),
             });
         }
 
@@ -176,10 +169,14 @@ impl GroundingVerifier {
             match self.verify_with_llm(client, answer, evidence).await {
                 Ok(result) => return Ok(result),
                 Err(err) => {
-                    warn!(
+                    tracing::error!(
                         error = %err,
-                        "LLM verification failed, falling back to heuristic"
+                        "LLM verification failed, falling back to heuristic — quality degraded"
                     );
+                    // Fall through to heuristic with "heuristic_fallback" method tag
+                    let mut result = self.verify_heuristic(answer, evidence)?;
+                    result.method = "heuristic_fallback".to_string();
+                    return Ok(result);
                 }
             }
         }
@@ -244,7 +241,8 @@ impl GroundingVerifier {
             confidence,
             reasoning: parsed.reasoning,
             ungrounded_claims: parsed.ungrounded_claims,
-            claim_confidences: Vec::new(), // TODO: populate from LLM structured output
+            claim_confidences: Vec::new(),
+            method: "llm".to_string(),
         })
     }
 
@@ -271,6 +269,7 @@ impl GroundingVerifier {
                 reasoning: "Answer contains no meaningful tokens.".into(),
                 ungrounded_claims: Vec::new(),
                 claim_confidences: Vec::new(),
+                method: "heuristic".to_string(),
             });
         }
 
@@ -315,6 +314,7 @@ impl GroundingVerifier {
             ),
             ungrounded_claims: Vec::new(),
             claim_confidences: Vec::new(),
+            method: "heuristic".to_string(),
         })
     }
 }

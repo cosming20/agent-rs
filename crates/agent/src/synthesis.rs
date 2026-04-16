@@ -171,7 +171,7 @@ impl ResponseSynthesizer {
                     index: idx + 1,
                     content_snippet: snippet,
                     source,
-                    score: doc.score.0,
+                    score: doc.score.value(),
                 }
             })
             .collect()
@@ -180,8 +180,10 @@ impl ResponseSynthesizer {
 
 /// Extract citation indices like [1], [4] from the answer text.
 fn find_referenced_indices(answer: &str) -> Vec<usize> {
-    let re = Regex::new(r"\[(\d+)\]").expect("citation regex is valid");
-    re.captures_iter(answer)
+    static CITATION_RE: std::sync::LazyLock<Regex> =
+        std::sync::LazyLock::new(|| Regex::new(r"\[(\d+)\]").unwrap());
+    CITATION_RE
+        .captures_iter(answer)
         .filter_map(|cap| cap[1].parse::<usize>().ok())
         .collect()
 }
