@@ -267,6 +267,10 @@ pub struct IngestionPipeline {
     /// `None` when not configured; the ingest state machine is skipped
     /// gracefully (dedup and partial-failure tracking are disabled).
     pg_store: Option<Arc<PgStore>>,
+    /// Optional observability handle. When `Some`, the pipeline emits
+    /// per-chunk quality metrics (tokens, chars, heading depth, flags)
+    /// and a chunks_per_doc histogram entry at the end of ingest.
+    metrics: Option<Arc<agent_rs_observability::metrics::RetrievalMetrics>>,
 }
 
 impl IngestionPipeline {
@@ -323,6 +327,7 @@ impl IngestionPipeline {
             ingest_backend: config.ingest_backend,
             docling_client: config.docling_client.map(tokio::sync::Mutex::new),
             pg_store: config.pg_store,
+            metrics: None,
         }
     }
 
@@ -336,6 +341,50 @@ impl IngestionPipeline {
     pub fn with_pg_store(mut self, pg_store: Arc<PgStore>) -> Self {
         self.pg_store = Some(pg_store);
         self
+    }
+
+    /// Attach an observability handle so per-chunk quality metrics flow
+    /// to the configured OTel collector.
+    pub fn with_metrics(
+        mut self,
+        metrics: Arc<agent_rs_observability::metrics::RetrievalMetrics>,
+    ) -> Self {
+        self.metrics = Some(metrics);
+        self
+    }
+
+    /// Emit per-chunk quality metrics for one batch of chunks. Called from
+    /// `ingest_text` and `ingest_pdf` after chunking succeeds; no-op when
+    /// no metrics handle is attached.
+    fn emit_chunk_quality(&self, chunks: &[DocumentChunk]) {
+        let Some(m) = self.metrics.as_ref() else {
+            return;
+        };
+        m.record_chunks_per_doc(chunks.len() as u64);
+        for c in chunks {
+            // `token_count == 0` can mean either an empty chunk or a
+            // non-token-aware strategy; fall back to a cheap char/4 estimate
+            // to keep the histogram meaningful in the latter case.
+            let tokens = if c.metadata.token_count > 0 {
+                c.metadata.token_count as u64
+            } else {
+                (c.content.chars().count() / 4).max(1) as u64
+            };
+            let chars = c.content.chars().count() as u64;
+            let depth = c.metadata.headings.len() as u64;
+            m.record_chunk_tokens(tokens);
+            m.record_chunk_chars(chars);
+            m.record_chunk_heading_depth(depth);
+            if c.metadata.has_table {
+                m.record_chunk_flag("has_table");
+            }
+            if c.metadata.has_list {
+                m.record_chunk_flag("has_list");
+            }
+            if c.content.trim().is_empty() {
+                m.record_chunk_empty_embed();
+            }
+        }
     }
 
     /// Ingest a plain-text document.
@@ -376,6 +425,10 @@ impl IngestionPipeline {
 
         let chunks_created = chunks.len();
         tracing::info!(doc_id, chunks_created, "chunking complete");
+
+        // Emit per-chunk quality metrics (token / char / heading-depth
+        // histograms + flag counters). No-op when no metrics handle.
+        self.emit_chunk_quality(&chunks);
 
         // 2. Embed all chunks (batch).
         let texts: Vec<&str> = chunks.iter().map(|c| c.content.as_str()).collect();
@@ -1093,6 +1146,10 @@ impl IngestionPipeline {
             .enumerate()
             .map(|(i, c)| proto_chunk_to_document_chunk(c, doc_id, source, total_chunks, i))
             .collect();
+
+        // Emit per-chunk quality metrics (token / char / heading-depth
+        // histograms + flag counters). No-op when no metrics handle.
+        self.emit_chunk_quality(&pseudo_chunks);
 
         let ingest_run_id_str = ingest_run_id.to_string();
 

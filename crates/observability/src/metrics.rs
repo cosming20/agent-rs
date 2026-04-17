@@ -50,6 +50,14 @@ const LLM_LATENCY_MS: &str = "llm.latency_ms";
 const LLM_FAILURES_TOTAL: &str = "llm.failures_total";
 const INGEST_STAGE_MS: &str = "ingestion.stage_ms";
 
+// ---- Tier 2 — chunk quality ----
+const CHUNKS_PER_DOC: &str = "ingestion.chunks_per_doc";
+const CHUNK_TOKENS: &str = "ingestion.chunk_tokens";
+const CHUNK_CHARS: &str = "ingestion.chunk_chars";
+const CHUNK_HEADING_DEPTH: &str = "ingestion.chunk_heading_depth";
+const CHUNK_FLAG_TOTAL: &str = "ingestion.chunk_flag_total";
+const CHUNK_EMPTY_EMBED_TOTAL: &str = "ingestion.chunk_empty_embed_total";
+
 /// Histogram bucket boundaries for retrieval latency (seconds).
 ///
 /// Chosen to give fine granularity for sub-100 ms fast paths and coarser
@@ -78,6 +86,26 @@ const INGEST_STAGE_MS_BUCKETS: &[f64] = &[
     50.0, 100.0, 250.0, 500.0, 1000.0, 2500.0, 5000.0, 10_000.0, 30_000.0, 60_000.0, 120_000.0,
     300_000.0, 600_000.0,
 ];
+
+/// Histogram buckets for chunks-per-document count.
+const CHUNKS_PER_DOC_BUCKETS: &[f64] = &[
+    1.0, 5.0, 10.0, 25.0, 50.0, 100.0, 250.0, 500.0, 1000.0, 2500.0, 5000.0, 10_000.0,
+];
+
+/// Histogram buckets for per-chunk token count. Upper bound matches the
+/// HybridChunker's max_tokens=1024 ceiling + a bit of headroom.
+const CHUNK_TOKENS_BUCKETS: &[f64] = &[
+    8.0, 16.0, 32.0, 64.0, 128.0, 256.0, 384.0, 512.0, 768.0, 1024.0, 1536.0, 2048.0,
+];
+
+/// Histogram buckets for per-chunk character count.
+const CHUNK_CHARS_BUCKETS: &[f64] = &[
+    32.0, 64.0, 128.0, 256.0, 512.0, 1024.0, 2048.0, 4096.0, 8192.0, 16_384.0,
+];
+
+/// Histogram buckets for heading-path depth. Depth 0 = chunk has no
+/// surrounding heading context (typically a preamble or page header).
+const CHUNK_HEADING_DEPTH_BUCKETS: &[f64] = &[0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 8.0, 10.0];
 
 /// All custom metric instruments for the retrieval pipeline.
 ///
@@ -130,6 +158,22 @@ pub struct RetrievalMetrics {
     /// Per-stage ingestion wall-clock time in ms, labelled by stage name.
     /// Stages: docling_parse, embed, kg_extraction, summarize, total.
     ingest_stage_ms: metrics::Histogram<f64>,
+
+    // ---- Tier 2 — chunk quality ----
+    /// Number of chunks produced per document.
+    chunks_per_doc: metrics::Histogram<u64>,
+    /// Per-chunk token count (cl100k_base).
+    chunk_tokens: metrics::Histogram<u64>,
+    /// Per-chunk character count.
+    chunk_chars: metrics::Histogram<u64>,
+    /// Per-chunk heading-path depth.
+    chunk_heading_depth: metrics::Histogram<u64>,
+    /// Per-chunk flag counters, labelled by flag name (has_table, has_list,
+    /// has_picture, has_code, has_formula).
+    chunk_flag: metrics::Counter<u64>,
+    /// Chunks whose embed_text is empty or whitespace-only — a silent
+    /// ingestion regression symptom if the rate climbs above baseline.
+    chunk_empty_embed: metrics::Counter<u64>,
 }
 
 impl RetrievalMetrics {
@@ -304,6 +348,56 @@ impl RetrievalMetrics {
             .with_boundaries(INGEST_STAGE_MS_BUCKETS.to_vec())
             .build();
 
+        // ---- Tier 2 instruments ----
+        let chunks_per_doc = meter
+            .u64_histogram(CHUNKS_PER_DOC)
+            .with_description("Number of chunks produced per ingested document.")
+            .with_unit("chunks")
+            .with_boundaries(CHUNKS_PER_DOC_BUCKETS.to_vec())
+            .build();
+
+        let chunk_tokens = meter
+            .u64_histogram(CHUNK_TOKENS)
+            .with_description("Per-chunk token count (cl100k_base).")
+            .with_unit("tokens")
+            .with_boundaries(CHUNK_TOKENS_BUCKETS.to_vec())
+            .build();
+
+        let chunk_chars = meter
+            .u64_histogram(CHUNK_CHARS)
+            .with_description("Per-chunk character count.")
+            .with_unit("chars")
+            .with_boundaries(CHUNK_CHARS_BUCKETS.to_vec())
+            .build();
+
+        let chunk_heading_depth = meter
+            .u64_histogram(CHUNK_HEADING_DEPTH)
+            .with_description(
+                "Per-chunk heading-path depth. Depth 0 = chunk has no surrounding \
+                 heading context.",
+            )
+            .with_unit("headings")
+            .with_boundaries(CHUNK_HEADING_DEPTH_BUCKETS.to_vec())
+            .build();
+
+        let chunk_flag = meter
+            .u64_counter(CHUNK_FLAG_TOTAL)
+            .with_description(
+                "Per-chunk structural-flag counts, labelled by flag name \
+                 (has_table, has_list, has_picture, has_code, has_formula).",
+            )
+            .with_unit("chunks")
+            .build();
+
+        let chunk_empty_embed = meter
+            .u64_counter(CHUNK_EMPTY_EMBED_TOTAL)
+            .with_description(
+                "Chunks whose embed_text is empty or whitespace-only — signals a \
+                 chunker regression if the rate climbs above baseline.",
+            )
+            .with_unit("chunks")
+            .build();
+
         Self {
             retrieval_latency,
             retrieval_results,
@@ -326,6 +420,12 @@ impl RetrievalMetrics {
             llm_latency_ms,
             llm_failures,
             ingest_stage_ms,
+            chunks_per_doc,
+            chunk_tokens,
+            chunk_chars,
+            chunk_heading_depth,
+            chunk_flag,
+            chunk_empty_embed,
         }
     }
 
@@ -502,6 +602,43 @@ impl RetrievalMetrics {
     pub fn record_ingest_stage_ms(&self, stage: &'static str, elapsed_ms: f64) {
         self.ingest_stage_ms
             .record(elapsed_ms, &[KeyValue::new("ingest.stage", stage)]);
+    }
+
+    // ---- Tier 2 helpers — chunk quality ----
+
+    /// Record the number of chunks produced by one document ingest.
+    pub fn record_chunks_per_doc(&self, count: u64) {
+        self.chunks_per_doc.record(count, &[]);
+    }
+
+    /// Record a single chunk's token count.
+    pub fn record_chunk_tokens(&self, tokens: u64) {
+        self.chunk_tokens.record(tokens, &[]);
+    }
+
+    /// Record a single chunk's character count.
+    pub fn record_chunk_chars(&self, chars: u64) {
+        self.chunk_chars.record(chars, &[]);
+    }
+
+    /// Record a single chunk's heading-path depth.
+    pub fn record_chunk_heading_depth(&self, depth: u64) {
+        self.chunk_heading_depth.record(depth, &[]);
+    }
+
+    /// Increment one of the structural-flag counters.
+    ///
+    /// `flag` is one of `has_table`, `has_list`, `has_picture`, `has_code`,
+    /// `has_formula`.
+    pub fn record_chunk_flag(&self, flag: &'static str) {
+        self.chunk_flag
+            .add(1, &[KeyValue::new("chunk.flag", flag)]);
+    }
+
+    /// Increment the empty-embed-text chunk counter — signals a silent
+    /// chunker regression when the rate climbs above baseline.
+    pub fn record_chunk_empty_embed(&self) {
+        self.chunk_empty_embed.add(1, &[]);
     }
 }
 
