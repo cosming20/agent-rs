@@ -9,11 +9,12 @@ use tokio::sync::Mutex;
 use agent_rs_core::config::{BraveConfig, FetchConfig, WebBudgetConfig};
 use agent_rs_core::types::UserId;
 use agent_rs_retrieval::RetrievalRouter;
+use agent_rs_stores::postgres::PgStore;
 use agent_rs_stores::traits::StateStore;
 use agent_rs_stores::types::SearchResult;
 use agent_rs_tools::{
-    FetchUrlTool, IngestTool, RememberTool, SearchKnowledgeTool, SearchNewsTool, SearchWebTool,
-    WebBudgetTracker,
+    DocumentInfoTool, FetchUrlTool, RememberTool, SearchKnowledgeTool, SearchNewsTool,
+    SearchWebTool, WebBudgetTracker,
 };
 use rig::tool::ToolDyn;
 
@@ -28,6 +29,10 @@ pub type ToolSet = (Vec<Box<dyn ToolDyn>>, Arc<Mutex<Vec<SearchResult>>>);
 pub struct ToolFactory {
     router: Arc<RetrievalRouter>,
     store: Arc<dyn StateStore>,
+    /// Concrete Postgres handle for tools that need PgStore-specific methods
+    /// (currently `DocumentInfoTool` which calls `list_ingested_documents`,
+    /// not part of the StateStore trait surface).
+    pg_store: Arc<PgStore>,
     brave_config: BraveConfig,
     fetch_config: FetchConfig,
     web_budget_config: WebBudgetConfig,
@@ -51,7 +56,7 @@ impl ToolFactory {
     /// - `web_budget_config` -- per-query web budget limits.
     pub fn new(
         router: Arc<RetrievalRouter>,
-        store: Arc<dyn StateStore>,
+        pg_store: Arc<PgStore>,
         brave_config: BraveConfig,
         fetch_config: FetchConfig,
         web_budget_config: WebBudgetConfig,
@@ -60,9 +65,11 @@ impl ToolFactory {
             .timeout(std::time::Duration::from_secs(brave_config.timeout_s))
             .build()
             .expect("failed to build shared HTTP client");
+        let store: Arc<dyn StateStore> = Arc::clone(&pg_store) as _;
         Self {
             router,
             store,
+            pg_store,
             brave_config,
             fetch_config,
             web_budget_config,
@@ -106,7 +113,10 @@ impl ToolFactory {
                 Arc::clone(&budget),
             )),
             Box::new(RememberTool::new(Arc::clone(&self.store), user_id.clone())),
-            Box::new(IngestTool::new()),
+            // document_info — metadata about ingested docs (page count,
+            // language, ingest date, etc.) for meta-questions that don't
+            // need a content search.
+            Box::new(DocumentInfoTool::new(Arc::clone(&self.pg_store))),
         ];
 
         (tools, evidence_collector)

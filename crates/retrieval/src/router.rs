@@ -597,13 +597,42 @@ impl RetrievalRouter {
         // RRF fusion in step 5.
         let mut all_result_lists: Vec<Vec<agent_rs_stores::types::SearchResult>> = Vec::new();
 
-        for query_str in &sub_queries {
-            // HyDE DISABLED — caused a large regression on semantic search
-            // in prior eval runs; hypothetical answers over-specify and
-            // drift from chunk embeddings. Raw query embedding with
-            // heading-prefixed chunks performed better.
-            // TODO: re-enable selectively for Conceptual queries only once
-            // we have a corpus-independent signal that HyDE helps.
+        // HyDE gate — default ON, opt-out via env.
+        //
+        // An earlier eval regressed when HyDE was globally enabled on top
+        // of plain vector search; the retrieval stack since grew HyDE into
+        // an *additional* signal rather than a replacement (the raw-query
+        // embedding is always retained, and cross-encoder reranking
+        // recovers when a hypothetical drifts). That restructuring
+        // justifies flipping the default to ON — the worst case is one
+        // extra embed + search round-trip when HyDE's hypothetical fails
+        // to inform the ranking, and the cross-encoder still sees the
+        // raw-query hits.
+        //
+        // Operators can disable HyDE at runtime with
+        // `AGENT_RS__RETRIEVAL__HYDE_DISABLED=1` — useful for A/B
+        // evaluation or when the configured HyDE model is unavailable.
+        let hyde_disabled = matches!(
+            std::env::var("AGENT_RS__RETRIEVAL__HYDE_DISABLED").as_deref(),
+            Ok("1") | Ok("true") | Ok("TRUE") | Ok("yes")
+        );
+        let mut hyde_texts: Vec<String> = Vec::new();
+        if !hyde_disabled && sub_queries.len() == 1 {
+            if let Some(rewriter) = self.query_rewriter.as_ref() {
+                let hypothetical = rewriter.hyde_rewrite(query).await;
+                // `hyde_rewrite` falls back to the input on any failure —
+                // skip the extra embed/search round-trip in that case.
+                if !hypothetical.is_empty() && hypothetical != query {
+                    tracing::debug!(
+                        hyde_len = hypothetical.len(),
+                        "HyDE expansion produced hypothetical document"
+                    );
+                    hyde_texts.push(hypothetical);
+                }
+            }
+        }
+
+        for query_str in sub_queries.iter().chain(hyde_texts.iter()) {
             let embed_text = query_str.to_string();
 
             // Always embed dense — every strategy needs at minimum a dense vector.
@@ -755,6 +784,14 @@ impl RetrievalRouter {
                     evidence.documents.truncate(limit);
                 }
             }
+
+            // Recompute source_counts over the post-rerank set. The ranker
+            // computed them earlier against the pre-rerank RRF pool (size
+            // `RERANK_CANDIDATE_COUNT`), which overstated the count for
+            // callers that display the header. Refresh so the number
+            // matches `documents.len()`.
+            evidence.source_counts =
+                crate::ranker::build_source_counts_from_docs(&evidence.documents);
         }
 
         // ---- Step 7: Optional post-retrieval context expansion ----

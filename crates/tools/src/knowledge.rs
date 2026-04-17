@@ -78,20 +78,24 @@ impl Tool for SearchKnowledgeTool {
     async fn definition(&self, _prompt: String) -> ToolDefinition {
         ToolDefinition {
             name: Self::NAME.to_string(),
-            description: "Search the internal knowledge base for information relevant to the \
-                          query. Returns formatted evidence with sources and scores. Use this \
-                          tool to find factual information from ingested documents."
+            description: "Primary knowledge-retrieval tool. Searches the ingested document \
+                          corpus and returns the top-matching chunks as numbered evidence \
+                          (with page, section, score). Prefer this over general knowledge for \
+                          any domain question. Use a focused query in the SAME language as \
+                          the ingested corpus (not necessarily the user's language). One call \
+                          is usually enough; do not re-query unless the first result is \
+                          clearly off-topic."
                 .to_string(),
             parameters: json!({
                 "type": "object",
                 "properties": {
                     "query": {
                         "type": "string",
-                        "description": "The search query to find relevant knowledge."
+                        "description": "Focused retrieval query — typically 2-8 meaningful tokens. For definition questions, use the concept noun plus a hint like 'definiție' / 'definition'. Copy identifiers verbatim (section numbers, codes)."
                     },
                     "strategy": {
                         "type": "string",
-                        "description": "Retrieval strategy: semantic, keyword, hybrid, graph, graph_hybrid, rag_completion, summaries, temporal, graph_cot, graph_constrained. Defaults to hybrid.",
+                        "description": "Retrieval strategy. Default 'graph_hybrid' is best for 90% of queries (dense + BM25 + graph traversal + triplets + cross-encoder rerank). Use 'keyword' ONLY when the query is an exact-string lookup (section 2.1, code A.2.2). Use 'graph_cot' for multi-hop reasoning that requires iterative graph traversal. Avoid 'semantic' unless debugging.",
                         "enum": [
                             "semantic", "keyword", "hybrid", "graph",
                             "graph_hybrid", "rag_completion", "summaries",
@@ -100,7 +104,7 @@ impl Tool for SearchKnowledgeTool {
                     },
                     "limit": {
                         "type": "integer",
-                        "description": "Maximum number of results to return (default: 10)."
+                        "description": "Max evidence chunks to return (default 10). Use 5 for focused definition queries, 10 for exploratory, 15-20 only when you need breadth."
                     }
                 },
                 "required": ["query"]
@@ -114,10 +118,13 @@ impl Tool for SearchKnowledgeTool {
             ToolError::McpClient("search_knowledge: router not initialized".into())
         })?;
 
+        // Default aligns with the system-prompt guidance: `graph_hybrid` is
+        // the strongest single-call strategy (dense + BM25 + graph + triplets
+        // + cross-encoder rerank) and handles the 90% case.
         let strategy = match args.strategy.as_deref() {
             Some(s) => RetrievalStrategy::from_db_str(s)
                 .map_err(|e| ToolError::McpClient(format!("invalid retrieval strategy: {e}")))?,
-            None => RetrievalStrategy::Hybrid,
+            None => RetrievalStrategy::GraphHybrid,
         };
 
         let limit = args.limit.unwrap_or(DEFAULT_LIMIT);

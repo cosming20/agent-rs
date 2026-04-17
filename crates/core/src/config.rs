@@ -481,7 +481,12 @@ impl Default for Settings {
                 password: "neo4j".into(),
             },
             agent: AgentConfig {
-                max_steps: 10,
+                // Most RAG queries finish in 1 tool call. Two-step ceiling
+                // leaves room for one focused retry when the first attempt
+                // returns thin evidence; anything beyond that is usually
+                // the agent flailing. Raise explicitly via config when a
+                // workload genuinely needs deeper tool chains.
+                max_steps: 4,
                 max_retries: 1,
                 system_prompt_file: String::new(),
             },

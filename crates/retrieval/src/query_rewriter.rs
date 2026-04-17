@@ -762,11 +762,17 @@ impl QueryRewriter {
                     "content": trimmed,
                 }
             ],
-            "temperature": 0.3_f32,
-            // gpt-5.x and o-series reject `max_tokens`; newer Chat Completions
-            // API uses `max_completion_tokens`. Kept compatible with all
-            // current OpenAI Chat Completion models.
-            "max_completion_tokens": 300_u32,
+            // Ranking-signal determinism: HyDE output shapes the embedded
+            // query that all downstream retrievers see. Temperature pinned
+            // to 0 and an explicit seed keep consecutive runs reproducible.
+            "temperature": 0.0_f32,
+            "seed": crate::llm_determinism::RANKING_LLM_SEED,
+            // gpt-5.x / o-series reject `max_tokens`; newer Chat Completions
+            // API uses `max_completion_tokens`. A 300-token cap is tight
+            // for reasoning models (they burn budget on internal reasoning);
+            // raised to 1500 to leave headroom above the model's reasoning
+            // overhead.
+            "max_completion_tokens": 1500_u32,
         });
 
         let body_bytes = match serde_json::to_vec(&body) {

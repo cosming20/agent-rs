@@ -44,11 +44,13 @@ use agent_rs_stores::neo4j::structural::{
 
 use super::chunker::{self, ChunkerConfig, DocumentChunk};
 use super::docling_client::DoclingSidecarClient;
+use super::entity_id::EntityId;
 use super::graph_extractor::{
     DEFAULT_BATCH_CONCURRENCY, ExtractedNode, KnowledgeGraph, LlmGraphExtractor, Triplet,
     sanitize_relationship,
 };
 use super::summarizer::{ChunkSummarizer, DEFAULT_SUMMARIZER_CONCURRENCY};
+use super::text_normalize::normalize_docling_text;
 
 // ---- Result type ----
 
@@ -523,12 +525,20 @@ impl IngestionPipeline {
                 .extract_batch(&text_refs, self.llm_concurrency)
                 .await;
 
-            let (nodes, edges) = build_llm_graph_structures(doc_id, source, &chunks, &graphs)?;
+            // The text-ingest path has no sha256 handy, so derive a
+            // deterministic canonical DocumentId from the user-supplied
+            // doc_id. Keeps `id` uniqueness on a UUID domain while the
+            // human string stays queryable via `external_doc_id`.
+            let canonical_doc_id = Uuid::new_v5(&NAMESPACE_OID, doc_id.as_bytes()).to_string();
+            let (nodes, edges) =
+                build_llm_graph_structures(&canonical_doc_id, doc_id, source, &chunks, &graphs)?;
             let triplets = build_triplets(&chunks, &graphs);
             (nodes, edges, triplets)
         } else {
             let all_entities = extract_entities_from_chunks(&chunks);
-            let (nodes, edges) = build_graph_structures(doc_id, source, &chunks, &all_entities)?;
+            let canonical_doc_id = Uuid::new_v5(&NAMESPACE_OID, doc_id.as_bytes()).to_string();
+            let (nodes, edges) =
+                build_graph_structures(&canonical_doc_id, doc_id, source, &chunks, &all_entities)?;
             (nodes, edges, Vec::new())
         };
 
@@ -992,7 +1002,7 @@ impl IngestionPipeline {
                 .await
         };
 
-        let docling_response = match docling_response {
+        let mut docling_response = match docling_response {
             Ok(r) => r,
             Err(e) => {
                 // Best-effort: mark partial failure in Postgres.
@@ -1010,6 +1020,38 @@ impl IngestionPipeline {
                 return Err(e);
             }
         };
+
+        // ---- Step 3b: normalise text emitted by the Docling sidecar ----
+        //
+        // Docling decomposes diacritics into spacing-mark + space + letter
+        // sequences; left untouched these corrupt BM25 tokenisation and
+        // dense embeddings. See `text_normalize` module docs for details.
+        // Applied before step 4 (embeddings) and step 5 (Neo4j writes) so
+        // every downstream store sees the composed form.
+        let mut text_normalised_chunks: usize = 0;
+        for chunk in &mut docling_response.chunks {
+            let original_embed_len = chunk.embed_text.len();
+            let original_raw_len = chunk.raw_text.len();
+            chunk.embed_text = normalize_docling_text(&chunk.embed_text);
+            chunk.raw_text = normalize_docling_text(&chunk.raw_text);
+            chunk.section_title = normalize_docling_text(&chunk.section_title);
+            for heading in &mut chunk.heading_path {
+                *heading = normalize_docling_text(heading);
+            }
+            if chunk.embed_text.len() != original_embed_len
+                || chunk.raw_text.len() != original_raw_len
+            {
+                text_normalised_chunks += 1;
+            }
+        }
+        if text_normalised_chunks > 0 {
+            tracing::info!(
+                doc_id,
+                affected = text_normalised_chunks,
+                total = docling_response.chunks.len(),
+                "Docling: text normalisation collapsed combining-mark artefacts"
+            );
+        }
 
         let header = &docling_response.header;
         tracing::info!(
@@ -1153,6 +1195,12 @@ impl IngestionPipeline {
 
         let ingest_run_id_str = ingest_run_id.to_string();
 
+        // Canonical Document id — matches the id computed by the structural
+        // path (`proto_header_to_snapshot` uses the same sha256-derived
+        // UUIDv5), so both entity and structural graph writers now MERGE
+        // onto the same Neo4j Document node instead of creating two.
+        let canonical_doc_id = Uuid::new_v5(&NAMESPACE_OID, sha256.as_bytes()).to_string();
+
         let (graph_nodes, graph_edges, triplets) = if let Some(extractor) =
             self.llm_extractor.as_ref()
         {
@@ -1160,8 +1208,13 @@ impl IngestionPipeline {
             let graphs = extractor
                 .extract_batch(&text_refs, self.llm_concurrency)
                 .await;
-            let (mut nodes, edges) =
-                build_llm_graph_structures(doc_id, source, &pseudo_chunks, &graphs)?;
+            let (mut nodes, edges) = build_llm_graph_structures(
+                &canonical_doc_id,
+                doc_id,
+                source,
+                &pseudo_chunks,
+                &graphs,
+            )?;
             let triplets = build_triplets(&pseudo_chunks, &graphs);
             // Tag every node with ingest_run_id for rollback.
             for node in &mut nodes {
@@ -1175,8 +1228,13 @@ impl IngestionPipeline {
             (nodes, edges, triplets)
         } else {
             let all_entities = extract_entities_from_chunks(&pseudo_chunks);
-            let (mut nodes, edges) =
-                build_graph_structures(doc_id, source, &pseudo_chunks, &all_entities)?;
+            let (mut nodes, edges) = build_graph_structures(
+                &canonical_doc_id,
+                doc_id,
+                source,
+                &pseudo_chunks,
+                &all_entities,
+            )?;
             for node in &mut nodes {
                 if let Some(obj) = node.properties.as_object_mut() {
                     obj.insert(
@@ -1971,7 +2029,8 @@ fn extract_entities_from_chunks(chunks: &[DocumentChunk]) -> Vec<Vec<ExtractedEn
 /// - Chunk -[NEXT]-> Chunk edges (ordering)
 /// - Chunk -[MENTIONS]-> Entity edges
 fn build_graph_structures(
-    doc_id: &str,
+    canonical_doc_id: &str,
+    external_doc_id: &str,
     source: &str,
     chunks: &[DocumentChunk],
     entities_per_chunk: &[Vec<ExtractedEntity>],
@@ -1991,11 +2050,15 @@ fn build_graph_structures(
     let mut nodes: Vec<GraphNode> = Vec::new();
     let mut edges: Vec<GraphEdge> = Vec::new();
 
-    // Document node.
+    // Document node. Keyed by the canonical (content-derived) id so the
+    // entity-path Document converges with the structural-path Document
+    // on the Docling flow (both derive from sha256). The user-facing
+    // `external_doc_id` is kept as a property for human lookup.
     nodes.push(GraphNode {
-        id: doc_id.to_owned(),
+        id: canonical_doc_id.to_owned(),
         label: doc_label,
         properties: json!({
+            "external_doc_id": external_doc_id,
             "source": source,
             "total_chunks": chunks.len(),
         }),
@@ -2012,7 +2075,8 @@ fn build_graph_structures(
             id: chunk_node_id.clone(),
             label: chunk_label.clone(),
             properties: json!({
-                "doc_id": doc_id,
+                "doc_id": canonical_doc_id,
+                "external_doc_id": external_doc_id,
                 "chunk_index": chunk.chunk_index,
                 "section_title": chunk.metadata.section_title,
             }),
@@ -2020,7 +2084,7 @@ fn build_graph_structures(
 
         // Document -[HAS_CHUNK]-> Chunk.
         edges.push(GraphEdge {
-            source_id: doc_id.to_owned(),
+            source_id: canonical_doc_id.to_owned(),
             target_id: chunk_node_id.clone(),
             relation_type: has_chunk_rel.clone(),
             properties: json!({"chunk_index": chunk.chunk_index}),
@@ -2088,7 +2152,8 @@ fn build_graph_structures(
 /// 4. Emits `Chunk -[MENTIONS]-> Entity` edges for every entity that appeared
 ///    in a given chunk.
 fn build_llm_graph_structures(
-    doc_id: &str,
+    canonical_doc_id: &str,
+    external_doc_id: &str,
     source: &str,
     chunks: &[DocumentChunk],
     graphs: &[KnowledgeGraph],
@@ -2108,26 +2173,58 @@ fn build_llm_graph_structures(
     let mut nodes: Vec<GraphNode> = Vec::new();
     let mut edges: Vec<GraphEdge> = Vec::new();
 
-    // Document node.
+    // Document node — see `build_graph_structures` for the canonical-vs-
+    // external_doc_id rationale.
     nodes.push(GraphNode {
-        id: doc_id.to_owned(),
+        id: canonical_doc_id.to_owned(),
         label: doc_label,
         properties: json!({
+            "external_doc_id": external_doc_id,
             "source": source,
             "total_chunks": chunks.len(),
         }),
     });
 
     // Cross-chunk entity dedup: keep the first seen version of each entity.
+    // Entity IDs go through `EntityId::try_new` first — empty, single-char,
+    // and numeric-only tokens are dropped with a per-reason counter so
+    // Neo4j never sees junk keys.
     let mut entity_index: HashMap<String, ExtractedNode> = HashMap::new();
+    let mut entity_drop_counts: HashMap<&'static str, usize> = HashMap::new();
 
-    // First pass: collect the unique entities from all chunks (first writer wins).
     for graph in graphs {
         for node in &graph.nodes {
-            entity_index
-                .entry(node.id.clone())
-                .or_insert_with(|| node.clone());
+            match EntityId::try_new(&node.id) {
+                Ok(eid) => {
+                    // Insert using the validated, NFC-normalised form as
+                    // the index key so trivial encoding differences dedup.
+                    entity_index
+                        .entry(eid.into_inner())
+                        .or_insert_with(|| node.clone());
+                }
+                Err(err) => {
+                    *entity_drop_counts.entry(err.kind()).or_insert(0) += 1;
+                    tracing::debug!(
+                        raw = %node.id,
+                        reason = err.kind(),
+                        "dropping invalid LLM entity id"
+                    );
+                }
+            }
         }
+    }
+    if !entity_drop_counts.is_empty() {
+        let total: usize = entity_drop_counts.values().sum();
+        tracing::info!(
+            doc_id = %external_doc_id,
+            total_dropped = total,
+            empty = entity_drop_counts.get("empty").copied().unwrap_or(0),
+            too_short = entity_drop_counts.get("too_short").copied().unwrap_or(0),
+            too_long = entity_drop_counts.get("too_long").copied().unwrap_or(0),
+            numeric_only = entity_drop_counts.get("numeric_only").copied().unwrap_or(0),
+            kept = entity_index.len(),
+            "entity id validation: dropped invalid LLM-extracted ids"
+        );
     }
 
     // Emit graph nodes for unique entities (sorted for determinism).
@@ -2154,14 +2251,15 @@ fn build_llm_graph_structures(
             id: chunk_node_id.clone(),
             label: chunk_label.clone(),
             properties: json!({
-                "doc_id": doc_id,
+                "doc_id": canonical_doc_id,
+                "external_doc_id": external_doc_id,
                 "chunk_index": chunk.chunk_index,
                 "section_title": chunk.metadata.section_title,
             }),
         });
 
         edges.push(GraphEdge {
-            source_id: doc_id.to_owned(),
+            source_id: canonical_doc_id.to_owned(),
             target_id: chunk_node_id.clone(),
             relation_type: has_chunk_rel.clone(),
             properties: json!({"chunk_index": chunk.chunk_index}),
@@ -2180,17 +2278,25 @@ fn build_llm_graph_structures(
             continue;
         };
 
+        // Entity IDs referenced from MENTIONS / typed edges need the same
+        // validation + normalisation applied during index construction so
+        // lookups line up with the stored keys.
+        let normalise_ref = |raw: &str| EntityId::try_new(raw).ok().map(EntityId::into_inner);
+
         // MENTIONS edges from this chunk to every unique entity in its graph.
-        let mut mentioned_in_chunk: std::collections::HashSet<&str> =
+        let mut mentioned_in_chunk: std::collections::HashSet<String> =
             std::collections::HashSet::new();
         for node in &graph.nodes {
-            if !entity_index.contains_key(&node.id) {
+            let Some(key) = normalise_ref(&node.id) else {
+                continue;
+            };
+            if !entity_index.contains_key(&key) {
                 continue;
             }
-            if mentioned_in_chunk.insert(node.id.as_str()) {
+            if mentioned_in_chunk.insert(key.clone()) {
                 edges.push(GraphEdge {
                     source_id: chunk_node_id.clone(),
-                    target_id: node.id.clone(),
+                    target_id: key,
                     relation_type: mentions_rel.clone(),
                     properties: json!({}),
                 });
@@ -2199,16 +2305,28 @@ fn build_llm_graph_structures(
 
         // Typed entity->entity edges from this chunk's graph.
         for edge in &graph.edges {
-            if !entity_index.contains_key(&edge.source_node_id)
-                || !entity_index.contains_key(&edge.target_node_id)
-            {
-                tracing::debug!(
-                    src = %edge.source_node_id,
-                    dst = %edge.target_node_id,
-                    "dropping LLM edge referencing unknown node"
-                );
-                continue;
-            }
+            let src_key = match normalise_ref(&edge.source_node_id) {
+                Some(k) if entity_index.contains_key(&k) => k,
+                _ => {
+                    tracing::debug!(
+                        src = %edge.source_node_id,
+                        dst = %edge.target_node_id,
+                        "dropping LLM edge referencing unknown source node"
+                    );
+                    continue;
+                }
+            };
+            let dst_key = match normalise_ref(&edge.target_node_id) {
+                Some(k) if entity_index.contains_key(&k) => k,
+                _ => {
+                    tracing::debug!(
+                        src = %edge.source_node_id,
+                        dst = %edge.target_node_id,
+                        "dropping LLM edge referencing unknown target node"
+                    );
+                    continue;
+                }
+            };
 
             let rel_str = sanitize_relationship(&edge.relationship_name);
             let relation_type = match RelationType::new(&rel_str) {
@@ -2225,8 +2343,8 @@ fn build_llm_graph_structures(
             };
 
             edges.push(GraphEdge {
-                source_id: edge.source_node_id.clone(),
-                target_id: edge.target_node_id.clone(),
+                source_id: src_key,
+                target_id: dst_key,
                 relation_type,
                 properties: json!({
                     "description": edge.description,

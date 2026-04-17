@@ -24,6 +24,7 @@ pub mod error;
 pub mod graph_cot;
 pub mod http;
 pub mod ingestion;
+pub mod llm_determinism;
 pub mod metadata_filter;
 pub mod openai_embedder;
 pub mod proto;

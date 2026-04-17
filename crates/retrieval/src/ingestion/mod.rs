@@ -18,11 +18,13 @@
 pub mod chunker;
 pub mod coordinator;
 pub mod docling_client;
+pub mod entity_id;
 pub mod graph_extractor;
 pub mod metadata;
 pub mod mock_docling;
 pub mod pipeline;
 pub mod summarizer;
+pub mod text_normalize;
 pub mod types;
 
 pub use chunker::{ChunkStrategy, ChunkerConfig, DocumentChunk};

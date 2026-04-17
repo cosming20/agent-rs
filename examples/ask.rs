@@ -186,7 +186,13 @@ async fn main() -> Result<()> {
 
     let t = Instant::now();
     let response = orchestrator
-        .process_query(args.question, session_id, user_id, args.strategy, args.limit)
+        .process_query(
+            args.question,
+            session_id,
+            user_id,
+            args.strategy,
+            args.limit,
+        )
         .await?;
     let elapsed_ms = t.elapsed().as_millis() as u64;
 
@@ -206,10 +212,7 @@ async fn main() -> Result<()> {
         println!("  (no citations)");
     } else {
         for c in &response.citations {
-            println!(
-                "[{}] {}  (score={:.4})",
-                c.index, c.source, c.score
-            );
+            println!("[{}] {}  (score={:.4})", c.index, c.source, c.score);
             print_wrapped("    ", &c.content_snippet, 84);
             println!();
         }
