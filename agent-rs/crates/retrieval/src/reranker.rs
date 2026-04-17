@@ -28,12 +28,13 @@
 //! [`CrossEncoderReranker::rerank`] before truncating to the caller's `limit`.
 
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use agent_rs_core::Score;
 use agent_rs_stores::types::SearchResult;
 use backon::{ExponentialBuilder, Retryable};
 use serde::{Deserialize, Serialize};
+use tokio::sync::Semaphore;
 use tracing::instrument;
 
 use crate::error::RetrievalError;
@@ -51,6 +52,16 @@ const DEFAULT_MODEL: &str = "jina-reranker-v2-base-multilingual";
 
 /// Jina rerank API endpoint.
 const JINA_RERANK_URL: &str = "https://api.jina.ai/v1/rerank";
+
+/// Maximum concurrent rerank calls across all queries. Prevents a thundering
+/// herd from slamming Jina on traffic spikes and triggering a rate-limit
+/// cascade that would degrade every in-flight query.
+const DEFAULT_MAX_CONCURRENCY: usize = 8;
+
+/// Per-request timeout. Shorter than the provider's inherent limit: the
+/// reranker is optional and the router falls back cleanly on failure, so we
+/// prefer to bail fast and keep the overall query latency bounded.
+const RERANK_REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
 
 // ---- Request/Response types ----
 
@@ -79,11 +90,18 @@ struct RerankResult {
 // ---- CrossEncoderReranker ----
 
 /// Cross-encoder reranker backed by Jina's hosted API.
+///
+/// The api_key is held in an `Arc<str>` so that retry-closure clones are
+/// pointer-sized instead of full-string copies. The concurrency semaphore
+/// is shared across every clone of this struct, so global concurrency is
+/// enforced regardless of how many `Arc<CrossEncoderReranker>` references
+/// the router holds.
 #[derive(Clone)]
 pub struct CrossEncoderReranker {
     client: reqwest::Client,
-    api_key: String,
-    model: String,
+    api_key: Arc<str>,
+    model: Arc<str>,
+    semaphore: Arc<Semaphore>,
 }
 
 impl std::fmt::Debug for CrossEncoderReranker {
@@ -91,6 +109,10 @@ impl std::fmt::Debug for CrossEncoderReranker {
         f.debug_struct("CrossEncoderReranker")
             .field("model", &self.model)
             .field("api_key", &"***")
+            .field(
+                "available_permits",
+                &self.semaphore.available_permits(),
+            )
             .finish()
     }
 }
@@ -100,6 +122,14 @@ impl CrossEncoderReranker {
     ///
     /// Reads from `JINA_API_KEY` env var if `api_key` is empty.
     pub fn new(api_key: String) -> Result<Self, RetrievalError> {
+        Self::with_max_concurrency(api_key, DEFAULT_MAX_CONCURRENCY)
+    }
+
+    /// Construct a reranker with an explicit max-concurrency cap.
+    pub fn with_max_concurrency(
+        api_key: String,
+        max_concurrency: usize,
+    ) -> Result<Self, RetrievalError> {
         let api_key = if api_key.is_empty() {
             std::env::var("JINA_API_KEY").map_err(|_| RetrievalError::Embedding {
                 reason: "JINA_API_KEY not set and no api_key provided".to_owned(),
@@ -109,24 +139,32 @@ impl CrossEncoderReranker {
         };
 
         let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(60))
+            .timeout(RERANK_REQUEST_TIMEOUT)
+            .pool_max_idle_per_host(max_concurrency)
             .build()
             .map_err(|e| RetrievalError::Embedding {
                 reason: format!("failed to build reqwest client: {e}"),
             })?;
 
-        tracing::info!(model = %DEFAULT_MODEL, "CrossEncoderReranker initialised (Jina API)");
+        let permits = max_concurrency.max(1);
+        tracing::info!(
+            model = %DEFAULT_MODEL,
+            max_concurrency = permits,
+            timeout_s = RERANK_REQUEST_TIMEOUT.as_secs(),
+            "CrossEncoderReranker initialised (Jina API)"
+        );
 
         Ok(Self {
             client,
-            api_key,
-            model: DEFAULT_MODEL.to_owned(),
+            api_key: Arc::<str>::from(api_key),
+            model: Arc::<str>::from(DEFAULT_MODEL),
+            semaphore: Arc::new(Semaphore::new(permits)),
         })
     }
 
     /// Use a non-default Jina reranker model (e.g. "jina-reranker-v1-turbo-en").
     pub fn with_model(mut self, model: String) -> Self {
-        self.model = model;
+        self.model = Arc::<str>::from(model);
         self
     }
 
@@ -139,6 +177,16 @@ impl CrossEncoderReranker {
     ///
     /// Returns up to `top_k` results sorted by descending cross-encoder score.
     /// The [`SearchResult::score`] field is replaced with the relevance score.
+    ///
+    /// Documents with empty `chunk_text` are filtered out before the API call
+    /// (the cross-encoder would return spurious low scores for empty input,
+    /// wasting API budget and polluting the ranking). The filtered docs are
+    /// appended to the end of the result in their original order so they
+    /// still surface if `top_k` is large enough.
+    ///
+    /// Requests are serialised through a workspace-wide semaphore to cap
+    /// concurrent calls to Jina; this prevents traffic spikes from triggering
+    /// a rate-limit cascade that would degrade every concurrent query.
     #[instrument(skip(self, documents), fields(
         query_len = query.len(),
         candidates = documents.len(),
@@ -154,85 +202,120 @@ impl CrossEncoderReranker {
             return Ok(Vec::new());
         }
 
-        // Extract text bodies for the API. Keep the original documents around
-        // so we can map scores back by index.
-        let texts: Vec<String> = documents
-            .iter()
-            .map(|doc| {
-                doc.payload
-                    .get(CHUNK_TEXT_KEY)
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_owned()
-            })
-            .collect();
+        // Partition documents by whether they have text to rerank. Indexing
+        // preserves original order for the skipped set, which is appended at
+        // the end of the output if room remains after the reranked batch.
+        let (candidates, skipped): (Vec<(usize, SearchResult, String)>, Vec<SearchResult>) =
+            documents.into_iter().fold(
+                (Vec::new(), Vec::new()),
+                |(mut kept, mut skipped), doc| {
+                    let text = doc
+                        .payload
+                        .get(CHUNK_TEXT_KEY)
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_owned();
+                    if text.is_empty() {
+                        skipped.push(doc);
+                    } else {
+                        kept.push((kept.len(), doc, text));
+                    }
+                    (kept, skipped)
+                },
+            );
 
-        // Skip the API call if all documents are empty.
-        if texts.iter().all(|t| t.is_empty()) {
-            tracing::warn!("all documents have empty chunk_text; skipping reranker");
-            return Ok(documents.into_iter().take(top_k).collect());
+        if candidates.is_empty() {
+            tracing::warn!(
+                skipped = skipped.len(),
+                "all documents had empty chunk_text; skipping reranker"
+            );
+            return Ok(skipped.into_iter().take(top_k).collect());
         }
 
-        let text_refs: Vec<&str> = texts.iter().map(|s| s.as_str()).collect();
+        if !skipped.is_empty() {
+            tracing::debug!(
+                with_text = candidates.len(),
+                empty_text = skipped.len(),
+                "rerank: filtered docs without chunk_text"
+            );
+        }
 
+        let text_refs: Vec<&str> = candidates.iter().map(|(_, _, t)| t.as_str()).collect();
         let request = RerankRequest {
             model: &self.model,
             query,
             documents: text_refs,
-            top_n: top_k.min(documents.len()),
+            top_n: top_k.min(candidates.len()),
             return_documents: false,
         };
 
-        let body = serde_json::to_string(&request).map_err(|e| RetrievalError::Embedding {
+        let body = serde_json::to_vec(&request).map_err(|e| RetrievalError::Embedding {
             reason: format!("failed to serialize rerank request: {e}"),
         })?;
+        // Ref-counted body so retry-closure clones are pointer-sized, not a
+        // full memcpy of the JSON payload (can be 10-50KB for 50 candidates).
+        let body: Arc<[u8]> = Arc::from(body);
 
-        // Retry on transient errors (429, 5xx).
-        let client = self.client.clone();
-        let api_key = self.api_key.clone();
-        let body_ref = body.clone();
+        // Bound total rerank concurrency. Held for the duration of the retry
+        // loop to ensure a single query never occupies more than one permit.
+        let _permit =
+            self.semaphore
+                .clone()
+                .acquire_owned()
+                .await
+                .map_err(|e| RetrievalError::Embedding {
+                    reason: format!("rerank semaphore closed: {e}"),
+                })?;
 
-        let call = || {
-            let client = client.clone();
-            let api_key = api_key.clone();
-            let body_ref = body_ref.clone();
-            async move {
-                let resp = client
-                    .post(JINA_RERANK_URL)
-                    .bearer_auth(&api_key)
-                    .header("Content-Type", "application/json")
-                    .body(body_ref)
-                    .send()
-                    .await
-                    .map_err(|e| RetrievalError::Embedding {
-                        reason: format!("jina rerank HTTP request failed: {e}"),
-                    })?;
+        let started = Instant::now();
+        let rerank_response = {
+            let client = &self.client;
+            let api_key = self.api_key.clone();
+            let body = body.clone();
 
-                let status = resp.status();
-                if !status.is_success() {
-                    let body_text = resp.text().await.unwrap_or_else(|_| "<no body>".into());
-                    let reason = format!("jina rerank API error (HTTP {status}): {body_text}");
-                    if status.as_u16() == 429 || status.is_server_error() {
-                        tracing::warn!(
-                            status = %status,
-                            attempt_will_retry = true,
-                            "jina rerank retryable error"
-                        );
+            let call = || {
+                let client = client.clone();
+                let api_key = api_key.clone();
+                let body = body.clone();
+                async move {
+                    let resp = client
+                        .post(JINA_RERANK_URL)
+                        .bearer_auth(api_key.as_ref())
+                        .header("Content-Type", "application/json")
+                        .body(body.to_vec())
+                        .send()
+                        .await
+                        .map_err(|e| RetrievalError::Embedding {
+                            reason: format!("jina rerank HTTP request failed: {e}"),
+                        })?;
+
+                    let status = resp.status();
+                    if !status.is_success() {
+                        let body_text = resp.text().await.unwrap_or_else(|_| "<no body>".into());
+                        // Log only status + truncated body; Jina error messages can echo
+                        // request fragments which may include PII from chunk text.
+                        let snippet = body_text.chars().take(256).collect::<String>();
+                        let reason = format!("jina rerank API error (HTTP {status}): {snippet}");
+                        if status.as_u16() == 429 || status.is_server_error() {
+                            tracing::warn!(
+                                status = %status,
+                                attempt_will_retry = true,
+                                "jina rerank retryable error"
+                            );
+                        }
+                        return Err(RetrievalError::Embedding { reason });
                     }
-                    return Err(RetrievalError::Embedding { reason });
+
+                    let parsed: RerankResponse =
+                        resp.json().await.map_err(|e| RetrievalError::Embedding {
+                            reason: format!("failed to parse jina rerank response: {e}"),
+                        })?;
+
+                    Ok::<_, RetrievalError>(parsed)
                 }
+            };
 
-                let parsed: RerankResponse =
-                    resp.json().await.map_err(|e| RetrievalError::Embedding {
-                        reason: format!("failed to parse jina rerank response: {e}"),
-                    })?;
-
-                Ok::<_, RetrievalError>(parsed)
-            }
-        };
-
-        let rerank_response = call
-            .retry(
+            call.retry(
                 ExponentialBuilder::default()
                     .with_min_delay(Duration::from_secs(2))
                     .with_max_delay(Duration::from_secs(8))
@@ -249,23 +332,32 @@ impl CrossEncoderReranker {
                     "jina reranker rate-limited; retrying after backoff"
                 );
             })
-            .await?;
+            .await?
+        };
+        let latency_ms = started.elapsed().as_millis() as u64;
 
-        // Map results back onto original SearchResult objects.
-        let n = documents.len();
-        let mut doc_slots: Vec<Option<SearchResult>> = documents.into_iter().map(Some).collect();
+        // Map Jina's returned indices back onto the original SearchResult objects.
+        let n = candidates.len();
+        let mut doc_slots: Vec<Option<SearchResult>> =
+            candidates.into_iter().map(|(_, doc, _)| Some(doc)).collect();
 
         let mut reranked: Vec<SearchResult> = Vec::with_capacity(top_k);
+        let mut dropped_oor = 0usize;
         for result in rerank_response.results {
             if result.index >= n {
-                return Err(RetrievalError::Embedding {
-                    reason: format!(
-                        "jina returned out-of-range index {} (candidates: {n})",
-                        result.index
-                    ),
-                });
+                // Soft-skip: one bad index shouldn't fail the whole rerank.
+                // Router already has a hard-fallback path for total failure.
+                dropped_oor += 1;
+                tracing::warn!(
+                    index = result.index,
+                    candidates = n,
+                    "jina returned out-of-range index; skipping"
+                );
+                continue;
             }
             if let Some(mut doc) = doc_slots[result.index].take() {
+                // Score::new coerces non-finite to 0.0 (post-Phase A), so a
+                // malformed score never poisons RRF's unwrap_or(Equal) sort.
                 doc.score = Score::new(result.relevance_score);
                 reranked.push(doc);
                 if reranked.len() >= top_k {
@@ -274,9 +366,22 @@ impl CrossEncoderReranker {
             }
         }
 
-        tracing::debug!(
+        // Backfill from empty-text skipped docs if the caller asked for more
+        // than Jina could score. Preserves original ordering.
+        if reranked.len() < top_k {
+            for doc in skipped {
+                if reranked.len() >= top_k {
+                    break;
+                }
+                reranked.push(doc);
+            }
+        }
+
+        tracing::info!(
             input_count = n,
             output_count = reranked.len(),
+            dropped_out_of_range = dropped_oor,
+            latency_ms,
             usage = ?rerank_response.usage,
             "jina rerank complete"
         );
