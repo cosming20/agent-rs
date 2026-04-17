@@ -265,8 +265,13 @@ fn apply_source_weight(results: Vec<SearchResult>, weight: f64) -> Vec<SearchRes
 ///
 /// The source is extracted from the `"source"` field in the document payload,
 /// falling back to `"unknown"` when the field is absent or not a string.
-/// Computed from the final truncated result set to ensure accuracy.
-fn build_source_counts_from_docs(documents: &[SearchResult]) -> HashMap<String, usize> {
+///
+/// Called twice on the router path when a reranker is configured: once by
+/// [`ResultRanker::rank`] against the RRF pool, then again by the router
+/// after reranking has truncated the pack down to `limit`. Exposed as
+/// `pub(crate)` so the router can refresh the counts and keep the
+/// header in sync with `documents.len()`.
+pub(crate) fn build_source_counts_from_docs(documents: &[SearchResult]) -> HashMap<String, usize> {
     let mut counts: HashMap<String, usize> = HashMap::new();
     for doc in documents {
         let source = match doc.payload.get("source").and_then(|v| v.as_str()) {

@@ -434,6 +434,7 @@ impl GraphCotRetriever {
             ],
             max_completion_tokens: self.config.llm_max_tokens,
             temperature: 0.0,
+            seed: crate::llm_determinism::RANKING_LLM_SEED,
             response_format: ResponseFormat::sufficiency_schema(),
         };
 
@@ -548,6 +549,14 @@ impl GraphCotRetriever {
             seen.insert(r.id.clone());
         }
         let mut merged: Vec<SearchResult> = initial_results.clone();
+
+        // Queries already issued through `retrieve_fn` — the loop skips a
+        // follow-up whose query string has been seen before, avoiding the
+        // embed + seed-derivation + graph-traversal round-trip that would
+        // rediscover the same candidates. Saves ~0.5–1 s per redundant
+        // iteration on stable-seeds cases.
+        let mut queries_issued: HashSet<String> = HashSet::new();
+        queries_issued.insert(question.to_owned());
 
         // Per-iteration diagnostics, exposed via debug logging.
         let mut iteration_logs: Vec<IterationLog> = Vec::with_capacity(self.config.max_iterations);
@@ -732,6 +741,26 @@ impl GraphCotRetriever {
                 "GraphCoT: selected next query for follow-up retrieval"
             );
 
+            // Early-exit: if this exact query was already issued in a prior
+            // iteration (or is the original question), the retrieval would
+            // deterministically return the same candidates. Short-circuit.
+            if !queries_issued.insert(next_query.clone()) {
+                debug!(
+                    iteration = iteration,
+                    stop_reason = "query_repeated",
+                    next_query = %next_query,
+                    merged_count = merged.len(),
+                    "GraphCoT: query already issued; skipping redundant follow-up"
+                );
+                iteration_logs.push(IterationLog {
+                    iteration,
+                    query_used: next_query,
+                    chunks_added: 0,
+                    sufficiency,
+                });
+                return merged;
+            }
+
             // Issue the follow-up retrieval. Errors are logged and the iteration
             // is treated as a no-op rather than failing the whole loop.
             let new_results = match retrieve_fn(next_query.clone()).await {
@@ -815,6 +844,7 @@ impl GraphCotRetriever {
             ],
             max_completion_tokens: self.config.llm_max_tokens,
             temperature: 0.0,
+            seed: crate::llm_determinism::RANKING_LLM_SEED,
             response_format: ResponseFormat::json_schema(),
         };
 
@@ -953,6 +983,10 @@ struct ChatRequest<'a> {
     messages: Vec<ChatMessage<'a>>,
     max_completion_tokens: u32,
     temperature: f32,
+    /// Ranking-signal determinism: the sufficiency check and CoT decision
+    /// both feed into which candidates enter the evidence pack, so we pin
+    /// the seed. Best-effort on reasoning models; exact on others.
+    seed: u32,
     response_format: ResponseFormat,
 }
 

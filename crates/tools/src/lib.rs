@@ -35,8 +35,8 @@ pub mod remember;
 pub mod web;
 
 pub use budget::WebBudgetTracker;
+pub use document_info::DocumentInfoTool;
 pub use fetch::FetchUrlTool;
-pub use ingest::IngestTool;
 pub use knowledge::SearchKnowledgeTool;
 pub use mcp_client::McpClient;
 pub use remember::RememberTool;

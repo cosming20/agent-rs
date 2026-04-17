@@ -11,6 +11,7 @@ use agent_rs_core::errors::AgentError;
 use agent_rs_core::types::{MessageRole, RetrievalStrategy, SessionId, UserId};
 use agent_rs_observability::metrics::RetrievalMetrics;
 use agent_rs_retrieval::{ResultRanker, RetrievalRouter};
+use agent_rs_stores::postgres::PgStore;
 use agent_rs_stores::traits::StateStore;
 use tracing::{info, instrument};
 
@@ -59,20 +60,27 @@ impl AgentOrchestrator {
     /// Returns `AgentError::Orchestrator` if the LLM client cannot be created.
     pub fn new(
         settings: &Settings,
-        store: Arc<dyn StateStore>,
+        pg_store: Arc<PgStore>,
         router: Arc<RetrievalRouter>,
         metrics: Arc<RetrievalMetrics>,
     ) -> Result<Self, AgentError> {
+        // Erase the concrete PgStore to the StateStore trait for memory /
+        // history / persister paths that only need trait-level methods.
+        let store: Arc<dyn StateStore> = Arc::clone(&pg_store) as _;
+
         // Shared memory manager over the state store.
         let memory = Arc::new(MemoryManager::new(Arc::clone(&store)));
 
         // Step 1: Context builder
         let context_builder = ContextBuilder::new(Arc::clone(&memory), &settings.context);
 
-        // Tool factory (shared across requests; creates per-request tool sets)
+        // Tool factory (shared across requests; creates per-request tool sets).
+        // Receives the concrete pg_store so DocumentInfoTool can call
+        // PgStore::list_ingested_documents() which isn't part of the
+        // StateStore trait.
         let tool_factory = Arc::new(ToolFactory::new(
             Arc::clone(&router),
-            Arc::clone(&store),
+            Arc::clone(&pg_store),
             settings.brave.clone(),
             settings.fetch.clone(),
             settings.web_budget.clone(),

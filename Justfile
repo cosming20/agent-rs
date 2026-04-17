@@ -105,6 +105,9 @@ _db_url := "postgres://" + env_var_or_default("AGENT_RS__POSTGRES__USER", "agent
            ":" + env_var_or_default("AGENT_RS__POSTGRES__PORT", "1054") + \
            "/" + env_var_or_default("AGENT_RS__POSTGRES__DB", "agentic_ra")
 
+_qdrant_rest_url := "http://" + env_var_or_default("AGENT_RS__QDRANT__HOST", "localhost") + \
+                    ":" + env_var_or_default("AGENT_RS__QDRANT__REST_PORT", "1051")
+
 # Run all pending Diesel migrations against the configured Postgres.
 migrations:
     diesel migration run \
@@ -210,6 +213,31 @@ build:
     cargo build --release --workspace --examples
 
 # ─── Cleanup ──────────────────────────────────────────────────────────────
+
+# In-place wipe of all ingested data across Neo4j, Qdrant, and Postgres.
+# Containers keep running, Diesel migrations + DB schema are preserved,
+# `target/` is untouched — fastest path to a clean slate between ingest
+# iterations. Requires confirmation. Uses `FORCE=1` to skip the prompt in
+# scripts (e.g. `FORCE=1 just data-wipe`).
+data-wipe:
+    @if [ "${FORCE:-0}" != "1" ]; then \
+        read -p "Wipe ALL data from Neo4j + Qdrant + Postgres? (schema kept, target/ kept) [y/N] " c; \
+        if [ "$c" != "y" ] && [ "$c" != "Y" ]; then echo "Aborted."; exit 1; fi; \
+     fi
+    @echo "→ Neo4j: deleting all nodes + relationships..."
+    docker exec agentic-ra-neo4j cypher-shell \
+        -u "$AGENT_RS__NEO4J__USER" -p "$AGENT_RS__NEO4J__PASSWORD" \
+        'MATCH (n) DETACH DELETE n;'
+    @echo "→ Qdrant: listing + dropping every collection..."
+    @for c in $(curl -s -H "api-key: $AGENT_RS__QDRANT__API_KEY" {{_qdrant_rest_url}}/collections | python3 -c 'import json,sys; print("\n".join(c["name"] for c in json.load(sys.stdin)["result"]["collections"]))'); do \
+        echo "   drop collection: $c"; \
+        curl -s -H "api-key: $AGENT_RS__QDRANT__API_KEY" -X DELETE {{_qdrant_rest_url}}/collections/$c > /dev/null; \
+     done
+    @echo "→ Postgres: truncating application tables (schema + migrations kept)..."
+    docker exec agentic-ra-postgres psql \
+        -U "$AGENT_RS__POSTGRES__USER" -d "$AGENT_RS__POSTGRES__DB" \
+        -c 'TRUNCATE ingested_documents, evidence_items, query_runs, chat_messages, memories, strategy_performance RESTART IDENTITY CASCADE;'
+    @echo "Data wipe complete. target/ untouched; containers still running."
 
 # Remove cargo target directory.
 clean:

@@ -21,6 +21,7 @@ use tracing::{instrument, warn};
 use unicode_normalization::UnicodeNormalization;
 
 use crate::error::RetrievalError;
+use crate::llm_determinism::RANKING_LLM_SEED;
 
 // ---------------------------------------------------------------------------
 // Public output types
@@ -376,6 +377,14 @@ impl WeightedKeywordExtractor {
                 {"role": "system", "content": WEIGHTED_KEYWORDS_SYSTEM_PROMPT},
                 {"role": "user", "content": query},
             ],
+            // Determinism controls. The weighted-keyword output is a
+            // ranking signal — two different extractions for the same
+            // query yield different RRF orderings, which breaks A/B
+            // evaluation. `temperature: 0.0` + an explicit seed pin the
+            // output to a reproducible distribution (OpenAI's `seed`
+            // parameter is best-effort but dramatically cuts variance).
+            "temperature": 0.0_f32,
+            "seed": RANKING_LLM_SEED,
         });
 
         let call = || async {
