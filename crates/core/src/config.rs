@@ -161,6 +161,80 @@ pub struct RankerConfig {
     pub rrf_k: usize,
 }
 
+/// Cross-encoder reranker provider.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum RerankerProvider {
+    /// Jina `jina-reranker-v2-base-multilingual` via `api.jina.ai`.
+    #[default]
+    Jina,
+    /// ZeroEntropy `zerank-2` via `api.zeroentropy.dev`.
+    ZeroEntropy,
+}
+
+/// ZeroEntropy inference latency mode. Maps to the `latency` field on
+/// `POST /v1/models/rerank`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum LatencyMode {
+    /// Request sub-second inference. 429 on rate-limit overflow (lower limit).
+    #[default]
+    Fast,
+    /// Request higher-rate-limit inference, may take >10s.
+    Slow,
+}
+
+/// Cross-encoder reranker configuration.
+///
+/// Provider selection is compile-time-safe via [`RerankerProvider`]. The
+/// `score_threshold` filter enables calibrated-score culling for providers
+/// that return calibrated relevance scores (ZeroEntropy does; Jina does not —
+/// leave `None` when using Jina).
+#[derive(Clone, Default, Deserialize, Serialize)]
+pub struct RerankerConfig {
+    /// Reranker provider.
+    #[serde(default)]
+    pub provider: RerankerProvider,
+    /// Optional override for the provider's default model. `None` = provider default.
+    #[serde(default)]
+    pub model: Option<String>,
+    /// API key. Empty means "read from provider's env var at runtime".
+    #[serde(default)]
+    pub api_key: String,
+    /// Optional score threshold: docs with `relevance_score < threshold` are
+    /// dropped after reranking. Only useful when the provider emits
+    /// calibrated scores (e.g. ZeroEntropy zerank-2). `None` disables.
+    #[serde(default)]
+    pub score_threshold: Option<f64>,
+    /// Default inference latency mode (ZeroEntropy only).
+    #[serde(default)]
+    pub latency_mode: LatencyMode,
+    /// Maximum concurrent rerank calls across the workspace.
+    #[serde(default = "default_rerank_concurrency")]
+    pub max_concurrency: usize,
+    /// Disable the reranker entirely. Takes precedence over env-var detection.
+    #[serde(default)]
+    pub disabled: bool,
+}
+
+fn default_rerank_concurrency() -> usize {
+    8
+}
+
+impl fmt::Debug for RerankerConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("RerankerConfig")
+            .field("provider", &self.provider)
+            .field("model", &self.model)
+            .field("api_key", &"***")
+            .field("score_threshold", &self.score_threshold)
+            .field("latency_mode", &self.latency_mode)
+            .field("max_concurrency", &self.max_concurrency)
+            .field("disabled", &self.disabled)
+            .finish()
+    }
+}
+
 /// Faithfulness verifier configuration.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct VerifierConfig {
@@ -364,6 +438,8 @@ pub struct Settings {
     pub evidence: EvidenceConfig,
     pub synthesis: SynthesisConfig,
     pub ranker: RankerConfig,
+    #[serde(default)]
+    pub reranker: RerankerConfig,
     pub verifier: VerifierConfig,
     pub web_budget: WebBudgetConfig,
     pub brave: BraveConfig,
@@ -421,6 +497,15 @@ impl Default for Settings {
                 max_snippet_length: 5000,
             },
             ranker: RankerConfig { rrf_k: 60 },
+            reranker: RerankerConfig {
+                provider: RerankerProvider::Jina,
+                model: None,
+                api_key: String::new(),
+                score_threshold: None,
+                latency_mode: LatencyMode::Fast,
+                max_concurrency: 8,
+                disabled: false,
+            },
             verifier: VerifierConfig {
                 confidence_threshold: 0.5,
             },

@@ -205,16 +205,31 @@ pub async fn build_router(
         }
     }
 
-    // Jina cross-encoder reranker.
-    if !features.skip_reranking {
-        if let Ok(jina_key) = std::env::var("JINA_API_KEY") {
-            match CrossEncoderReranker::new(jina_key) {
+    // Cross-encoder reranker (Jina or ZeroEntropy per config).
+    //
+    // When the config provides a provider + api_key, use it directly.
+    // Otherwise fall back to env-var detection (prefers ZEROENTROPY_API_KEY
+    // over JINA_API_KEY so ops can flip providers by swapping a secret
+    // without touching config files).
+    if !features.skip_reranking && !settings.reranker.disabled {
+        let has_config_key = !settings.reranker.api_key.is_empty();
+        let reranker_result = if has_config_key {
+            Some(CrossEncoderReranker::from_config(&settings.reranker))
+        } else {
+            CrossEncoderReranker::try_from_env()
+        };
+
+        if let Some(result) = reranker_result {
+            match result {
                 Ok(reranker) => {
                     router = router.with_reranker(Arc::new(reranker));
-                    info!("Jina reranker enabled");
+                    info!(
+                        provider = ?settings.reranker.provider,
+                        "cross-encoder reranker enabled"
+                    );
                 }
                 Err(e) => {
-                    warn!(error = %e, "Jina reranker init failed");
+                    warn!(error = %e, "reranker init failed");
                 }
             }
         }

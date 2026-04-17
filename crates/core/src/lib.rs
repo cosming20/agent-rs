@@ -9,7 +9,9 @@ pub mod logging;
 pub mod types;
 
 // Re-export commonly used items at crate root for ergonomic imports.
-pub use config::{DoclingConfig, IngestBackend, Settings};
+pub use config::{
+    DoclingConfig, IngestBackend, LatencyMode, RerankerConfig, RerankerProvider, Settings,
+};
 pub use errors::{AgentError, AgentRsError, RetrievalError, StoreError, ToolError};
 pub use types::{
     CollectionName, Confidence, DatasetName, Embedding, IngestStatus, InvalidIngestStatus,
