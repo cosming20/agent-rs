@@ -6,9 +6,9 @@
 use std::sync::Arc;
 
 use agent_rs_retrieval::{
-    adjust_for_weighted_keywords, order_candidates_overlap_first, weighted_bm25_query,
     BM25WeightingConfig, EntityLinkerPrioritizationConfig, RerankAdjustmentConfig,
-    WeightedKeywordExtractor, WeightedKeywordExtractorConfig,
+    WeightedKeywordExtractor, WeightedKeywordExtractorConfig, adjust_for_weighted_keywords,
+    order_candidates_overlap_first, weighted_bm25_query,
 };
 
 #[tokio::test]
@@ -41,12 +41,8 @@ async fn mock_llm_success_flows_to_all_three_consumers() {
 
     // Consumer #2: rerank adjustment boosts a matching candidate.
     let candidate = "A compiler translates static types into machine code.";
-    let adjusted = adjust_for_weighted_keywords(
-        1.0,
-        candidate,
-        &kw,
-        &RerankAdjustmentConfig::default(),
-    );
+    let adjusted =
+        adjust_for_weighted_keywords(1.0, candidate, &kw, &RerankAdjustmentConfig::default());
     assert!(adjusted > 1.0, "adjusted={adjusted}, expected boost");
 
     // Consumer #3: entity-linker tiering puts the intersection member first.
@@ -86,7 +82,8 @@ async fn mock_llm_failure_keeps_all_consumers_as_noops() {
         q
     );
     let base = 0.5_f32;
-    let adj = adjust_for_weighted_keywords(base, "any text", &kw, &RerankAdjustmentConfig::default());
+    let adj =
+        adjust_for_weighted_keywords(base, "any text", &kw, &RerankAdjustmentConfig::default());
     assert!((adj - base).abs() < 1e-6);
     let extracted = vec!["foo".to_owned(), "bar".to_owned()];
     let ordered = order_candidates_overlap_first(

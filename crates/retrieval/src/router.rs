@@ -47,8 +47,8 @@ use crate::{
     },
     strategy::get_descriptor,
     weighted_keywords::{
-        adjust_for_weighted_keywords, WeightedKeywordExtractor,
-        WeightedKeywordIntegrationConfig, WeightedKeywords,
+        WeightedKeywordExtractor, WeightedKeywordIntegrationConfig, WeightedKeywords,
+        adjust_for_weighted_keywords,
     },
 };
 use agent_rs_stores::traits::{GraphStore, VectorStore};
@@ -685,9 +685,7 @@ impl RetrievalRouter {
                     // Weighted-keyword rerank adjustment (consumer #2).
                     // Applied on the post-rerank list; empty keywords or
                     // disabled integration → byte-identical no-op.
-                    if let Some(rerank_cfg) =
-                        self.weighted_keyword_integration.rerank.as_ref()
-                    {
+                    if let Some(rerank_cfg) = self.weighted_keyword_integration.rerank.as_ref() {
                         if !weighted_keywords.terms.is_empty() {
                             let before_top = reranked.first().map(|d| d.score.value());
                             for doc in reranked.iter_mut() {
