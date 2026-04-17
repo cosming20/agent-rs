@@ -312,6 +312,11 @@ impl EntityLinkResult {
 // Entity extraction prompt
 // ---------------------------------------------------------------------------
 
+/// Test-visible alias for the entity-extract prompt. Integration tests
+/// (prompt snapshot bias guard) import this to verify universality.
+#[doc(hidden)]
+pub const ENTITY_EXTRACT_PROMPT_FOR_TESTING: &str = ENTITY_EXTRACT_PROMPT;
+
 const ENTITY_EXTRACT_PROMPT: &str = "\
 Extract the key named entities from the user's query. Return ONLY concrete \
 entities (people, organizations, legal articles, concepts, places, events) \

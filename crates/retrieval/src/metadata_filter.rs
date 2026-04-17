@@ -76,8 +76,12 @@ const PROMPT_CACHE_KEY: &str = "agent-rs-metadata-filter-v1";
 ///   identical across every call, keeping the cache key stable.
 /// - Dynamic content (the query) is injected only as the user message.
 ///
-/// Handles Romanian and English queries, covering the metadata fields present
-/// in the enriched Docling payload schema.
+/// Language-agnostic: the prompt treats numbered-reference detection as a
+/// cross-lingual structural task, covering the metadata fields present in
+/// the enriched Docling payload schema.
+#[doc(hidden)]
+pub const SYSTEM_PROMPT_FOR_TESTING: &str = SYSTEM_PROMPT;
+
 const SYSTEM_PROMPT: &str = r#"You are a metadata extraction assistant.
 Your task: analyse a user query and extract structural metadata hints that
 indicate which document chunks are most likely to answer the question.
