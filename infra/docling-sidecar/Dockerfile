@@ -1,7 +1,7 @@
 # syntax=docker/dockerfile:1
 # =============================================================================
 # Docling gRPC sidecar
-# Build context: REPO ROOT (infra/docker-compose.yml sets context: ..)
+# Build context: REPO ROOT (docker-compose.yml at root sets context: .)
 # Paths below are relative to repo root.
 # =============================================================================
 
@@ -54,7 +54,7 @@ print('[models] Docling layout + tableformer-accurate pre-downloaded OK')"
 # Compile protobuf stubs into the installed package.
 # The proto file is copied from the Rust workspace (repo root context).
 # =============================================================================
-COPY agent-rs/proto/agentic_rag/v1/chunker.proto /workdir/proto/agentic_rag/v1/chunker.proto
+COPY proto/agentic_rag/v1/chunker.proto /workdir/proto/agentic_rag/v1/chunker.proto
 
 # Ensure the generated package directory exists with an __init__.py.
 RUN mkdir -p /app/src/agentic_rag/v1 \
