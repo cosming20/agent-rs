@@ -82,6 +82,32 @@ migrations-revert:
 psql:
     docker exec -it agentic-ra-postgres psql -U "$AGENT_RS__POSTGRES__USER" -d "$AGENT_RS__POSTGRES__DB"
 
+# ─── Docling native (bypass Docker to get MPS on Apple Silicon) ──────────
+
+# Start the Docling sidecar natively on the host using a local Python venv.
+# Apple's MPS accelerator cannot be reached from a Docker Linux VM, so to
+# use Metal on macOS the sidecar must run here directly. The
+# agentic-ra-docling-sidecar Docker container must be STOPPED first
+# (run `docker compose stop docling-sidecar`).
+#
+# First time: creates .venv/docling-sidecar and installs deps. Subsequent
+# runs reuse the venv.
+docling-native:
+    @test -d .venv/docling-sidecar || python3 -m venv .venv/docling-sidecar
+    @.venv/docling-sidecar/bin/pip install --quiet --upgrade pip
+    @.venv/docling-sidecar/bin/pip install --quiet -e infra/docling-sidecar
+    @echo "Starting docling sidecar on host (MPS will be auto-detected if available)..."
+    DOCLING_GRPC_HOST=0.0.0.0 \
+    DOCLING_GRPC_PORT=1068 \
+    DOCLING_TABLEFORMER_MODE=${DOCLING_TABLEFORMER_MODE:-fast} \
+    DOCLING_ACCELERATOR=${DOCLING_ACCELERATOR:-auto} \
+    DOCLING_MAX_PDF_BYTES=104857600 \
+    DOCLING_MAX_PAGES=500 \
+    DOCLING_PARSE_TIMEOUT_S=600 \
+    DOCLING_STREAM_IDLE_TIMEOUT_S=600 \
+    DOCLING_MAX_CHUNKS_PER_DOC=10000 \
+    .venv/docling-sidecar/bin/python -m docling_sidecar
+
 # ─── Dev loop ─────────────────────────────────────────────────────────────
 
 # Ingest one document (PDF / txt / md). Usage: `just ingest test.pdf`
