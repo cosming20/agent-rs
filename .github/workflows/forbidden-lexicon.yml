@@ -13,15 +13,21 @@ jobs:
       - name: Grep forbidden lexicon
         run: |
           set -e
-          # Allowlisted file: character-set support, not domain bias.
-          ALLOWLIST='crates/retrieval/src/ingestion/metadata.rs'
+          # Allowlisted files:
+          #  - metadata.rs: Unicode diacritic handling, not domain bias.
+          #  - prompt_snapshots.rs: the Layer-2 bias-guard test file itself;
+          #    it must literally contain the forbidden lexicon to assert
+          #    against it at runtime.
           PATTERN='penal|criminal|romanian|codul|articolul|pedepsit|Cod Penal'
           # -iE = case-insensitive extended regex; -r recursive; exclude allowlist.
           MATCHES=$(grep -IrnEi \
             --include='*.rs' \
             --include='*.md' \
             "$PATTERN" \
-            crates/ | grep -v "^$ALLOWLIST" || true)
+            crates/ \
+            | grep -v '^crates/retrieval/src/ingestion/metadata.rs' \
+            | grep -v '^crates/retrieval/tests/prompt_snapshots.rs' \
+            || true)
           if [ -n "$MATCHES" ]; then
             echo "Forbidden lexicon matches found (outside allowlist):"
             echo "$MATCHES"

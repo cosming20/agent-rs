@@ -499,8 +499,8 @@ fn json_to_qdrant_filter(
         // Dispatch on condition type: match (exact or text) vs range.
         if let Some(match_obj) = cond.get("match") {
             if let Some(text_val) = match_obj.get("text").and_then(|v| v.as_str()) {
-                // Full-text tokenized substring match (e.g., "188" matches
-                // "Articolul 188 - Omorul").  Uses Qdrant's MatchText.
+                // Full-text tokenized substring match (e.g., "15" matches
+                // "Section 15 - Overview").  Uses Qdrant's MatchText.
                 must.push(Condition::matches_text(key, text_val));
             } else if let Some(match_value) = match_obj.get("value") {
                 // Exact value match.

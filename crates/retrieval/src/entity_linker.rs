@@ -319,15 +319,18 @@ pub const ENTITY_EXTRACT_PROMPT_FOR_TESTING: &str = ENTITY_EXTRACT_PROMPT;
 
 const ENTITY_EXTRACT_PROMPT: &str = "\
 Extract the key named entities from the user's query. Return ONLY concrete \
-entities (people, organizations, legal articles, concepts, places, events) \
-— NOT generic terms like \"document\", \"section\", or \"information\".
+entities (people, organizations, locations, products, standards, concepts, \
+numbered-section references, dates, events) — NOT generic terms like \
+\"document\", \"section\", or \"information\" unless they are part of a \
+named reference.
 
 Rules:
-- For legal queries: extract article numbers (\"articolul 188\"), legal \
-  concepts (\"omor\", \"furt\", \"tâlhărie\"), and institutions.
-- For technical queries: extract product names, technologies, standards.
+- Extract named entities, identifiers, and numbered references from the \
+  query regardless of domain or language.
 - Return an empty array if the query has no specific named entities.
 - Maximum 5 entities.
-- Use the CANONICAL form: \"furt\" not \"furtul\", \"omor\" not \"omorul\".
-- Match the language of the source text (Romanian entities stay Romanian).
+- Use the CANONICAL form: prefer the base / lemma / citation form over an \
+  inflected surface form when a clear canonical exists.
+- Preserve the language of the source text: entities stay in their \
+  original language unless the user explicitly asks for translation.
 ";

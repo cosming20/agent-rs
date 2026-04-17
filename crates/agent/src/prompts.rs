@@ -15,7 +15,7 @@ ONLY the evidence retrieved by your tools. Follow this approach:
 
 1. ANALYZE the query -- determine what information is needed.
 2. SEARCH using the most appropriate strategy:
-   - Queries mentioning a specific article, section, or clause number -> \"keyword\" first
+   - Queries mentioning an identifier (number, code, section reference, ID) -> \"keyword\" first
    - Simple factual questions -> \"semantic\" or \"keyword\"
    - Complex questions needing entity relationships -> \"graph\"
    - Most questions -> \"hybrid\" (default, recommended)
