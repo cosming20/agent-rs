@@ -54,13 +54,26 @@ fn fixture_path(name: &str) -> PathBuf {
 
 fn assert_matches_fixture(label: &str, prompt: &str, fixture_name: &str) {
     let path = fixture_path(fixture_name);
+    // Set UPDATE_SNAPSHOTS=1 to (re)write the fixture from the live prompt.
+    // Intended for initial creation and deliberate prompt updates only.
+    if std::env::var("UPDATE_SNAPSHOTS").ok().as_deref() == Some("1") {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).ok();
+        }
+        fs::write(&path, prompt.trim_end())
+            .unwrap_or_else(|e| panic!("failed to write fixture {}: {e}", path.display()));
+        return;
+    }
     let fixture = fs::read_to_string(&path).unwrap_or_else(|e| {
-        panic!("missing fixture {fixture_name} at {}: {e}", path.display())
+        panic!(
+            "missing fixture {fixture_name} at {} — re-run with UPDATE_SNAPSHOTS=1 to create: {e}",
+            path.display()
+        )
     });
     assert_eq!(
         prompt.trim(),
         fixture.trim(),
-        "prompt {label} diverged from committed fixture {fixture_name}"
+        "prompt {label} diverged from committed fixture {fixture_name} (run with UPDATE_SNAPSHOTS=1 if this change is intentional)"
     );
 }
 

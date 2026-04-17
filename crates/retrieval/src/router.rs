@@ -471,11 +471,12 @@ impl RetrievalRouter {
         let mut all_result_lists: Vec<Vec<agent_rs_stores::types::SearchResult>> = Vec::new();
 
         for query_str in &sub_queries {
-            // HyDE DISABLED — caused -48pp regression on semantic search.
-            // The hypothetical answer is too specific for Romanian legal text
-            // and mismatches with the actual chunk embeddings. Raw query
-            // embedding + Docling heading-prefixed chunks works better.
-            // TODO: re-enable selectively for Conceptual queries only.
+            // HyDE DISABLED — caused a large regression on semantic search
+            // in prior eval runs; hypothetical answers over-specify and
+            // drift from chunk embeddings. Raw query embedding with
+            // heading-prefixed chunks performed better.
+            // TODO: re-enable selectively for Conceptual queries only once
+            // we have a corpus-independent signal that HyDE helps.
             let embed_text = query_str.to_string();
 
             // Always embed dense — every strategy needs at minimum a dense vector.
@@ -1018,7 +1019,7 @@ fn filter_conditions_to_json(conditions: &[FilterCondition]) -> serde_json::Valu
             FilterCondition::Contains { field, text } => {
                 // Use Qdrant's full-text `match.text` (tokenized substring
                 // search within the field value) rather than exact `match.value`.
-                // "188" will match "Articolul 188 - Omorul" via token overlap.
+                // "15" will match "Section 15 - Overview" via token overlap.
                 serde_json::json!({
                     "key": field,
                     "match": { "text": text }

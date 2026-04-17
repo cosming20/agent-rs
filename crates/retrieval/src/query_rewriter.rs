@@ -15,9 +15,9 @@
 //!   module logs a warning and returns the original query verbatim as a single
 //!   `Factual` sub-query. The retrieval pipeline is never blocked because
 //!   rewriting failed.
-//! - **Romanian legal awareness** — The system prompt includes explicit
-//!   guidance for Romanian legal queries: article cross-references, crime
-//!   definitions, penalty lookups, negation rewriting.
+//! - **Structure-aware decomposition** — The system prompt recognises common
+//!   query shapes (comparisons, numbered-reference lookups, multi-hop
+//!   chains, negations) without assuming any specific domain or language.
 //! - **Prompt-cache friendly** — System prompt and JSON schema are static so
 //!   the static prefix (≥1024 tokens) reliably hits OpenAI's automatic prompt
 //!   cache, reducing cost on high-volume workloads.
@@ -33,7 +33,7 @@
 //!
 //! ```rust,ignore
 //! let rewriter = QueryRewriter::new(QueryRewriterConfig { ... });
-//! let rewritten = rewriter.rewrite("Ce diferență este între furt și tâlhărie?").await?;
+//! let rewritten = rewriter.rewrite("What's the difference between a compiler and an interpreter?").await?;
 //! for sq in &rewritten.sub_queries {
 //!     // dispatch sq.text to the retrieval back-end
 //! }
@@ -100,41 +100,20 @@ all aspects of the original intent.
 
 ## Keep the query as-is (should_decompose: false) when:
 - The query has a single clear retrieval need (factual look-up, simple
-  definition, one specific article, one specific person/event).
-- Examples: "What is tâlhăria?", "Define robbery", "Art. 233 Cod Penal",
-  "Who is Ion Creangă?", "What year was Romania's constitution adopted?".
+  definition, one specific numbered reference, one specific person/event).
+- The query is an exact-match keyword or identifier lookup.
+- The query is short (under ~10 words) and expresses a single intent.
 
 ## Decompose the query (should_decompose: true) when:
-- The query asks to COMPARE two or more concepts, crimes, laws, or entities.
-- The query contains MULTIPLE retrieval needs joined by "și" / "and" / "or".
-- The query asks about both a definition AND a consequence / penalty.
+- The query asks to COMPARE two or more concepts, items, or entities.
+- The query contains MULTIPLE retrieval needs joined by "and" / "or" /
+  cross-lingual equivalents.
+- The query asks both about a definition AND a consequence / implication.
 - The query asks what something is NOT (negation) — rewrite to:
     (a) definition of the positive concept, and
     (b) exceptions / exclusions from that concept.
-- The query implies a multi-hop lookup (e.g. "what punishment applies to X"
-  where X is itself defined in another article).
-- Examples:
-    "Ce diferență este între furt și tâlhărie?" → 3 sub-queries:
-      • original query (comparative anchor)
-      • "definiția furtului Cod Penal"
-      • "definiția tâlhăriei Cod Penal"
-    "Ce NU este tâlhărie?" → 2 sub-queries:
-      • "definiția tâlhăriei"
-      • "excepțiile și limitele noțiunii de tâlhărie"
-    "What are the penalties and elements of robbery?" → 2 sub-queries:
-      • "definition of robbery criminal elements"
-      • "penalties for robbery"
-
-# Romanian legal query guidance
-
-- Article references: "Art. 233 Cod Penal" → keep as one factual sub-query.
-- Crime definitions: always emit a sub-query prefixed "definiția {infracțiunea}".
-- Cross-article penalties: emit a sub-query "pedeapsa pentru {infracțiunea}".
-- Comparative crimes (e.g. furt vs. tâlhărie): emit one sub-query per crime
-  plus the original comparative query.
-- Aggravating circumstances (forme agravate): emit sub-queries for both the
-  basic form and the aggravated form.
-- Constitutional/civil law queries follow the same decomposition rules.
+- The query implies a multi-hop lookup (one fact depends on another that
+  is itself defined elsewhere).
 
 # Output rules
 
@@ -144,25 +123,27 @@ all aspects of the original intent.
 3. Maximum 3 sub-queries (enforced by schema).
 4. If should_decompose is false, emit exactly 1 sub-query equal to the original.
 5. query_type classification:
-   - factual   — single-hop factual look-up (definition, article, date, name)
+   - factual   — single-hop factual look-up (definition, reference, date, name)
    - conceptual — abstract concept that requires understanding, not just recall
    - comparative — requires retrieving multiple items and comparing them
    - negation  — asks what something is NOT; rewrite to positive + exclusions
 6. intent — one short phrase explaining WHY this sub-query was generated.
 7. reasoning — a 1-2 sentence explanation of the overall decomposition decision.
-8. Return ONLY valid JSON matching the provided schema. No prose, no markdown.
+8. Do NOT translate: preserve the user's language in every sub-query.
+9. Do NOT add domain assumptions the user did not state.
+10. Return ONLY valid JSON matching the provided schema. No prose, no markdown.
 
 # Few-shot examples
 
-Query: "Ce este tâlhăria?"
+Query: "What is the return type of the split() method?"
 Output:
 {
-  "reasoning": "Single-concept definition query. No decomposition needed.",
+  "reasoning": "Single-concept definition query about a specific API method. No decomposition needed.",
   "should_decompose": false,
   "sub_queries": [
     {
-      "text": "Ce este tâlhăria?",
-      "intent": "Direct definition lookup for tâlhărie",
+      "text": "What is the return type of the split() method?",
+      "intent": "Direct API lookup",
       "query_type": "factual"
     }
   ]
@@ -170,25 +151,25 @@ Output:
 
 ---
 
-Query: "Ce diferență este între furt și tâlhărie?"
+Query: "What's the difference between a compiler and an interpreter, and which one does Python use?"
 Output:
 {
-  "reasoning": "Comparative query requiring independent definitions of furt and tâlhărie before comparison can be grounded.",
+  "reasoning": "Comparative query combined with a downstream factual lookup. Decompose so each leg has a focused retrieval target.",
   "should_decompose": true,
   "sub_queries": [
     {
-      "text": "Ce diferență este între furt și tâlhărie?",
-      "intent": "Original comparative anchor — preserves direct-match retrieval",
+      "text": "What's the difference between a compiler and an interpreter, and which one does Python use?",
+      "intent": "Original query preserved for direct-match retrieval",
       "query_type": "comparative"
     },
     {
-      "text": "definiția și elementele constitutive ale furtului Cod Penal",
-      "intent": "Retrieve full definition of furt to support comparison",
-      "query_type": "factual"
+      "text": "How does a compiler differ from an interpreter?",
+      "intent": "Retrieve the comparative definition",
+      "query_type": "comparative"
     },
     {
-      "text": "definiția și elementele constitutive ale tâlhăriei Cod Penal",
-      "intent": "Retrieve full definition of tâlhărie to support comparison",
+      "text": "Does Python use a compiler or an interpreter?",
+      "intent": "Retrieve the Python-specific factual answer",
       "query_type": "factual"
     }
   ]
@@ -196,52 +177,68 @@ Output:
 
 ---
 
-Query: "What are the penalties for robbery and how does it differ from theft?"
+Query: "Who discovered the element named after the country in which it was first found?"
 Output:
 {
-  "reasoning": "Mixed query: penalties (factual) plus comparison (comparative). Decompose into three focused lookups.",
+  "reasoning": "Multi-hop query: one step identifies the element, the next identifies its discoverer. Decompose into a chain.",
   "should_decompose": true,
   "sub_queries": [
     {
-      "text": "What are the penalties for robbery and how does it differ from theft?",
-      "intent": "Original query preserved for direct retrieval",
-      "query_type": "comparative"
-    },
-    {
-      "text": "penalties and sentencing for robbery",
-      "intent": "Isolate the penalty aspect for targeted retrieval",
+      "text": "Who discovered the element named after the country in which it was first found?",
+      "intent": "Original multi-hop query preserved",
       "query_type": "factual"
     },
     {
-      "text": "definition of robbery vs theft elements and distinctions",
-      "intent": "Isolate the comparative definitional aspect",
-      "query_type": "comparative"
+      "text": "Which elements are named after the country where they were first found?",
+      "intent": "First hop: identify the element",
+      "query_type": "factual"
+    },
+    {
+      "text": "Who discovered those elements?",
+      "intent": "Second hop: identify the discoverer",
+      "query_type": "factual"
     }
   ]
 }
 
 ---
 
-Query: "Ce NU este considerat tâlhărie în Codul Penal?"
+Query: "Section 4.2"
 Output:
 {
-  "reasoning": "Negation query. Rewrite as positive definition plus exclusions/exceptions.",
+  "reasoning": "Pure numbered-reference lookup. Exact-keyword retrieval is appropriate.",
+  "should_decompose": false,
+  "sub_queries": [
+    {
+      "text": "Section 4.2",
+      "intent": "Exact-reference lookup",
+      "query_type": "factual"
+    }
+  ]
+}
+
+---
+
+Query: "List database engines that support ACID transactions but not SQL."
+Output:
+{
+  "reasoning": "Negation / combined-constraint query. Rewrite into the positive definitions plus the exclusion.",
   "should_decompose": true,
   "sub_queries": [
     {
-      "text": "Ce NU este considerat tâlhărie în Codul Penal?",
+      "text": "List database engines that support ACID transactions but not SQL.",
       "intent": "Original negation query preserved",
       "query_type": "negation"
     },
     {
-      "text": "definiția tâlhăriei și elementele sale constitutive Cod Penal",
-      "intent": "Retrieve positive definition to anchor the negation",
+      "text": "Which database engines support ACID transactions?",
+      "intent": "Retrieve the positive set",
       "query_type": "factual"
     },
     {
-      "text": "excepțiile și limitele infracțiunii de tâlhărie situații care nu constituie tâlhărie",
-      "intent": "Retrieve exclusions and boundary cases for tâlhărie",
-      "query_type": "conceptual"
+      "text": "Which database engines do not use SQL as their query language?",
+      "intent": "Retrieve the exclusion set",
+      "query_type": "factual"
     }
   ]
 }
@@ -798,24 +795,27 @@ write a short passage (3-5 sentences) that looks like it could be a real \
 paragraph from a document that answers the question.
 
 Rules:
-- Write in the SAME LANGUAGE as the question (Romanian for Romanian, English \
-  for English).
-- Use a formal, factual tone — as if quoting from a legal code, textbook, or \
-  official document.
-- Include specific terminology, article numbers, or technical terms that \
-  would appear in the real source document.
+- Write in the SAME LANGUAGE as the question.
+- Use a formal, factual tone — as if quoting from a reference work, \
+  textbook, or primary source.
+- Include specific terminology, identifiers, or technical terms that \
+  would plausibly appear in the real source document for that question.
 - Do NOT say \"the answer is\" or \"according to\". Write AS IF you are the \
   document itself.
 - Keep it concise: 3-5 sentences maximum.
-- For legal queries: mimic the style of the Romanian Penal Code (articol, \
-  alineat, pedeapsă, infracțiune).
-- For technical queries: mimic technical documentation style.
+- Match the register of whatever domain the question implies — technical \
+  documentation, encyclopedia article, reference manual, research paper, \
+  or business report.
 
 Example:
-  Question: \"Ce prevede articolul 188 din Codul Penal?\"
-  Output: \"Articolul 188 - Omorul. (1) Uciderea unei persoane se pedepsește \
-  cu închisoare de la 10 la 20 de ani și interzicerea exercitării unor drepturi. \
-  (2) Tentativa se pedepsește.\"\
+  Question: \"What is the TCP three-way handshake?\"
+  Output: \"The TCP three-way handshake establishes a reliable connection \
+  between two hosts before any application data is exchanged. The initiator \
+  sends a SYN segment with its initial sequence number; the responder replies \
+  with a SYN-ACK carrying its own initial sequence number and acknowledging \
+  the initiator's. The initiator then responds with an ACK, at which point \
+  both sides have agreed on starting sequence numbers and the connection \
+  enters the ESTABLISHED state.\"\
 ";
 
 // ---------------------------------------------------------------------------

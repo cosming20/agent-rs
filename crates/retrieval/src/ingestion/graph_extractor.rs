@@ -114,14 +114,15 @@ of entities (nodes) and relationships (edges) that captures the salient facts.
 # Node rules
 
 - **Type labels**: Use specific but reusable categories. Prefer:
-  Person, Organization, Location, Date, Event, Document, Law, Article, Concept,
+  Person, Organization, Location, Date, Event, Document, Concept,
   Product, Technology, Discipline, Material, Process, Quantity, Measurement,
-  Crime, Penalty, Right, Obligation, Currency, Title, Role, BodyPart, Disease,
+  Right, Obligation, Currency, Title, Role, BodyPart, Disease,
   Treatment, Chemical, Species, Vehicle, Building, Award, Phenomenon.
   Avoid generic "Entity", "Thing", "Item".
-- **Node IDs**: Lowercase ASCII snake_case slugs (`albert_einstein`, `world_war_two`,
-  `articolul_170`, `tâlhăria_calificată` → `talharia_calificata`).
-  - Strip diacritics: ă→a, â→a, î→i, ș→s, ț→t, é→e, ü→u, ñ→n, etc.
+- **Node IDs**: Lowercase ASCII snake_case slugs (`albert_einstein`,
+  `world_war_two`, `section_4_2`, `request_timeout`).
+  - Strip diacritics and combining marks to plain ASCII (ă→a, â→a, é→e,
+    ü→u, ñ→n, ś→s, ç→c, etc.).
   - Replace spaces and punctuation with underscores. Collapse multiple underscores.
   - Never use integer IDs. IDs are the dedup key across the entire corpus.
 - **Names**: The full canonical name as it appears in the text (preserve diacritics).
@@ -131,26 +132,30 @@ of entities (nodes) and relationships (edges) that captures the salient facts.
 
 - If "Einstein" appears, then later "Albert Einstein" appears, use the SAME id
   `albert_einstein` for both. Always prefer the most complete identifier.
-- Pronouns and anaphora: resolve "he/she/it/they/el/dansul" to the most recent
-  matching entity. Never create a node for a pronoun.
+- Pronouns and anaphora: resolve "he/she/it/they" (and cross-lingual
+  equivalents) to the most recent matching entity. Never create a node
+  for a pronoun.
 - Dates: Format `YYYY-MM-DD` when fully specified; otherwise `YYYY-MM` or `YYYY`.
-  Romanian dates: "5 iunie 2014" → `2014-06-05`.
-- Numeric quantities: include the unit in the name (e.g. `5_ani_de_inchisoare`).
+  Parse dates written in any language into this canonical form
+  (e.g. "5 June 2014" → `2014-06-05`).
+- Numeric quantities: include the unit in the name (e.g. `5_year_sentence`,
+  `250_milliseconds`).
 
 # Edge rules
 
 - Use snake_case verb phrases in the present tense or past participle:
-  `founded_by`, `located_in`, `acted_in`, `signed_on`, `pedepsit_cu`,
-  `constituie`, `reglementat_de`, `aplicabil_pentru`, `succeeded_by`.
+  `founded_by`, `located_in`, `acted_in`, `signed_on`, `depends_on`,
+  `authored_by`, `regulated_by`, `applies_to`, `succeeded_by`,
+  `composed_of`, `reports_to`, `references`.
 - Source and target node IDs MUST appear in the nodes list. Never invent IDs.
 - Capture IMPLICIT relations the text strongly entails. For example:
-  "Furtul savarsit prin violenta devine talharie" implies
-  `furt -[constituie_atunci_cand_violent]-> talharie`.
+  "When X happens, Y becomes Z" implies `x -[causes]-> z` when `z` is a
+  defined state of `y`.
 - Focus on meaningful, non-trivial relations. Skip incidental mentions
   ("the document is 5 pages long").
-- For legal/regulatory text: extract `pedepsit_cu` (punished_by),
-  `aplicabil_pentru` (applies_to), `defineste` (defines),
-  `agraveaza` (aggravates), `excepte_de_la` (excludes_from).
+- For regulatory / rule-bearing text: extract relations like `prohibits`,
+  `permits`, `requires`, `defines`, `aggravates`, `excludes_from`,
+  `applies_to` — using the language of the source document.
 
 # Few-shot examples
 
@@ -190,43 +195,72 @@ Expected output:
   ]
 }
 
-EXAMPLE 2 — Romanian legal text:
-"Articolul 233. Tâlhăria. Furtul săvârșit prin întrebuințarea de violențe sau
-amenințări ori prin punerea victimei în stare de inconștiență sau neputință de
-a se apăra se pedepsește cu închisoarea de la 2 la 7 ani."
+EXAMPLE 2 — Technical reference text:
+"The TCP protocol, defined in RFC 793 (1981), implements reliable ordered
+delivery over IP by introducing sequence numbers and acknowledgements.
+Van Jacobson's 1988 paper introduced congestion control, which is now part
+of RFC 5681. Without congestion control, TCP suffers from congestion
+collapse under heavy load."
 
 Expected output:
 {
   "nodes": [
-    {"id": "articolul_233", "name": "Articolul 233", "type": "Article",
-     "description": "Articolul 233 din Codul Penal definește tâlhăria."},
-    {"id": "talharia", "name": "Tâlhăria", "type": "Crime",
-     "description": "Furt savarsit prin violenta sau amenintari."},
-    {"id": "furtul", "name": "Furtul", "type": "Crime",
-     "description": "Luarea unui bun mobil din posesia altuia fara consimtamant."},
-    {"id": "violenta", "name": "violența", "type": "Concept",
-     "description": "Folosirea fortei fizice impotriva victimei."},
-    {"id": "amenintari", "name": "amenințări", "type": "Concept",
-     "description": "Intimidarea victimei pentru a obtine bunul."},
-    {"id": "2_pana_la_7_ani_inchisoare", "name": "închisoarea de la 2 la 7 ani",
-     "type": "Penalty", "description": "Pedeapsa cu inchisoarea intre 2 si 7 ani."}
+    {"id": "tcp_protocol", "name": "TCP protocol", "type": "Concept",
+     "description": "Reliable ordered delivery protocol over IP."},
+    {"id": "rfc_793", "name": "RFC 793", "type": "Document",
+     "description": "1981 specification defining TCP."},
+    {"id": "rfc_5681", "name": "RFC 5681", "type": "Document",
+     "description": "Specification that includes TCP congestion control."},
+    {"id": "ip", "name": "IP", "type": "Concept",
+     "description": "Internet Protocol, the layer over which TCP runs."},
+    {"id": "sequence_numbers", "name": "sequence numbers", "type": "Concept",
+     "description": "Per-byte numbering used by TCP to achieve ordered delivery."},
+    {"id": "acknowledgements", "name": "acknowledgements", "type": "Concept",
+     "description": "Receiver-side confirmations used by TCP."},
+    {"id": "van_jacobson", "name": "Van Jacobson", "type": "Person",
+     "description": "Introduced TCP congestion control in a 1988 paper."},
+    {"id": "van_jacobson_1988_paper", "name": "Van Jacobson 1988 paper",
+     "type": "Document", "description": "Introduced TCP congestion control."},
+    {"id": "congestion_control", "name": "congestion control", "type": "Concept",
+     "description": "Mechanism to avoid TCP congestion collapse."},
+    {"id": "congestion_collapse", "name": "congestion collapse", "type": "Concept",
+     "description": "Failure mode under heavy load without congestion control."},
+    {"id": "1981", "name": "1981", "type": "Date",
+     "description": "Publication year of RFC 793."},
+    {"id": "1988", "name": "1988", "type": "Date",
+     "description": "Publication year of Van Jacobson's congestion-control paper."}
   ],
   "edges": [
-    {"source_node_id": "articolul_233", "target_node_id": "talharia",
-     "relationship_name": "defineste",
-     "description": "Articolul 233 defineste talharia."},
-    {"source_node_id": "talharia", "target_node_id": "furtul",
-     "relationship_name": "constituie_forma_agravata_de",
-     "description": "Talharia este o forma agravata a furtului."},
-    {"source_node_id": "talharia", "target_node_id": "violenta",
-     "relationship_name": "implica",
-     "description": "Talharia presupune folosirea violentei."},
-    {"source_node_id": "talharia", "target_node_id": "amenintari",
-     "relationship_name": "implica",
-     "description": "Talharia poate fi savarsita prin amenintari."},
-    {"source_node_id": "talharia", "target_node_id": "2_pana_la_7_ani_inchisoare",
-     "relationship_name": "pedepsit_cu",
-     "description": "Talharia se pedepseste cu inchisoarea de la 2 la 7 ani."}
+    {"source_node_id": "rfc_793", "target_node_id": "tcp_protocol",
+     "relationship_name": "defines",
+     "description": "RFC 793 defines the TCP protocol."},
+    {"source_node_id": "rfc_793", "target_node_id": "1981",
+     "relationship_name": "published_in",
+     "description": "RFC 793 was published in 1981."},
+    {"source_node_id": "tcp_protocol", "target_node_id": "ip",
+     "relationship_name": "runs_over",
+     "description": "TCP runs over IP."},
+    {"source_node_id": "tcp_protocol", "target_node_id": "sequence_numbers",
+     "relationship_name": "uses",
+     "description": "TCP uses sequence numbers for ordered delivery."},
+    {"source_node_id": "tcp_protocol", "target_node_id": "acknowledgements",
+     "relationship_name": "uses",
+     "description": "TCP uses acknowledgements for reliable delivery."},
+    {"source_node_id": "van_jacobson", "target_node_id": "van_jacobson_1988_paper",
+     "relationship_name": "authored",
+     "description": "Van Jacobson authored the 1988 paper."},
+    {"source_node_id": "van_jacobson_1988_paper", "target_node_id": "congestion_control",
+     "relationship_name": "introduces",
+     "description": "The paper introduces TCP congestion control."},
+    {"source_node_id": "van_jacobson_1988_paper", "target_node_id": "1988",
+     "relationship_name": "published_in",
+     "description": "Published in 1988."},
+    {"source_node_id": "rfc_5681", "target_node_id": "congestion_control",
+     "relationship_name": "includes",
+     "description": "RFC 5681 includes TCP congestion control."},
+    {"source_node_id": "congestion_control", "target_node_id": "congestion_collapse",
+     "relationship_name": "prevents",
+     "description": "Congestion control prevents congestion collapse under heavy load."}
   ]
 }
 
