@@ -34,6 +34,10 @@ path = "examples/ingest.rs"
 name = "query"
 path = "examples/query.rs"
 
+[[example]]
+name = "ask"
+path = "examples/ask.rs"
+
 [dependencies]
 agent-rs-core          = { path = "crates/core" }
 agent-rs-stores        = { path = "crates/stores" }

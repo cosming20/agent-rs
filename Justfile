@@ -161,8 +161,15 @@ ingest path *args:
 
 # Run one retrieval query. Usage: `just query "ce este histograma?"`
 # Extra flags go through:  `just query --strategy hybrid --limit 5 "my query"`
+# Returns ranked chunks only — no LLM answer synthesis, no tools.
 query *args:
     cargo run --release --example query -- {{args}}
+
+# Ask a question through the full agent pipeline (tools + grounding +
+# LLM answer synthesis with citations). Usage: `just ask "what is X?"`.
+# Extra flags: --strategy <name> --limit N --user <id>.
+ask *args:
+    cargo run --release --example ask -- {{args}}
 
 # A/B compare: weighted-keyword feature OFF then ON for the same query.
 query-ab query:

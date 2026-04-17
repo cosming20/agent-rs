@@ -69,6 +69,22 @@ pub struct VectorPoint {
     pub payload: serde_json::Value,
 }
 
+/// Payload-only projection of a stored point.
+///
+/// Returned by `VectorStore::get_by_ids` when callers only need to rehydrate
+/// payload fields (e.g. `chunk_text`, `section_title`, `page_start`) without
+/// paying the bandwidth cost of shipping the dense vector back.
+///
+/// IDs are the same string IDs that were used at upsert time; the backend
+/// may have stored them as UUIDs internally (Qdrant requires UUID / u64),
+/// but the round-trip preserves the original string form when the caller
+/// supplied a valid UUID string.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PointPayload {
+    pub id: String,
+    pub payload: serde_json::Value,
+}
+
 /// Configuration for creating a vector collection.
 ///
 /// Supports named vectors: a mandatory dense vector and an optional
@@ -190,7 +206,21 @@ impl NodeLabel {
     pub fn as_str(&self) -> &str {
         &self.0
     }
+
+    /// Well-known structural label for chunk nodes.
+    ///
+    /// The literal `"Chunk"` contains only ASCII alphanumerics, which satisfies
+    /// the invariant checked by [`NodeLabel::new`]. Kept as an infallible
+    /// constructor so call sites on hot paths don't propagate a `Result` just
+    /// for a compile-time constant label.
+    pub fn chunk() -> Self {
+        Self(CHUNK_LABEL.to_owned())
+    }
 }
+
+/// Label used for document-chunk nodes. Centralised so retrieval filters and
+/// ingest-time writers agree on the exact spelling.
+pub const CHUNK_LABEL: &str = "Chunk";
 
 impl std::fmt::Display for NodeLabel {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {

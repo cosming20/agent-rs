@@ -432,7 +432,7 @@ impl GraphCotRetriever {
                     content: &user_content,
                 },
             ],
-            max_tokens: self.config.llm_max_tokens,
+            max_completion_tokens: self.config.llm_max_tokens,
             temperature: 0.0,
             response_format: ResponseFormat::sufficiency_schema(),
         };
@@ -813,7 +813,7 @@ impl GraphCotRetriever {
                     content: &user_content,
                 },
             ],
-            max_tokens: self.config.llm_max_tokens,
+            max_completion_tokens: self.config.llm_max_tokens,
             temperature: 0.0,
             response_format: ResponseFormat::json_schema(),
         };
@@ -941,11 +941,17 @@ struct CotDecision {
 
 // ---- OpenAI request/response types ----
 
+/// Chat Completions request body.
+///
+/// The token cap is serialised as `max_completion_tokens`, the name required
+/// by gpt-5.x and the o-series reasoning models. The legacy `max_tokens`
+/// field was deprecated for Chat Completions in favour of this one, and
+/// newer models reject requests that send the old name.
 #[derive(Debug, Serialize)]
 struct ChatRequest<'a> {
     model: &'a str,
     messages: Vec<ChatMessage<'a>>,
-    max_tokens: u32,
+    max_completion_tokens: u32,
     temperature: f32,
     response_format: ResponseFormat,
 }

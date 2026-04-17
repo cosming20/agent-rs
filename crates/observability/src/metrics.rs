@@ -573,7 +573,8 @@ impl RetrievalMetrics {
 
         self.llm_calls.add(1, attrs_component);
         self.llm_tokens_prompt.add(prompt_tokens, attrs_full);
-        self.llm_tokens_completion.add(completion_tokens, attrs_full);
+        self.llm_tokens_completion
+            .add(completion_tokens, attrs_full);
         self.llm_latency_ms.record(latency_ms, attrs_component);
 
         let cost = llm_cost_usd(model, prompt_tokens, completion_tokens);
@@ -631,8 +632,7 @@ impl RetrievalMetrics {
     /// `flag` is one of `has_table`, `has_list`, `has_picture`, `has_code`,
     /// `has_formula`.
     pub fn record_chunk_flag(&self, flag: &'static str) {
-        self.chunk_flag
-            .add(1, &[KeyValue::new("chunk.flag", flag)]);
+        self.chunk_flag.add(1, &[KeyValue::new("chunk.flag", flag)]);
     }
 
     /// Increment the empty-embed-text chunk counter — signals a silent
@@ -658,22 +658,40 @@ fn model_price(model: &str) -> Option<ModelPrice> {
     // Match by prefix so date-stamped model IDs route to the right base
     // price without a combinatorial explosion of table entries.
     if model.starts_with("gpt-5.4-mini") {
-        return Some(ModelPrice { prompt_per_1m: 0.25, completion_per_1m: 1.25 });
+        return Some(ModelPrice {
+            prompt_per_1m: 0.25,
+            completion_per_1m: 1.25,
+        });
     }
     if model.starts_with("gpt-5.4") {
-        return Some(ModelPrice { prompt_per_1m: 2.50, completion_per_1m: 10.00 });
+        return Some(ModelPrice {
+            prompt_per_1m: 2.50,
+            completion_per_1m: 10.00,
+        });
     }
     if model.starts_with("gpt-4o-mini") {
-        return Some(ModelPrice { prompt_per_1m: 0.15, completion_per_1m: 0.60 });
+        return Some(ModelPrice {
+            prompt_per_1m: 0.15,
+            completion_per_1m: 0.60,
+        });
     }
     if model.starts_with("gpt-4o") {
-        return Some(ModelPrice { prompt_per_1m: 2.50, completion_per_1m: 10.00 });
+        return Some(ModelPrice {
+            prompt_per_1m: 2.50,
+            completion_per_1m: 10.00,
+        });
     }
     if model.starts_with("text-embedding-3-large") {
-        return Some(ModelPrice { prompt_per_1m: 0.13, completion_per_1m: 0.0 });
+        return Some(ModelPrice {
+            prompt_per_1m: 0.13,
+            completion_per_1m: 0.0,
+        });
     }
     if model.starts_with("text-embedding-3-small") {
-        return Some(ModelPrice { prompt_per_1m: 0.02, completion_per_1m: 0.0 });
+        return Some(ModelPrice {
+            prompt_per_1m: 0.02,
+            completion_per_1m: 0.0,
+        });
     }
     None
 }
