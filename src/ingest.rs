@@ -110,12 +110,12 @@ pub async fn build_ingestion_pipeline(
                 .or_else(|_| std::env::var("LLM_MODEL"))
                 .unwrap_or_else(|_| "gpt-5.4-mini-2026-03-17".to_owned());
             info!(model = %model, "ChunkSummarizer enabled");
+            let mut summarizer = ChunkSummarizer::new(key, model, Arc::clone(&http_client));
+            if let Some(m) = metrics.clone() {
+                summarizer = summarizer.with_metrics(m);
+            }
             config = config
-                .with_summarizer(Arc::new(ChunkSummarizer::new(
-                    key,
-                    model,
-                    Arc::clone(&http_client),
-                )))
+                .with_summarizer(Arc::new(summarizer))
                 .with_summaries_collection(summaries_collection.clone());
         }
     } else {
@@ -147,11 +147,15 @@ pub async fn build_ingestion_pipeline(
         info!("PgStore wired into ingestion pipeline");
     }
 
-    Ok(IngestionPipeline::with_config(
+    let mut pipeline = IngestionPipeline::with_config(
         embedder,
         stores.qdrant.clone() as Arc<dyn VectorStore + Send + Sync>,
         stores.neo4j.clone() as Arc<dyn GraphStore + Send + Sync>,
         collection.clone(),
         config,
-    ))
+    );
+    if let Some(m) = metrics {
+        pipeline = pipeline.with_metrics(m);
+    }
+    Ok(pipeline)
 }

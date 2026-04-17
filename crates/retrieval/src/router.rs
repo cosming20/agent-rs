@@ -24,6 +24,7 @@
 //! Phase 4 will extract seed IDs from the query embedding nearest-neighbours.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use agent_rs_core::{CollectionName, Embedding, RetrievalStrategy};
 use agent_rs_observability::metrics::RetrievalMetrics;
@@ -45,6 +46,10 @@ use crate::{
         vector::{summaries_search, temporal_search, vector_search},
     },
     strategy::get_descriptor,
+    weighted_keywords::{
+        WeightedKeywordExtractor, WeightedKeywordIntegrationConfig, WeightedKeywords,
+        adjust_for_weighted_keywords,
+    },
 };
 use agent_rs_stores::traits::{GraphStore, VectorStore};
 
@@ -144,6 +149,31 @@ pub struct RetrievalRouter {
     /// When `Some`, the router emits metrics for reranker fallback events.
     /// Passed from the top-level startup wiring via [`with_metrics`].
     metrics: Option<Arc<RetrievalMetrics>>,
+
+    /// Optional LLM-backed weighted-keyword extractor.
+    ///
+    /// When `Some`, runs in the pre-dispatch parallel join alongside the
+    /// query rewriter and produces an `Arc<WeightedKeywords>` consumed by
+    /// the rerank adjustment (and, in future commits, by BM25 query
+    /// rewrite and entity-linker candidate prioritisation). Failures and
+    /// branch-local timeouts collapse to `WeightedKeywords::empty()`, so
+    /// every consumer's empty-input path is byte-identical to when this
+    /// extractor is absent.
+    weighted_keyword_extractor: Option<Arc<WeightedKeywordExtractor>>,
+
+    /// Per-consumer integration toggles for the weighted-keyword signal.
+    ///
+    /// Default: all three consumers (BM25, rerank, entity_linker) enabled.
+    /// Set any field to `None` at construction time to disable that
+    /// consumer's integration without touching the extractor.
+    weighted_keyword_integration: WeightedKeywordIntegrationConfig,
+
+    /// Branch-local timeout for the weighted-keyword extraction future.
+    ///
+    /// If the LLM call does not complete within this budget, the branch
+    /// resolves to `WeightedKeywords::empty()` — preventing a slow
+    /// extractor from extending the router's overall deadline.
+    weighted_keyword_branch_budget: Duration,
 }
 
 impl RetrievalRouter {
@@ -179,7 +209,44 @@ impl RetrievalRouter {
             context_expander: None,
             entity_linker: None,
             metrics: None,
+            weighted_keyword_extractor: None,
+            weighted_keyword_integration: WeightedKeywordIntegrationConfig::default(),
+            weighted_keyword_branch_budget: Duration::from_secs(6),
         }
+    }
+
+    /// Attach an LLM-backed weighted-keyword extractor.
+    ///
+    /// The extractor runs in parallel with `query_rewriter`, `entity_linker`,
+    /// and `metadata_filter` (all subject to their own enable conditions)
+    /// and produces weighted terms consumed by the rerank adjustment. See
+    /// [`weighted_keywords`](crate::weighted_keywords) for the integration
+    /// contract.
+    pub fn with_weighted_keyword_extractor(
+        mut self,
+        extractor: Arc<WeightedKeywordExtractor>,
+    ) -> Self {
+        self.weighted_keyword_extractor = Some(extractor);
+        self
+    }
+
+    /// Override the per-consumer integration config for weighted keywords.
+    ///
+    /// Default enables all three consumers with default per-consumer
+    /// sub-configs. Set fields to `None` to disable that consumer's
+    /// integration.
+    pub fn with_weighted_keyword_integration(
+        mut self,
+        cfg: WeightedKeywordIntegrationConfig,
+    ) -> Self {
+        self.weighted_keyword_integration = cfg;
+        self
+    }
+
+    /// Override the branch-local timeout for the weighted-keyword extractor.
+    pub fn with_weighted_keyword_branch_budget(mut self, budget: Duration) -> Self {
+        self.weighted_keyword_branch_budget = budget;
+        self
     }
 
     /// Attach an optional triplet collection to this router.
@@ -299,48 +366,74 @@ impl RetrievalRouter {
         query.to_owned()
     }
 
-    /// Hydrate triplet search results by looking up the chunks that generated
-    /// them. Each triplet carries a `chunk_id` in its payload; this method
-    /// runs a filtered search on the main collection to retrieve the actual
-    /// chunk documents with their `chunk_text` for proper ranking.
+    /// Rehydrate triplet search results into chunk-shaped [`SearchResult`]s.
+    ///
+    /// Each triplet point in the triplets collection carries a `chunk_id`
+    /// field pointing to the chunk it was extracted from. This method:
+    ///
+    /// 1. Walks the triplet hits in their original rank order and collects
+    ///    `chunk_id`s, deduplicating while preserving order (so the best
+    ///    triplet score wins when the same chunk is cited by multiple
+    ///    triplets).
+    /// 2. Batch-fetches the authoritative chunk payloads from the main
+    ///    collection via [`VectorStore::get_by_ids`], which returns only
+    ///    payloads for IDs that actually exist — orphan triplets whose
+    ///    chunks have been deleted are silently dropped.
+    /// 3. Emits [`SearchResult`]s keyed by `chunk_id` with:
+    ///    - the chunk's full payload (so `chunk_text` / `section_title` /
+    ///      `page_start` / `source` are populated);
+    ///    - the triplet's score (carrying the "triplet ranked close to
+    ///      query" signal into RRF fusion).
+    ///
+    /// Emitting chunk IDs is critical for RRF deduplication: when the same
+    /// chunk surfaces from vector search and triplet search, RRF combines
+    /// their reciprocal ranks instead of double-counting.
     async fn hydrate_chunks_from_triplets(
         &self,
-        chunk_ids: &[String],
-        dense: &agent_rs_core::Embedding,
+        triplet_results: &[agent_rs_stores::types::SearchResult],
         limit: usize,
     ) -> Vec<agent_rs_stores::types::SearchResult> {
-        use std::collections::HashSet;
-        let unique_ids: HashSet<&String> = chunk_ids.iter().collect();
-        let mut hydrated = Vec::new();
+        use std::collections::{HashMap, HashSet};
 
-        for chunk_id in unique_ids {
-            let filter = serde_json::json!({
-                "key": "chunk_id",
-                "match": {"value": chunk_id}
-            });
-            match self
-                .vector_store
-                .search_with_filter(&self.collection, dense, 1, Some(filter))
-                .await
-            {
-                Ok(mut results) => {
-                    if let Some(chunk) = results.pop() {
-                        hydrated.push(chunk);
-                    }
-                }
-                Err(e) => {
-                    tracing::debug!(
-                        chunk_id = %chunk_id,
-                        error = %e,
-                        "failed to hydrate triplet chunk"
-                    );
-                }
+        let mut seen: HashSet<String> = HashSet::new();
+        let mut ordered: Vec<(String, agent_rs_core::Score)> = Vec::new();
+        for tr in triplet_results {
+            let Some(chunk_id) = tr.payload.get("chunk_id").and_then(|v| v.as_str()) else {
+                continue;
+            };
+            if seen.insert(chunk_id.to_owned()) {
+                ordered.push((chunk_id.to_owned(), tr.score));
             }
-            if hydrated.len() >= limit {
+            if ordered.len() >= limit {
                 break;
             }
         }
-        hydrated
+        if ordered.is_empty() {
+            return Vec::new();
+        }
+
+        let ids: Vec<String> = ordered.iter().map(|(id, _)| id.clone()).collect();
+        let payloads = match self.vector_store.get_by_ids(&self.collection, &ids).await {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    n_ids = ids.len(),
+                    "failed to rehydrate triplet-sourced chunks; dropping triplet contribution"
+                );
+                return Vec::new();
+            }
+        };
+        let payload_by_id: HashMap<String, serde_json::Value> =
+            payloads.into_iter().map(|p| (p.id, p.payload)).collect();
+
+        ordered
+            .into_iter()
+            .filter_map(|(id, score)| {
+                let payload = payload_by_id.get(&id)?.clone();
+                Some(agent_rs_stores::types::SearchResult { id, score, payload })
+            })
+            .collect()
     }
 
     /// Derive seed node IDs for graph traversal by running a quick vector search
@@ -458,9 +551,43 @@ impl RetrievalRouter {
             None
         };
 
-        // Run all three in parallel.
-        let (sub_queries_result, _entity_link, qdrant_filter_json) =
-            tokio::join!(rewrite_fut, entity_link_fut, metadata_filter_fut);
+        // Weighted-keyword extraction — soft-optional with branch-local
+        // timeout. Any failure / timeout collapses to empty so consumers
+        // observe byte-identical behaviour to the extractor-absent path.
+        let weighted_keyword_fut = async {
+            let Some(extractor) = self.weighted_keyword_extractor.as_ref() else {
+                return Arc::new(WeightedKeywords::empty());
+            };
+            let budget = self.weighted_keyword_branch_budget;
+            match tokio::time::timeout(budget, extractor.extract(query)).await {
+                Ok(Ok(kw)) => {
+                    tracing::debug!(
+                        terms = kw.terms.len(),
+                        "weighted keyword extraction complete"
+                    );
+                    Arc::new(kw)
+                }
+                Ok(Err(e)) => {
+                    tracing::warn!(error = %e, "weighted keyword extractor returned error; using empty");
+                    Arc::new(WeightedKeywords::empty())
+                }
+                Err(_) => {
+                    tracing::warn!(
+                        budget_ms = budget.as_millis() as u64,
+                        "weighted keyword branch exceeded budget; using empty"
+                    );
+                    Arc::new(WeightedKeywords::empty())
+                }
+            }
+        };
+
+        // Run all four in parallel.
+        let (sub_queries_result, _entity_link, qdrant_filter_json, weighted_keywords) = tokio::join!(
+            rewrite_fut,
+            entity_link_fut,
+            metadata_filter_fut,
+            weighted_keyword_fut,
+        );
         let sub_queries = sub_queries_result?;
 
         // ---- Step 3–4: Embed + dispatch per sub-query ----
@@ -470,12 +597,42 @@ impl RetrievalRouter {
         // RRF fusion in step 5.
         let mut all_result_lists: Vec<Vec<agent_rs_stores::types::SearchResult>> = Vec::new();
 
-        for query_str in &sub_queries {
-            // HyDE DISABLED — caused -48pp regression on semantic search.
-            // The hypothetical answer is too specific for Romanian legal text
-            // and mismatches with the actual chunk embeddings. Raw query
-            // embedding + Docling heading-prefixed chunks works better.
-            // TODO: re-enable selectively for Conceptual queries only.
+        // HyDE gate — default ON, opt-out via env.
+        //
+        // An earlier eval regressed when HyDE was globally enabled on top
+        // of plain vector search; the retrieval stack since grew HyDE into
+        // an *additional* signal rather than a replacement (the raw-query
+        // embedding is always retained, and cross-encoder reranking
+        // recovers when a hypothetical drifts). That restructuring
+        // justifies flipping the default to ON — the worst case is one
+        // extra embed + search round-trip when HyDE's hypothetical fails
+        // to inform the ranking, and the cross-encoder still sees the
+        // raw-query hits.
+        //
+        // Operators can disable HyDE at runtime with
+        // `AGENT_RS__RETRIEVAL__HYDE_DISABLED=1` — useful for A/B
+        // evaluation or when the configured HyDE model is unavailable.
+        let hyde_disabled = matches!(
+            std::env::var("AGENT_RS__RETRIEVAL__HYDE_DISABLED").as_deref(),
+            Ok("1") | Ok("true") | Ok("TRUE") | Ok("yes")
+        );
+        let mut hyde_texts: Vec<String> = Vec::new();
+        if !hyde_disabled && sub_queries.len() == 1 {
+            if let Some(rewriter) = self.query_rewriter.as_ref() {
+                let hypothetical = rewriter.hyde_rewrite(query).await;
+                // `hyde_rewrite` falls back to the input on any failure —
+                // skip the extra embed/search round-trip in that case.
+                if !hypothetical.is_empty() && hypothetical != query {
+                    tracing::debug!(
+                        hyde_len = hypothetical.len(),
+                        "HyDE expansion produced hypothetical document"
+                    );
+                    hyde_texts.push(hypothetical);
+                }
+            }
+        }
+
+        for query_str in sub_queries.iter().chain(hyde_texts.iter()) {
             let embed_text = query_str.to_string();
 
             // Always embed dense — every strategy needs at minimum a dense vector.
@@ -504,31 +661,25 @@ impl RetrievalRouter {
                         .await
                     {
                         Ok(triplet_results) => {
-                            let chunk_ids: Vec<String> = triplet_results
-                                .iter()
-                                .filter_map(|r| {
-                                    r.payload
-                                        .get("chunk_id")
-                                        .and_then(|v| v.as_str())
-                                        .map(String::from)
-                                })
-                                .collect();
-
-                            if !chunk_ids.is_empty() {
-                                let hydrated = self
-                                    .hydrate_chunks_from_triplets(&chunk_ids, &dense, limit)
-                                    .await;
-                                if !hydrated.is_empty() {
-                                    all_result_lists.push(hydrated);
-                                }
-                            }
-
+                            // Triplet payloads carry only (subject, predicate, object,
+                            // chunk_id, triplet_text) — they lack `chunk_text`,
+                            // `source`, `page_start`, `section_title` that the
+                            // downstream evidence pack expects. We rehydrate to
+                            // chunk-shaped hits before fusion so empty rows never
+                            // reach the user and RRF can dedup triplet-sourced
+                            // chunks against vector/keyword/graph hits by chunk_id.
+                            let hydrated = self
+                                .hydrate_chunks_from_triplets(&triplet_results, limit)
+                                .await;
                             tracing::debug!(
                                 strategy = %strategy,
-                                count = triplet_results.len(),
-                                "triplet search contributed to RRF fusion"
+                                triplet_count = triplet_results.len(),
+                                hydrated = hydrated.len(),
+                                "triplet search contributed rehydrated chunks to RRF fusion"
                             );
-                            all_result_lists.push(triplet_results);
+                            if !hydrated.is_empty() {
+                                all_result_lists.push(hydrated);
+                            }
                         }
                         Err(e) => {
                             tracing::warn!(
@@ -579,7 +730,42 @@ impl RetrievalRouter {
                 "cross-encoder reranking"
             );
             match reranker.rerank(primary_query, candidates, limit).await {
-                Ok(reranked) => {
+                Ok(mut reranked) => {
+                    // Weighted-keyword rerank adjustment (consumer #2).
+                    // Applied on the post-rerank list; empty keywords or
+                    // disabled integration → byte-identical no-op.
+                    if let Some(rerank_cfg) = self.weighted_keyword_integration.rerank.as_ref() {
+                        if !weighted_keywords.terms.is_empty() {
+                            let before_top = reranked.first().map(|d| d.score.value());
+                            for doc in reranked.iter_mut() {
+                                let text = doc
+                                    .payload
+                                    .get("chunk_text")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("");
+                                let adjusted = adjust_for_weighted_keywords(
+                                    doc.score.value() as f32,
+                                    text,
+                                    weighted_keywords.as_ref(),
+                                    rerank_cfg,
+                                );
+                                doc.score = agent_rs_core::Score::new(adjusted as f64);
+                            }
+                            reranked.sort_by(|a, b| {
+                                b.score
+                                    .value()
+                                    .partial_cmp(&a.score.value())
+                                    .unwrap_or(std::cmp::Ordering::Equal)
+                            });
+                            let after_top = reranked.first().map(|d| d.score.value());
+                            tracing::debug!(
+                                terms = weighted_keywords.terms.len(),
+                                before_top = ?before_top,
+                                after_top = ?after_top,
+                                "rerank adjusted by weighted keywords"
+                            );
+                        }
+                    }
                     evidence.documents = reranked;
                 }
                 Err(e) => {
@@ -598,6 +784,14 @@ impl RetrievalRouter {
                     evidence.documents.truncate(limit);
                 }
             }
+
+            // Recompute source_counts over the post-rerank set. The ranker
+            // computed them earlier against the pre-rerank RRF pool (size
+            // `RERANK_CANDIDATE_COUNT`), which overstated the count for
+            // callers that display the header. Refresh so the number
+            // matches `documents.len()`.
+            evidence.source_counts =
+                crate::ranker::build_source_counts_from_docs(&evidence.documents);
         }
 
         // ---- Step 7: Optional post-retrieval context expansion ----
@@ -767,6 +961,8 @@ impl RetrievalRouter {
                 let seeds = self.derive_seed_ids(query_str, dense, limit).await?;
                 let results = graph_search(
                     &*self.graph_store,
+                    &*self.vector_store,
+                    &self.collection,
                     query_str,
                     &seeds,
                     DEFAULT_GRAPH_DEPTH,
@@ -781,6 +977,8 @@ impl RetrievalRouter {
                 let seeds = self.derive_seed_ids(query_str, dense, limit).await?;
                 let results = graph_rag_context_search(
                     &*self.graph_store,
+                    &*self.vector_store,
+                    &self.collection,
                     query_str,
                     &seeds,
                     DEFAULT_GRAPH_DEPTH,
@@ -807,6 +1005,8 @@ impl RetrievalRouter {
                 let seeds = self.derive_seed_ids(query_str, dense, limit).await?;
                 let initial = graph_cot_search(
                     &*self.graph_store,
+                    &*self.vector_store,
+                    &self.collection,
                     query_str,
                     &seeds,
                     DEFAULT_GRAPH_DEPTH,
@@ -831,8 +1031,16 @@ impl RetrievalRouter {
                         let f_seeds = this
                             .derive_seed_ids(&follow_up, &f_dense, cot_limit)
                             .await?;
-                        graph_search(&*this.graph_store, &follow_up, &f_seeds, depth, cot_limit)
-                            .await
+                        graph_search(
+                            &*this.graph_store,
+                            &*this.vector_store,
+                            &this.collection,
+                            &follow_up,
+                            &f_seeds,
+                            depth,
+                            cot_limit,
+                        )
+                        .await
                     };
 
                     cot.retrieve(query_str, initial, retrieve_fn).await
@@ -907,6 +1115,8 @@ impl RetrievalRouter {
                         ),
                         graph_search(
                             &*self.graph_store,
+                            &*self.vector_store,
+                            &self.collection,
                             query_str,
                             &seeds,
                             DEFAULT_GRAPH_DEPTH,
@@ -952,6 +1162,8 @@ impl RetrievalRouter {
                     let (graph_result, vector_result) = tokio::join!(
                         graph_constrained_search(
                             &*self.graph_store,
+                            &*self.vector_store,
+                            &self.collection,
                             query_str,
                             &seeds,
                             DEFAULT_GRAPH_DEPTH,
@@ -972,6 +1184,8 @@ impl RetrievalRouter {
                     let (graph_result, vector_result) = tokio::join!(
                         graph_constrained_search(
                             &*self.graph_store,
+                            &*self.vector_store,
+                            &self.collection,
                             query_str,
                             &seeds,
                             DEFAULT_GRAPH_DEPTH,
@@ -1018,7 +1232,7 @@ fn filter_conditions_to_json(conditions: &[FilterCondition]) -> serde_json::Valu
             FilterCondition::Contains { field, text } => {
                 // Use Qdrant's full-text `match.text` (tokenized substring
                 // search within the field value) rather than exact `match.value`.
-                // "188" will match "Articolul 188 - Omorul" via token overlap.
+                // "15" will match "Section 15 - Overview" via token overlap.
                 serde_json::json!({
                     "key": field,
                     "match": { "text": text }

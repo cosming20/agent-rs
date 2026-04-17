@@ -24,6 +24,7 @@ pub mod error;
 pub mod graph_cot;
 pub mod http;
 pub mod ingestion;
+pub mod llm_determinism;
 pub mod metadata_filter;
 pub mod openai_embedder;
 pub mod proto;
@@ -33,6 +34,7 @@ pub mod reranker;
 pub mod router;
 pub mod search;
 pub mod strategy;
+pub mod weighted_keywords;
 
 pub use context_expander::{ContextChunk, ContextExpander, ContextExpanderConfig, ExpandedChunk};
 pub use embedder::{Embedder, FastEmbedder, FastEmbedderConfig, SparseVector};
@@ -54,3 +56,9 @@ pub use ranker::{EvidencePack, ResultRanker};
 pub use reranker::CrossEncoderReranker;
 pub use router::RetrievalRouter;
 pub use strategy::StrategyRegistry;
+pub use weighted_keywords::{
+    BM25WeightingConfig, EntityLinkerPrioritizationConfig, RerankAdjustmentConfig,
+    WeightedKeywordExtractor, WeightedKeywordExtractorConfig, WeightedKeywordIntegrationConfig,
+    WeightedKeywords, WeightedTerm, adjust_for_weighted_keywords, order_candidates_overlap_first,
+    weighted_bm25_query,
+};

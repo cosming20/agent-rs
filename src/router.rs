@@ -16,6 +16,10 @@ use agent_rs_retrieval::query_rewriter::{QueryRewriter, QueryRewriterConfig};
 use agent_rs_retrieval::ranker::ResultRanker;
 use agent_rs_retrieval::reranker::CrossEncoderReranker;
 use agent_rs_retrieval::router::RetrievalRouter;
+use agent_rs_retrieval::weighted_keywords::{
+    BM25WeightingConfig, EntityLinkerPrioritizationConfig, RerankAdjustmentConfig,
+    WeightedKeywordExtractor, WeightedKeywordExtractorConfig, WeightedKeywordIntegrationConfig,
+};
 use agent_rs_stores::traits::{GraphStore, VectorStore};
 use anyhow::{Context, Result};
 use tracing::{info, warn};
@@ -37,6 +41,11 @@ pub struct RouterFeatures {
     pub skip_entity_linker: bool,
     pub skip_reranking: bool,
     pub skip_graph_cot: bool,
+    /// Skip the entire weighted-keyword extractor. With this true the
+    /// router sees `None` for the extractor and all three consumer
+    /// integrations collapse to byte-identical no-ops. Used to capture
+    /// a feature-off baseline.
+    pub skip_weighted_keywords: bool,
 }
 
 impl RouterFeatures {
@@ -49,6 +58,7 @@ impl RouterFeatures {
             skip_entity_linker: false,
             skip_reranking: false,
             skip_graph_cot: false,
+            skip_weighted_keywords: false,
         }
     }
 
@@ -66,6 +76,7 @@ impl RouterFeatures {
             skip_entity_linker: skip("EVAL_SKIP_ENTITY_LINKER"),
             skip_reranking: skip("EVAL_SKIP_RERANKING"),
             skip_graph_cot: skip("EVAL_SKIP_GRAPH_COT"),
+            skip_weighted_keywords: skip("EVAL_SKIP_WEIGHTED_KEYWORDS"),
         }
     }
 }
@@ -147,10 +158,9 @@ pub async fn build_router(
                 max_sub_queries: 3,
                 temperature: 0.1,
             };
-            router = router.with_query_rewriter(Arc::new(QueryRewriter::new(
-                config,
-                Arc::clone(&http_client),
-            )));
+            let mut rewriter = QueryRewriter::new(config, Arc::clone(&http_client));
+            rewriter = rewriter.with_metrics(Arc::clone(&metrics));
+            router = router.with_query_rewriter(Arc::new(rewriter));
             info!(model = %model, "QueryRewriter enabled");
         }
     }
@@ -232,6 +242,41 @@ pub async fn build_router(
                     warn!(error = %e, "reranker init failed");
                 }
             }
+        }
+    }
+
+    // LLM-backed weighted-keyword extractor. Runs in parallel with the
+    // other pre-dispatch LLM calls; feeds the rerank adjustment (BM25
+    // rewrite and entity-linker candidate tiering wiring land in
+    // follow-up commits). Failures / branch-local timeouts collapse to
+    // empty, keeping the pipeline byte-identical to the extractor-absent
+    // path.
+    if !features.skip_weighted_keywords {
+        if let Some(key) = api_key() {
+            let model = std::env::var("WEIGHTED_KEYWORD_MODEL")
+                .unwrap_or_else(|_| "gpt-5.4-mini-2026-03-17".to_owned());
+            let mut wk_cfg = WeightedKeywordExtractorConfig::new(key);
+            wk_cfg.model = model.clone();
+            let extractor = Arc::new(
+                WeightedKeywordExtractor::new(wk_cfg, Arc::clone(&http_client))
+                    .with_metrics(Arc::clone(&metrics)),
+            );
+            // Default integration: all three consumers enabled. Today
+            // only rerank is wired at call-site (see crates/retrieval/
+            // src/router.rs); BM25 and entity_linker integrations land
+            // as follow-ups. The integration config stays complete so
+            // we don't need to touch this block when they land.
+            let integration = WeightedKeywordIntegrationConfig {
+                bm25: Some(BM25WeightingConfig::default()),
+                rerank: Some(RerankAdjustmentConfig::default()),
+                entity_linker: Some(EntityLinkerPrioritizationConfig::default()),
+            };
+            router = router
+                .with_weighted_keyword_extractor(extractor)
+                .with_weighted_keyword_integration(integration);
+            info!(model = %model, "WeightedKeywordExtractor enabled");
+        } else {
+            info!("no API key — WeightedKeywordExtractor disabled");
         }
     }
 

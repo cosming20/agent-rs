@@ -1,0 +1,47 @@
+# ============================================================
+# OTel Collector — Telemetry pipeline config
+# ============================================================
+# Receives OTLP traces and forwards to Jaeger.
+# WARNING: The exporter MUST target jaeger:4317 (Docker service
+# name), NEVER localhost:4317. Both Jaeger and the Collector
+# listen on container port 4317 — using localhost would create
+# an infinite loop.
+# ============================================================
+
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+      http:
+        endpoint: 0.0.0.0:4318
+
+processors:
+  batch:
+    timeout: 200ms
+    send_batch_size: 512
+
+exporters:
+  otlp/jaeger:
+    endpoint: jaeger:4317
+    tls:
+      insecure: true
+  prometheus:
+    endpoint: 0.0.0.0:8889
+    namespace: agentic_ra
+
+extensions:
+  health_check:
+    endpoint: 0.0.0.0:13133
+
+service:
+  extensions: [health_check]
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [batch]
+      exporters: [otlp/jaeger]
+    metrics:
+      receivers: [otlp]
+      processors: [batch]
+      exporters: [prometheus]
