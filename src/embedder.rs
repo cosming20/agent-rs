@@ -1,8 +1,10 @@
 //! Embedder initialization.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use agent_rs_retrieval::embedder::{Embedder, FastEmbedder, FastEmbedderConfig};
+use agent_rs_retrieval::http::build_http_client;
 use agent_rs_retrieval::openai_embedder::{OpenAIEmbedder, OpenAIEmbedderConfig};
 use anyhow::{Context, Result};
 use tracing::info;
@@ -32,7 +34,9 @@ pub async fn build_embedder() -> Result<(Arc<dyn Embedder + Send + Sync>, String
         let config = OpenAIEmbedderConfig::new(api_key)
             .with_model(model.clone())
             .with_dimensions(dims);
-        let dense = OpenAIEmbedder::new(config);
+        let http_client = build_http_client(Duration::from_secs(60))
+            .context("build HTTP client for OpenAIEmbedder")?;
+        let dense = OpenAIEmbedder::new(config, http_client);
         let label = format!("openai-{}-{}", model, dense.dimensions());
         Ok((Arc::new(dense) as Arc<dyn Embedder + Send + Sync>, label))
     } else {

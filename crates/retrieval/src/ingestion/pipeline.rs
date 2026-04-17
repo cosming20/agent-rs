@@ -1859,9 +1859,8 @@ struct ExtractedEntity {
 /// acronyms. Phase 2 will add LLM-based extraction.
 fn extract_entities_from_chunks(chunks: &[DocumentChunk]) -> Vec<Vec<ExtractedEntity>> {
     // Module-level lazy-compiled regexes (compiled once, reused across calls).
-    static CAP_PHRASE_RE: std::sync::LazyLock<Regex> = std::sync::LazyLock::new(|| {
-        Regex::new(r"\b([A-Z][a-z]+(?:\s+[A-Z][a-z]+)+)\b").unwrap()
-    });
+    static CAP_PHRASE_RE: std::sync::LazyLock<Regex> =
+        std::sync::LazyLock::new(|| Regex::new(r"\b([A-Z][a-z]+(?:\s+[A-Z][a-z]+)+)\b").unwrap());
     static ACRONYM_RE: std::sync::LazyLock<Regex> =
         std::sync::LazyLock::new(|| Regex::new(r"\b([A-Z]{2,}(?:\.[A-Z]+)*)\b").unwrap());
     let cap_phrase_re = &*CAP_PHRASE_RE;

@@ -6,8 +6,8 @@
 //! and accumulated evidence.
 
 use std::sync::Arc;
-use tokio::sync::Mutex;
 use std::time::Instant;
+use tokio::sync::Mutex;
 
 use agent_rs_core::errors::AgentError;
 use agent_rs_stores::types::SearchResult;
@@ -196,10 +196,7 @@ impl AgentRunner {
 ///
 /// Uses `tokio::sync::Mutex` which is safe to hold across `.await` points
 /// and cannot be poisoned (unlike `std::sync::Mutex`).
-async fn drain_evidence(
-    collector: &Arc<Mutex<Vec<SearchResult>>>,
-    target: &mut Vec<SearchResult>,
-) {
+async fn drain_evidence(collector: &Arc<Mutex<Vec<SearchResult>>>, target: &mut Vec<SearchResult>) {
     let mut collected = collector.lock().await;
     target.append(&mut collected);
 }

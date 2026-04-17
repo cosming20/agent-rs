@@ -80,7 +80,11 @@ pub struct SearchWebTool {
 
 impl SearchWebTool {
     /// Create a new `SearchWebTool` with the given budget tracker, config, and shared HTTP client.
-    pub fn new(budget: Arc<WebBudgetTracker>, config: BraveConfig, http_client: reqwest::Client) -> Self {
+    pub fn new(
+        budget: Arc<WebBudgetTracker>,
+        config: BraveConfig,
+        http_client: reqwest::Client,
+    ) -> Self {
         Self {
             budget: Some(budget),
             config: Some(config),
@@ -133,7 +137,8 @@ impl Tool for SearchWebTool {
             tracing::error!(query = %args.query, "Brave API key not configured; web search failed");
             return Err(ToolError::WebSearch(
                 "web search unavailable: BRAVE_API_KEY not configured. \
-                 Do not claim that a web search was performed.".into(),
+                 Do not claim that a web search was performed."
+                    .into(),
             ));
         }
 
@@ -229,7 +234,11 @@ pub struct SearchNewsTool {
 
 impl SearchNewsTool {
     /// Create a new `SearchNewsTool` with the given budget tracker, config, and shared HTTP client.
-    pub fn new(budget: Arc<WebBudgetTracker>, config: BraveConfig, http_client: reqwest::Client) -> Self {
+    pub fn new(
+        budget: Arc<WebBudgetTracker>,
+        config: BraveConfig,
+        http_client: reqwest::Client,
+    ) -> Self {
         Self {
             budget: Some(budget),
             config: Some(config),
@@ -280,7 +289,8 @@ impl Tool for SearchNewsTool {
             tracing::error!(query = %args.query, "Brave API key not configured; news search failed");
             return Err(ToolError::WebSearch(
                 "news search unavailable: BRAVE_API_KEY not configured. \
-                 Do not claim that a news search was performed.".into(),
+                 Do not claim that a news search was performed."
+                    .into(),
             ));
         }
 

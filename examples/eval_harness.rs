@@ -38,6 +38,7 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Instant;
 
 use anyhow::{Context, Result};
@@ -929,6 +930,7 @@ async fn main() -> Result<()> {
         &triplet_collection,
         &summaries_collection,
         &IngestFeatures::from_env(),
+        None, // metrics: eval harness does not instrument graph extraction
     )
     .await?;
 
@@ -980,6 +982,10 @@ async fn main() -> Result<()> {
         &triplet_collection,
         &summaries_collection,
         &RouterFeatures::from_env(),
+        // Eval harness does not use a live OTel provider, so no metrics are wired.
+        Arc::new(agent_rs_observability::metrics::RetrievalMetrics::new(
+            "eval",
+        )),
     )
     .await?;
 

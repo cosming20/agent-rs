@@ -65,6 +65,7 @@
 
 use std::collections::HashSet;
 use std::future::Future;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use agent_rs_stores::types::SearchResult;
@@ -312,7 +313,7 @@ pub struct IterationLog {
 /// Wraps a reqwest client and the configured LLM credentials. Cheap to clone.
 #[derive(Clone)]
 pub struct GraphCotRetriever {
-    client: reqwest::Client,
+    client: Arc<reqwest::Client>,
     config: GraphCotConfig,
 }
 
@@ -334,19 +335,16 @@ impl GraphCotRetriever {
     ///
     /// Returns [`RetrievalError::Embedding`] if the underlying reqwest client
     /// cannot be built (extremely unlikely in practice).
-    pub fn new(config: GraphCotConfig) -> Result<Self, RetrievalError> {
+    pub fn new(
+        config: GraphCotConfig,
+        client: Arc<reqwest::Client>,
+    ) -> Result<Self, RetrievalError> {
         if config.llm_api_key.is_empty() {
             return Err(RetrievalError::Routing {
                 strategy: "GraphCoT".to_owned(),
                 reason: "llm_api_key is empty".to_owned(),
             });
         }
-        let client = reqwest::Client::builder()
-            .timeout(HTTP_TIMEOUT)
-            .build()
-            .map_err(|e| RetrievalError::Embedding {
-                reason: format!("failed to build reqwest client: {e}"),
-            })?;
 
         tracing::info!(
             model = %config.llm_model,
@@ -360,13 +358,18 @@ impl GraphCotRetriever {
 
     /// Convenience constructor from `OPENAI_API_KEY` / `LLM_API_KEY` env vars.
     ///
+    /// Builds a shared HTTP client with a 20-second request timeout.
     /// Returns `None` if no API key is set.
     #[must_use]
     pub fn try_from_env() -> Option<Result<Self, RetrievalError>> {
+        use crate::http::build_http_client;
         std::env::var("OPENAI_API_KEY")
             .or_else(|_| std::env::var("LLM_API_KEY"))
             .ok()
-            .map(|k| Self::new(GraphCotConfig::new(k)))
+            .map(|k| {
+                let client = build_http_client(HTTP_TIMEOUT)?;
+                Self::new(GraphCotConfig::new(k), client)
+            })
     }
 
     /// Evaluate whether the retrieved evidence is sufficient to answer the query.

@@ -143,7 +143,10 @@ impl Score {
         if value.is_finite() {
             Self(value)
         } else {
-            tracing::warn!(raw = value, "Score::new received non-finite value, coercing to 0.0");
+            tracing::warn!(
+                raw = value,
+                "Score::new received non-finite value, coercing to 0.0"
+            );
             Self(0.0)
         }
     }

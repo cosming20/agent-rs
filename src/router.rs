@@ -1,20 +1,23 @@
 //! Retrieval router assembly with all cognitive features.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use agent_rs_core::config::Settings;
 use agent_rs_core::types::CollectionName;
+use agent_rs_observability::metrics::RetrievalMetrics;
 use agent_rs_retrieval::context_expander::{ContextExpander, ContextExpanderConfig};
 use agent_rs_retrieval::embedder::Embedder;
 use agent_rs_retrieval::entity_linker::{EntityLinker, EntityLinkerConfig};
 use agent_rs_retrieval::graph_cot::{GraphCotConfig, GraphCotRetriever};
+use agent_rs_retrieval::http::build_http_client;
 use agent_rs_retrieval::metadata_filter::{MetadataFilterConfig, MetadataFilterExtractor};
 use agent_rs_retrieval::query_rewriter::{QueryRewriter, QueryRewriterConfig};
 use agent_rs_retrieval::ranker::ResultRanker;
 use agent_rs_retrieval::reranker::CrossEncoderReranker;
 use agent_rs_retrieval::router::RetrievalRouter;
 use agent_rs_stores::traits::{GraphStore, VectorStore};
-use anyhow::Result;
+use anyhow::{Context, Result};
 use tracing::{info, warn};
 
 use crate::stores::Stores;
@@ -83,6 +86,9 @@ fn api_key() -> Option<String> {
 /// Features (query rewriting, metadata filtering, context expansion,
 /// entity linking, reranking, GraphCoT) are each gated by the
 /// corresponding flag in `features` AND by the presence of an API key.
+// All arguments are mandatory wiring inputs; a config struct would add
+// indirection without clarity gains at these call sites.
+#[allow(clippy::too_many_arguments)]
 pub async fn build_router(
     settings: &Settings,
     stores: &Stores,
@@ -91,7 +97,13 @@ pub async fn build_router(
     triplet_collection: &CollectionName,
     summaries_collection: &CollectionName,
     features: &RouterFeatures,
+    metrics: Arc<RetrievalMetrics>,
 ) -> Result<Arc<RetrievalRouter>> {
+    // Build one shared HTTP client for all LLM-calling components.
+    // 60-second request timeout; connection timeout is 10 s (set in build_http_client).
+    let http_client = build_http_client(Duration::from_secs(60))
+        .context("build shared HTTP client for router")?;
+
     let ranker = ResultRanker::new(settings.ranker.rrf_k);
 
     let mut router = RetrievalRouter::new(
@@ -110,7 +122,7 @@ pub async fn build_router(
             let model =
                 std::env::var("LLM_MODEL").unwrap_or_else(|_| "gpt-5.4-mini-2026-03-17".to_owned());
             let config = GraphCotConfig::new(key).with_model(model);
-            match GraphCotRetriever::new(config) {
+            match GraphCotRetriever::new(config, Arc::clone(&http_client)) {
                 Ok(cot) => {
                     router = router.with_graph_cot_retriever(Arc::new(cot));
                     info!("GraphCoT retriever enabled");
@@ -135,7 +147,10 @@ pub async fn build_router(
                 max_sub_queries: 3,
                 temperature: 0.1,
             };
-            router = router.with_query_rewriter(Arc::new(QueryRewriter::new(config)));
+            router = router.with_query_rewriter(Arc::new(QueryRewriter::new(
+                config,
+                Arc::clone(&http_client),
+            )));
             info!(model = %model, "QueryRewriter enabled");
         }
     }
@@ -150,7 +165,7 @@ pub async fn build_router(
                 model: model.clone(),
                 temperature: 0.0,
             };
-            match MetadataFilterExtractor::new(config) {
+            match MetadataFilterExtractor::new(config, Arc::clone(&http_client)) {
                 Ok(extractor) => {
                     router = router.with_metadata_filter(Arc::new(extractor));
                     info!(model = %model, "MetadataFilterExtractor enabled");
@@ -183,6 +198,7 @@ pub async fn build_router(
             let linker = Arc::new(EntityLinker::new(
                 stores.neo4j.clone() as Arc<dyn GraphStore + Send + Sync>,
                 config,
+                Arc::clone(&http_client),
             ));
             router = router.with_entity_linker(linker);
             info!("EntityLinker enabled");
@@ -203,6 +219,9 @@ pub async fn build_router(
             }
         }
     }
+
+    // Wire shared metric instruments for reranker-fallback events.
+    router = router.with_metrics(metrics);
 
     Ok(Arc::new(router))
 }

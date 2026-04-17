@@ -86,9 +86,8 @@ impl ContextBuilder {
             }
             Err(err) => {
                 warn!(error = %err, "failed to load long-term memories, continuing without");
-                ctx.conversation_context.push_str(
-                    "\n[System: Long-term memory unavailable for this query.]",
-                );
+                ctx.conversation_context
+                    .push_str("\n[System: Long-term memory unavailable for this query.]");
             }
         }
 

@@ -109,10 +109,7 @@ impl std::fmt::Debug for CrossEncoderReranker {
         f.debug_struct("CrossEncoderReranker")
             .field("model", &self.model)
             .field("api_key", &"***")
-            .field(
-                "available_permits",
-                &self.semaphore.available_permits(),
-            )
+            .field("available_permits", &self.semaphore.available_permits())
             .finish()
     }
 }
@@ -206,9 +203,9 @@ impl CrossEncoderReranker {
         // preserves original order for the skipped set, which is appended at
         // the end of the output if room remains after the reranked batch.
         let (candidates, skipped): (Vec<(usize, SearchResult, String)>, Vec<SearchResult>) =
-            documents.into_iter().fold(
-                (Vec::new(), Vec::new()),
-                |(mut kept, mut skipped), doc| {
+            documents
+                .into_iter()
+                .fold((Vec::new(), Vec::new()), |(mut kept, mut skipped), doc| {
                     let text = doc
                         .payload
                         .get(CHUNK_TEXT_KEY)
@@ -221,8 +218,7 @@ impl CrossEncoderReranker {
                         kept.push((kept.len(), doc, text));
                     }
                     (kept, skipped)
-                },
-            );
+                });
 
         if candidates.is_empty() {
             tracing::warn!(
@@ -258,14 +254,11 @@ impl CrossEncoderReranker {
 
         // Bound total rerank concurrency. Held for the duration of the retry
         // loop to ensure a single query never occupies more than one permit.
-        let _permit =
-            self.semaphore
-                .clone()
-                .acquire_owned()
-                .await
-                .map_err(|e| RetrievalError::Embedding {
-                    reason: format!("rerank semaphore closed: {e}"),
-                })?;
+        let _permit = self.semaphore.clone().acquire_owned().await.map_err(|e| {
+            RetrievalError::Embedding {
+                reason: format!("rerank semaphore closed: {e}"),
+            }
+        })?;
 
         let started = Instant::now();
         let rerank_response = {
@@ -338,8 +331,10 @@ impl CrossEncoderReranker {
 
         // Map Jina's returned indices back onto the original SearchResult objects.
         let n = candidates.len();
-        let mut doc_slots: Vec<Option<SearchResult>> =
-            candidates.into_iter().map(|(_, doc, _)| Some(doc)).collect();
+        let mut doc_slots: Vec<Option<SearchResult>> = candidates
+            .into_iter()
+            .map(|(_, doc, _)| Some(doc))
+            .collect();
 
         let mut reranked: Vec<SearchResult> = Vec::with_capacity(top_k);
         let mut dropped_oor = 0usize;

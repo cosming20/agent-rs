@@ -441,7 +441,7 @@ struct LlmSubQuery {
 /// or by cloning.
 #[derive(Clone)]
 pub struct QueryRewriter {
-    client: reqwest::Client,
+    client: Arc<reqwest::Client>,
     api_key: Arc<String>,
     model: Arc<String>,
     max_sub_queries: usize,
@@ -466,14 +466,9 @@ impl QueryRewriter {
     ///
     /// The `max_sub_queries` value is clamped to `1..=3` and `temperature` is
     /// clamped to `0.0..=1.0` to prevent misconfiguration.
-    pub fn new(config: QueryRewriterConfig) -> Self {
+    pub fn new(config: QueryRewriterConfig, client: Arc<reqwest::Client>) -> Self {
         let max_sub_queries = config.max_sub_queries.clamp(1, MAX_SUB_QUERIES_HARD_LIMIT);
         let temperature = config.temperature.clamp(0.0_f32, 1.0_f32);
-
-        let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(60))
-            .build()
-            .unwrap_or_else(|_| reqwest::Client::new());
 
         tracing::info!(
             model = %config.model,
