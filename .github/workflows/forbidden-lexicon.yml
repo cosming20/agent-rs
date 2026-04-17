@@ -1,0 +1,32 @@
+name: forbidden-lexicon
+
+on:
+  pull_request:
+    paths:
+      - 'crates/**'
+
+jobs:
+  grep:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Grep forbidden lexicon
+        run: |
+          set -e
+          # Allowlisted file: character-set support, not domain bias.
+          ALLOWLIST='crates/retrieval/src/ingestion/metadata.rs'
+          PATTERN='penal|criminal|romanian|codul|articolul|pedepsit|Cod Penal'
+          # -iE = case-insensitive extended regex; -r recursive; exclude allowlist.
+          MATCHES=$(grep -IrnEi \
+            --include='*.rs' \
+            --include='*.md' \
+            "$PATTERN" \
+            crates/ | grep -v "^$ALLOWLIST" || true)
+          if [ -n "$MATCHES" ]; then
+            echo "Forbidden lexicon matches found (outside allowlist):"
+            echo "$MATCHES"
+            echo ""
+            echo "Remove domain-biased content or extend allowlist with justification."
+            exit 1
+          fi
+          echo "No forbidden lexicon matches."
