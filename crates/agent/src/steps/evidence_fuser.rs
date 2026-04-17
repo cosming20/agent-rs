@@ -3,6 +3,9 @@
 //! Produces a single ranked, deduplicated [`EvidencePack`] from
 //! heterogeneous evidence sources.
 
+use std::sync::Arc;
+
+use agent_rs_observability::metrics::RetrievalMetrics;
 use agent_rs_retrieval::ResultRanker;
 use tracing::{info, instrument, warn};
 
@@ -11,12 +14,13 @@ use crate::context::QueryContext;
 /// Fuses knowledge-base and web evidence into a single ranked evidence pack.
 pub struct EvidenceFuser {
     ranker: ResultRanker,
+    metrics: Arc<RetrievalMetrics>,
 }
 
 impl EvidenceFuser {
-    /// Create a new EvidenceFuser with the given ranker.
-    pub fn new(ranker: ResultRanker) -> Self {
-        Self { ranker }
+    /// Create a new EvidenceFuser with the given ranker and metrics handle.
+    pub fn new(ranker: ResultRanker, metrics: Arc<RetrievalMetrics>) -> Self {
+        Self { ranker, metrics }
     }
 
     /// Fuse KB + web evidence and populate `ctx.evidence` / `ctx.fused_pack`.
@@ -53,6 +57,7 @@ impl EvidenceFuser {
                 event = "zero_evidence",
                 "ZERO EVIDENCE after retrieval — synthesis will return 'I don't know'"
             );
+            self.metrics.record_zero_evidence(ctx.strategy);
         } else {
             info!(
                 kb = ctx.kb_evidence.len(),

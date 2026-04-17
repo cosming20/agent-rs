@@ -22,6 +22,7 @@ pub mod embedder;
 pub mod entity_linker;
 pub mod error;
 pub mod graph_cot;
+pub mod http;
 pub mod ingestion;
 pub mod metadata_filter;
 pub mod openai_embedder;

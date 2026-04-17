@@ -9,6 +9,7 @@ use std::sync::Arc;
 use agent_rs_core::config::Settings;
 use agent_rs_core::errors::AgentError;
 use agent_rs_core::types::{MessageRole, RetrievalStrategy, SessionId, UserId};
+use agent_rs_observability::metrics::RetrievalMetrics;
 use agent_rs_retrieval::{ResultRanker, RetrievalRouter};
 use agent_rs_stores::traits::StateStore;
 use tracing::{info, instrument};
@@ -51,6 +52,7 @@ impl AgentOrchestrator {
     /// - `settings` -- application configuration.
     /// - `store` -- shared state store (Postgres) for history, memory, runs.
     /// - `router` -- shared retrieval router for knowledge search.
+    /// - `metrics` -- shared metric instruments for the retrieval pipeline.
     ///
     /// # Errors
     ///
@@ -59,6 +61,7 @@ impl AgentOrchestrator {
         settings: &Settings,
         store: Arc<dyn StateStore>,
         router: Arc<RetrievalRouter>,
+        metrics: Arc<RetrievalMetrics>,
     ) -> Result<Self, AgentError> {
         // Shared memory manager over the state store.
         let memory = Arc::new(MemoryManager::new(Arc::clone(&store)));
@@ -86,7 +89,7 @@ impl AgentOrchestrator {
 
         // Step 3: Evidence fuser
         let ranker = ResultRanker::new(settings.ranker.rrf_k);
-        let evidence_fuser = EvidenceFuser::new(ranker);
+        let evidence_fuser = EvidenceFuser::new(ranker, Arc::clone(&metrics));
 
         // Step 4: Grounding gate
         let verifier = Arc::new(GroundingVerifier::new(
@@ -94,11 +97,12 @@ impl AgentOrchestrator {
             &settings.llm.api_key,
             &settings.llm.model,
         ));
-        let grounding_gate = GroundingGate::new(verifier, settings.agent.max_retries);
+        let grounding_gate =
+            GroundingGate::new(verifier, settings.agent.max_retries, Arc::clone(&metrics));
 
         // Step 5: Result persister
         let synthesizer = ResponseSynthesizer::new(settings.synthesis.max_snippet_length);
-        let result_persister = ResultPersister::new(synthesizer, memory, store);
+        let result_persister = ResultPersister::new(synthesizer, memory, store, metrics);
 
         Ok(Self {
             context_builder,

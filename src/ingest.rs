@@ -5,7 +5,9 @@ use std::time::Duration;
 
 use agent_rs_core::config::{IngestBackend, Settings};
 use agent_rs_core::types::CollectionName;
+use agent_rs_observability::metrics::RetrievalMetrics;
 use agent_rs_retrieval::embedder::Embedder;
+use agent_rs_retrieval::http::build_http_client;
 use agent_rs_retrieval::ingestion::docling_client::DoclingSidecarClient;
 use agent_rs_retrieval::ingestion::{
     ChunkSummarizer, ChunkerConfig, IngestionPipeline, IngestionPipelineConfig, LlmGraphExtractor,
@@ -62,6 +64,9 @@ fn api_key() -> Option<String> {
 
 /// Build a fully-wired [`IngestionPipeline`] with Docling sidecar, KG
 /// extraction, summarization, and Postgres state machine.
+// All arguments are mandatory wiring inputs; a config struct would add
+// indirection without clarity gains at these call sites.
+#[allow(clippy::too_many_arguments)]
 pub async fn build_ingestion_pipeline(
     settings: &Settings,
     stores: &Stores,
@@ -70,7 +75,13 @@ pub async fn build_ingestion_pipeline(
     triplet_collection: &CollectionName,
     summaries_collection: &CollectionName,
     features: &IngestFeatures,
+    metrics: Option<Arc<RetrievalMetrics>>,
 ) -> Result<IngestionPipeline> {
+    // Build one shared HTTP client for all LLM-calling ingestion components.
+    // 120-second request timeout to accommodate slow graph extraction on large chunks.
+    let http_client = build_http_client(Duration::from_secs(120))
+        .context("build shared HTTP client for ingestion pipeline")?;
+
     let mut config = IngestionPipelineConfig::new(ChunkerConfig::default());
 
     // LLM KG extraction.
@@ -80,7 +91,11 @@ pub async fn build_ingestion_pipeline(
                 .or_else(|_| std::env::var("LLM_MODEL"))
                 .unwrap_or_else(|_| "gpt-5.4-mini-2026-03-17".to_owned());
             info!(model = %model, "LLM graph extractor enabled");
-            config = config.with_llm_extractor(Arc::new(LlmGraphExtractor::new(key, model)));
+            let mut extractor = LlmGraphExtractor::new(key, model, Arc::clone(&http_client));
+            if let Some(m) = metrics.clone() {
+                extractor = extractor.with_metrics(m);
+            }
+            config = config.with_llm_extractor(Arc::new(extractor));
         } else {
             info!("no API key — heuristic entity extraction");
         }
@@ -96,7 +111,11 @@ pub async fn build_ingestion_pipeline(
                 .unwrap_or_else(|_| "gpt-5.4-mini-2026-03-17".to_owned());
             info!(model = %model, "ChunkSummarizer enabled");
             config = config
-                .with_summarizer(Arc::new(ChunkSummarizer::new(key, model)))
+                .with_summarizer(Arc::new(ChunkSummarizer::new(
+                    key,
+                    model,
+                    Arc::clone(&http_client),
+                )))
                 .with_summaries_collection(summaries_collection.clone());
         }
     } else {

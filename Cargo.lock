@@ -46,6 +46,7 @@ name = "agent-rs-agent"
 version = "0.1.0"
 dependencies = [
  "agent-rs-core",
+ "agent-rs-observability",
  "agent-rs-retrieval",
  "agent-rs-stores",
  "agent-rs-tools",
@@ -100,6 +101,7 @@ name = "agent-rs-retrieval"
 version = "0.1.0"
 dependencies = [
  "agent-rs-core",
+ "agent-rs-observability",
  "agent-rs-stores",
  "async-trait",
  "backon",

@@ -33,12 +33,39 @@ fn is_internal_ip(addr: &IpAddr) -> bool {
                 || ip.octets()[0] == 100 && (ip.octets()[1] & 0xC0) == 64 // 100.64.0.0/10 (CGNAT)
         }
         IpAddr::V6(ip) => {
+            // Fix 1a: IPv4-mapped IPv6 (::ffff:0:0/96). An attacker can bypass v4
+            // SSRF checks by encoding a private IPv4 address as an IPv6 mapped
+            // address (e.g. ::ffff:169.254.169.254 → AWS metadata endpoint).
+            // Re-check the embedded v4 address using the full v4 ruleset.
+            if let Some(v4) = ip.to_ipv4_mapped() {
+                return is_internal_ip(&IpAddr::V4(v4));
+            }
+
             ip.is_loopback()        // ::1
                 || ip.is_unspecified() // ::
-                // Unique local addresses (fc00::/7)
+                // Unique local addresses (fc00::/7) — RFC 4193 private ranges
                 || (ip.segments()[0] & 0xfe00) == 0xfc00
-                // Link-local (fe80::/10)
+                // Fix 1b: Link-local (fe80::/10) — already present but documented explicitly.
+                // Covers link-local unicast; hosts on the same link, not routable.
                 || (ip.segments()[0] & 0xffc0) == 0xfe80
+                // Fix 1c: Multicast (ff00::/8) — RFC 4291 §2.7.
+                // Multicast addresses should never be the target of a fetch.
+                || (ip.segments()[0] & 0xff00) == 0xff00
+                // Fix 1d: Discard-only (100::/64) — RFC 6666.
+                // Traffic to this range is intentionally discarded; never a valid destination.
+                || (ip.segments()[0] == 0x0100
+                    && ip.segments()[1] == 0x0000
+                    && ip.segments()[2] == 0x0000
+                    && ip.segments()[3] == 0x0000)
+                // Fix 1e: Documentation ranges:
+                //   2001:db8::/32 — RFC 3849, reserved for docs/examples.
+                //   2001:0002::/48 — RFC 5180, benchmarking (BMWG).
+                // Neither should be reachable in production; block to prevent
+                // accidental exfiltration to reserved space.
+                || (ip.segments()[0] == 0x2001 && ip.segments()[1] == 0x0db8)
+                || (ip.segments()[0] == 0x2001
+                    && ip.segments()[1] == 0x0002
+                    && ip.segments()[2] == 0x0000)
         }
     }
 }
@@ -198,10 +225,81 @@ impl Tool for FetchUrlTool {
 
         tracing::info!(url = %args.url, pinned_ip = %validated.addr.ip(), "fetching URL content");
 
+        // Fix 2: Custom redirect policy that re-validates each redirect target.
+        //
+        // reqwest::Client::builder().resolve() pins DNS only for the *initial*
+        // hostname. On a 30x redirect to a *different* hostname reqwest
+        // re-resolves via the system resolver, which opens a DNS-rebinding
+        // window. We close that window with a custom policy that:
+        //   1. Rejects non-http(s) schemes (blocks file://, gopher://, etc.)
+        //   2. Runs full SSRF validation (scheme + resolved IPs) on the
+        //      redirect target before following it.
+        //   3. Enforces the configured max_redirects cap.
+        let max_redirects = config.max_redirects;
+        let redirect_policy = reqwest::redirect::Policy::custom(move |attempt| {
+            // Enforce the redirect cap first.
+            if attempt.previous().len() >= max_redirects {
+                return attempt.stop();
+            }
+
+            let location = attempt.url();
+
+            // Only permit http/https on redirects; block file://, gopher://, etc.
+            match location.scheme() {
+                "http" | "https" => {}
+                scheme => {
+                    tracing::warn!(
+                        redirect_url = %location,
+                        scheme = %scheme,
+                        "SSRF blocked: redirect to non-http(s) scheme"
+                    );
+                    return attempt.stop();
+                }
+            }
+
+            // Validate the redirect target's host against internal IP ranges.
+            // We cannot do async DNS resolution inside this sync closure, so we
+            // use the synchronous std resolver as a best-effort check. The async
+            // validate_url_ssrf path (pre-request) remains the primary guard.
+            let host = match location.host_str() {
+                Some(h) => h.to_string(),
+                None => {
+                    tracing::warn!(redirect_url = %location, "SSRF blocked: redirect URL has no host");
+                    return attempt.stop();
+                }
+            };
+            let port = location.port_or_known_default().unwrap_or(443);
+            let addr_str = format!("{host}:{port}");
+
+            match std::net::ToSocketAddrs::to_socket_addrs(&addr_str.as_str()) {
+                Ok(addrs) => {
+                    for socket_addr in addrs {
+                        if is_internal_ip(&socket_addr.ip()) {
+                            tracing::warn!(
+                                redirect_url = %location,
+                                resolved_ip = %socket_addr.ip(),
+                                "SSRF blocked: redirect resolves to internal IP"
+                            );
+                            return attempt.stop();
+                        }
+                    }
+                    attempt.follow()
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        redirect_url = %location,
+                        error = %e,
+                        "SSRF blocked: redirect DNS resolution failed"
+                    );
+                    attempt.stop()
+                }
+            }
+        });
+
         // Build per-request client with DNS pinning to eliminate rebinding TOCTOU.
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(config.timeout))
-            .redirect(reqwest::redirect::Policy::limited(config.max_redirects))
+            .redirect(redirect_policy)
             .resolve(&validated.host, validated.addr)
             .build()
             .map_err(|e| ToolError::FetchFailed {
@@ -227,9 +325,14 @@ impl Tool for FetchUrlTool {
             });
         }
 
-        // Early reject when Content-Length header exceeds the budget.
+        // Fix 3: Early reject when Content-Length header exceeds the budget.
+        //
+        // Previously compared as `content_length as usize > config.max_bytes`.
+        // On 32-bit targets, casting a u64 ≥ 2³² to usize wraps to a small
+        // value (e.g. 2³²+1 → 1), silently bypassing this gate. Compare
+        // entirely in u64 to avoid any truncation on any target width.
         if let Some(content_length) = response.content_length() {
-            if content_length as usize > config.max_bytes {
+            if content_length > config.max_bytes as u64 {
                 return Err(ToolError::FetchFailed {
                     url: args.url,
                     reason: format!(

@@ -26,6 +26,8 @@
 //! HTTP 429 responses are retried with exponential backoff via the `backon`
 //! crate. Other transient errors (5xx) are also retried.
 
+use std::sync::Arc;
+
 use async_trait::async_trait;
 use backon::{ExponentialBuilder, Retryable};
 use reqwest::StatusCode;
@@ -170,7 +172,7 @@ impl OpenAIEmbedderConfig {
 /// and all fields are owned, immutable data.
 #[derive(Clone)]
 pub struct OpenAIEmbedder {
-    client: reqwest::Client,
+    client: Arc<reqwest::Client>,
     api_key: String,
     model: String,
     dims: usize,
@@ -191,8 +193,7 @@ impl OpenAIEmbedder {
     ///
     /// No network call is made during construction. The first embedding
     /// request will validate the API key.
-    pub fn new(config: OpenAIEmbedderConfig) -> Self {
-        let client = reqwest::Client::new();
+    pub fn new(config: OpenAIEmbedderConfig, client: Arc<reqwest::Client>) -> Self {
         tracing::info!(
             model = %config.model,
             dims = config.dimensions,

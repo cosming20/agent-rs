@@ -90,9 +90,8 @@ impl GraphStore for Neo4jStore {
         }
 
         for (label, rows) in &by_label {
-            let cypher = format!(
-                "UNWIND $rows AS row MERGE (n:{label} {{id: row.id}}) SET n += row.props"
-            );
+            let cypher =
+                format!("UNWIND $rows AS row MERGE (n:{label} {{id: row.id}}) SET n += row.props");
             let batch_val = serde_json::Value::Array(rows.clone());
             let bolt = neo4rs::BoltType::try_from(batch_val)
                 .map_err(|e| StoreError::Serialization(format!("node batch for {label}: {e}")))?;
@@ -102,7 +101,11 @@ impl GraphStore for Neo4jStore {
                 .map_err(StoreError::from)?;
         }
 
-        tracing::debug!(labels = by_label.len(), total = nodes.len(), "batch upserted nodes");
+        tracing::debug!(
+            labels = by_label.len(),
+            total = nodes.len(),
+            "batch upserted nodes"
+        );
         Ok(())
     }
 
@@ -138,7 +141,10 @@ impl GraphStore for Neo4jStore {
                 "dst": edge.target_id,
                 "props": edge.properties,
             });
-            by_rel.entry(edge.relation_type.as_str()).or_default().push(row);
+            by_rel
+                .entry(edge.relation_type.as_str())
+                .or_default()
+                .push(row);
         }
 
         for (rel_type, rows) in &by_rel {
@@ -148,15 +154,20 @@ impl GraphStore for Neo4jStore {
                  MERGE (a)-[r:{rel_type}]->(b) SET r += row.props"
             );
             let batch_val = serde_json::Value::Array(rows.clone());
-            let bolt = neo4rs::BoltType::try_from(batch_val)
-                .map_err(|e| StoreError::Serialization(format!("edge batch for {rel_type}: {e}")))?;
+            let bolt = neo4rs::BoltType::try_from(batch_val).map_err(|e| {
+                StoreError::Serialization(format!("edge batch for {rel_type}: {e}"))
+            })?;
             self.graph
                 .run(neo4rs::query(&cypher).param("rows", bolt))
                 .await
                 .map_err(StoreError::from)?;
         }
 
-        tracing::debug!(rel_types = by_rel.len(), total = edges.len(), "batch upserted edges");
+        tracing::debug!(
+            rel_types = by_rel.len(),
+            total = edges.len(),
+            "batch upserted edges"
+        );
         Ok(())
     }
 

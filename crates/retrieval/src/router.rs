@@ -26,6 +26,7 @@
 use std::sync::Arc;
 
 use agent_rs_core::{CollectionName, Embedding, RetrievalStrategy};
+use agent_rs_observability::metrics::RetrievalMetrics;
 use tracing::instrument;
 
 use crate::{
@@ -137,6 +138,12 @@ pub struct RetrievalRouter {
     /// [`EntityLinker::link`] to check if query entities exist in Neo4j.
     /// If linked entities are found, graph-based strategies are preferred.
     entity_linker: Option<Arc<EntityLinker>>,
+
+    /// Optional shared metric instruments.
+    ///
+    /// When `Some`, the router emits metrics for reranker fallback events.
+    /// Passed from the top-level startup wiring via [`with_metrics`].
+    metrics: Option<Arc<RetrievalMetrics>>,
 }
 
 impl RetrievalRouter {
@@ -171,6 +178,7 @@ impl RetrievalRouter {
             metadata_filter: None,
             context_expander: None,
             entity_linker: None,
+            metrics: None,
         }
     }
 
@@ -208,6 +216,17 @@ impl RetrievalRouter {
     /// Returns the router by value to support builder-style construction.
     pub fn with_reranker(mut self, reranker: Arc<CrossEncoderReranker>) -> Self {
         self.reranker = Some(reranker);
+        self
+    }
+
+    /// Attach shared metric instruments for operational observability.
+    ///
+    /// When set, the router emits metrics for reranker fallback events.
+    /// Typically called once at startup with the globally shared [`RetrievalMetrics`].
+    ///
+    /// Returns the router by value to support builder-style construction.
+    pub fn with_metrics(mut self, metrics: Arc<RetrievalMetrics>) -> Self {
+        self.metrics = Some(metrics);
         self
     }
 
@@ -573,6 +592,9 @@ impl RetrievalRouter {
                         error = %e,
                         "cross-encoder reranking failed; falling back to RRF-ranked results"
                     );
+                    if let Some(m) = &self.metrics {
+                        m.record_reranker_fallback(strategy);
+                    }
                     evidence.documents.truncate(limit);
                 }
             }

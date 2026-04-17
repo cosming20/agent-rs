@@ -15,8 +15,9 @@ default = ["legacy_pdf_extract"]
 legacy_pdf_extract = ["dep:pdf-extract"]
 
 [dependencies]
-agent-rs-core   = { workspace = true }
-agent-rs-stores = { workspace = true }
+agent-rs-core          = { workspace = true }
+agent-rs-stores        = { workspace = true }
+agent-rs-observability = { workspace = true }
 
 # Embeddings (ONNX local inference)
 fastembed = "5"

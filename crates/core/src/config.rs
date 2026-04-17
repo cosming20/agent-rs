@@ -312,6 +312,32 @@ pub struct ServerConfig {
     pub host: String,
     /// Port the gRPC server listens on (default: 1059).
     pub port: u16,
+    /// Maximum number of results a caller may request in a single query.
+    ///
+    /// Any `limit` field in [`QueryRequest`] is clamped to this value before
+    /// being forwarded to the retrieval engine.
+    ///
+    /// Override via `AGENT_RS__SERVER__MAX_LIMIT_PER_QUERY`.
+    pub max_limit_per_query: usize,
+    /// Wall-clock timeout applied to every gRPC request (seconds).
+    ///
+    /// Requests that exceed this deadline are cancelled with
+    /// `DEADLINE_EXCEEDED`. Protects the server from runaway agent pipelines.
+    ///
+    /// Override via `AGENT_RS__SERVER__REQUEST_TIMEOUT_S`.
+    pub request_timeout_s: u64,
+    /// Maximum number of concurrent HTTP/2 streams per connection.
+    ///
+    /// Maps directly to tonic's `max_concurrent_streams` setting.
+    ///
+    /// Override via `AGENT_RS__SERVER__MAX_CONCURRENT_STREAMS`.
+    pub max_concurrent_streams: u32,
+    /// Maximum number of in-flight gRPC calls per TCP connection.
+    ///
+    /// Maps directly to tonic's `concurrency_limit_per_connection` setting.
+    ///
+    /// Override via `AGENT_RS__SERVER__CONCURRENCY_PER_CONNECTION`.
+    pub concurrency_per_connection: u32,
 }
 
 impl ServerConfig {
@@ -431,6 +457,10 @@ impl Default for Settings {
             server: ServerConfig {
                 host: "[::]".into(),
                 port: 1059,
+                max_limit_per_query: 200,
+                request_timeout_s: 120,
+                max_concurrent_streams: 256,
+                concurrency_per_connection: 32,
             },
             ingest_backend: IngestBackend::default(),
             docling: DoclingConfig {
