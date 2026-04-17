@@ -4,3 +4,4 @@
 # Evaluation corpus — kept local, not committed (binary, licence-uncertain).
 /test.pdf
 
+.env
