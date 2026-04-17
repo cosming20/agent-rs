@@ -118,16 +118,43 @@ pub struct WeightedKeywords {
     ///
     /// Invariants (enforced at construction):
     /// - Every `weight` is in `(0.0, 1.0]`.
-    /// - Sorted by `weight` descending.
-    /// - Deduplicated by `term` (case-insensitive Unicode folding, NFKC).
+    /// - If non-empty, the maximum `weight` equals exactly `1.0` (linear
+    ///   renormalization against the emitted max).
+    /// - Sorted by `weight` descending. Ties preserve the LLM's emission
+    ///   order (stable sort).
+    /// - Deduplicated by `term` after NFKC + case folding; on collision
+    ///   the higher-weight entry wins and `is_phrase` of the winner is
+    ///   kept.
+    /// - Every `term` is non-empty after normalization.
     pub terms: Vec<WeightedTerm>,
 }
 
+impl WeightedKeywords {
+    /// The safe-fallback empty value. All consumers' empty-input paths are
+    /// byte-identical to pre-feature behavior when they receive this.
+    pub fn empty() -> Self { /* ... */ }
+
+    /// Sum of all weights. Used by the rerank coverage ratio (§7.2).
+    pub fn total_weight(&self) -> f32 { /* ... */ }
+
+    /// First `k` entries (already sorted by weight desc).
+    pub fn top_k(&self, k: usize) -> &[WeightedTerm] { /* ... */ }
+
+    /// Convenience iterator; primarily exists to discourage consumers from
+    /// indexing into `terms` directly.
+    pub fn iter(&self) -> impl Iterator<Item = &WeightedTerm> { /* ... */ }
+}
+
 pub struct WeightedTerm {
-    /// Surface form as emitted by the LLM, trimmed, with surrounding
+    /// Surface form after NFKC normalization, trimmed, with surrounding
     /// punctuation removed. No stemming, no language-specific morphology.
+    /// Guaranteed non-empty.
     pub term: String,
-    /// Normalized importance score in `(0.0, 1.0]`.
+    /// Ordinal importance score in `(0.0, 1.0]`. **Not a calibrated
+    /// probability, confidence, or corpus-aware relevance estimate** —
+    /// only the ordering and relative magnitude are meaningful. Consumers
+    /// must treat it as rank information, not as a scalar with absolute
+    /// interpretation.
     pub weight: f32,
     /// True if this term is a multi-token phrase to be treated as a
     /// contiguous token group by downstream consumers.
@@ -139,16 +166,47 @@ pub struct WeightedTerm {
 /// extractor itself.
 pub struct WeightedKeywordIntegrationConfig {
     pub bm25: Option<BM25WeightingConfig>,
-    pub rerank_alpha: Option<f32>,
-    pub entity_linker_top_k: Option<usize>,
+    pub rerank: Option<RerankAdjustmentConfig>,
+    pub entity_linker: Option<EntityLinkerPrioritizationConfig>,
 }
 
 pub struct BM25WeightingConfig {
-    /// Terms with weight strictly less than `min_weight` are dropped from
-    /// the rewritten BM25 query string.
+    /// Terms with `weight < min_weight` are dropped from the rewritten
+    /// BM25 query string.
     pub min_weight: f32,
-    /// Upper cap on term repetition in the rewritten BM25 query string.
+    /// Upper cap on per-term repetition in the rewritten BM25 query.
+    /// Applied **after** token-level aggregation across term sources, so
+    /// phrase expansion cannot accumulate above the cap for a single
+    /// token.
     pub max_repeats: u32,
+    /// Minimum Unicode grapheme-cluster count for a single-token term to
+    /// be kept. Language-agnostic — drops short tokens by length alone,
+    /// not by matching a stopword list. Default (picked in plan) is
+    /// small (e.g., `2` or `3`). Phrase terms are exempt from this filter
+    /// at the phrase level; it applies to tokens produced by phrase
+    /// expansion.
+    pub min_term_chars: usize,
+    /// When `true`, phrase terms are emitted as both the full phrase
+    /// (intact, once) and their component tokens (at reduced repetition).
+    /// When `false`, only the full phrase is emitted.
+    pub phrase_token_expansion: bool,
+}
+
+pub struct RerankAdjustmentConfig {
+    /// Blend factor for the coverage-ratio adjustment (§7.2). Small by
+    /// construction — the cross-encoder must remain the dominant signal.
+    pub alpha: f32,
+    /// Multiplier applied to phrase-term weights when computing both
+    /// matched and total weight for the coverage ratio. Rewards phrase
+    /// matches over equivalent-mass token matches. Default ≥ 1.0.
+    pub phrase_bonus: f32,
+}
+
+pub struct EntityLinkerPrioritizationConfig {
+    /// Max number of weighted terms considered as fallback probes when
+    /// neither the overlap-first nor extracted-entity queues have
+    /// exhausted `max_matches`.
+    pub top_k: usize,
 }
 ```
 
@@ -205,8 +263,31 @@ The extractor is held as `Arc<WeightedKeywordExtractor>` on the router
 (consistent with other LLM extractors) and its output wrapped in `Arc<…>`
 for cheap sharing among consumers.
 
-When the extractor fails (all retries exhausted) the router receives
-`WeightedKeywords::empty()` and the pipeline continues unmodified.
+### 6.1 Timeout orchestration (router-level)
+
+The weighted-keyword branch is **soft-optional**. Router orchestration
+guarantees:
+
+1. The extractor future is wrapped in a **branch-local timeout**
+   (`router.weighted_keyword_branch_budget`, e.g. 6 s — concrete default
+   chosen in the plan). This timeout lives at the router layer, **not**
+   relying solely on the extractor's internal per-call timeout from
+   `WeightedKeywordExtractorConfig`.
+2. On branch-timeout expiry, the branch resolves to
+   `Ok(WeightedKeywords::empty())` — it never propagates a timeout error
+   that could force the other parallel branches to wait.
+3. The weighted-keyword branch **never extends the router's overall
+   deadline**. If the router's total budget has been exceeded by the
+   time `tokio::join!` would otherwise still be waiting on this branch,
+   the branch is cancelled and treated as empty.
+4. Branch cancellation and branch-timeout hits are both recorded as
+   `weighted_keyword_extractor_failures_total{kind="timeout"|"cancelled"}`
+   metrics (see §9.3), so tail-latency regressions from this component
+   are observable.
+
+Consequence: when the extractor fails or times out (any cause, including
+all retries exhausted), consumers receive `empty()` and the pipeline
+continues unmodified — at no worse than today's p95/p99 latency.
 
 ## 7. Consumer integrations
 
@@ -230,23 +311,51 @@ pub fn weighted_bm25_query(
 ) -> String;
 ```
 
-Algorithm:
+**Algorithm (revised):**
 
 1. If `kw.terms.is_empty()` → return `original_query.to_string()` unchanged.
-2. Drop terms whose `weight < cfg.min_weight`.
-3. For each surviving term:
-   - If `is_phrase` is true, split on whitespace into component tokens.
-   - Otherwise treat the term itself as one token.
-4. Emit each token `repeats = max(1, ceil(weight * cfg.max_repeats as f32)) as u32`
-   times.
-5. Join all emitted tokens with a single space — this becomes the new BM25
-   query text.
+2. Filter: drop terms whose `weight < cfg.min_weight`.
+3. **Preserve phrases as phrases.** For each surviving term that is a
+   phrase (`is_phrase == true`):
+   - Emit the phrase **intact once** (contiguous, as a single
+     space-separated group — surrounded by phrase markers if the
+     backend supports them; otherwise as plain contiguous tokens).
+   - If `cfg.phrase_token_expansion == true`, **additionally** emit
+     each component token at **reduced** repetition
+     (`ceil(weight * max_repeats / 2)`), subject to the
+     `min_term_chars` filter below. When `false`, the phrase is
+     emitted only as the intact form.
+4. For single-token terms (`is_phrase == false`):
+   - Drop if `token.graphemes().count() < cfg.min_term_chars`.
+     Unicode grapheme clusters — language-agnostic — no stopword list.
+   - Emit the token with multiplicity
+     `max(1, ceil(weight * cfg.max_repeats))`.
+5. **Token-level aggregation.** After steps 3–4, the same token may
+   have been produced from multiple sources (e.g., a phrase expansion
+   and a standalone single-token term). Aggregate per unique token:
+   sum the repetition counts, **then** clamp the per-token total to
+   `cfg.max_repeats`. This prevents amplification explosions from
+   overlapping phrase-token expansions.
+6. Join: intact phrases (from step 3) and aggregated single tokens
+   (from step 5) with single spaces. Original query text is not
+   included — the rewrite replaces it.
 
-BM25's sub-linear TF saturation means the repetition produces a controlled
-boost that asymptotes. `max_repeats` caps the amplification.
+BM25's sub-linear TF saturation means the bounded repetition produces a
+controlled boost that asymptotes. `max_repeats` caps the amplification
+*per token* after aggregation, so phrase-token expansion cannot smuggle
+in extra weight beyond the cap.
 
-No tokenizer-sharing, no corpus priors, no stemming, no language detection.
-Works with any BM25 backend Qdrant swaps in.
+**Explicitly rejected alternative:** a hardcoded language-agnostic
+stopword list (e.g., `the, and, of, in`). This would be English-only in
+practice and reintroduces the same class of domain/language bias that
+§8 is removing from the existing prompts. The combination of
+information-content prompt + `min_weight` threshold + `min_term_chars`
+filter handles function-word noise without a hardcoded list. A
+corpus-derived stopword pass, if needed, is within the scope of
+sub-project #3 (corpus-derived token bridger), not this one.
+
+No tokenizer-sharing, no corpus priors, no stemming, no language
+detection. Works with any BM25 backend Qdrant swaps in.
 
 ### 7.2 `ranker.rs` — post-rerank score adjustment
 
@@ -258,46 +367,129 @@ Instead, we adjust the score **after** the cross-encoder returns it.
 The adjustment lives in `ranker.rs` (post-rerank surface) — `reranker.rs`
 stays a pure cross-encoder wrapper.
 
+**Design — bounded coverage-ratio adjustment (revised from v1):**
+
+The original substring-based additive boost had three structural flaws:
+
+1. `contains()` matches across word boundaries (`art` inside `article`);
+2. Summing over matched weights rewarded long / verbose candidates that
+   happened to contain many terms "somewhere";
+3. The signal was unbounded in principle — proportional to the sum of
+   all emitted weights — making the adjustment distribution-sensitive
+   across queries with different term counts.
+
+The revised adjustment uses **boundary-aware matching** and a **coverage
+ratio** that is naturally bounded in `[0, 1]`:
+
 ```rust
 fn adjust_for_weighted_keywords(
     reranker_score: f32,
     candidate_text: &str,
     kw: &WeightedKeywords,
-    alpha: f32,
+    cfg: &RerankAdjustmentConfig,
 ) -> f32 {
-    if kw.terms.is_empty() || alpha == 0.0 {
+    if kw.terms.is_empty() || cfg.alpha == 0.0 {
         return reranker_score;
     }
-    let mut boost = 0.0_f32;
-    let lower = candidate_text.to_lowercase();
+
+    // 1. Normalize candidate once (NFKC + lowercase).
+    let normalized = normalize_candidate(candidate_text);
+
+    // 2. Per-term matching with boundary awareness:
+    //    - single-token terms: Unicode-word-boundary match (`\b<term>\b`
+    //      with \b defined over Unicode word characters, not ASCII).
+    //    - phrase terms: exact contiguous token sequence match after
+    //      NFKC + lowercase folding.
+    let mut matched_weighted_mass = 0.0_f32;
+    let mut total_weighted_mass = 0.0_f32;
     for t in &kw.terms {
-        if lower.contains(&t.term.to_lowercase()) {
-            boost += t.weight;
+        let bonus = if t.is_phrase { cfg.phrase_bonus } else { 1.0 };
+        let mass = t.weight * bonus;
+        total_weighted_mass += mass;
+        if term_matches(&normalized, t) {
+            matched_weighted_mass += mass;
         }
     }
-    reranker_score * (1.0 + alpha * boost)
+
+    // 3. Coverage ratio — naturally bounded in [0, 1].
+    let coverage = matched_weighted_mass / total_weighted_mass;
+
+    reranker_score * (1.0 + cfg.alpha * coverage)
 }
 ```
 
-Default `alpha = 0.2`. The cross-encoder remains the dominant signal;
-weights bias toward candidates containing user-important terms. Empty
-keywords → the function is a byte-identical no-op.
+Properties:
 
-### 7.3 `entity_linker` — candidate prioritization
+- **Bounded:** `coverage ∈ [0, 1]`, so the multiplicative adjustment is
+  bounded in `[1.0, 1.0 + alpha]`. Long verbose candidates cannot
+  accumulate a runaway boost.
+- **Coverage-aware:** matching three of five high-weight terms is
+  rewarded more than matching one out of fifty low-weight terms, for
+  the same total mass.
+- **Phrase-preferring:** phrase terms contribute `weight * phrase_bonus`
+  to both numerator and denominator; matching the phrase preserves the
+  bonus in the numerator only if the phrase is actually matched as a
+  contiguous sequence, which is strictly harder than matching its
+  tokens individually. Phrase hits therefore earn disproportionately
+  more coverage credit than the same tokens matched individually.
+- **Boundary-aware:** `art` no longer matches `article`, `504` no
+  longer matches `25041`, `AI` no longer matches random substrings.
+- **Safe empty-path:** with `kw.terms.is_empty()` or `alpha == 0.0` the
+  function is a byte-identical no-op.
 
-Today `entity_linker` LLM-extracts entity candidates from the query, then
-looks them up in Neo4j. It treats every candidate equally. With weighted
-keywords available, we prioritize:
+Default `alpha = 0.2`, `phrase_bonus = 1.5` (concrete values selected in
+the plan with reasoning recorded). The cross-encoder remains the
+dominant signal by construction — at `alpha = 0.2` a fully-covered
+adjustment is at most a 20 % multiplicative bump.
 
-- First: top-K highest-weight terms (K = `entity_linker_top_k`, default 5)
-  become the first candidates tried against Neo4j.
-- Then: remaining LLM-extracted entity candidates are appended.
-- Early-exit: once `EntityLinkerConfig::max_matches` entities are found,
-  remaining lookups are skipped.
+**Unicode word boundaries** use `regex::Regex` with `\b` in Unicode
+mode (enabled by default in the `regex` crate). This handles Latin,
+Cyrillic, Greek, Arabic, CJK, and mixed scripts uniformly — no
+language-specific logic.
+
+### 7.3 `entity_linker` — candidate prioritization (revised)
+
+Today `entity_linker` LLM-extracts entity candidates from the query,
+then looks them up in Neo4j. It treats every candidate equally.
+
+**Problem with a naive top-K approach:** weighted keywords are not
+necessarily entity-shaped. For a query like *"how to retry failed
+webhook delivery after timeout"*, the top keywords might be `retry`,
+`webhook delivery`, `timeout` — none of which is guaranteed to be a
+graph entity. Blindly feeding them as Neo4j lookup candidates would
+spend Neo4j budget on cold misses.
+
+**Overlap-first precedence (revised design):**
+
+The entity linker merges weighted keywords with extracted entity
+candidates using a three-tier priority queue. Let:
+
+- `E` = set of LLM-extracted entity candidates (today's source)
+- `W` = set of weighted-keyword terms (NFKC + case-folded forms)
+
+Lookup order:
+
+1. **Intersection first (highest priority):** terms in `W ∩ E` — weighted
+   keywords that are also LLM-identified as entity candidates. These
+   are the highest-confidence lookups: the LLM flagged them as
+   entities *and* they carry user-importance weight. Within this tier,
+   order by descending weight.
+2. **Extracted entities next:** entries in `E \ W` — LLM-identified
+   entities not present in the weighted-keyword set. Today's behavior
+   for these, preserved.
+3. **Weighted-keyword fallback probes (lowest priority):** top
+   `entity_linker.top_k` entries from `W \ E`, in weight order. These
+   are "the user thinks these terms matter, try them as entity probes
+   if we have budget left."
+
+**Early-exit:** once `EntityLinkerConfig::max_matches` entities have
+been resolved, remaining lookups in any tier are skipped. This
+preserves the existing budget semantics — the overlap-first heuristic
+only changes *which* lookups happen within that budget.
 
 No change to the `entity_linker::link()` signature — only its internal
-candidate-ordering logic. When weighted keywords are empty, behavior is
-byte-identical to today.
+candidate-ordering logic. When weighted keywords are empty, the queue
+collapses to tier 2 and behavior is byte-identical to today.
 
 ## 8. Prompt universalization (prerequisite work in this same PR)
 
@@ -328,18 +520,48 @@ single one implicitly anchors the model. Suggested domain pool: software
 documentation, fiction excerpts, meeting notes, encyclopedia entries,
 product manuals, recipes. None tied to the current `test.pdf` content.
 
-### 8.4 CI guard
+### 8.4 Forbidden-lexicon guard (two layers)
 
-One new CI step (and a matching pre-commit hook entry) greps the `crates/`
-tree for a forbidden-word list:
+This is an enforceable tripwire against regression, **not** a
+bias-proofing mechanism. Grep alone is easy to bypass with casing,
+punctuation, unicode homoglyphs, or framings that don't contain any
+listed token ("legal statute section" would still sail through). The
+spec therefore pairs a coarse CI grep with a more robust
+prompt-snapshot test.
+
+**Layer 1 — CI grep (coarse tripwire).** One new CI step (and a
+matching pre-commit hook entry) greps the `crates/` tree for a
+forbidden-lexicon list:
 
 ```
 penal | criminal | romanian | codul | articolul | pedepsit | Cod Penal
 ```
 
 Matches in `crates/retrieval/src/ingestion/metadata.rs` are allowlisted
-(the diacritic handling file). Any other match fails the build. This
-stops bias from re-entering later.
+(the diacritic handling file). Any other match fails the build.
+
+**Layer 2 — prompt snapshot tests (the real guard).** Canonical prompt
+strings for each of the five prompt-bearing files (§8.1) are stored as
+snapshot fixtures under `crates/retrieval/src/testdata/prompts/`. A
+unit test:
+
+1. Loads the prompt string at runtime from each module.
+2. Normalizes it: NFKC, lowercase, punctuation stripped, Unicode
+   homoglyph folding, whitespace collapsed.
+3. Asserts the normalized form contains no entry from a **normalized
+   forbidden lexicon** (the same list above, applied after the same
+   normalization pipeline).
+4. Also diff-compares against the stored snapshot and requires the
+   diff to be reviewed and explicitly blessed on change.
+
+The snapshot test catches:
+- Casing / punctuation / homoglyph bypasses the grep misses.
+- Silent prompt edits during code review (the diff surfaces them).
+
+It does **not** catch semantic domain framing that uses none of the
+forbidden tokens — that remains a human-review concern. The spec is
+explicit that this guard is **"forbidden lexicon + snapshot diff",
+not "bias proof"**.
 
 ## 9. Error handling
 
@@ -364,16 +586,63 @@ shipping all three integrations enabled by default.
 
 ### 9.3 Observability
 
-- Traces: `#[instrument(skip(self))]` on `extract`, fields
-  `%query_hash, terms_count, elapsed_ms`. Query is hashed (blake3),
-  never logged verbatim.
-- Metrics:
-  - `weighted_keyword_extractor_calls_total`
-  - `weighted_keyword_extractor_failures_total{kind=…}`
-  - `weighted_keyword_extractor_latency_ms` histogram
-- Per-consumer structured-field logs when weights changed behavior:
-  `bm25_query_rewritten=true`, `rerank_adjusted=true`,
-  `entity_linker_prioritized=true`.
+Thin health metrics (call / failure / latency) are insufficient for
+tuning a ranking component — when quality shifts, we need enough
+distribution-level signal to localize the cause to extractor output,
+thresholding, BM25 rewrite, rerank adjustment, or entity
+prioritization. The metric set is therefore expanded.
+
+**Traces.** `#[instrument(skip(self))]` on `extract`, fields
+`%query_hash, terms_count, surviving_count, elapsed_ms`. Query is
+hashed (blake3), never logged verbatim. Consumer-side adjustments add
+fields `bm25_rewritten_tokens`, `rerank_coverage`,
+`entity_priority_hits` on their respective spans.
+
+**Extractor health.**
+- `weighted_keyword_extractor_calls_total` (counter)
+- `weighted_keyword_extractor_failures_total{kind}` (counter) —
+  `kind ∈ {http_5xx, http_4xx, timeout, cancelled, rate_limit, malformed_json, schema_violation}`
+- `weighted_keyword_extractor_latency_ms` (histogram)
+- `weighted_keyword_extractor_nonempty_total` (counter) — paired with
+  `calls_total` to derive a non-empty rate
+
+**Extractor output distribution.** (Needed to tell whether the LLM is
+emitting usable signal.)
+- `weighted_keyword_terms_emitted` (histogram) — raw term count per
+  call
+- `weighted_keyword_terms_surviving_threshold` (histogram) — term
+  count after `min_weight` + `min_term_chars` filters
+- `weighted_keyword_phrase_ratio` (histogram) — phrase fraction of
+  emitted terms
+
+**BM25 consumer.** (Needed to tell whether query rewrite amplified
+useful tokens vs noise.)
+- `weighted_bm25_rewritten_tokens` (histogram) — output query token
+  count after aggregation
+- `weighted_bm25_unique_tokens` (histogram) — distinct tokens in
+  output
+
+**Rerank consumer.** (Needed to tell whether adjustment is moving the
+distribution.)
+- `weighted_rerank_coverage` (histogram) — the computed coverage
+  ratio per candidate, bucketed
+- `weighted_rerank_adjustment_ratio` (histogram) —
+  `adjusted_score / reranker_score` per candidate
+
+**Entity-linker consumer.** (Needed to tell whether overlap-first
+precedence is actually finding overlaps.)
+- `weighted_entity_tier_hits_total{tier}` (counter) —
+  `tier ∈ {intersection, extracted, fallback}` — counts per-tier
+  Neo4j lookups that resolved to an entity
+- `weighted_entity_priority_hits_total` (counter) — convenience sum
+  of `tier={intersection, fallback}`
+
+Per-consumer structured-field logs when weights changed behavior:
+`bm25_query_rewritten=true`, `rerank_adjusted=true`,
+`entity_linker_prioritized=true`.
+
+All metrics feed the existing OpenTelemetry pipeline — no new
+collectors.
 
 ## 10. Testing strategy
 
@@ -389,31 +658,73 @@ shipping all three integrations enabled by default.
 
 ### 10.2 Unit tests for pure integration functions
 
-- `weighted_bm25_query`:
+- `weighted_bm25_query` (revised algorithm, §7.1):
   - Empty keywords → output equals `original_query`.
-  - Term repetition respects `max_repeats` cap.
   - Threshold filter drops terms below `min_weight`.
-  - Phrase splitting: phrase tokens treated individually.
-- `adjust_for_weighted_keywords`:
+  - Length filter drops single-token terms shorter than `min_term_chars`;
+    does **not** drop phrase terms at the phrase level.
+  - Phrase preservation: with `phrase_token_expansion = false`, the
+    phrase appears intact exactly once; with `true`, the phrase appears
+    intact once and component tokens appear at reduced repetition.
+  - Token-level aggregation: when a token appears from multiple term
+    sources (e.g., a standalone single-token term and a phrase
+    expansion), per-token total is aggregated, then clamped to
+    `max_repeats` — never exceeds `max_repeats` for any unique token.
+  - Rejected-alternative regression test: asserts the function does
+    **not** drop common English function words (`the`, `and`, `of`,
+    `in`) by any hardcoded list — only by threshold and length.
+- `adjust_for_weighted_keywords` (revised algorithm, §7.2):
   - `alpha == 0` → returns `reranker_score` unchanged.
   - Empty keywords → returns `reranker_score` unchanged.
-  - Boost monotonically non-decreasing in term coverage.
-- Entity-linker top-K selection:
-  - Terms returned in weight-descending order.
-  - Respects `top_k` cap.
+  - **Bounded adjustment:** output is always in
+    `[reranker_score, reranker_score * (1.0 + alpha)]`.
+  - **Boundary-aware matching:** query term `"art"` does **not** match
+    candidate text `"article"`; term `"504"` does **not** match
+    candidate text `"25041"`; term `"AI"` does **not** match
+    candidate text `"brains"`.
+  - **Coverage ratio:** for a candidate matching all terms, the
+    adjustment equals `reranker_score * (1.0 + alpha)`; for a
+    candidate matching none, the adjustment equals `reranker_score`.
+  - **Phrase bonus:** matching a phrase earns strictly more coverage
+    credit than matching each of its tokens individually (when
+    `phrase_bonus > 1.0`).
+  - **Monotonicity in coverage:** if candidate A matches a strict
+    superset of the terms candidate B matches, A's adjusted score is
+    ≥ B's adjusted score (at equal base `reranker_score`).
+- Entity-linker overlap-first precedence (§7.3):
+  - Intersection-tier entries come first, ordered by weight
+    descending.
+  - Extracted-entity tier next, preserving original ordering.
+  - Fallback tier entries come last, capped at `top_k`.
+  - When weighted keywords are empty, queue collapses to tier 2
+    only and ordering matches today's behavior byte-identically.
 
 ### 10.3 Property tests (`proptest`)
 
 On `weighted_bm25_query`:
 
-- **Idempotency:** applying the function with the output as the new
-  `original_query` and the same keywords gives a stable result under
-  repeated application (converges).
-- **Monotonicity:** for two terms *a* and *b* with `weight_a > weight_b`
-  and equal `is_phrase`, *a* appears at least as many times as *b* in the
-  output.
-- **Cap respect:** no individual token appears more than `max_repeats`
-  times per original-term (across terms is unbounded, within is capped).
+- **Idempotency convergence:** repeatedly applying the function with
+  the previous output as the new `original_query` and the same
+  keywords converges to a fixpoint within 2 iterations.
+- **Per-token cap:** no single unique token appears more than
+  `max_repeats` times in the output, regardless of how many term
+  sources produced it.
+- **Weight-rank preservation (for non-phrase terms):** for two
+  single-token terms *a* and *b* with `weight_a > weight_b` that both
+  pass the filters, the count of *a* in the output is ≥ count of *b*.
+- **Empty-input invariant:** if `kw.terms` is empty after filtering,
+  output equals `original_query`.
+
+On `adjust_for_weighted_keywords`:
+
+- **Bounded adjustment invariant:** for any candidate text and any
+  non-negative `alpha`, the output is in
+  `[reranker_score, reranker_score * (1.0 + alpha)]`.
+- **Coverage monotonicity:** adding a matched term to a candidate
+  (shadowing one that wasn't matched) cannot decrease the adjusted
+  score.
+- **Empty-keywords no-op:** for any `cfg`, empty `kw` produces output
+  equal to `reranker_score`.
 
 ### 10.4 Integration tests (`crates/retrieval/tests/weighted_keywords_integration.rs`)
 
@@ -427,14 +738,18 @@ On `weighted_bm25_query`:
 
 ### 10.5 Doctests
 
-Every public item (`WeightedKeywordExtractor`, `WeightedKeywords`,
-`WeightedTerm`, `WeightedKeywordIntegrationConfig`,
-`BM25WeightingConfig`, `weighted_bm25_query`) carries a runnable
-`/// # Examples` block per the project Rust style guide.
+Every public item carries a runnable `/// # Examples` block per the
+project Rust style guide:
+`WeightedKeywordExtractor`, `WeightedKeywordExtractorConfig`,
+`WeightedKeywords` (including `empty()`, `total_weight()`, `top_k()`,
+`iter()`), `WeightedTerm`, `WeightedKeywordIntegrationConfig`,
+`BM25WeightingConfig`, `RerankAdjustmentConfig`,
+`EntityLinkerPrioritizationConfig`, `weighted_bm25_query`,
+`adjust_for_weighted_keywords`.
 
 ### 10.6 End-to-end evaluation
 
-**Step 1** — regenerate eval dataset from the current `test.pdf`:
+**Step 1 — regenerate eval dataset from the current `test.pdf`:**
 
 ```bash
 python eval/generate_enterprise_v3.py \
@@ -442,12 +757,12 @@ python eval/generate_enterprise_v3.py \
     --output eval/test_pdf_v1.json
 ```
 
-Produces a dataset with ~200 questions stratified across the existing 10
-question types and 3 difficulty tiers. Committed alongside the spec for
-reproducibility. The generator is already domain-agnostic by construction.
+Produces a dataset with ~200 questions stratified across the existing
+10 question types and 3 difficulty tiers. Committed alongside the
+spec for reproducibility. The generator is domain-agnostic by
+construction.
 
-**Step 2** — after prompt de-biasing but *before* building the extractor,
-capture a baseline:
+**Step 2 — baseline capture** (post-de-bias, no feature):
 
 ```bash
 EVAL_DATASET=eval/test_pdf_v1.json \
@@ -455,20 +770,14 @@ EVAL_SAVE_BASELINE=1 \
 cargo run --release --example eval_harness
 ```
 
-This baseline reflects the *post-de-bias, no-feature* state. Using a
-post-de-bias baseline isolates the feature's true contribution from any
-recovery-from-bias effect.
-
-**Step 3** — after building the extractor and wiring consumers:
+**Step 3 — feature-on run:**
 
 ```bash
 EVAL_DATASET=eval/test_pdf_v1.json \
 cargo run --release --example eval_harness
 ```
 
-Harness auto-compares against `baseline_eval.json`.
-
-**Step 4** — ablation runs, each toggling one consumer while disabling
+**Step 4 — ablation runs**, each toggling one consumer while disabling
 the other two via `WeightedKeywordIntegrationConfig`:
 
 ```
@@ -477,33 +786,104 @@ ablation_rerank_only.json
 ablation_entity_only.json
 ```
 
+### 10.7 Metrics computed and compared
+
+Hit@1 alone is too thin — this feature touches query-side recall
+(BM25 rewrite, entity prioritization) *and* rerank ordering. We
+cannot localize gains without separating the two surfaces.
+
+Per strategy × question-type × difficulty tier, the harness computes
+and reports:
+
+| Metric | Surface | What it tells us |
+|---|---|---|
+| **Hit@1**, **Hit@5** | post-rerank | primary top-rank quality |
+| **MRR** | post-rerank | rank position of the first correct result |
+| **NDCG@5** | post-rerank | graded ranking quality (the reranker's main turf) |
+| **Recall@5 (pre-rerank)** | fusion output | candidate-pool quality before rerank; isolates BM25 rewrite + entity prioritization lift |
+| **Recall@5 (post-rerank)** | final | candidate pool after rerank adjustment |
+
+Separating pre-rerank Recall@5 from post-rerank NDCG@5 is the key
+diagnostic: it tells us whether lift came from *getting better
+candidates in* (BM25 + entity) or from *reordering the same pool*
+(rerank adjustment) — or both, or either but not the other.
+
+### 10.8 Statistical rigor of per-type gates
+
+"No regression greater than 2 percentage points on any question type"
+is statistically noisy for types with small sample counts. The spec
+therefore:
+
+- **Reports sample counts per question type and difficulty tier** in
+  the eval harness output.
+- **Computes bootstrap 95% confidence intervals** for each metric
+  (1000 resamples, stratified by question type) and prints them
+  alongside point estimates.
+- **Per-type regression gate:** for question types with sample count
+  ≥ 20, the `> 2 pp` regression gate in §11 applies as a point
+  comparison. For smaller samples, a "regression" requires the
+  baseline-vs-feature-on 95% CIs to be **non-overlapping in the
+  direction of degradation**. This avoids blocking merges on noisy
+  single-digit-sample slices.
+
+### 10.9 Cross-corpus generalization — acknowledged gap
+
+A single-corpus eval (even one freshly regenerated from a
+non-legal `test.pdf`) cannot prove universality. The extractor or
+the de-biased prompts could overfit stylistic properties of
+whatever corpus is in `test.pdf` today.
+
+For this sub-project, a single corpus is accepted as the scope —
+adding a second corpus belongs to the follow-up work listed in §13.
+The spec documents this explicitly rather than pretending the
+generalization claim is settled.
+
 ## 11. Acceptance criteria
 
-| Metric | Requirement |
-|---|---|
-| Hit@1 on `graph_hybrid` strategy | Strictly greater than post-de-bias baseline |
-| Hit@1 on `lexical_exact` + `single_hop` types | Strictly greater than baseline |
-| Hit@1 on any question type | No regression greater than 2 percentage points |
-| End-to-end p50 latency | No regression greater than 10 % |
-| LLM cost per query | Documented in PR description; not a hard gate |
-| Static bias check (grep in CI) | Zero matches outside `metadata.rs` |
-| `cargo fmt / check / clippy -D warnings / test` | All green |
+Point estimates below are compared against the post-de-bias baseline
+(§10.6 Step 2). Per-type regression gates follow the sample-size rule
+in §10.8 (point comparison for n ≥ 20, non-overlapping 95 % CIs for
+n < 20).
+
+| Metric | Surface | Requirement |
+|---|---|---|
+| Hit@1 (`graph_hybrid`) | post-rerank | Strictly greater than baseline |
+| MRR (`graph_hybrid`) | post-rerank | Strictly greater than baseline |
+| Recall@5 pre-rerank (`graph_hybrid`) | fusion | Strictly greater than baseline — confirms BM25 rewrite + entity prioritization are the query-side driver |
+| NDCG@5 (`graph_hybrid`) | post-rerank | Strictly greater than baseline — confirms rerank adjustment is helping, not hurting |
+| Hit@1 on `lexical_exact` + `single_hop` types | post-rerank | Strictly greater than baseline |
+| Any per-type Hit@1 regression | post-rerank | No regression per §10.8 rule |
+| End-to-end p50 latency | router | No regression greater than 10 % |
+| End-to-end p95 latency | router | No regression greater than 15 % (the branch-local timeout of §6.1 is the primary defense) |
+| LLM cost per query | — | Documented in PR description; not a hard gate |
+| Forbidden-lexicon guard (grep) | CI | Zero matches outside `metadata.rs` |
+| Prompt snapshot tests (§8.4 Layer 2) | CI | All green |
+| `cargo fmt / check / clippy -D warnings / test` | CI | All green |
 
 ## 12. Sequencing inside this sub-project
 
 ```
 Step 1 · Regenerate eval/test_pdf_v1.json from current test.pdf
 Step 2 · De-bias the five prompt-bearing files + delete the router comment
-Step 3 · Add CI guard for forbidden domain-word list
-Step 4 · Capture baseline eval (post-de-bias, no feature)
-Step 5 · Implement WeightedKeywordExtractor + config + prompt
-Step 6 · Implement weighted_bm25_query pure function + wire into search/keyword
-Step 7 · Implement rerank adjustment in ranker.rs + wire into rerank flow
-Step 8 · Implement entity_linker candidate prioritization
-Step 9 · Wire extractor into router's parallel join
-Step 10 · Unit + property + integration + doctests
-Step 11 · Feature-on eval + ablation runs
-Step 12 · PR with before/after metrics
+Step 3 · Add forbidden-lexicon guard — Layer 1 (CI grep) + Layer 2
+         (prompt snapshot tests with NFKC/fold normalization)
+Step 4 · Capture baseline eval (post-de-bias, no feature);
+         baseline includes Hit@1/Hit@5/MRR/NDCG@5 + pre- and
+         post-rerank Recall@5, with sample counts + bootstrap CIs
+Step 5 · Implement WeightedKeywordExtractor + config + universal prompt
+Step 6 · Implement weighted_bm25_query (revised algorithm, §7.1)
+         + wire into search/keyword
+Step 7 · Implement adjust_for_weighted_keywords (bounded coverage-ratio,
+         §7.2) in ranker.rs + wire into rerank flow
+Step 8 · Implement overlap-first entity-linker prioritization (§7.3)
+Step 9 · Wire extractor into router's parallel join with
+         branch-local timeout (§6.1); cancellation/timeout metrics
+Step 10 · Unit + property + integration + doctests (§10.1–10.5)
+Step 11 · Feature-on eval + per-consumer ablation runs; emit metrics
+          distributions (§9.3) during ablation for tunability
+Step 12 · PR with before/after metric tables (all metrics from §10.7),
+          sample counts, bootstrap CIs, and acceptance-criteria
+          checklist (§11) filled in
 ```
 
 Steps 1–4 are the de-bias half (committable as its own commit if desired,
@@ -514,15 +894,50 @@ but shipped in the same PR). Steps 5–11 are the weighted-keyword half.
 | Risk | Mitigation |
 |---|---|
 | LLM output quality varies across corpora | Prompt asks for information-content weighting based purely on term properties within the query, no corpus priors; empty output falls back safely |
-| Added LLM call inflates eval cost | Latency hidden by parallel `join!`; cost per query documented in PR; `max_retries=2` caps worst-case cost |
-| Reranker score distribution shifts enough to break downstream thresholds | `alpha=0.2` is small; acceptance gate catches latency + Hit@1 regressions per-type |
-| BM25 repetition amplifies already-common terms | `min_weight` threshold drops noise; `max_repeats` caps amplification; BM25 TF saturation is sub-linear |
-| Future contributor re-introduces domain bias in prompts | CI grep guard rejects commits reintroducing the forbidden word list |
+| Added LLM call inflates eval cost | Latency hidden by parallel `join!` + branch-local timeout (§6.1); cost per query documented in PR; `max_retries=2` caps worst-case cost |
+| Weighted-keyword branch is the slowest and blows router p95 | Branch-local timeout at the router layer (§6.1) forces the branch to resolve to `empty()` independent of the extractor's own per-call timeout |
+| Rerank coverage ratio misfires on score distributions with narrow dynamic range | `alpha=0.2` is small; coverage is bounded in `[0,1]`; §10.7 splits NDCG@5 (post-rerank) from Recall@5 (pre-rerank) so adjustment regressions are localizable |
+| BM25 phrase-token expansion amplifies common short tokens | `min_term_chars` universal length filter + token-level aggregation with `max_repeats` cap applied *after* aggregation |
+| Future contributor re-introduces domain bias in prompts | Forbidden-lexicon grep guard (Layer 1) + prompt snapshot tests with normalization (Layer 2); §8.4 documents the limitations of both honestly |
 | Per-sub-query keyword extraction later wants a different output shape | Forward-compat design (§5.3) — new method, same output type |
+| **Single-corpus eval overfits to whatever is in the current `test.pdf`** | Acknowledged in §10.9. Follow-up work: add a second eval corpus (small is fine) in a subsequent PR, ideally before sub-project #2 lands. Not a blocker here, but tracked. |
+| Substring-free word-boundary matching regresses on scripts without explicit word separators (e.g., Thai, some CJK contexts) | Unicode-mode `\b` in the `regex` crate delegates to Unicode properties; residual script-specific issues, if they appear in eval, are captured by per-type Hit@1 and addressed via prompt iteration rather than adding language-specific logic |
 
 ## 14. Open questions
 
-None — all design points are resolved. Implementation-level naming and
-exact default values (`min_weight`, `max_repeats`, `alpha`,
-`entity_linker_top_k`) are deferred to the writing-plans phase and will
-be selected there with reasoning recorded in the plan.
+These are genuinely unresolved items whose answers belong to the
+implementation plan, not to the spec. Listed honestly rather than
+hidden as "None":
+
+1. **Phrase preservation vs token expansion default.** The spec allows
+   both (`phrase_token_expansion` flag). The plan must pick the
+   default — `true` (preserve + expand at half repetition) or `false`
+   (preserve only) — and justify it empirically after a sanity check
+   on a few queries from the new `test.pdf`.
+2. **`min_term_chars` default.** The spec uses a universal length
+   filter but doesn't fix the threshold. Candidates to consider in
+   the plan: `2` (aggressive — drops many single-letter tokens but
+   may drop short numeric IDs), `3` (moderate), `4` (conservative,
+   preserves most short IDs and common content words).
+3. **Rerank `alpha` and `phrase_bonus` defaults.** Spec fixes the
+   shape (bounded coverage ratio with phrase bonus) but not the
+   exact numeric defaults. The plan selects them; a sweep over a
+   small grid on the new `test.pdf` is appropriate.
+4. **Entity-linker `top_k` default.** Spec picks overlap-first
+   precedence; `top_k` governs how many fallback probes flow into
+   tier 3. Small default (3–5) is appropriate; plan picks the
+   concrete value.
+5. **Router branch-local timeout for the weighted-keyword branch.**
+   Spec requires this timeout but does not fix its value. Must be
+   short enough to preserve p95, long enough to let typical LLM
+   calls complete (e.g., 4–8 s). Plan picks based on measured LLM
+   latency distribution on the existing extractors.
+6. **Whether the CI lexicon grep runs on all `crates/` or a
+   narrower allowlist of prompt-bearing files.** The spec as written
+   runs on all `crates/` with a `metadata.rs` allowlist. The plan
+   may narrow this if false-positive rate from legitimate code
+   comments in unrelated modules proves too high in practice.
+
+None of these affects the architecture, public types, or acceptance
+criteria. They are concrete defaults to be picked with reasoning in
+the plan phase and recorded alongside the plan.
