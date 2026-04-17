@@ -115,6 +115,8 @@ struct ChatMessage<'a> {
 #[derive(Debug, Deserialize)]
 struct ChatResponse {
     choices: Vec<ChatChoice>,
+    #[serde(default)]
+    usage: Option<Usage>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -125,6 +127,12 @@ struct ChatChoice {
 #[derive(Debug, Deserialize)]
 struct ChatResponseMessage {
     content: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct Usage {
+    prompt_tokens: u64,
+    completion_tokens: u64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -156,6 +164,7 @@ pub struct ChunkSummarizer {
     api_key: Arc<String>,
     model: Arc<String>,
     max_retries: u32,
+    metrics: Option<Arc<agent_rs_observability::metrics::RetrievalMetrics>>,
 }
 
 impl std::fmt::Debug for ChunkSummarizer {
@@ -181,6 +190,7 @@ impl ChunkSummarizer {
             api_key: Arc::new(api_key),
             model: Arc::new(model),
             max_retries: DEFAULT_MAX_RETRIES,
+            metrics: None,
         }
     }
 
@@ -192,6 +202,16 @@ impl ChunkSummarizer {
     /// Override the retry budget. The default is [`DEFAULT_MAX_RETRIES`].
     pub fn with_max_retries(mut self, max_retries: u32) -> Self {
         self.max_retries = max_retries;
+        self
+    }
+
+    /// Attach a metrics handle so per-call cost / tokens / latency are
+    /// emitted to the OTel pipeline.
+    pub fn with_metrics(
+        mut self,
+        metrics: Arc<agent_rs_observability::metrics::RetrievalMetrics>,
+    ) -> Self {
+        self.metrics = Some(metrics);
         self
     }
 
@@ -251,11 +271,16 @@ impl ChunkSummarizer {
             reason: format!("serialize summarization request: {e}"),
         })?;
 
+        let llm_started = std::time::Instant::now();
         let response_bytes = self.call_api_with_retry(body_bytes).await?;
+        let llm_elapsed_ms = llm_started.elapsed().as_secs_f64() * 1000.0;
 
         let chat: ChatResponse = match serde_json::from_slice(&response_bytes) {
             Ok(c) => c,
             Err(e) => {
+                if let Some(m) = self.metrics.as_ref() {
+                    m.record_llm_failure("summarizer", "malformed_json");
+                }
                 tracing::warn!(
                     error = %e,
                     "failed to parse summarization response; returning empty summary"
@@ -263,6 +288,16 @@ impl ChunkSummarizer {
                 return Ok(String::new());
             }
         };
+
+        if let (Some(m), Some(u)) = (self.metrics.as_ref(), chat.usage.as_ref()) {
+            m.record_llm_call(
+                "summarizer",
+                self.model.as_str(),
+                u.prompt_tokens,
+                u.completion_tokens,
+                llm_elapsed_ms,
+            );
+        }
 
         let summary = chat
             .choices

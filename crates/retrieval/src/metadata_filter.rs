@@ -11,8 +11,8 @@
 //! Ingested documents carry a rich 27-field metadata payload (page_start,
 //! page_end, section_title, has_table, has_formula, has_code, …).  Without
 //! filter narrowing, every query scans all indexed chunks.  With it, a query
-//! like "Ce prevede tabelul din articolul 188?" narrows the search space to
-//! chunks where `has_table = true` AND `section_title` contains "188".
+//! like "what does the table in section 15 say?" narrows the search space
+//! to chunks where `has_table = true` AND `section_title` contains "15".
 //!
 //! # Resilience
 //!
@@ -30,7 +30,7 @@
 //!     temperature: 0.0,
 //! });
 //!
-//! let hints = extractor.extract("Ce prevede articolul 188 cu privire la tabel?").await;
+//! let hints = extractor.extract("what does the table in section 15 say?").await;
 //! let filters = MetadataFilterExtractor::to_qdrant_filter(&hints);
 //! ```
 
@@ -76,8 +76,12 @@ const PROMPT_CACHE_KEY: &str = "agent-rs-metadata-filter-v1";
 ///   identical across every call, keeping the cache key stable.
 /// - Dynamic content (the query) is injected only as the user message.
 ///
-/// Handles Romanian and English queries, covering the metadata fields present
-/// in the enriched Docling payload schema.
+/// Language-agnostic: the prompt treats numbered-reference detection as a
+/// cross-lingual structural task, covering the metadata fields present in
+/// the enriched Docling payload schema.
+#[doc(hidden)]
+pub const SYSTEM_PROMPT_FOR_TESTING: &str = SYSTEM_PROMPT;
+
 const SYSTEM_PROMPT: &str = r#"You are a metadata extraction assistant.
 Your task: analyse a user query and extract structural metadata hints that
 indicate which document chunks are most likely to answer the question.
@@ -88,57 +92,57 @@ You MUST return strict JSON matching the provided schema. No prose, no markdown.
 
 ## page_start / page_end
 Extract if the query references a specific page or page range.
-- "pagina 47" → page_start: 47, page_end: 47
-- "paginile 50-55" → page_start: 50, page_end: 55
-- "pagina 10 până la 15" → page_start: 10, page_end: 15
-- "page 10" → page_start: 10, page_end: 10
-- "pages 3 to 7" → page_start: 3, page_end: 7
+- "page 47" → page_start: 47, page_end: 47
+- "pages 50-55" → page_start: 50, page_end: 55
+- "pages 10 to 15" → page_start: 10, page_end: 15
+Cross-lingual equivalents of "page" are valid anchors too.
 If NO page reference → page_start: null, page_end: null
 
 ## article_number
-Extract if the query references a specific article, section, or numbered clause.
-- "articolul 188" → "188"
-- "art. 345" → "345"
+Extract if the query references a specific numbered section: article,
+section, chapter, clause, paragraph, rule, or equivalent — in any language.
+- "section 3.4" → "3.4"
 - "Article 15" → "15"
-- "secțiunea 3.4" → "3.4"
-- "alineatul (2)" → "(2)"
-If NO article/section reference → null
+- "chapter 7" → "7"
+- "§ 4.2" → "4.2"
+- "paragraph (2)" → "(2)"
+- "rule 12" → "12"
+If NO numbered-section reference → null
 
 ## section_contains
 Extract a short keyword or phrase that should appear in the section title if
 the query describes a named section or topic heading. Use only if the user
 names a specific section or chapter. Keep it short (1-3 words max).
-- "capitolul despre furt" → "furt"
-- "secțiunea privind pedepsele" → "pedepse"
-- "chapter on penalties" → "penalties"
+- "chapter about caching" → "caching"
+- "section on error handling" → "error handling"
+- "the introduction" → "introduction"
 If NO section name is given → null
 
 ## requires_table
-Set to true ONLY if the query explicitly asks about a table, grid, list
-presented in table form, or uses words like: tabel, tabelul, tabelar,
-table, tablou, matrice, grilă.
+Set to true ONLY if the query explicitly asks about a table, matrix, grid,
+spreadsheet, or list presented in tabular form. Cross-lingual equivalents
+of those words count.
 Otherwise false.
 
 ## requires_formula
 Set to true ONLY if the query explicitly asks about a formula, equation,
-mathematical expression, or calculation. Words: formulă, formula, ecuație,
-equation, calcul.
+mathematical expression, or calculation. Cross-lingual equivalents count.
 Otherwise false.
 
 ## requires_code
 Set to true ONLY if the query explicitly asks about code, a code example,
-program listing, or algorithm. Words: cod, code, exemplu de cod, listing,
-algoritm, program, funcție, function.
+program listing, function, or algorithm. Cross-lingual equivalents count.
 Otherwise false.
 
 # Important rules
 
 - Most queries are plain natural language with NO structural hints.
   For those, return all nulls and all false values — do NOT invent hints.
-- Do NOT extract article numbers from incidental numbers in a query
+- Do NOT extract a number that is incidental to the query
   (e.g. "give me 3 examples" must NOT produce article_number: "3").
-- Only extract article_number when the query contains an explicit article,
-  section, or clause reference marker (articolul, art., Article, §, alin., etc.).
+- Only extract article_number when the query contains an explicit reference
+  marker (article, section, chapter, clause, paragraph, §, or a clearly
+  equivalent marker in any language).
 - Return empty/default hints when nothing structural is detected.
 
 # Output
@@ -160,14 +164,15 @@ pub struct QueryMetadataHints {
     /// `Some((50, 55))` means pages 50 through 55.
     pub page_range: Option<(u32, u32)>,
 
-    /// Article or section number extracted from the query.
+    /// Numbered-section reference extracted from the query.
     ///
-    /// `Some("188")` means the query explicitly references "articolul 188".
+    /// `Some("15")` means the query explicitly references a numbered section
+    /// such as "section 15", "article 15", "chapter 15", "§ 15", etc.
     pub article_number: Option<String>,
 
     /// Short fragment that should appear in the `section_title` payload field.
     ///
-    /// `Some("furt")` narrows to sections whose title contains "furt".
+    /// `Some("caching")` narrows to sections whose title contains "caching".
     pub section_contains: Option<String>,
 
     /// The query explicitly mentions a table or tabular data.

@@ -7,7 +7,7 @@
 
 use neo4rs::query;
 
-use crate::types::{GraphEdge, GraphNode, RelationType};
+use crate::types::{GraphEdge, GraphNode, NodeLabel, RelationType};
 
 /// Convert a `serde_json::Value` to `neo4rs::types::BoltType`.
 ///
@@ -56,11 +56,16 @@ pub(crate) fn get_node_by_id(id: &str) -> neo4rs::Query {
     query("MATCH (n {id: $id}) RETURN n").param("id", id)
 }
 
+/// Maximum graph traversal depth enforced by [`get_neighbors`] /
+/// [`get_neighbors_of_labels`]. Requests exceeding this cap are clamped (and
+/// logged) rather than rejected to keep ad-hoc retrieval paths from failing on
+/// overly ambitious parameters.
+pub(crate) const MAX_GRAPH_DEPTH: usize = 5;
+
 /// BUILD: variable-length neighbor expansion up to `depth`.
 ///
 /// Returns distinct neighbor nodes (excludes the start node).
 pub(crate) fn get_neighbors(node_id: &str, depth: usize) -> neo4rs::Query {
-    const MAX_GRAPH_DEPTH: usize = 5;
     let clamped = depth.min(MAX_GRAPH_DEPTH);
     if depth > MAX_GRAPH_DEPTH {
         tracing::warn!(
@@ -72,6 +77,50 @@ pub(crate) fn get_neighbors(node_id: &str, depth: usize) -> neo4rs::Query {
     let cypher = format!(
         "MATCH (start {{id: $id}})-[*1..{clamped}]-(neighbor) \
          WHERE neighbor.id <> $id \
+         RETURN DISTINCT neighbor"
+    );
+    query(&cypher).param("id", node_id)
+}
+
+/// BUILD: variable-length neighbor expansion up to `depth`, restricted to
+/// neighbors carrying any of the supplied labels.
+///
+/// The label predicate is pushed into Cypher as an alternation
+/// (`neighbor:A|B|C`), so the database filters before returning rows — the
+/// cost we pay when falling back to client-side filtering in the trait's
+/// default implementation is avoided for Neo4j.
+///
+/// An empty `labels` slice degrades to plain [`get_neighbors`] semantics
+/// (no label filter). Label names are validated on [`NodeLabel`] construction
+/// to ASCII alphanumeric + underscore, so the `format!` interpolation is safe.
+pub(crate) fn get_neighbors_of_labels(
+    node_id: &str,
+    depth: usize,
+    labels: &[NodeLabel],
+) -> neo4rs::Query {
+    let clamped = depth.min(MAX_GRAPH_DEPTH);
+    if depth > MAX_GRAPH_DEPTH {
+        tracing::warn!(
+            requested = depth,
+            clamped = clamped,
+            "graph traversal depth clamped to MAX_GRAPH_DEPTH"
+        );
+    }
+
+    let label_pred = if labels.is_empty() {
+        String::new()
+    } else {
+        let alts = labels
+            .iter()
+            .map(NodeLabel::as_str)
+            .collect::<Vec<_>>()
+            .join("|");
+        format!(" AND neighbor:{alts}")
+    };
+
+    let cypher = format!(
+        "MATCH (start {{id: $id}})-[*1..{clamped}]-(neighbor) \
+         WHERE neighbor.id <> $id{label_pred} \
          RETURN DISTINCT neighbor"
     );
     query(&cypher).param("id", node_id)

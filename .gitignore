@@ -1,3 +1,9 @@
 /target/
 /test_results/
 .fastembed_cache/
+# Evaluation corpus — kept local, not committed (binary, licence-uncertain).
+/test.pdf
+
+.env
+# Python venv for running the Docling sidecar natively (MPS on macOS).
+.venv/

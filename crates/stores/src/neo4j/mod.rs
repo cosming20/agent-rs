@@ -15,7 +15,7 @@ use uuid::Uuid;
 
 use crate::{
     traits::GraphStore,
-    types::{GraphEdge, GraphNode, GraphPath, RelationType},
+    types::{GraphEdge, GraphNode, GraphPath, NodeLabel, RelationType},
 };
 
 // ---- Neo4jStore ----
@@ -208,6 +208,40 @@ impl GraphStore for Neo4jStore {
         while let Some(row) = result.next().await.map_err(StoreError::from)? {
             let node: neo4rs::Node = row.get("neighbor").map_err(|e| {
                 StoreError::QueryFailed(format!("failed to deserialize neighbor: {e}"))
+            })?;
+            nodes.push(bolt_node_to_graph_node(node)?);
+        }
+        Ok(nodes)
+    }
+
+    /// Cypher-level label-filtered neighbor expansion.
+    ///
+    /// Overrides the trait default (which filters client-side) so the
+    /// predicate is pushed into the database and only matching rows cross the
+    /// network boundary.
+    #[instrument(
+        name = "neo4j_store.get_neighbors_of_labels",
+        skip(self, labels),
+        fields(node_id = %node_id, depth, n_labels = labels.len())
+    )]
+    async fn get_neighbors_of_labels(
+        &self,
+        node_id: &str,
+        depth: usize,
+        labels: &[NodeLabel],
+    ) -> Result<Vec<GraphNode>, StoreError> {
+        let mut result = self
+            .graph
+            .execute(queries::get_neighbors_of_labels(node_id, depth, labels))
+            .await
+            .map_err(StoreError::from)?;
+
+        let mut nodes = Vec::new();
+        while let Some(row) = result.next().await.map_err(StoreError::from)? {
+            let node: neo4rs::Node = row.get("neighbor").map_err(|e| {
+                StoreError::QueryFailed(format!(
+                    "failed to deserialize label-filtered neighbor: {e}"
+                ))
             })?;
             nodes.push(bolt_node_to_graph_node(node)?);
         }

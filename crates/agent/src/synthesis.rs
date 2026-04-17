@@ -77,6 +77,12 @@ impl ResponseSynthesizer {
         verification: &VerificationResult,
         strategy: RetrievalStrategy,
     ) -> Result<SynthesizedResponse, AgentError> {
+        // Clean the LLM's answer before further processing — system prompt
+        // tries to suppress chatty tails, but a defence-in-depth strip keeps
+        // the evidence pack deterministic even when the model drifts.
+        let answer = strip_chatty_tail(answer);
+        let answer = answer.as_str();
+
         let all_citations = self.build_citations(evidence);
 
         // Only include citations the LLM actually referenced in the answer
@@ -199,4 +205,25 @@ fn find_referenced_indices(answer: &str) -> Vec<usize> {
         .captures_iter(answer)
         .filter_map(|cap| cap[1].parse::<usize>().ok())
         .collect()
+}
+
+/// Strip trailing "chatty tails" that common LLM outputs append — follow-up
+/// invitations, hedged offers, "hope this helps" closers. These degrade the
+/// user experience (the answer looked done, yet the model kept talking) and
+/// they make the response length non-deterministic.
+///
+/// Matches case-insensitively at a paragraph / sentence boundary near the
+/// end of the answer; the stripped region runs through end-of-string.
+///
+/// Multilingual: covers Romanian + English phrasings the default prompt
+/// tries (but cannot guarantee) to suppress upstream.
+pub(crate) fn strip_chatty_tail(answer: &str) -> String {
+    static TAIL_RE: std::sync::LazyLock<Regex> = std::sync::LazyLock::new(|| {
+        Regex::new(
+            r"(?is)\s*(?:\n{1,}|\.\s+|-\s+)(?:dacă (?:vrei|dore[șs]ti|ai nevoie|pot|ai întrebări|vrei mai multe)|pot să[-\s][șț]i|vrei să|let me know if|would you (?:like|prefer)|if you (?:want|'?d like|need)|hope (?:this|that) helps|is there anything else|feel free to|should you have).*$",
+        )
+        .expect("strip_chatty_tail regex is statically valid")
+    });
+    let stripped = TAIL_RE.replace(answer, "");
+    stripped.trim_end().to_owned()
 }

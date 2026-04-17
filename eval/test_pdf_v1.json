@@ -1,0 +1,105 @@
+{
+  "schema_version": "2",
+  "dataset_name": "test_pdf_v1_image_analysis",
+  "description": "Hand-curated evaluation dataset for the current test.pdf: 'Analiza Imaginilor: Indrumar de Laborator' (Vertan, Ciuc, Zamfir, 2001) — Romanian image-processing textbook. Replaces the stale Romanian-Penal-Code datasets after the universality domain shift. Small by design (10 questions) — enough to detect regressions; use enterprise_v3.json's regen once the pickle cache is warm.",
+  "allowed_difficulties": [
+    "easy",
+    "medium",
+    "hard"
+  ],
+  "allowed_types": [
+    "single_hop",
+    "lexical_exact",
+    "conceptual",
+    "multi_hop"
+  ],
+  "documents": [
+    {
+      "path": "../test.pdf",
+      "doc_id": "image_analysis_textbook",
+      "source": "vertan_ciuc_zamfir_2001"
+    }
+  ],
+  "questions": [
+    {
+      "id": "q01",
+      "difficulty": "easy",
+      "type": "single_hop",
+      "question": "Cine sunt autorii îndrumarului de laborator?",
+      "expected_doc_ids": ["image_analysis_textbook"],
+      "expected_text_contains": ["Vertan"]
+    },
+    {
+      "id": "q02",
+      "difficulty": "easy",
+      "type": "single_hop",
+      "question": "Ce este histograma unei imagini?",
+      "expected_doc_ids": ["image_analysis_textbook"],
+      "expected_text_contains": ["histograma"]
+    },
+    {
+      "id": "q03",
+      "difficulty": "easy",
+      "type": "lexical_exact",
+      "question": "metoda Bhattacharyya",
+      "expected_doc_ids": ["image_analysis_textbook"],
+      "expected_text_contains": ["Bhattacharyya"]
+    },
+    {
+      "id": "q04",
+      "difficulty": "medium",
+      "type": "single_hop",
+      "question": "Cum se face segmentarea cu prag optim?",
+      "expected_doc_ids": ["image_analysis_textbook"],
+      "expected_text_contains": ["prag"]
+    },
+    {
+      "id": "q05",
+      "difficulty": "medium",
+      "type": "single_hop",
+      "question": "Ce metode există pentru etichetarea imaginilor binare?",
+      "expected_doc_ids": ["image_analysis_textbook"],
+      "expected_text_contains": ["etichetare"]
+    },
+    {
+      "id": "q06",
+      "difficulty": "medium",
+      "type": "conceptual",
+      "question": "Ce operatori se folosesc la extragerea contururilor din imagini?",
+      "expected_doc_ids": ["image_analysis_textbook"],
+      "expected_text_contains": ["gradient"]
+    },
+    {
+      "id": "q07",
+      "difficulty": "medium",
+      "type": "single_hop",
+      "question": "Cum se caracterizează texturile prin matrici de coocurență?",
+      "expected_doc_ids": ["image_analysis_textbook"],
+      "expected_text_contains": ["cooc"]
+    },
+    {
+      "id": "q08",
+      "difficulty": "hard",
+      "type": "multi_hop",
+      "question": "Ce diferență există între segmentarea pe histogramă și creșterea regiunilor?",
+      "expected_doc_ids": ["image_analysis_textbook"],
+      "expected_text_contains": ["regiunil"]
+    },
+    {
+      "id": "q09",
+      "difficulty": "medium",
+      "type": "conceptual",
+      "question": "Ce sunt momentele statistice și invarianții pentru caracterizarea regiunilor?",
+      "expected_doc_ids": ["image_analysis_textbook"],
+      "expected_text_contains": ["momente"]
+    },
+    {
+      "id": "q10",
+      "difficulty": "hard",
+      "type": "multi_hop",
+      "question": "Ce abordări există pentru caracterizarea texturilor în acest îndrumar?",
+      "expected_doc_ids": ["image_analysis_textbook"],
+      "expected_text_contains": ["textur"]
+    }
+  ]
+}

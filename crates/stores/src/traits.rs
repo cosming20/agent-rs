@@ -10,7 +10,7 @@ use uuid::Uuid;
 
 use crate::types::{
     ChatMessage, CollectionConfig, EvidenceItem, FilterSpec, GraphEdge, GraphNode, GraphPath,
-    Memory, QueryRun, RelationType, SearchResult, VectorPoint,
+    Memory, NodeLabel, PointPayload, QueryRun, RelationType, SearchResult, VectorPoint,
 };
 
 // ---- Vector Store ----
@@ -95,6 +95,27 @@ pub trait VectorStore: Send + Sync {
 
     /// Check if a collection exists.
     async fn collection_exists(&self, name: &CollectionName) -> Result<bool, StoreError>;
+
+    /// Fetch payloads for a batch of point IDs.
+    ///
+    /// Used by graph-driven retrieval paths to rehydrate chunk content for
+    /// nodes discovered via Neo4j traversal. Missing IDs are silently dropped
+    /// from the returned vector (they surface as a count delta to the caller,
+    /// which is expected to treat them as orphan/skew evidence rather than an
+    /// error).
+    ///
+    /// Dense / sparse vectors are *not* returned — this is a payload-only
+    /// projection. Vector rehydration would require a separate method with a
+    /// different return shape.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError`] on backend failure. Missing IDs are not an error.
+    async fn get_by_ids(
+        &self,
+        collection: &CollectionName,
+        ids: &[String],
+    ) -> Result<Vec<PointPayload>, StoreError>;
 }
 
 // ---- Graph Store ----
@@ -126,6 +147,39 @@ pub trait GraphStore: Send + Sync {
         node_id: &str,
         depth: usize,
     ) -> Result<Vec<GraphNode>, StoreError>;
+
+    /// Get neighbors of a node up to `depth` hops, restricted to the given
+    /// labels.
+    ///
+    /// An empty `labels` slice preserves the behaviour of [`get_neighbors`]
+    /// (no filter). Callers supply a slice so multi-label queries stay
+    /// expressible without allocation on the common single-label path.
+    ///
+    /// The default implementation delegates to [`get_neighbors`] and filters
+    /// client-side; backends that can push the predicate into the query
+    /// language (e.g. Neo4j via `neighbor:Label` in Cypher) should override
+    /// this method for efficiency.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError`] on backend failure.
+    async fn get_neighbors_of_labels(
+        &self,
+        node_id: &str,
+        depth: usize,
+        labels: &[NodeLabel],
+    ) -> Result<Vec<GraphNode>, StoreError> {
+        let all = self.get_neighbors(node_id, depth).await?;
+        if labels.is_empty() {
+            return Ok(all);
+        }
+        let wanted: std::collections::HashSet<&str> =
+            labels.iter().map(NodeLabel::as_str).collect();
+        Ok(all
+            .into_iter()
+            .filter(|n| wanted.contains(n.label.as_str()))
+            .collect())
+    }
 
     /// Traverse the graph from a starting node, filtering by relationship types.
     async fn traverse(

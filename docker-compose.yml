@@ -1,0 +1,349 @@
+# ============================================================
+# agent-rs — Infrastructure Services
+# ============================================================
+# Root-level compose file: uses /.env directly (no symlink needed).
+# All host ports are configurable via .env (see .env.example).
+# WARNING: Jaeger uses in-memory storage — trace data is lost
+# on container restart. Acceptable for dev/staging only.
+# ============================================================
+
+networks:
+  agentic-ra-net:
+    driver: bridge
+
+volumes:
+  qdrant_storage:
+  postgres_data:
+  neo4j_data:
+  prometheus_data:
+  grafana_data:
+  ruvector_data:
+  docling_models:
+
+services:
+  # ----------------------------------------------------------
+  # Qdrant — Vector similarity search
+  # ----------------------------------------------------------
+  qdrant:
+    image: qdrant/qdrant:v1.17.1
+    container_name: agentic-ra-qdrant
+    restart: "on-failure:5"
+    ports:
+      - "${QDRANT_GRPC_PORT}:6334"
+      - "${QDRANT_HTTP_PORT}:6333"
+    volumes:
+      - qdrant_storage:/qdrant/storage
+      - ./infra/qdrant/config.yaml:/qdrant/config/production.yaml:ro
+    environment:
+      - QDRANT__SERVICE__API_KEY=${QDRANT_API_KEY}
+    networks:
+      - agentic-ra-net
+    mem_limit: 2g
+    mem_reservation: 1g
+    cpus: 1.5
+    healthcheck:
+      test: ["CMD-SHELL", "bash -c 'echo > /dev/tcp/localhost/6333'"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  # ----------------------------------------------------------
+  # PostgreSQL — State store, chat history, memory, evidence
+  # ----------------------------------------------------------
+  postgres:
+    image: postgres:17.4
+    container_name: agentic-ra-postgres
+    restart: "on-failure:5"
+    ports:
+      - "${POSTGRES_PORT}:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./infra/postgres/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    environment:
+      - POSTGRES_USER=${POSTGRES_USER}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
+      - POSTGRES_DB=${POSTGRES_DB}
+    networks:
+      - agentic-ra-net
+    mem_limit: 1g
+    mem_reservation: 512m
+    cpus: 1.0
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB && psql -U $$POSTGRES_USER -d $$POSTGRES_DB -c 'SELECT 1'",
+        ]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 15s
+
+  # ----------------------------------------------------------
+  # Neo4j — Knowledge graph (Cognee graph backend)
+  # ----------------------------------------------------------
+  neo4j:
+    image: neo4j:5.26-community
+    container_name: agentic-ra-neo4j
+    restart: "on-failure:5"
+    ports:
+      - "${NEO4J_BOLT_PORT}:7687"
+      - "${NEO4J_HTTP_PORT}:7474"
+    volumes:
+      - neo4j_data:/data
+    environment:
+      - NEO4J_AUTH=${NEO4J_USER}/${NEO4J_PASSWORD}
+      - NEO4J_PLUGINS=["apoc"]
+    networks:
+      - agentic-ra-net
+    mem_limit: 2g
+    mem_reservation: 1g
+    cpus: 1.0
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:7474 || exit 1"]
+      interval: 10s
+      timeout: 10s
+      retries: 10
+      start_period: 30s
+
+  # ----------------------------------------------------------
+  # OPA — Policy decision point
+  # ----------------------------------------------------------
+  opa:
+    image: openpolicyagent/opa:1.4.2-debug
+    platform: linux/amd64
+    container_name: agentic-ra-opa
+    restart: unless-stopped
+    ports:
+      - "${OPA_PORT}:8181"
+    volumes:
+      - ./infra/opa/policies:/policies:ro
+    command:
+      - "run"
+      - "--server"
+      - "--addr=0.0.0.0:8181"
+      - "--log-level=${OPA_LOG_LEVEL}"
+      - "--log-format=json"
+      - "--set=decision_logs.console=true"
+      - "/policies"
+    networks:
+      - agentic-ra-net
+    mem_limit: 256m
+    mem_reservation: 128m
+    cpus: 0.5
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "wget -qO- http://localhost:8181/v1/policies | grep -q '\"id\"'",
+        ]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  # ----------------------------------------------------------
+  # Jaeger — Trace storage + UI (in-memory, ephemeral)
+  # ----------------------------------------------------------
+  jaeger:
+    image: jaegertracing/all-in-one:latest
+    container_name: agentic-ra-jaeger
+    restart: unless-stopped
+    ports:
+      - "${JAEGER_UI_PORT}:16686"
+    environment:
+      - COLLECTOR_OTLP_ENABLED=true
+    networks:
+      - agentic-ra-net
+    mem_limit: 1g
+    mem_reservation: 512m
+    cpus: 0.5
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "wget --spider http://localhost:14269/ && nc -z localhost 4317",
+        ]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  # ----------------------------------------------------------
+  # Brave Search MCP — Web search (internal-only)
+  # ----------------------------------------------------------
+  brave-search-mcp:
+    image: node:22-slim
+    container_name: agentic-ra-brave-search
+    restart: "on-failure:5"
+    command: npx -y @brave/brave-search-mcp-server@2.0.75 --transport http --port 1063 --enabled-tools brave_web_search brave_news_search
+    ports:
+      - "${BRAVE_MCP_PORT:-1063}:1063"
+    environment:
+      - BRAVE_API_KEY=${BRAVE_API_KEY}
+      - BRAVE_MCP_TRANSPORT=http
+      - BRAVE_MCP_PORT=1063
+      - BRAVE_MCP_HOST=0.0.0.0
+      - BRAVE_MCP_STATELESS=true
+      - BRAVE_MCP_ENABLED_TOOLS=brave_web_search,brave_news_search
+    networks:
+      - agentic-ra-net
+    mem_limit: 256m
+    mem_reservation: 128m
+    cpus: 0.5
+    healthcheck:
+      test: ["CMD-SHELL", "node -e \"require('http').get('http://localhost:1063/mcp', r => process.exit(r.statusCode < 500 ? 0 : 1)).on('error', () => process.exit(1))\""]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+
+  # ----------------------------------------------------------
+  # OTel Collector — Telemetry pipeline
+  # ----------------------------------------------------------
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:0.121.0
+    container_name: agentic-ra-otel-collector
+    restart: unless-stopped
+    ports:
+      - "${OTEL_COLLECTOR_PORT}:4317"
+      - "${OTEL_PROMETHEUS_PORT:-8889}:8889"
+    volumes:
+      - ./infra/otel/collector.yaml:/etc/otelcol-contrib/config.yaml:ro
+    networks:
+      - agentic-ra-net
+    depends_on:
+      jaeger:
+        condition: service_healthy
+    mem_limit: 512m
+    mem_reservation: 256m
+    cpus: 0.5
+    # No CMD-SHELL health check: scratch-based image has no shell.
+    # The collector is stateless with unless-stopped restart policy.
+    # It depends on jaeger:service_healthy and logs errors clearly.
+
+  # ----------------------------------------------------------
+  # Prometheus — Metrics storage
+  # ----------------------------------------------------------
+  prometheus:
+    image: prom/prometheus:v3.4.0
+    container_name: agentic-ra-prometheus
+    restart: unless-stopped
+    ports:
+      - "${PROMETHEUS_PORT:-1066}:9090"
+    volumes:
+      - ./infra/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+    networks:
+      - agentic-ra-net
+    depends_on:
+      otel-collector:
+        condition: service_started
+    mem_limit: 512m
+    mem_reservation: 256m
+    cpus: 0.5
+
+  # ----------------------------------------------------------
+  # Grafana — Observability dashboard
+  # ----------------------------------------------------------
+  grafana:
+    image: grafana/grafana-oss:12.1.0
+    container_name: agentic-ra-grafana
+    restart: unless-stopped
+    ports:
+      - "${GRAFANA_PORT:-1067}:3000"
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./infra/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./infra/grafana/dashboards:/var/lib/grafana/dashboards:ro
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_ADMIN_PASSWORD:-admin}
+      - GF_AUTH_ANONYMOUS_ENABLED=true
+      - GF_AUTH_ANONYMOUS_ORG_ROLE=Viewer
+      - POSTGRES_USER=${POSTGRES_USER:-agentic_ra}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-changeme-postgres}
+      - POSTGRES_DB=${POSTGRES_DB:-agentic_ra}
+    networks:
+      - agentic-ra-net
+    depends_on:
+      prometheus:
+        condition: service_started
+    mem_limit: 512m
+    mem_reservation: 256m
+    cpus: 0.5
+
+  # ----------------------------------------------------------
+  # RuVector — Self-learning vector database (optional)
+  # ----------------------------------------------------------
+  ruvector:
+    image: ghcr.io/ruvnet/ruvector:latest
+    container_name: agentic-ra-ruvector
+    restart: "on-failure:5"
+    ports:
+      - "${RUVECTOR_HTTP_PORT:-1064}:6333"
+      - "${RUVECTOR_GRPC_PORT:-1065}:6334"
+    volumes:
+      - ruvector_data:/data
+    networks:
+      - agentic-ra-net
+    mem_limit: 2g
+    mem_reservation: 1g
+    cpus: 1.5
+    healthcheck:
+      test: ["CMD-SHELL", "wget --spider -q http://localhost:6333/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+    profiles:
+      - ruvector
+
+  # ----------------------------------------------------------
+  # Docling Sidecar — PDF parsing + structural chunking (gRPC)
+  # Port 1068 (1064/1065 reserved for ruvector profile).
+  # Build context: repo root (current directory).
+  # ----------------------------------------------------------
+  docling-sidecar:
+    build:
+      context: .
+      dockerfile: infra/docling-sidecar/Dockerfile
+    container_name: agentic-ra-docling-sidecar
+    restart: "on-failure:5"
+    ports:
+      - "${DOCLING_SIDECAR_PORT:-1068}:1068"
+    volumes:
+      - docling_models:/root/.cache/docling
+    environment:
+      - DOCLING_CACHE_DIR=/root/.cache/docling
+      - DOCLING_LOG_LEVEL=INFO
+      - DOCLING_GRPC_HOST=0.0.0.0
+      - DOCLING_GRPC_PORT=1068
+      - DOCLING_MAX_PDF_BYTES=104857600
+      - DOCLING_MAX_PAGES=500
+      - DOCLING_PARSE_TIMEOUT_S=600
+      - DOCLING_STREAM_IDLE_TIMEOUT_S=600
+      - DOCLING_MAX_CHUNKS_PER_DOC=10000
+      # fast | accurate — "accurate" is the default; slower (~+40%) and
+      # ~3-4 GB more peak memory but significantly better on complex
+      # nested tables (merged cells, multi-row headers). Flip to "fast"
+      # for text-heavy corpora or Docker Desktop VMs <12 GB.
+      - DOCLING_TABLEFORMER_MODE=${DOCLING_TABLEFORMER_MODE:-accurate}
+      # cpu | cuda | mps | auto — auto-detects via torch at sidecar
+      # startup. NOTE: MPS is NOT available inside Docker on macOS
+      # (Linux VM has no Metal API). To use MPS on Apple Silicon, run
+      # the sidecar natively on the host with `just docling-native`.
+      - DOCLING_ACCELERATOR=${DOCLING_ACCELERATOR:-auto}
+    networks:
+      - agentic-ra-net
+    # Docling layout-heron + tableformer ACCURATE peak ~8-10 GB on large
+    # PDFs. Docker Desktop VM must be >= 16 GB (Settings > Resources > Memory).
+    mem_limit: 12g
+    mem_reservation: 6g
+    cpus: 4.0
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/grpc_health_probe", "-addr=:1068", "-rpc-timeout=5s"]
+      interval: 15s
+      timeout: 5s
+      start_period: 180s
+      retries: 3

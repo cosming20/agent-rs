@@ -1,8 +1,9 @@
 //! agent-rs — reusable wiring functions for the agentic RAG system.
 //!
 //! This library provides builder functions that compose the crates in the
-//! workspace into a runnable system. Both `src/main.rs` (the gRPC server)
-//! and `examples/eval_harness.rs` (the evaluation tool) import from here.
+//! workspace into a runnable system. Used by `src/main.rs` (the gRPC
+//! server) and the dev-loop examples in `examples/` (`ingest.rs`,
+//! `query.rs`).
 //!
 //! # Modules
 //!

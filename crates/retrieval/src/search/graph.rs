@@ -19,11 +19,14 @@
 //!
 //! [`GraphCotRetriever`]: crate::graph_cot::GraphCotRetriever
 
+use std::cmp::Ordering;
 use std::collections::HashMap;
 
-use agent_rs_core::Score;
-use agent_rs_stores::{traits::GraphStore, types::SearchResult};
-use serde_json::json;
+use agent_rs_core::{CollectionName, Score};
+use agent_rs_stores::{
+    traits::{GraphStore, VectorStore},
+    types::{NodeLabel, PointPayload, SearchResult},
+};
 use tracing::instrument;
 
 use crate::error::RetrievalError;
@@ -57,70 +60,112 @@ const BASE_DEPTH_SCORE: f64 = 1.0;
 ///
 /// # Errors
 ///
-/// Returns [`RetrievalError::Store`] if any `get_neighbors` call fails.
-#[instrument(skip(store), fields(
+/// Returns [`RetrievalError::Store`] on graph-traversal or payload-rehydration
+/// failure.
+///
+/// # Invariants enforced
+///
+/// 1. **Label filter**: only `Chunk`-labeled neighbors are considered. Entity,
+///    Document, Page, Section, Table, and Picture nodes are dropped at the
+///    database boundary so they never enter the RRF-fused result stream.
+///    Non-chunk nodes carry no `chunk_text` payload and would surface as
+///    empty rows in the user-facing evidence pack.
+///
+/// 2. **Payload-or-drop**: every returned [`SearchResult`] carries the
+///    authoritative Qdrant payload (`chunk_text`, `section_title`,
+///    `page_start`, …). Chunk IDs that exist in Neo4j but are absent from
+///    the vector collection (index skew) are logged and dropped rather than
+///    emitted with empty content.
+///
+/// `query` is retained for trace-span provenance only and is not attached to
+/// the per-result payload (payload comes from Qdrant and already contains the
+/// full chunk metadata).
+#[instrument(skip(graph, vectors), fields(
+    collection = %collection,
     num_seeds = seed_node_ids.len(),
     max_depth,
     limit,
 ))]
 pub async fn graph_search(
-    store: &(dyn GraphStore + Send + Sync),
+    graph: &(dyn GraphStore + Send + Sync),
+    vectors: &(dyn VectorStore + Send + Sync),
+    collection: &CollectionName,
     query: &str,
     seed_node_ids: &[String],
     max_depth: usize,
     limit: usize,
 ) -> Result<Vec<SearchResult>, RetrievalError> {
-    // best_score tracks the highest score seen for each unique node ID so that
-    // nodes reachable from multiple seeds keep only their best result.
+    let _ = query; // Reserved for future scoring heuristics; see docstring.
+
+    // Push the Chunk label predicate into Cypher so we don't waste bandwidth
+    // transporting Entity / Document / Page / Section / Table / Picture nodes
+    // just to drop them here.
+    let chunk_labels = [NodeLabel::chunk()];
+
+    // best_score collapses duplicate chunks reachable from multiple seeds,
+    // keeping the highest observed score. Scoring is uniform today because
+    // `get_neighbors_of_labels` returns a flat unordered set — depth-aware
+    // scoring would need a backend API change.
     let mut best_score: HashMap<String, f64> = HashMap::new();
-    // node_payload retains the payload of the first (highest-score) encounter.
-    let mut node_payload: HashMap<String, serde_json::Value> = HashMap::new();
 
     for seed_id in seed_node_ids {
-        let neighbors = store
-            .get_neighbors(seed_id, max_depth)
+        let neighbors = graph
+            .get_neighbors_of_labels(seed_id, max_depth, &chunk_labels)
             .await
             .map_err(RetrievalError::Store)?;
 
-        for node in neighbors.iter() {
-            // Uniform scoring: `get_neighbors` returns a flat unordered list
-            // without depth information. The enumerate index is NOT traversal
-            // depth. Depth-aware scoring requires a GraphStore API change to
-            // return `(GraphNode, usize)`. RRF fusion handles relative ranking.
-            let score = BASE_DEPTH_SCORE;
-
-            let entry = best_score.entry(node.id.clone()).or_insert(0.0);
-            if score > *entry {
-                *entry = score;
-                node_payload.insert(
-                    node.id.clone(),
-                    json!({
-                        "node_id": node.id,
-                        "label": node.label.as_str(),
-                        "properties": node.properties,
-                        "source": "neo4j",
-                        "query": query,
-                        "depth": max_depth,
-                    }),
-                );
+        for node in neighbors {
+            let entry = best_score.entry(node.id).or_insert(0.0);
+            if BASE_DEPTH_SCORE > *entry {
+                *entry = BASE_DEPTH_SCORE;
             }
         }
     }
 
-    // Sort by descending score then by ID for determinism.
+    // Deterministic ordering: score desc, then id asc for tie-break.
     let mut scored: Vec<(String, f64)> = best_score.into_iter().collect();
     scored.sort_unstable_by(|(id_a, score_a), (id_b, score_b)| {
         score_b
             .partial_cmp(score_a)
-            .unwrap_or(std::cmp::Ordering::Equal)
+            .unwrap_or(Ordering::Equal)
             .then_with(|| id_a.cmp(id_b))
     });
+    scored.truncate(limit);
+
+    if scored.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    // Rehydrate payloads from the vector store. Qdrant returns only IDs that
+    // still exist; we drop the rest so empty-content results never leak.
+    let ids: Vec<String> = scored.iter().map(|(id, _)| id.clone()).collect();
+    let payloads = vectors
+        .get_by_ids(collection, &ids)
+        .await
+        .map_err(RetrievalError::Store)?;
+
+    let payload_by_id: HashMap<String, serde_json::Value> = payloads
+        .into_iter()
+        .map(|PointPayload { id, payload }| (id, payload))
+        .collect();
+
+    let n_requested = ids.len();
+    let n_hydrated = payload_by_id.len();
+    if n_hydrated < n_requested {
+        tracing::warn!(
+            requested = n_requested,
+            hydrated = n_hydrated,
+            missing = n_requested - n_hydrated,
+            collection = %collection,
+            "graph_search: chunk IDs present in Neo4j but missing from Qdrant (index skew)"
+        );
+    }
 
     let results: Vec<SearchResult> = scored
         .into_iter()
-        .take(limit)
         .filter_map(|(id, score)| {
-            node_payload.remove(&id).map(|payload| SearchResult {
+            let payload = payload_by_id.get(&id)?.clone();
+            Some(SearchResult {
                 id,
                 score: Score::new(score),
                 payload,
@@ -148,13 +193,16 @@ pub async fn graph_search(
 /// # Errors
 ///
 /// Returns [`RetrievalError::Store`] if the underlying traversal fails.
-#[instrument(skip(store), fields(
+#[instrument(skip(graph, vectors), fields(
+    collection = %collection,
     num_seeds = seed_node_ids.len(),
     max_depth,
     limit,
 ))]
 pub async fn graph_cot_search(
-    store: &(dyn GraphStore + Send + Sync),
+    graph: &(dyn GraphStore + Send + Sync),
+    vectors: &(dyn VectorStore + Send + Sync),
+    collection: &CollectionName,
     query: &str,
     seed_node_ids: &[String],
     max_depth: usize,
@@ -162,7 +210,16 @@ pub async fn graph_cot_search(
 ) -> Result<Vec<SearchResult>, RetrievalError> {
     // The CoT iteration is applied by the router after this function returns.
     // Here we only produce the initial evidence pool.
-    graph_search(store, query, seed_node_ids, max_depth, limit).await
+    graph_search(
+        graph,
+        vectors,
+        collection,
+        query,
+        seed_node_ids,
+        max_depth,
+        limit,
+    )
+    .await
 }
 
 // ---- graph_constrained_search ----
@@ -176,13 +233,16 @@ pub async fn graph_cot_search(
 /// # Errors
 ///
 /// Returns [`RetrievalError::Store`] if the underlying traversal fails.
-#[instrument(skip(store), fields(
+#[instrument(skip(graph, vectors), fields(
+    collection = %collection,
     num_seeds = seed_node_ids.len(),
     max_depth,
     limit,
 ))]
 pub async fn graph_constrained_search(
-    store: &(dyn GraphStore + Send + Sync),
+    graph: &(dyn GraphStore + Send + Sync),
+    vectors: &(dyn VectorStore + Send + Sync),
+    collection: &CollectionName,
     query: &str,
     seed_node_ids: &[String],
     max_depth: usize,
@@ -191,7 +251,16 @@ pub async fn graph_constrained_search(
     tracing::debug!(
         "graph_constrained_search: constraint filtering not yet implemented; using graph_search"
     );
-    graph_search(store, query, seed_node_ids, max_depth, limit).await
+    graph_search(
+        graph,
+        vectors,
+        collection,
+        query,
+        seed_node_ids,
+        max_depth,
+        limit,
+    )
+    .await
 }
 
 // ---- graph_rag_context_search ----
@@ -205,13 +274,16 @@ pub async fn graph_constrained_search(
 /// # Errors
 ///
 /// Returns [`RetrievalError::Store`] if the underlying traversal fails.
-#[instrument(skip(store), fields(
+#[instrument(skip(graph, vectors), fields(
+    collection = %collection,
     num_seeds = seed_node_ids.len(),
     max_depth,
     limit,
 ))]
 pub async fn graph_rag_context_search(
-    store: &(dyn GraphStore + Send + Sync),
+    graph: &(dyn GraphStore + Send + Sync),
+    vectors: &(dyn VectorStore + Send + Sync),
+    collection: &CollectionName,
     query: &str,
     seed_node_ids: &[String],
     max_depth: usize,
@@ -220,5 +292,14 @@ pub async fn graph_rag_context_search(
     tracing::debug!(
         "graph_rag_context_search: context injection not yet implemented; using graph_search"
     );
-    graph_search(store, query, seed_node_ids, max_depth, limit).await
+    graph_search(
+        graph,
+        vectors,
+        collection,
+        query,
+        seed_node_ids,
+        max_depth,
+        limit,
+    )
+    .await
 }
