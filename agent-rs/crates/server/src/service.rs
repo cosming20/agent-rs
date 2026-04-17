@@ -9,7 +9,7 @@
 use std::sync::Arc;
 
 use tonic::{Request, Response, Status};
-use tracing::instrument;
+use tracing::{instrument, warn};
 use uuid::Uuid;
 
 use agent_rs_agent::orchestrator::AgentOrchestrator;
@@ -23,17 +23,30 @@ use crate::proto::agentic_rag::v1::{
     health_service_server::HealthService, query_service_server::QueryService,
 };
 
+/// Default number of results when the caller supplies `limit == 0`.
+const DEFAULT_LIMIT: usize = 10;
+
 // ---- QueryServiceImpl ----
 
 /// gRPC service that routes queries through the agent pipeline.
 pub struct QueryServiceImpl {
     orchestrator: Arc<AgentOrchestrator>,
+    /// Hard cap on caller-supplied `limit` values. Sourced from
+    /// [`ServerConfig::max_limit_per_query`].
+    max_limit: usize,
 }
 
 impl QueryServiceImpl {
     /// Construct a new query service wrapping the given orchestrator.
-    pub fn new(orchestrator: Arc<AgentOrchestrator>) -> Self {
-        Self { orchestrator }
+    ///
+    /// `max_limit` is the maximum number of evidence results the caller is
+    /// allowed to request in a single [`QueryRequest`]. Any higher value is
+    /// clamped and a `WARN` log is emitted so operators can detect abuse.
+    pub fn new(orchestrator: Arc<AgentOrchestrator>, max_limit: usize) -> Self {
+        Self {
+            orchestrator,
+            max_limit,
+        }
     }
 }
 
@@ -72,10 +85,23 @@ impl QueryService for QueryServiceImpl {
         let session_id = SessionId::from_uuid(session_uuid);
         let user_id = UserId::from_string(req.user_id.clone());
         let strategy = proto_strategy_to_domain(req.strategy);
-        let limit = if req.limit > 0 {
+
+        let requested_limit = if req.limit > 0 {
             req.limit as usize
         } else {
-            10
+            DEFAULT_LIMIT
+        };
+        let limit = if requested_limit > self.max_limit {
+            warn!(
+                requested = requested_limit,
+                clamped = self.max_limit,
+                session_id = %req.session_id,
+                user_id = %req.user_id,
+                "caller limit exceeded cap; clamping to max_limit_per_query",
+            );
+            self.max_limit
+        } else {
+            requested_limit
         };
 
         let response = self

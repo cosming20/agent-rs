@@ -152,7 +152,7 @@ struct ApiErrorDetail {
 /// once at startup and shared across the ingestion pipeline.
 #[derive(Clone)]
 pub struct ChunkSummarizer {
-    client: reqwest::Client,
+    client: Arc<reqwest::Client>,
     api_key: Arc<String>,
     model: Arc<String>,
     max_retries: u32,
@@ -170,11 +170,7 @@ impl std::fmt::Debug for ChunkSummarizer {
 
 impl ChunkSummarizer {
     /// Create a new summarizer with the given OpenAI API key and model.
-    pub fn new(api_key: String, model: String) -> Self {
-        let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(60))
-            .build()
-            .unwrap_or_else(|_| reqwest::Client::new());
+    pub fn new(api_key: String, model: String, client: Arc<reqwest::Client>) -> Self {
         tracing::info!(
             model = %model,
             max_retries = DEFAULT_MAX_RETRIES,
@@ -189,8 +185,8 @@ impl ChunkSummarizer {
     }
 
     /// Create a summarizer using the default model (`gpt-4o-mini`).
-    pub fn with_default_model(api_key: String) -> Self {
-        Self::new(api_key, DEFAULT_MODEL.to_owned())
+    pub fn with_default_model(api_key: String, client: Arc<reqwest::Client>) -> Self {
+        Self::new(api_key, DEFAULT_MODEL.to_owned(), client)
     }
 
     /// Override the retry budget. The default is [`DEFAULT_MAX_RETRIES`].

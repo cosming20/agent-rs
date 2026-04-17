@@ -7,6 +7,7 @@ use std::sync::Arc;
 
 use agent_rs_core::errors::AgentError;
 use agent_rs_core::types::MessageRole;
+use agent_rs_observability::metrics::RetrievalMetrics;
 use agent_rs_stores::traits::StateStore;
 use agent_rs_stores::types::QueryRun;
 use chrono::Utc;
@@ -22,6 +23,7 @@ pub struct ResultPersister {
     synthesizer: ResponseSynthesizer,
     memory: Arc<MemoryManager>,
     store: Arc<dyn StateStore>,
+    metrics: Arc<RetrievalMetrics>,
 }
 
 impl ResultPersister {
@@ -30,11 +32,13 @@ impl ResultPersister {
         synthesizer: ResponseSynthesizer,
         memory: Arc<MemoryManager>,
         store: Arc<dyn StateStore>,
+        metrics: Arc<RetrievalMetrics>,
     ) -> Self {
         Self {
             synthesizer,
             memory,
             store,
+            metrics,
         }
     }
 
@@ -47,6 +51,12 @@ impl ResultPersister {
         let verification = ctx.verification.as_ref().ok_or_else(|| {
             AgentError::Orchestrator("verification result missing before persist".into())
         })?;
+
+        // Emit verifier method and query duration metrics before synthesis.
+        self.metrics
+            .record_verifier_method(&verification.method, verification.is_grounded);
+        self.metrics
+            .record_query_duration_ms(ctx.elapsed_ms() as f64, ctx.strategy);
 
         // Synthesize citations
         let response = self.synthesizer.synthesize(

@@ -80,17 +80,21 @@ impl Default for EntityLinkerConfig {
 #[derive(Clone)]
 pub struct EntityLinker {
     graph_store: Arc<dyn GraphStore + Send + Sync>,
-    client: reqwest::Client,
+    client: Arc<reqwest::Client>,
     api_key: String,
     model: String,
     max_entities: usize,
 }
 
 impl EntityLinker {
-    pub fn new(graph_store: Arc<dyn GraphStore + Send + Sync>, config: EntityLinkerConfig) -> Self {
+    pub fn new(
+        graph_store: Arc<dyn GraphStore + Send + Sync>,
+        config: EntityLinkerConfig,
+        client: Arc<reqwest::Client>,
+    ) -> Self {
         Self {
             graph_store,
-            client: reqwest::Client::new(),
+            client,
             api_key: config.api_key,
             model: config.model,
             max_entities: config.max_entities,

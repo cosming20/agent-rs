@@ -42,6 +42,7 @@ pub mod proto {
 }
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use tonic::transport::Server;
 use tracing::{info, instrument};
@@ -78,12 +79,35 @@ pub async fn run(
                 reason: e.to_string(),
             })?;
 
-    let query_svc = QueryServiceServer::new(QueryServiceImpl::new(Arc::clone(&orchestrator)));
+    let query_svc = QueryServiceServer::new(QueryServiceImpl::new(
+        Arc::clone(&orchestrator),
+        settings.server.max_limit_per_query,
+    ));
     let health_svc = HealthServiceServer::new(HealthServiceImpl);
 
-    info!(bind_addr = %addr, "gRPC server starting");
+    let srv_cfg = &settings.server;
+    let request_timeout = Duration::from_secs(srv_cfg.request_timeout_s);
+    let tcp_keepalive = Duration::from_secs(30);
+
+    info!(
+        bind_addr = %addr,
+        request_timeout_s = srv_cfg.request_timeout_s,
+        max_concurrent_streams = srv_cfg.max_concurrent_streams,
+        concurrency_per_connection = srv_cfg.concurrency_per_connection,
+        "gRPC server starting",
+    );
 
     Server::builder()
+        // Per-request wall-time cap — cancels runaway agent pipelines.
+        .timeout(request_timeout)
+        // Detect dead peers and reclaim file descriptors.
+        .tcp_keepalive(Some(tcp_keepalive))
+        // Per-connection in-flight call cap (tower layer).
+        .concurrency_limit_per_connection(srv_cfg.concurrency_per_connection as usize)
+        // HTTP/2 stream-level cap.
+        .max_concurrent_streams(Some(srv_cfg.max_concurrent_streams))
+        // TODO: wire TLS when `settings.server.tls_cert_path` / `tls_key_path`
+        // config fields are added.  For now the server binds in plaintext.
         .add_service(query_svc)
         .add_service(health_svc)
         .serve(addr)

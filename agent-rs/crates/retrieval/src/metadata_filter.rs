@@ -271,7 +271,7 @@ impl MetadataFilterConfig {
 /// startup and share across request handlers via `Arc<MetadataFilterExtractor>`.
 #[derive(Clone)]
 pub struct MetadataFilterExtractor {
-    client: reqwest::Client,
+    client: Arc<reqwest::Client>,
     api_key: Arc<String>,
     model: Arc<String>,
     temperature: f32,
@@ -296,14 +296,10 @@ impl MetadataFilterExtractor {
     ///
     /// Returns [`RetrievalError::Ingestion`] if the HTTP client cannot be
     /// built (extremely rare — only when TLS libraries are missing).
-    pub fn new(config: MetadataFilterConfig) -> Result<Self, RetrievalError> {
-        let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(30))
-            .build()
-            .map_err(|e| RetrievalError::Ingestion {
-                reason: format!("build MetadataFilterExtractor HTTP client: {e}"),
-            })?;
-
+    pub fn new(
+        config: MetadataFilterConfig,
+        client: Arc<reqwest::Client>,
+    ) -> Result<Self, RetrievalError> {
         tracing::info!(
             model = %config.model,
             temperature = config.temperature,

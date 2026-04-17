@@ -160,7 +160,9 @@ impl VectorStore for QdrantStore {
             .client
             .query(
                 QueryPointsBuilder::new(collection.as_str())
-                    .query(qdrant_client::qdrant::Query::from(query.as_slice().to_vec()))
+                    .query(qdrant_client::qdrant::Query::from(
+                        query.as_slice().to_vec(),
+                    ))
                     .using("dense")
                     .limit(limit as u64)
                     .with_payload(true),
@@ -193,7 +195,9 @@ impl VectorStore for QdrantStore {
         limit: usize,
     ) -> Result<Vec<SearchResult>, StoreError> {
         let prefetch_dense = PrefetchQueryBuilder::default()
-            .query(qdrant_client::qdrant::Query::from(dense.as_slice().to_vec()))
+            .query(qdrant_client::qdrant::Query::from(
+                dense.as_slice().to_vec(),
+            ))
             .using("dense")
             .limit(limit as u64)
             .build();
@@ -246,7 +250,9 @@ impl VectorStore for QdrantStore {
         filter: Option<serde_json::Value>,
     ) -> Result<Vec<SearchResult>, StoreError> {
         let mut builder = QueryPointsBuilder::new(collection.as_str())
-            .query(qdrant_client::qdrant::Query::from(query.as_slice().to_vec()))
+            .query(qdrant_client::qdrant::Query::from(
+                query.as_slice().to_vec(),
+            ))
             .using("dense")
             .limit(limit as u64)
             .with_payload(true);

@@ -34,6 +34,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use agent_rs_observability::metrics::RetrievalMetrics;
 use backon::{ExponentialBuilder, Retryable};
 use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
@@ -479,10 +480,12 @@ struct ApiErrorDetail {
 /// once at startup and shared across the ingestion pipeline.
 #[derive(Clone)]
 pub struct LlmGraphExtractor {
-    client: reqwest::Client,
+    client: Arc<reqwest::Client>,
     api_key: Arc<String>,
     model: Arc<String>,
     max_retries: u32,
+    /// Optional shared metric instruments for graph extraction failures.
+    metrics: Option<Arc<RetrievalMetrics>>,
 }
 
 impl std::fmt::Debug for LlmGraphExtractor {
@@ -499,11 +502,7 @@ impl LlmGraphExtractor {
     /// Create a new extractor with the given OpenAI API key and model.
     ///
     /// Use `DEFAULT_MODEL` (`gpt-4o-mini`) when the caller has no preference.
-    pub fn new(api_key: String, model: String) -> Self {
-        let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(120))
-            .build()
-            .unwrap_or_else(|_| reqwest::Client::new());
+    pub fn new(api_key: String, model: String, client: Arc<reqwest::Client>) -> Self {
         tracing::info!(
             model = %model,
             max_retries = DEFAULT_MAX_RETRIES,
@@ -514,17 +513,28 @@ impl LlmGraphExtractor {
             api_key: Arc::new(api_key),
             model: Arc::new(model),
             max_retries: DEFAULT_MAX_RETRIES,
+            metrics: None,
         }
     }
 
     /// Create a new extractor using the default model (`gpt-4o-mini`).
-    pub fn with_default_model(api_key: String) -> Self {
-        Self::new(api_key, DEFAULT_MODEL.to_owned())
+    pub fn with_default_model(api_key: String, client: Arc<reqwest::Client>) -> Self {
+        Self::new(api_key, DEFAULT_MODEL.to_owned(), client)
     }
 
     /// Override the retry budget. The default is `DEFAULT_MAX_RETRIES`.
     pub fn with_max_retries(mut self, max_retries: u32) -> Self {
         self.max_retries = max_retries;
+        self
+    }
+
+    /// Attach shared metric instruments for extraction failure tracking.
+    ///
+    /// When set, [`extract_batch`] increments the graph extraction failure
+    /// counter each time both the primary and sanitized fallback attempts fail
+    /// for a chunk.
+    pub fn with_metrics(mut self, metrics: Arc<RetrievalMetrics>) -> Self {
+        self.metrics = Some(metrics);
         self
     }
 
@@ -757,6 +767,9 @@ impl LlmGraphExtractor {
                                     error = %e2,
                                     "fallback extraction also failed; using empty graph"
                                 );
+                                if let Some(m) = &extractor.metrics {
+                                    m.record_graph_extraction_failure();
+                                }
                                 (idx, KnowledgeGraph::default())
                             }
                         }

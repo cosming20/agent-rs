@@ -8,6 +8,7 @@ use std::sync::Arc;
 
 use agent_rs_core::errors::AgentError;
 use agent_rs_core::types::Confidence;
+use agent_rs_observability::metrics::RetrievalMetrics;
 use tracing::{error, info, instrument, warn};
 
 use crate::context::QueryContext;
@@ -19,14 +20,20 @@ use crate::verifier::{GroundingVerifier, VerificationResult};
 pub struct GroundingGate {
     verifier: Arc<GroundingVerifier>,
     max_retries: usize,
+    metrics: Arc<RetrievalMetrics>,
 }
 
 impl GroundingGate {
     /// Create a new GroundingGate.
-    pub fn new(verifier: Arc<GroundingVerifier>, max_retries: usize) -> Self {
+    pub fn new(
+        verifier: Arc<GroundingVerifier>,
+        max_retries: usize,
+        metrics: Arc<RetrievalMetrics>,
+    ) -> Self {
         Self {
             verifier,
             max_retries,
+            metrics,
         }
     }
 
@@ -50,10 +57,16 @@ impl GroundingGate {
 
         while let Some(ref verification) = ctx.verification {
             if !self.verifier.needs_retry(verification) || ctx.retries >= self.max_retries {
+                // Emit retries_exhausted only when we hit the cap while still ungrounded.
+                if ctx.retries >= self.max_retries && self.verifier.needs_retry(verification) {
+                    self.metrics
+                        .record_grounding_retries_exhausted(ctx.strategy);
+                }
                 break;
             }
 
             ctx.retries += 1;
+            self.metrics.record_grounding_retry(ctx.strategy);
             warn!(
                 confidence = verification.confidence.value(),
                 is_grounded = verification.is_grounded,

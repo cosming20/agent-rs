@@ -13,6 +13,7 @@ use agent_rs::stores::connect_stores;
 use agent_rs_agent::orchestrator::AgentOrchestrator;
 use agent_rs_core::config::Settings;
 use agent_rs_core::types::CollectionName;
+use agent_rs_observability::metrics::RetrievalMetrics;
 use agent_rs_observability::tracing::init_tracing;
 use anyhow::{Context, Result};
 use tracing::info;
@@ -32,10 +33,16 @@ async fn main() -> Result<()> {
     let (embedder, label) = agent_rs::embedder::build_embedder().await?;
     info!(embedder = %label, "embedder ready");
 
-    // 3. Build retrieval router with all cognitive features enabled.
+    // 3. Instantiate shared metric instruments (registered against the global
+    //    OTel meter provider set up by init_tracing above).
+    let metrics = Arc::new(RetrievalMetrics::new("agent-rs"));
+
+    // 4. Build retrieval router with all cognitive features enabled.
     let collection = CollectionName::from_string(settings.retrieval.dataset.clone());
-    let triplet_collection = CollectionName::from_string(format!("{}_triplets", collection.as_str()));
-    let summaries_collection = CollectionName::from_string(format!("{}_summaries", collection.as_str()));
+    let triplet_collection =
+        CollectionName::from_string(format!("{}_triplets", collection.as_str()));
+    let summaries_collection =
+        CollectionName::from_string(format!("{}_summaries", collection.as_str()));
 
     let router = agent_rs::router::build_router(
         &settings,
@@ -45,20 +52,25 @@ async fn main() -> Result<()> {
         &triplet_collection,
         &summaries_collection,
         &RouterFeatures::production(),
+        Arc::clone(&metrics),
     )
     .await?;
 
     info!("retrieval router ready");
 
-    // 4. Create agent orchestrator (wires pipeline steps).
-    let orchestrator =
-        AgentOrchestrator::new(&settings, stores.postgres.clone(), Arc::clone(&router))
-            .context("failed to create agent orchestrator")?;
+    // 5. Create agent orchestrator, passing the shared metrics handle.
+    let orchestrator = AgentOrchestrator::new(
+        &settings,
+        stores.postgres.clone(),
+        Arc::clone(&router),
+        Arc::clone(&metrics),
+    )
+    .context("failed to create agent orchestrator")?;
     let orchestrator = Arc::new(orchestrator);
 
     info!("orchestrator ready — starting gRPC server");
 
-    // 5. Start gRPC server (blocks until shutdown).
+    // 6. Start gRPC server (blocks until shutdown).
     agent_rs_server::run(&settings, orchestrator)
         .await
         .context("gRPC server failed")?;
