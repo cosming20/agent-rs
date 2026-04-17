@@ -33,7 +33,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use agent_rs::embedder::build_embedder;
-use agent_rs::ingest::{build_ingestion_pipeline, IngestFeatures};
+use agent_rs::ingest::{IngestFeatures, build_ingestion_pipeline};
 use agent_rs::stores::connect_stores;
 use agent_rs_core::config::Settings;
 use agent_rs_core::types::CollectionName;
@@ -41,7 +41,7 @@ use agent_rs_observability::metrics::RetrievalMetrics;
 use agent_rs_observability::tracing::init_tracing;
 use agent_rs_stores::traits::VectorStore;
 use agent_rs_stores::types::CollectionConfig;
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use tracing::{info, warn};
 
 struct Args {
@@ -237,19 +237,10 @@ async fn main() -> Result<()> {
     println!("  path                : {}", args.pdf_path.display());
     println!("  chunks created      : {}", result.chunks_created);
     println!("  vectors upserted    : {}", result.vectors_upserted);
-    println!(
-        "  graph nodes created : {}",
-        result.graph_nodes_created
-    );
-    println!(
-        "  graph edges created : {}",
-        result.graph_edges_created
-    );
+    println!("  graph nodes created : {}", result.graph_nodes_created);
+    println!("  graph edges created : {}", result.graph_edges_created);
     println!("  triplets upserted   : {}", result.triplets_upserted);
-    println!(
-        "  summaries created   : {}",
-        result.summaries_created
-    );
+    println!("  summaries created   : {}", result.summaries_created);
     println!("  ingest duration_ms  : {}", result.duration_ms);
     println!("  wall-clock ms       : {}", ingest_ms);
     println!("  collection          : {}", collection);

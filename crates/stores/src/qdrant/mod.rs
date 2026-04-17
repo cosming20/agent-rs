@@ -17,13 +17,14 @@ use agent_rs_core::{CollectionName, Embedding, StoreError};
 use async_trait::async_trait;
 use qdrant_client::Qdrant;
 use qdrant_client::qdrant::{
-    DeletePointsBuilder, DenseVector, Document, NamedVectors, PointId, PointStruct, PointsIdsList,
-    PrefetchQueryBuilder, QueryPointsBuilder, UpsertPointsBuilder, Vector, Vectors,
+    DeletePointsBuilder, DenseVector, Document, GetPointsBuilder, NamedVectors, PointId,
+    PointStruct, PointsIdsList, PrefetchQueryBuilder, QueryPointsBuilder, UpsertPointsBuilder,
+    Vector, Vectors,
 };
 use tracing::instrument;
 
 use crate::traits::VectorStore;
-use crate::types::{CollectionConfig, FilterSpec, SearchResult, VectorPoint};
+use crate::types::{CollectionConfig, FilterSpec, PointPayload, SearchResult, VectorPoint};
 use agent_rs_core::Score;
 
 // ---- QdrantStore ----
@@ -365,6 +366,79 @@ impl VectorStore for QdrantStore {
             .collection_exists(name.as_str())
             .await
             .map_err(StoreError::from)
+    }
+
+    /// Batch payload lookup by point ID.
+    ///
+    /// IDs that don't resolve to a point in the collection are silently
+    /// dropped; the caller sees only hits. Qdrant accepts the same
+    /// string-ID-to-UUID coercion as [`VectorStore::upsert`]: valid UUID
+    /// strings round-trip, and anything else is mapped to the deterministic
+    /// UUIDv5 projection used at upsert time so the lookup key stays stable.
+    ///
+    /// Vectors are not requested (`with_vectors(false)`) — this is a
+    /// payload-only projection used for graph-search rehydration.
+    #[instrument(skip(self, ids), fields(collection = %collection, n_ids = ids.len()))]
+    async fn get_by_ids(
+        &self,
+        collection: &CollectionName,
+        ids: &[String],
+    ) -> Result<Vec<PointPayload>, StoreError> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let point_ids: Vec<PointId> = ids
+            .iter()
+            .map(|id| match uuid::Uuid::parse_str(id) {
+                Ok(uuid) => PointId::from(uuid.to_string()),
+                Err(_) => {
+                    let ns = uuid::Uuid::NAMESPACE_OID;
+                    let uuid = uuid::Uuid::new_v5(&ns, id.as_bytes());
+                    PointId::from(uuid.to_string())
+                }
+            })
+            .collect();
+
+        let response = self
+            .client
+            .get_points(
+                GetPointsBuilder::new(collection.as_str(), point_ids)
+                    .with_payload(true)
+                    .with_vectors(false),
+            )
+            .await
+            .map_err(StoreError::from)?;
+
+        let mut out: Vec<PointPayload> = Vec::with_capacity(response.result.len());
+        for point in response.result {
+            let id_str = match point.id {
+                Some(qdrant_client::qdrant::PointId {
+                    point_id_options: Some(qdrant_client::qdrant::point_id::PointIdOptions::Uuid(s)),
+                }) => s,
+                Some(qdrant_client::qdrant::PointId {
+                    point_id_options: Some(qdrant_client::qdrant::point_id::PointIdOptions::Num(n)),
+                }) => n.to_string(),
+                _ => {
+                    // Missing ID on a returned point indicates a corrupt
+                    // response; skip defensively rather than invent a value.
+                    tracing::warn!(collection = %collection, "qdrant returned a point with no id");
+                    continue;
+                }
+            };
+            let payload_json = serde_json::Value::Object(
+                point
+                    .payload
+                    .into_iter()
+                    .map(|(k, v)| (k, qdrant_value_to_json(v)))
+                    .collect(),
+            );
+            out.push(PointPayload {
+                id: id_str,
+                payload: payload_json,
+            });
+        }
+        Ok(out)
     }
 }
 

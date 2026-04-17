@@ -154,6 +154,8 @@ pub async fn graph_hybrid_search(
         ),
         graph_search(
             graph_store,
+            vector_store,
+            collection,
             params.query,
             params.seed_node_ids,
             params.max_depth,

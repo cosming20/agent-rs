@@ -366,48 +366,74 @@ impl RetrievalRouter {
         query.to_owned()
     }
 
-    /// Hydrate triplet search results by looking up the chunks that generated
-    /// them. Each triplet carries a `chunk_id` in its payload; this method
-    /// runs a filtered search on the main collection to retrieve the actual
-    /// chunk documents with their `chunk_text` for proper ranking.
+    /// Rehydrate triplet search results into chunk-shaped [`SearchResult`]s.
+    ///
+    /// Each triplet point in the triplets collection carries a `chunk_id`
+    /// field pointing to the chunk it was extracted from. This method:
+    ///
+    /// 1. Walks the triplet hits in their original rank order and collects
+    ///    `chunk_id`s, deduplicating while preserving order (so the best
+    ///    triplet score wins when the same chunk is cited by multiple
+    ///    triplets).
+    /// 2. Batch-fetches the authoritative chunk payloads from the main
+    ///    collection via [`VectorStore::get_by_ids`], which returns only
+    ///    payloads for IDs that actually exist — orphan triplets whose
+    ///    chunks have been deleted are silently dropped.
+    /// 3. Emits [`SearchResult`]s keyed by `chunk_id` with:
+    ///    - the chunk's full payload (so `chunk_text` / `section_title` /
+    ///      `page_start` / `source` are populated);
+    ///    - the triplet's score (carrying the "triplet ranked close to
+    ///      query" signal into RRF fusion).
+    ///
+    /// Emitting chunk IDs is critical for RRF deduplication: when the same
+    /// chunk surfaces from vector search and triplet search, RRF combines
+    /// their reciprocal ranks instead of double-counting.
     async fn hydrate_chunks_from_triplets(
         &self,
-        chunk_ids: &[String],
-        dense: &agent_rs_core::Embedding,
+        triplet_results: &[agent_rs_stores::types::SearchResult],
         limit: usize,
     ) -> Vec<agent_rs_stores::types::SearchResult> {
-        use std::collections::HashSet;
-        let unique_ids: HashSet<&String> = chunk_ids.iter().collect();
-        let mut hydrated = Vec::new();
+        use std::collections::{HashMap, HashSet};
 
-        for chunk_id in unique_ids {
-            let filter = serde_json::json!({
-                "key": "chunk_id",
-                "match": {"value": chunk_id}
-            });
-            match self
-                .vector_store
-                .search_with_filter(&self.collection, dense, 1, Some(filter))
-                .await
-            {
-                Ok(mut results) => {
-                    if let Some(chunk) = results.pop() {
-                        hydrated.push(chunk);
-                    }
-                }
-                Err(e) => {
-                    tracing::debug!(
-                        chunk_id = %chunk_id,
-                        error = %e,
-                        "failed to hydrate triplet chunk"
-                    );
-                }
+        let mut seen: HashSet<String> = HashSet::new();
+        let mut ordered: Vec<(String, agent_rs_core::Score)> = Vec::new();
+        for tr in triplet_results {
+            let Some(chunk_id) = tr.payload.get("chunk_id").and_then(|v| v.as_str()) else {
+                continue;
+            };
+            if seen.insert(chunk_id.to_owned()) {
+                ordered.push((chunk_id.to_owned(), tr.score));
             }
-            if hydrated.len() >= limit {
+            if ordered.len() >= limit {
                 break;
             }
         }
-        hydrated
+        if ordered.is_empty() {
+            return Vec::new();
+        }
+
+        let ids: Vec<String> = ordered.iter().map(|(id, _)| id.clone()).collect();
+        let payloads = match self.vector_store.get_by_ids(&self.collection, &ids).await {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    n_ids = ids.len(),
+                    "failed to rehydrate triplet-sourced chunks; dropping triplet contribution"
+                );
+                return Vec::new();
+            }
+        };
+        let payload_by_id: HashMap<String, serde_json::Value> =
+            payloads.into_iter().map(|p| (p.id, p.payload)).collect();
+
+        ordered
+            .into_iter()
+            .filter_map(|(id, score)| {
+                let payload = payload_by_id.get(&id)?.clone();
+                Some(agent_rs_stores::types::SearchResult { id, score, payload })
+            })
+            .collect()
     }
 
     /// Derive seed node IDs for graph traversal by running a quick vector search
@@ -606,31 +632,25 @@ impl RetrievalRouter {
                         .await
                     {
                         Ok(triplet_results) => {
-                            let chunk_ids: Vec<String> = triplet_results
-                                .iter()
-                                .filter_map(|r| {
-                                    r.payload
-                                        .get("chunk_id")
-                                        .and_then(|v| v.as_str())
-                                        .map(String::from)
-                                })
-                                .collect();
-
-                            if !chunk_ids.is_empty() {
-                                let hydrated = self
-                                    .hydrate_chunks_from_triplets(&chunk_ids, &dense, limit)
-                                    .await;
-                                if !hydrated.is_empty() {
-                                    all_result_lists.push(hydrated);
-                                }
-                            }
-
+                            // Triplet payloads carry only (subject, predicate, object,
+                            // chunk_id, triplet_text) — they lack `chunk_text`,
+                            // `source`, `page_start`, `section_title` that the
+                            // downstream evidence pack expects. We rehydrate to
+                            // chunk-shaped hits before fusion so empty rows never
+                            // reach the user and RRF can dedup triplet-sourced
+                            // chunks against vector/keyword/graph hits by chunk_id.
+                            let hydrated = self
+                                .hydrate_chunks_from_triplets(&triplet_results, limit)
+                                .await;
                             tracing::debug!(
                                 strategy = %strategy,
-                                count = triplet_results.len(),
-                                "triplet search contributed to RRF fusion"
+                                triplet_count = triplet_results.len(),
+                                hydrated = hydrated.len(),
+                                "triplet search contributed rehydrated chunks to RRF fusion"
                             );
-                            all_result_lists.push(triplet_results);
+                            if !hydrated.is_empty() {
+                                all_result_lists.push(hydrated);
+                            }
                         }
                         Err(e) => {
                             tracing::warn!(
@@ -904,6 +924,8 @@ impl RetrievalRouter {
                 let seeds = self.derive_seed_ids(query_str, dense, limit).await?;
                 let results = graph_search(
                     &*self.graph_store,
+                    &*self.vector_store,
+                    &self.collection,
                     query_str,
                     &seeds,
                     DEFAULT_GRAPH_DEPTH,
@@ -918,6 +940,8 @@ impl RetrievalRouter {
                 let seeds = self.derive_seed_ids(query_str, dense, limit).await?;
                 let results = graph_rag_context_search(
                     &*self.graph_store,
+                    &*self.vector_store,
+                    &self.collection,
                     query_str,
                     &seeds,
                     DEFAULT_GRAPH_DEPTH,
@@ -944,6 +968,8 @@ impl RetrievalRouter {
                 let seeds = self.derive_seed_ids(query_str, dense, limit).await?;
                 let initial = graph_cot_search(
                     &*self.graph_store,
+                    &*self.vector_store,
+                    &self.collection,
                     query_str,
                     &seeds,
                     DEFAULT_GRAPH_DEPTH,
@@ -968,8 +994,16 @@ impl RetrievalRouter {
                         let f_seeds = this
                             .derive_seed_ids(&follow_up, &f_dense, cot_limit)
                             .await?;
-                        graph_search(&*this.graph_store, &follow_up, &f_seeds, depth, cot_limit)
-                            .await
+                        graph_search(
+                            &*this.graph_store,
+                            &*this.vector_store,
+                            &this.collection,
+                            &follow_up,
+                            &f_seeds,
+                            depth,
+                            cot_limit,
+                        )
+                        .await
                     };
 
                     cot.retrieve(query_str, initial, retrieve_fn).await
@@ -1044,6 +1078,8 @@ impl RetrievalRouter {
                         ),
                         graph_search(
                             &*self.graph_store,
+                            &*self.vector_store,
+                            &self.collection,
                             query_str,
                             &seeds,
                             DEFAULT_GRAPH_DEPTH,
@@ -1089,6 +1125,8 @@ impl RetrievalRouter {
                     let (graph_result, vector_result) = tokio::join!(
                         graph_constrained_search(
                             &*self.graph_store,
+                            &*self.vector_store,
+                            &self.collection,
                             query_str,
                             &seeds,
                             DEFAULT_GRAPH_DEPTH,
@@ -1109,6 +1147,8 @@ impl RetrievalRouter {
                     let (graph_result, vector_result) = tokio::join!(
                         graph_constrained_search(
                             &*self.graph_store,
+                            &*self.vector_store,
+                            &self.collection,
                             query_str,
                             &seeds,
                             DEFAULT_GRAPH_DEPTH,

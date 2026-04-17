@@ -581,15 +581,14 @@ impl QueryRewriter {
         let response_bytes = self.call_api_with_retry(body_bytes).await?;
         let llm_elapsed_ms = llm_started.elapsed().as_secs_f64() * 1000.0;
 
-        let chat: ChatResponse =
-            serde_json::from_slice(&response_bytes).map_err(|e| {
-                if let Some(m) = self.metrics.as_ref() {
-                    m.record_llm_failure("query_rewriter", "malformed_json");
-                }
-                RetrievalError::Ingestion {
-                    reason: format!("parse chat completion envelope: {e}"),
-                }
-            })?;
+        let chat: ChatResponse = serde_json::from_slice(&response_bytes).map_err(|e| {
+            if let Some(m) = self.metrics.as_ref() {
+                m.record_llm_failure("query_rewriter", "malformed_json");
+            }
+            RetrievalError::Ingestion {
+                reason: format!("parse chat completion envelope: {e}"),
+            }
+        })?;
 
         if let (Some(m), Some(u)) = (self.metrics.as_ref(), chat.usage.as_ref()) {
             m.record_llm_call(
@@ -764,7 +763,10 @@ impl QueryRewriter {
                 }
             ],
             "temperature": 0.3_f32,
-            "max_tokens": 300_u32,
+            // gpt-5.x and o-series reject `max_tokens`; newer Chat Completions
+            // API uses `max_completion_tokens`. Kept compatible with all
+            // current OpenAI Chat Completion models.
+            "max_completion_tokens": 300_u32,
         });
 
         let body_bytes = match serde_json::to_vec(&body) {

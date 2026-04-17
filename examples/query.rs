@@ -35,13 +35,13 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use agent_rs::embedder::build_embedder;
-use agent_rs::router::{build_router, RouterFeatures};
+use agent_rs::router::{RouterFeatures, build_router};
 use agent_rs::stores::connect_stores;
 use agent_rs_core::config::Settings;
 use agent_rs_core::types::{CollectionName, RetrievalStrategy};
 use agent_rs_observability::metrics::RetrievalMetrics;
 use agent_rs_observability::tracing::init_tracing;
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 
 struct Args {
     query: String,
@@ -163,7 +163,9 @@ async fn main() -> Result<()> {
     println!();
 
     let t_retrieve = Instant::now();
-    let pack = router.retrieve(&args.query, args.strategy, args.limit).await?;
+    let pack = router
+        .retrieve(&args.query, args.strategy, args.limit)
+        .await?;
     let retrieve_ms = t_retrieve.elapsed().as_millis() as u64;
 
     println!();
