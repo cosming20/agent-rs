@@ -1,6 +1,7 @@
 # ============================================================
-# Agentic RAG — Infrastructure Services
+# agent-rs — Infrastructure Services
 # ============================================================
+# Root-level compose file: uses /.env directly (no symlink needed).
 # All host ports are configurable via .env (see .env.example).
 # WARNING: Jaeger uses in-memory storage — trace data is lost
 # on container restart. Acceptable for dev/staging only.
@@ -32,7 +33,7 @@ services:
       - "${QDRANT_HTTP_PORT}:6333"
     volumes:
       - qdrant_storage:/qdrant/storage
-      - ./qdrant/config.yaml:/qdrant/config/production.yaml:ro
+      - ./infra/qdrant/config.yaml:/qdrant/config/production.yaml:ro
     environment:
       - QDRANT__SERVICE__API_KEY=${QDRANT_API_KEY}
     networks:
@@ -58,7 +59,7 @@ services:
       - "${POSTGRES_PORT}:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
-      - ./postgres/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+      - ./infra/postgres/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
     environment:
       - POSTGRES_USER=${POSTGRES_USER}
       - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
@@ -117,7 +118,7 @@ services:
     ports:
       - "${OPA_PORT}:8181"
     volumes:
-      - ./opa/policies:/policies:ro
+      - ./infra/opa/policies:/policies:ro
     command:
       - "run"
       - "--server"
@@ -209,7 +210,7 @@ services:
       - "${OTEL_COLLECTOR_PORT}:4317"
       - "${OTEL_PROMETHEUS_PORT:-8889}:8889"
     volumes:
-      - ./otel/collector.yaml:/etc/otelcol-contrib/config.yaml:ro
+      - ./infra/otel/collector.yaml:/etc/otelcol-contrib/config.yaml:ro
     networks:
       - agentic-ra-net
     depends_on:
@@ -232,7 +233,7 @@ services:
     ports:
       - "${PROMETHEUS_PORT:-1066}:9090"
     volumes:
-      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./infra/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
       - prometheus_data:/prometheus
     networks:
       - agentic-ra-net
@@ -254,8 +255,8 @@ services:
       - "${GRAFANA_PORT:-1067}:3000"
     volumes:
       - grafana_data:/var/lib/grafana
-      - ./grafana/provisioning:/etc/grafana/provisioning:ro
-      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - ./infra/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./infra/grafana/dashboards:/var/lib/grafana/dashboards:ro
     environment:
       - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_ADMIN_PASSWORD:-admin}
       - GF_AUTH_ANONYMOUS_ENABLED=true
@@ -300,12 +301,12 @@ services:
 
   # ----------------------------------------------------------
   # Docling Sidecar — PDF parsing + structural chunking (gRPC)
-  # Port 1068 (1064/1065 reserved for ruvector profile)
-  # Build context: repo root (../ from infra/) per amendment G1
+  # Port 1068 (1064/1065 reserved for ruvector profile).
+  # Build context: repo root (current directory).
   # ----------------------------------------------------------
   docling-sidecar:
     build:
-      context: ..
+      context: .
       dockerfile: infra/docling-sidecar/Dockerfile
     container_name: agentic-ra-docling-sidecar
     restart: "on-failure:5"
@@ -330,8 +331,7 @@ services:
     networks:
       - agentic-ra-net
     # Docling layout-heron + tableformer ACCURATE peak ~8-10 GB on large
-    # PDFs (2.4 MB legal code = hundreds of pages). Docker Desktop VM must
-    # be >= 16 GB (Settings > Resources > Memory).
+    # PDFs. Docker Desktop VM must be >= 16 GB (Settings > Resources > Memory).
     mem_limit: 12g
     mem_reservation: 6g
     cpus: 4.0
