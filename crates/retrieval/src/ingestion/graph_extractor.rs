@@ -641,12 +641,17 @@ impl LlmGraphExtractor {
             reason: format!("serialize graph extraction request: {e}"),
         })?;
 
+        let llm_started = std::time::Instant::now();
         let response_bytes = self.call_api_with_retry(body_bytes).await?;
+        let llm_elapsed_ms = llm_started.elapsed().as_secs_f64() * 1000.0;
 
         // Parse the outer chat completion envelope.
         let chat: ChatResponse = match serde_json::from_slice(&response_bytes) {
             Ok(c) => c,
             Err(e) => {
+                if let Some(m) = self.metrics.as_ref() {
+                    m.record_llm_failure("graph_extractor", "malformed_json");
+                }
                 tracing::warn!(
                     error = %e,
                     preview = %bytes_preview(&response_bytes),
@@ -658,7 +663,8 @@ impl LlmGraphExtractor {
 
         // Log token usage and prompt-cache hit ratio so we can verify caching
         // is actually working. cached_tokens > 0 means we hit OpenAI's
-        // automatic prompt cache (≥1024-token static prefix matched).
+        // automatic prompt cache (≥1024-token static prefix matched). Also
+        // emit OTel metrics so cost + latency land in Prometheus/Grafana.
         if let Some(usage) = chat.usage.as_ref() {
             let cached = usage
                 .prompt_tokens_details
@@ -676,8 +682,18 @@ impl LlmGraphExtractor {
                 total_tokens = usage.total_tokens,
                 cached_tokens = cached,
                 cache_hit_ratio = format!("{:.1}%", cache_ratio * 100.0),
+                latency_ms = llm_elapsed_ms,
                 "graph_extractor token usage"
             );
+            if let Some(m) = self.metrics.as_ref() {
+                m.record_llm_call(
+                    "graph_extractor",
+                    &self.model,
+                    usage.prompt_tokens,
+                    usage.completion_tokens,
+                    llm_elapsed_ms,
+                );
+            }
         }
 
         let Some(content) = chat
