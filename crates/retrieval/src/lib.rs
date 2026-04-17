@@ -33,6 +33,7 @@ pub mod reranker;
 pub mod router;
 pub mod search;
 pub mod strategy;
+pub mod weighted_keywords;
 
 pub use context_expander::{ContextChunk, ContextExpander, ContextExpanderConfig, ExpandedChunk};
 pub use embedder::{Embedder, FastEmbedder, FastEmbedderConfig, SparseVector};
@@ -54,3 +55,9 @@ pub use ranker::{EvidencePack, ResultRanker};
 pub use reranker::CrossEncoderReranker;
 pub use router::RetrievalRouter;
 pub use strategy::StrategyRegistry;
+pub use weighted_keywords::{
+    adjust_for_weighted_keywords, order_candidates_overlap_first, weighted_bm25_query,
+    BM25WeightingConfig, EntityLinkerPrioritizationConfig, RerankAdjustmentConfig,
+    WeightedKeywordExtractor, WeightedKeywordExtractorConfig, WeightedKeywordIntegrationConfig,
+    WeightedKeywords, WeightedTerm,
+};
