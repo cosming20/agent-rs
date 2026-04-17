@@ -329,7 +329,7 @@ async fn ingest_chunks(
         .zip(all_dense.iter())
         .map(|(chunk, dense)| VectorPoint {
             id: format!("art_{}", chunk.article_number),
-            embedding: Embedding(dense.0.clone()),
+            embedding: Embedding::from_vec(dense.as_slice().to_vec()),
             text: chunk.content.clone(),
             payload: serde_json::json!({
                 "article_number": chunk.article_number,
@@ -444,7 +444,7 @@ async fn run_legal_query(
                     EvidenceSnippet {
                         article,
                         snippet,
-                        score: doc.score.0,
+                        score: doc.score.value(),
                     }
                 })
                 .collect();
@@ -631,7 +631,7 @@ async fn main() -> Result<()> {
     info!(dims = dims, embedder = %embedder_label, "embedder ready");
 
     // 6. Set up collection.
-    let collection = CollectionName("legal_code_ro".into());
+    let collection = CollectionName::from_string("legal_code_ro".into());
 
     // 7. Ingest.
     info!("--- INGESTION PHASE ---");

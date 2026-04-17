@@ -39,13 +39,19 @@ impl EvidenceFuser {
         ctx.fused_pack = Some(fused_pack);
 
         if ctx.evidence.is_empty() {
+            // Do NOT short-circuit here: ctx.answer has already been produced
+            // by the agent and may contain a legitimate "I don't know" response
+            // that still needs verification + synthesis. The synthesis layer
+            // produces an honest admission when evidence is empty (see
+            // synthesis.rs), so the pipeline stays well-formed.
             warn!(
                 kb_raw = ctx.kb_evidence.len(),
                 web_raw = ctx.web_evidence.len(),
                 fused = fused_count,
                 strategy = %ctx.strategy,
                 query = %ctx.query,
-                "ZERO EVIDENCE after retrieval"
+                event = "zero_evidence",
+                "ZERO EVIDENCE after retrieval — synthesis will return 'I don't know'"
             );
         } else {
             info!(

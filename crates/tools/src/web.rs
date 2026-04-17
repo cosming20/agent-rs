@@ -126,12 +126,14 @@ impl Tool for SearchWebTool {
             ToolError::McpClient("search_web: brave config not initialized".into())
         })?;
 
-        // If no API key is configured, return a graceful fallback.
+        // Fail closed: without an API key the tool cannot function. Returning
+        // Ok("not available") let the agent treat the call as a successful
+        // empty search and produce confident answers without web context.
         if config.api_key.is_empty() {
-            tracing::warn!(query = %args.query, "Brave API key not configured; web search unavailable");
-            return Ok(format!(
-                "Web search is not available (no API key configured). Query: '{}'.",
-                args.query
+            tracing::error!(query = %args.query, "Brave API key not configured; web search failed");
+            return Err(ToolError::WebSearch(
+                "web search unavailable: BRAVE_API_KEY not configured. \
+                 Do not claim that a web search was performed.".into(),
             ));
         }
 
@@ -273,12 +275,12 @@ impl Tool for SearchNewsTool {
             ToolError::McpClient("search_news: brave config not initialized".into())
         })?;
 
-        // If no API key is configured, return a graceful fallback.
+        // Fail closed: without an API key the tool cannot function (see search_web).
         if config.api_key.is_empty() {
-            tracing::warn!(query = %args.query, "Brave API key not configured; news search unavailable");
-            return Ok(format!(
-                "News search is not available (no API key configured). Query: '{}'.",
-                args.query
+            tracing::error!(query = %args.query, "Brave API key not configured; news search failed");
+            return Err(ToolError::WebSearch(
+                "news search unavailable: BRAVE_API_KEY not configured. \
+                 Do not claim that a news search was performed.".into(),
             ));
         }
 
