@@ -1,0 +1,390 @@
+{
+  "annotations": {"list": []},
+  "description": "Cost, time, and chunk-quality overview for agent-rs ingest + query pipelines.",
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 0,
+  "id": null,
+  "links": [],
+  "liveNow": false,
+  "panels": [
+    {
+      "type": "row",
+      "id": 100,
+      "title": "Cost",
+      "gridPos": {"h": 1, "w": 24, "x": 0, "y": 0},
+      "collapsed": false,
+      "panels": []
+    },
+    {
+      "type": "stat",
+      "id": 1,
+      "title": "Total LLM cost (USD, since start)",
+      "gridPos": {"h": 5, "w": 6, "x": 0, "y": 1},
+      "datasource": {"type": "prometheus", "uid": "Prometheus"},
+      "fieldConfig": {
+        "defaults": {
+          "unit": "currencyUSD",
+          "decimals": 4,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {"color": "green", "value": null},
+              {"color": "yellow", "value": 1.0},
+              {"color": "red", "value": 5.0}
+            ]
+          }
+        }
+      },
+      "options": {
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "center",
+        "textMode": "value",
+        "reduceOptions": {"calcs": ["lastNotNull"]}
+      },
+      "targets": [
+        {
+          "datasource": {"type": "prometheus", "uid": "Prometheus"},
+          "expr": "sum(agentic_ra_llm_cost_usd_sum)",
+          "legendFormat": "total",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "type": "bargauge",
+      "id": 2,
+      "title": "Cost by component (USD)",
+      "gridPos": {"h": 5, "w": 9, "x": 6, "y": 1},
+      "datasource": {"type": "prometheus", "uid": "Prometheus"},
+      "fieldConfig": {
+        "defaults": {"unit": "currencyUSD", "decimals": 4, "min": 0}
+      },
+      "options": {
+        "displayMode": "gradient",
+        "orientation": "horizontal",
+        "showUnfilled": true,
+        "reduceOptions": {"calcs": ["lastNotNull"]}
+      },
+      "targets": [
+        {
+          "datasource": {"type": "prometheus", "uid": "Prometheus"},
+          "expr": "sum by (llm_component) (agentic_ra_llm_cost_usd_sum)",
+          "legendFormat": "{{llm_component}}",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "id": 3,
+      "title": "Cost rate (USD / min)",
+      "gridPos": {"h": 5, "w": 9, "x": 15, "y": 1},
+      "datasource": {"type": "prometheus", "uid": "Prometheus"},
+      "fieldConfig": {
+        "defaults": {"unit": "currencyUSD", "decimals": 5, "custom": {"lineInterpolation": "smooth", "fillOpacity": 10}}
+      },
+      "targets": [
+        {
+          "datasource": {"type": "prometheus", "uid": "Prometheus"},
+          "expr": "sum by (llm_component) (rate(agentic_ra_llm_cost_usd_sum[5m])) * 60",
+          "legendFormat": "{{llm_component}}",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "type": "bargauge",
+      "id": 4,
+      "title": "Tokens consumed by component (prompt + completion)",
+      "gridPos": {"h": 6, "w": 12, "x": 0, "y": 6},
+      "datasource": {"type": "prometheus", "uid": "Prometheus"},
+      "fieldConfig": {"defaults": {"unit": "short", "min": 0}},
+      "options": {
+        "displayMode": "gradient",
+        "orientation": "horizontal",
+        "reduceOptions": {"calcs": ["lastNotNull"]}
+      },
+      "targets": [
+        {
+          "datasource": {"type": "prometheus", "uid": "Prometheus"},
+          "expr": "sum by (llm_component) (agentic_ra_llm_tokens_prompt_total + agentic_ra_llm_tokens_completion_total)",
+          "legendFormat": "{{llm_component}}",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "type": "stat",
+      "id": 5,
+      "title": "LLM calls since start",
+      "gridPos": {"h": 6, "w": 6, "x": 12, "y": 6},
+      "datasource": {"type": "prometheus", "uid": "Prometheus"},
+      "fieldConfig": {"defaults": {"unit": "short"}},
+      "options": {"reduceOptions": {"calcs": ["lastNotNull"]}, "textMode": "value_and_name"},
+      "targets": [
+        {
+          "datasource": {"type": "prometheus", "uid": "Prometheus"},
+          "expr": "sum by (llm_component) (agentic_ra_llm_calls_total)",
+          "legendFormat": "{{llm_component}}",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "type": "stat",
+      "id": 6,
+      "title": "LLM failures by kind",
+      "gridPos": {"h": 6, "w": 6, "x": 18, "y": 6},
+      "datasource": {"type": "prometheus", "uid": "Prometheus"},
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [{"color": "green", "value": null}, {"color": "red", "value": 1}]
+          }
+        }
+      },
+      "options": {"reduceOptions": {"calcs": ["lastNotNull"]}, "textMode": "value_and_name", "colorMode": "background"},
+      "targets": [
+        {
+          "datasource": {"type": "prometheus", "uid": "Prometheus"},
+          "expr": "sum by (llm_component, llm_failure_kind) (agentic_ra_llm_failures_total)",
+          "legendFormat": "{{llm_component}}/{{llm_failure_kind}}",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "type": "row",
+      "id": 101,
+      "title": "Time",
+      "gridPos": {"h": 1, "w": 24, "x": 0, "y": 12},
+      "collapsed": false,
+      "panels": []
+    },
+    {
+      "type": "timeseries",
+      "id": 7,
+      "title": "Ingest stage latency (p95, ms)",
+      "gridPos": {"h": 7, "w": 12, "x": 0, "y": 13},
+      "datasource": {"type": "prometheus", "uid": "Prometheus"},
+      "fieldConfig": {"defaults": {"unit": "ms", "custom": {"lineInterpolation": "smooth"}}},
+      "targets": [
+        {
+          "datasource": {"type": "prometheus", "uid": "Prometheus"},
+          "expr": "histogram_quantile(0.95, sum by (ingest_stage, le) (rate(agentic_ra_ingestion_stage_ms_bucket[10m])))",
+          "legendFormat": "{{ingest_stage}}",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "id": 8,
+      "title": "LLM call latency (p50 / p95, ms)",
+      "gridPos": {"h": 7, "w": 12, "x": 12, "y": 13},
+      "datasource": {"type": "prometheus", "uid": "Prometheus"},
+      "fieldConfig": {"defaults": {"unit": "ms", "custom": {"lineInterpolation": "smooth"}}},
+      "targets": [
+        {
+          "datasource": {"type": "prometheus", "uid": "Prometheus"},
+          "expr": "histogram_quantile(0.5, sum by (llm_component, le) (rate(agentic_ra_llm_latency_ms_bucket[10m])))",
+          "legendFormat": "p50 {{llm_component}}",
+          "refId": "A"
+        },
+        {
+          "datasource": {"type": "prometheus", "uid": "Prometheus"},
+          "expr": "histogram_quantile(0.95, sum by (llm_component, le) (rate(agentic_ra_llm_latency_ms_bucket[10m])))",
+          "legendFormat": "p95 {{llm_component}}",
+          "refId": "B"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "id": 9,
+      "title": "Retrieval latency by strategy (p95, seconds)",
+      "gridPos": {"h": 7, "w": 12, "x": 0, "y": 20},
+      "datasource": {"type": "prometheus", "uid": "Prometheus"},
+      "fieldConfig": {"defaults": {"unit": "s", "custom": {"lineInterpolation": "smooth"}}},
+      "targets": [
+        {
+          "datasource": {"type": "prometheus", "uid": "Prometheus"},
+          "expr": "histogram_quantile(0.95, sum by (retrieval_strategy, le) (rate(agentic_ra_retrieval_latency_seconds_bucket[10m])))",
+          "legendFormat": "{{retrieval_strategy}}",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "type": "stat",
+      "id": 10,
+      "title": "Grounding pass rate (rolling 10 min)",
+      "gridPos": {"h": 7, "w": 12, "x": 12, "y": 20},
+      "datasource": {"type": "prometheus", "uid": "Prometheus"},
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "min": 0,
+          "max": 1,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {"color": "red", "value": null},
+              {"color": "yellow", "value": 0.7},
+              {"color": "green", "value": 0.9}
+            ]
+          }
+        }
+      },
+      "options": {"reduceOptions": {"calcs": ["lastNotNull"]}, "graphMode": "area", "colorMode": "background"},
+      "targets": [
+        {
+          "datasource": {"type": "prometheus", "uid": "Prometheus"},
+          "expr": "sum(rate(agentic_ra_grounding_pass_total[10m])) / (sum(rate(agentic_ra_grounding_pass_total[10m])) + sum(rate(agentic_ra_grounding_fail_total[10m])))",
+          "legendFormat": "pass rate",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "type": "row",
+      "id": 102,
+      "title": "Chunk quality",
+      "gridPos": {"h": 1, "w": 24, "x": 0, "y": 27},
+      "collapsed": false,
+      "panels": []
+    },
+    {
+      "type": "heatmap",
+      "id": 11,
+      "title": "Chunk token distribution",
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 28},
+      "datasource": {"type": "prometheus", "uid": "Prometheus"},
+      "fieldConfig": {"defaults": {"unit": "short", "custom": {"hideFrom": {"legend": false, "tooltip": false, "viz": false}}}},
+      "options": {
+        "calculate": false,
+        "cellGap": 1,
+        "color": {"mode": "scheme", "scheme": "Turbo", "steps": 64},
+        "legend": {"show": true},
+        "tooltip": {"show": true, "yHistogram": false},
+        "yAxis": {"unit": "short", "decimals": 0}
+      },
+      "targets": [
+        {
+          "datasource": {"type": "prometheus", "uid": "Prometheus"},
+          "expr": "sum by (le) (rate(agentic_ra_ingestion_chunk_tokens_bucket[10m]))",
+          "format": "heatmap",
+          "legendFormat": "{{le}}",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "type": "heatmap",
+      "id": 12,
+      "title": "Heading-path depth distribution",
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 28},
+      "datasource": {"type": "prometheus", "uid": "Prometheus"},
+      "fieldConfig": {"defaults": {"unit": "short"}},
+      "options": {
+        "calculate": false,
+        "cellGap": 1,
+        "color": {"mode": "scheme", "scheme": "Turbo", "steps": 64},
+        "yAxis": {"unit": "short", "decimals": 0}
+      },
+      "targets": [
+        {
+          "datasource": {"type": "prometheus", "uid": "Prometheus"},
+          "expr": "sum by (le) (rate(agentic_ra_ingestion_chunk_heading_depth_bucket[10m]))",
+          "format": "heatmap",
+          "legendFormat": "{{le}}",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "id": 13,
+      "title": "Chunks per ingested document (p50 / p95)",
+      "gridPos": {"h": 7, "w": 8, "x": 0, "y": 36},
+      "datasource": {"type": "prometheus", "uid": "Prometheus"},
+      "fieldConfig": {"defaults": {"unit": "short"}},
+      "targets": [
+        {
+          "datasource": {"type": "prometheus", "uid": "Prometheus"},
+          "expr": "histogram_quantile(0.5, sum by (le) (rate(agentic_ra_ingestion_chunks_per_doc_bucket[10m])))",
+          "legendFormat": "p50",
+          "refId": "A"
+        },
+        {
+          "datasource": {"type": "prometheus", "uid": "Prometheus"},
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(agentic_ra_ingestion_chunks_per_doc_bucket[10m])))",
+          "legendFormat": "p95",
+          "refId": "B"
+        }
+      ]
+    },
+    {
+      "type": "stat",
+      "id": 14,
+      "title": "Empty-embed chunks / min (should stay 0)",
+      "gridPos": {"h": 7, "w": 8, "x": 8, "y": 36},
+      "datasource": {"type": "prometheus", "uid": "Prometheus"},
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "decimals": 3,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {"color": "green", "value": null},
+              {"color": "yellow", "value": 0.1},
+              {"color": "red", "value": 1.0}
+            ]
+          }
+        }
+      },
+      "options": {"reduceOptions": {"calcs": ["lastNotNull"]}, "colorMode": "background", "graphMode": "area"},
+      "targets": [
+        {
+          "datasource": {"type": "prometheus", "uid": "Prometheus"},
+          "expr": "rate(agentic_ra_ingestion_chunk_empty_embed_total[5m]) * 60",
+          "legendFormat": "empties / min",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "type": "bargauge",
+      "id": 15,
+      "title": "Chunk flag rates (counts since start)",
+      "gridPos": {"h": 7, "w": 8, "x": 16, "y": 36},
+      "datasource": {"type": "prometheus", "uid": "Prometheus"},
+      "fieldConfig": {"defaults": {"unit": "short", "min": 0}},
+      "options": {"displayMode": "gradient", "orientation": "horizontal"},
+      "targets": [
+        {
+          "datasource": {"type": "prometheus", "uid": "Prometheus"},
+          "expr": "sum by (chunk_flag) (agentic_ra_ingestion_chunk_flag_total)",
+          "legendFormat": "{{chunk_flag}}",
+          "refId": "A"
+        }
+      ]
+    }
+  ],
+  "refresh": "30s",
+  "schemaVersion": 39,
+  "tags": ["agent-rs", "ingest", "cost", "quality"],
+  "templating": {"list": []},
+  "time": {"from": "now-1h", "to": "now"},
+  "timepicker": {},
+  "timezone": "",
+  "title": "agent-rs — Ingest & Cost Overview",
+  "uid": "agent-rs-ingest-overview",
+  "version": 1,
+  "weekStart": ""
+}
