@@ -393,6 +393,8 @@ struct JsonSchemaWrapper {
 #[derive(Debug, Deserialize)]
 struct ChatResponse {
     choices: Vec<ChatChoice>,
+    #[serde(default)]
+    usage: Option<Usage>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -403,6 +405,12 @@ struct ChatChoice {
 #[derive(Debug, Deserialize)]
 struct ChatResponseMessage {
     content: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct Usage {
+    prompt_tokens: u64,
+    completion_tokens: u64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -448,6 +456,7 @@ pub struct QueryRewriter {
     max_sub_queries: usize,
     temperature: f32,
     max_retries: u32,
+    metrics: Option<Arc<agent_rs_observability::metrics::RetrievalMetrics>>,
 }
 
 impl std::fmt::Debug for QueryRewriter {
@@ -485,7 +494,18 @@ impl QueryRewriter {
             max_sub_queries,
             temperature,
             max_retries: DEFAULT_MAX_RETRIES,
+            metrics: None,
         }
+    }
+
+    /// Attach a metrics handle so per-call cost / tokens / latency are
+    /// emitted to the OTel pipeline.
+    pub fn with_metrics(
+        mut self,
+        metrics: Arc<agent_rs_observability::metrics::RetrievalMetrics>,
+    ) -> Self {
+        self.metrics = Some(metrics);
+        self
     }
 
     /// Rewrite `query` into one to three focused sub-queries via LLM.
@@ -557,12 +577,29 @@ impl QueryRewriter {
             reason: format!("serialize query rewrite request: {e}"),
         })?;
 
+        let llm_started = std::time::Instant::now();
         let response_bytes = self.call_api_with_retry(body_bytes).await?;
+        let llm_elapsed_ms = llm_started.elapsed().as_secs_f64() * 1000.0;
 
         let chat: ChatResponse =
-            serde_json::from_slice(&response_bytes).map_err(|e| RetrievalError::Ingestion {
-                reason: format!("parse chat completion envelope: {e}"),
+            serde_json::from_slice(&response_bytes).map_err(|e| {
+                if let Some(m) = self.metrics.as_ref() {
+                    m.record_llm_failure("query_rewriter", "malformed_json");
+                }
+                RetrievalError::Ingestion {
+                    reason: format!("parse chat completion envelope: {e}"),
+                }
             })?;
+
+        if let (Some(m), Some(u)) = (self.metrics.as_ref(), chat.usage.as_ref()) {
+            m.record_llm_call(
+                "query_rewriter",
+                self.model.as_str(),
+                u.prompt_tokens,
+                u.completion_tokens,
+                llm_elapsed_ms,
+            );
+        }
 
         let content = chat
             .choices

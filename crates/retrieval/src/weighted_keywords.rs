@@ -298,12 +298,27 @@ impl Default for EntityLinkerPrioritizationConfig {
 pub struct WeightedKeywordExtractor {
     config: WeightedKeywordExtractorConfig,
     http: Arc<reqwest::Client>,
+    metrics: Option<Arc<agent_rs_observability::metrics::RetrievalMetrics>>,
 }
 
 impl WeightedKeywordExtractor {
     /// Construct an extractor with the given config and HTTP client.
     pub fn new(config: WeightedKeywordExtractorConfig, http: Arc<reqwest::Client>) -> Self {
-        Self { config, http }
+        Self {
+            config,
+            http,
+            metrics: None,
+        }
+    }
+
+    /// Attach a metrics handle so per-call cost / tokens / latency are
+    /// emitted to the OTel pipeline.
+    pub fn with_metrics(
+        mut self,
+        metrics: Arc<agent_rs_observability::metrics::RetrievalMetrics>,
+    ) -> Self {
+        self.metrics = Some(metrics);
+        self
     }
 
     /// Wrap in an `Arc` — convenience for the router, which shares one
@@ -364,6 +379,7 @@ impl WeightedKeywordExtractor {
         });
 
         let call = || async {
+            let started = std::time::Instant::now();
             let resp = self
                 .http
                 .post(endpoint)
@@ -379,6 +395,27 @@ impl WeightedKeywordExtractor {
                 return Err(ExtractError::Status { status, body });
             }
             let full: serde_json::Value = resp.json().await.map_err(ExtractError::Http)?;
+            let elapsed_ms = started.elapsed().as_secs_f64() * 1000.0;
+
+            // Emit cost / tokens / latency when a metrics handle is attached.
+            if let Some(m) = self.metrics.as_ref() {
+                let prompt_tokens = full
+                    .pointer("/usage/prompt_tokens")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0);
+                let completion_tokens = full
+                    .pointer("/usage/completion_tokens")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0);
+                m.record_llm_call(
+                    "weighted_keywords",
+                    &self.config.model,
+                    prompt_tokens,
+                    completion_tokens,
+                    elapsed_ms,
+                );
+            }
+
             let content = full
                 .pointer("/choices/0/message/content")
                 .and_then(|v| v.as_str())

@@ -37,6 +37,7 @@ use agent_rs::ingest::{build_ingestion_pipeline, IngestFeatures};
 use agent_rs::stores::connect_stores;
 use agent_rs_core::config::Settings;
 use agent_rs_core::types::CollectionName;
+use agent_rs_observability::metrics::RetrievalMetrics;
 use agent_rs_observability::tracing::init_tracing;
 use agent_rs_stores::traits::VectorStore;
 use agent_rs_stores::types::CollectionConfig;
@@ -180,6 +181,9 @@ async fn main() -> Result<()> {
     info!(%collection, %triplet_collection, %summaries_collection, "collections ready");
 
     // ---- Build ingestion pipeline (all features on unless EVAL_SKIP_* is set) ----
+    // Construct RetrievalMetrics so per-call LLM cost/tokens/latency flow
+    // through graph_extractor + summarizer into Prometheus/Grafana.
+    let metrics = Arc::new(RetrievalMetrics::new("agent-rs-ingest"));
     let pipeline = build_ingestion_pipeline(
         &settings,
         &stores,
@@ -188,7 +192,7 @@ async fn main() -> Result<()> {
         &triplet_collection,
         &summaries_collection,
         &IngestFeatures::from_env(),
-        None,
+        Some(Arc::clone(&metrics)),
     )
     .await?;
 
@@ -218,6 +222,12 @@ async fn main() -> Result<()> {
             .context("ingest_pdf")?
     };
     let ingest_ms = t_ingest.elapsed().as_millis() as u64;
+
+    // Emit total ingest time to OTel (Jaeger traces already show the
+    // per-stage breakdown via #[instrument] spans on docling_client,
+    // graph_extractor.extract_batch, summarizer.summarize_batch, embedder).
+    metrics.record_ingest_stage_ms("total", ingest_ms as f64);
+    metrics.record_ingest_stage_ms("pipeline", result.duration_ms as f64);
 
     // ---- Pretty summary ----
     println!();

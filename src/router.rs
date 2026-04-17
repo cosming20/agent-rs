@@ -158,10 +158,9 @@ pub async fn build_router(
                 max_sub_queries: 3,
                 temperature: 0.1,
             };
-            router = router.with_query_rewriter(Arc::new(QueryRewriter::new(
-                config,
-                Arc::clone(&http_client),
-            )));
+            let mut rewriter = QueryRewriter::new(config, Arc::clone(&http_client));
+            rewriter = rewriter.with_metrics(Arc::clone(&metrics));
+            router = router.with_query_rewriter(Arc::new(rewriter));
             info!(model = %model, "QueryRewriter enabled");
         }
     }
@@ -258,10 +257,10 @@ pub async fn build_router(
                 .unwrap_or_else(|_| "gpt-5.4-mini-2026-03-17".to_owned());
             let mut wk_cfg = WeightedKeywordExtractorConfig::new(key);
             wk_cfg.model = model.clone();
-            let extractor = Arc::new(WeightedKeywordExtractor::new(
-                wk_cfg,
-                Arc::clone(&http_client),
-            ));
+            let extractor = Arc::new(
+                WeightedKeywordExtractor::new(wk_cfg, Arc::clone(&http_client))
+                    .with_metrics(Arc::clone(&metrics)),
+            );
             // Default integration: all three consumers enabled. Today
             // only rerank is wired at call-site (see crates/retrieval/
             // src/router.rs); BM25 and entity_linker integrations land

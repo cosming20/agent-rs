@@ -41,6 +41,15 @@ const VERIFIER_METHOD_TOTAL: &str = "verification.method_total";
 const RERANKER_FALLBACK_TOTAL: &str = "retrieval.reranker_fallback_total";
 const GRAPH_EXTRACTION_FAILURE_TOTAL: &str = "ingestion.graph_extraction_failure_total";
 
+// ---- Tier 1 — cost + per-stage time ----
+const LLM_CALLS_TOTAL: &str = "llm.calls_total";
+const LLM_TOKENS_PROMPT_TOTAL: &str = "llm.tokens_prompt_total";
+const LLM_TOKENS_COMPLETION_TOTAL: &str = "llm.tokens_completion_total";
+const LLM_COST_USD: &str = "llm.cost_usd";
+const LLM_LATENCY_MS: &str = "llm.latency_ms";
+const LLM_FAILURES_TOTAL: &str = "llm.failures_total";
+const INGEST_STAGE_MS: &str = "ingestion.stage_ms";
+
 /// Histogram bucket boundaries for retrieval latency (seconds).
 ///
 /// Chosen to give fine granularity for sub-100 ms fast paths and coarser
@@ -55,6 +64,19 @@ const CONFIDENCE_BUCKETS: &[f64] = &[0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8
 /// Histogram bucket boundaries for query duration in milliseconds.
 const DURATION_MS_BUCKETS: &[f64] = &[
     10.0, 50.0, 100.0, 250.0, 500.0, 1000.0, 2500.0, 5000.0, 10000.0, 30000.0, 60000.0,
+];
+
+/// Histogram buckets for LLM cost in USD (wide range: cheap-call to costly
+/// long-context responses).
+const COST_USD_BUCKETS: &[f64] = &[
+    0.00001, 0.00005, 0.0001, 0.0005, 0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1.0,
+];
+
+/// Histogram buckets for ingest stage latency in milliseconds (docling
+/// parse can be minutes; extend to 10 min).
+const INGEST_STAGE_MS_BUCKETS: &[f64] = &[
+    50.0, 100.0, 250.0, 500.0, 1000.0, 2500.0, 5000.0, 10_000.0, 30_000.0, 60_000.0, 120_000.0,
+    300_000.0, 600_000.0,
 ];
 
 /// All custom metric instruments for the retrieval pipeline.
@@ -90,6 +112,24 @@ pub struct RetrievalMetrics {
     reranker_fallback: metrics::Counter<u64>,
     /// Count of graph extraction failures (both primary and fallback failed).
     graph_extraction_failure: metrics::Counter<u64>,
+
+    // ---- Tier 1 — cost + per-stage ingest time ----
+    /// Count of LLM invocations per component (labelled).
+    llm_calls: metrics::Counter<u64>,
+    /// Prompt tokens consumed, labelled by component.
+    llm_tokens_prompt: metrics::Counter<u64>,
+    /// Completion tokens consumed, labelled by component.
+    llm_tokens_completion: metrics::Counter<u64>,
+    /// Derived USD cost per LLM call. `0.0` for models absent from the
+    /// price table (with a one-shot WARN log the first time it happens).
+    llm_cost_usd: metrics::Histogram<f64>,
+    /// Per-call LLM latency in ms, labelled by component.
+    llm_latency_ms: metrics::Histogram<f64>,
+    /// Count of LLM failures, labelled by component + error kind.
+    llm_failures: metrics::Counter<u64>,
+    /// Per-stage ingestion wall-clock time in ms, labelled by stage name.
+    /// Stages: docling_parse, embed, kg_extraction, summarize, total.
+    ingest_stage_ms: metrics::Histogram<f64>,
 }
 
 impl RetrievalMetrics {
@@ -212,6 +252,58 @@ impl RetrievalMetrics {
             .with_unit("chunks")
             .build();
 
+        // ---- Tier 1 instruments ----
+        let llm_calls = meter
+            .u64_counter(LLM_CALLS_TOTAL)
+            .with_description("Number of LLM invocations, labelled by component.")
+            .with_unit("calls")
+            .build();
+
+        let llm_tokens_prompt = meter
+            .u64_counter(LLM_TOKENS_PROMPT_TOTAL)
+            .with_description("Prompt tokens consumed, labelled by component + model.")
+            .with_unit("tokens")
+            .build();
+
+        let llm_tokens_completion = meter
+            .u64_counter(LLM_TOKENS_COMPLETION_TOTAL)
+            .with_description("Completion tokens consumed, labelled by component + model.")
+            .with_unit("tokens")
+            .build();
+
+        let llm_cost_usd = meter
+            .f64_histogram(LLM_COST_USD)
+            .with_description("Derived USD cost per LLM call, labelled by component + model.")
+            .with_unit("USD")
+            .with_boundaries(COST_USD_BUCKETS.to_vec())
+            .build();
+
+        let llm_latency_ms = meter
+            .f64_histogram(LLM_LATENCY_MS)
+            .with_description("Per-call LLM latency in milliseconds, labelled by component.")
+            .with_unit("ms")
+            .with_boundaries(DURATION_MS_BUCKETS.to_vec())
+            .build();
+
+        let llm_failures = meter
+            .u64_counter(LLM_FAILURES_TOTAL)
+            .with_description(
+                "Number of LLM call failures, labelled by component + error kind \
+                 (http_5xx, http_4xx, timeout, rate_limit, malformed_json, schema_violation).",
+            )
+            .with_unit("events")
+            .build();
+
+        let ingest_stage_ms = meter
+            .f64_histogram(INGEST_STAGE_MS)
+            .with_description(
+                "Wall-clock time in ms for each ingestion phase: docling_parse, embed, \
+                 kg_extraction, summarize, total.",
+            )
+            .with_unit("ms")
+            .with_boundaries(INGEST_STAGE_MS_BUCKETS.to_vec())
+            .build();
+
         Self {
             retrieval_latency,
             retrieval_results,
@@ -227,6 +319,13 @@ impl RetrievalMetrics {
             verifier_method,
             reranker_fallback,
             graph_extraction_failure,
+            llm_calls,
+            llm_tokens_prompt,
+            llm_tokens_completion,
+            llm_cost_usd,
+            llm_latency_ms,
+            llm_failures,
+            ingest_stage_ms,
         }
     }
 
@@ -341,6 +440,137 @@ impl RetrievalMetrics {
     /// attempt for a chunk fail, leaving it with an empty knowledge graph.
     pub fn record_graph_extraction_failure(&self) {
         self.graph_extraction_failure.add(1, &[]);
+    }
+
+    // ---- Tier 1 helpers ----
+
+    /// Record one LLM call: increments call counter, token counters,
+    /// emits a USD cost derived from the pricing table, and records
+    /// latency. Pass-through for every LLM-using component.
+    ///
+    /// # Arguments
+    ///
+    /// * `component` — logical name (e.g. `"query_rewriter"`,
+    ///   `"graph_extractor"`, `"summarizer"`, `"weighted_keywords"`).
+    /// * `model` — the model identifier as sent to OpenAI; used to look
+    ///   up per-token pricing and stored as a metric label.
+    /// * `prompt_tokens`, `completion_tokens` — from the OpenAI response's
+    ///   `usage` field. Pass `0` when unavailable.
+    /// * `latency_ms` — wall-clock milliseconds for the LLM round-trip.
+    pub fn record_llm_call(
+        &self,
+        component: &'static str,
+        model: &str,
+        prompt_tokens: u64,
+        completion_tokens: u64,
+        latency_ms: f64,
+    ) {
+        let attrs_component = &[KeyValue::new("llm.component", component)];
+        let attrs_full = &[
+            KeyValue::new("llm.component", component),
+            KeyValue::new("llm.model", model.to_owned()),
+        ];
+
+        self.llm_calls.add(1, attrs_component);
+        self.llm_tokens_prompt.add(prompt_tokens, attrs_full);
+        self.llm_tokens_completion.add(completion_tokens, attrs_full);
+        self.llm_latency_ms.record(latency_ms, attrs_component);
+
+        let cost = llm_cost_usd(model, prompt_tokens, completion_tokens);
+        self.llm_cost_usd.record(cost, attrs_full);
+    }
+
+    /// Increment the LLM failure counter, labelled by component + kind.
+    ///
+    /// `kind` should be one of: `http_5xx`, `http_4xx`, `timeout`,
+    /// `rate_limit`, `malformed_json`, `schema_violation`, `cancelled`,
+    /// `other`.
+    pub fn record_llm_failure(&self, component: &'static str, kind: &'static str) {
+        self.llm_failures.add(
+            1,
+            &[
+                KeyValue::new("llm.component", component),
+                KeyValue::new("llm.failure_kind", kind),
+            ],
+        );
+    }
+
+    /// Record an ingest stage's wall-clock duration in milliseconds.
+    ///
+    /// `stage` is one of `docling_parse`, `embed`, `kg_extraction`,
+    /// `summarize`, `total`.
+    pub fn record_ingest_stage_ms(&self, stage: &'static str, elapsed_ms: f64) {
+        self.ingest_stage_ms
+            .record(elapsed_ms, &[KeyValue::new("ingest.stage", stage)]);
+    }
+}
+
+// ---- LLM pricing table (USD per 1M tokens) ----
+//
+// Rates are approximate and move over time — keep the table small, the
+// unknown-model path emits a zero cost with a one-shot WARN so missing
+// entries surface without silently corrupting dashboards. Values are a
+// close-enough snapshot from the model catalogs as of 2026.
+
+struct ModelPrice {
+    prompt_per_1m: f64,
+    completion_per_1m: f64,
+}
+
+fn model_price(model: &str) -> Option<ModelPrice> {
+    // Match by prefix so date-stamped model IDs route to the right base
+    // price without a combinatorial explosion of table entries.
+    if model.starts_with("gpt-5.4-mini") {
+        return Some(ModelPrice { prompt_per_1m: 0.25, completion_per_1m: 1.25 });
+    }
+    if model.starts_with("gpt-5.4") {
+        return Some(ModelPrice { prompt_per_1m: 2.50, completion_per_1m: 10.00 });
+    }
+    if model.starts_with("gpt-4o-mini") {
+        return Some(ModelPrice { prompt_per_1m: 0.15, completion_per_1m: 0.60 });
+    }
+    if model.starts_with("gpt-4o") {
+        return Some(ModelPrice { prompt_per_1m: 2.50, completion_per_1m: 10.00 });
+    }
+    if model.starts_with("text-embedding-3-large") {
+        return Some(ModelPrice { prompt_per_1m: 0.13, completion_per_1m: 0.0 });
+    }
+    if model.starts_with("text-embedding-3-small") {
+        return Some(ModelPrice { prompt_per_1m: 0.02, completion_per_1m: 0.0 });
+    }
+    None
+}
+
+fn llm_cost_usd(model: &str, prompt_tokens: u64, completion_tokens: u64) -> f64 {
+    match model_price(model) {
+        Some(p) => {
+            (prompt_tokens as f64 / 1_000_000.0) * p.prompt_per_1m
+                + (completion_tokens as f64 / 1_000_000.0) * p.completion_per_1m
+        }
+        None => {
+            // Unknown model — emit 0 and warn exactly once.
+            warn_unknown_model_once(model);
+            0.0
+        }
+    }
+}
+
+fn warn_unknown_model_once(model: &str) {
+    use std::collections::HashSet;
+    use std::sync::Mutex;
+    use std::sync::OnceLock;
+    static SEEN: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+    let seen = SEEN.get_or_init(|| Mutex::new(HashSet::new()));
+    let mut guard = match seen.lock() {
+        Ok(g) => g,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    if guard.insert(model.to_owned()) {
+        tracing::warn!(
+            model,
+            "llm_cost_usd: model not in pricing table; cost metric will report 0 for this model. \
+             Add it to `model_price()` in crates/observability/src/metrics.rs to fix."
+        );
     }
 }
 
