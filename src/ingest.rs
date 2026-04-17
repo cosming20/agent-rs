@@ -147,11 +147,15 @@ pub async fn build_ingestion_pipeline(
         info!("PgStore wired into ingestion pipeline");
     }
 
-    Ok(IngestionPipeline::with_config(
+    let mut pipeline = IngestionPipeline::with_config(
         embedder,
         stores.qdrant.clone() as Arc<dyn VectorStore + Send + Sync>,
         stores.neo4j.clone() as Arc<dyn GraphStore + Send + Sync>,
         collection.clone(),
         config,
-    ))
+    );
+    if let Some(m) = metrics {
+        pipeline = pipeline.with_metrics(m);
+    }
+    Ok(pipeline)
 }
