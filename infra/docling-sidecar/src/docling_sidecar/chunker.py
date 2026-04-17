@@ -16,6 +16,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+import os
+
 import tiktoken
 from docling.datamodel.base_models import InputFormat
 from docling.datamodel.pipeline_options import (
@@ -331,16 +333,72 @@ class ChunkerPool:
         )
 
     @staticmethod
+    def _resolve_accelerator():
+        """Pick the best accelerator device for Docling's layout + table models.
+
+        Precedence:
+        1. Explicit DOCLING_ACCELERATOR env var: cpu | cuda | mps | auto.
+        2. Auto-detect via torch: cuda → mps → cpu.
+
+        Note on Docker-on-macOS: Apple's Metal Performance Shaders (MPS) is a
+        macOS-only API. Docker Desktop on macOS runs a Linux VM that cannot
+        see Metal, so MPS will NOT be available here regardless of host
+        hardware — torch inside the container reports mps.is_available() ==
+        False. To actually use MPS, run this sidecar natively on the host
+        (outside Docker) with a Python venv. CUDA passthrough works on Linux
+        hosts with nvidia-container-toolkit configured in docker-compose.
+        """
+        from docling.datamodel.pipeline_options import AcceleratorDevice
+
+        override = os.environ.get("DOCLING_ACCELERATOR", "auto").strip().lower()
+        explicit = {
+            "cpu": AcceleratorDevice.CPU,
+            "cuda": AcceleratorDevice.CUDA,
+            "mps": AcceleratorDevice.MPS,
+            "auto": None,
+        }
+        if override in explicit:
+            if explicit[override] is not None:
+                logger.info("Accelerator: %s (explicit DOCLING_ACCELERATOR)", override)
+                return explicit[override]
+        else:
+            logger.warning(
+                "Unknown DOCLING_ACCELERATOR=%r; falling back to auto-detect", override
+            )
+
+        # Auto-detect via torch probes.
+        try:
+            import torch
+
+            if torch.cuda.is_available():
+                logger.info("Accelerator: CUDA (auto-detected)")
+                return AcceleratorDevice.CUDA
+            if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+                logger.info("Accelerator: MPS (auto-detected)")
+                return AcceleratorDevice.MPS
+        except Exception as exc:
+            logger.warning(
+                "torch not available for accelerator auto-detect (%s); using CPU",
+                exc,
+            )
+        logger.info("Accelerator: CPU (no GPU available)")
+        return AcceleratorDevice.CPU
+
+    @staticmethod
     def _build_converter() -> DocumentConverter:
         """Build a DocumentConverter for production PDF ingestion.
 
         Table structure mode is configurable via `DOCLING_TABLEFORMER_MODE`
         env var: "accurate" (default in spec) or "fast" (3-4 GB lower peak
         memory usage — required when Docker Desktop VM is <12 GB).
-        """
-        import os
 
-        from docling.datamodel.pipeline_options import TableStructureOptions
+        Accelerator is configurable via `DOCLING_ACCELERATOR`: cpu | cuda |
+        mps | auto. See `_resolve_accelerator` for the precedence rules.
+        """
+        from docling.datamodel.pipeline_options import (
+            AcceleratorOptions,
+            TableStructureOptions,
+        )
 
         mode_env = os.environ.get("DOCLING_TABLEFORMER_MODE", "accurate").lower()
         mode = (
@@ -350,10 +408,14 @@ class ChunkerPool:
         )
         logger.info("TableFormer mode: %s", mode.name)
 
+        accelerator_device = ChunkerPool._resolve_accelerator()
+        accelerator_options = AcceleratorOptions(device=accelerator_device)
+
         pdf_options = PdfPipelineOptions(
             do_ocr=False,
             do_table_structure=True,
             table_structure_options=TableStructureOptions(mode=mode),
+            accelerator_options=accelerator_options,
         )
         return DocumentConverter(
             format_options={
