@@ -73,3 +73,13 @@ tokio-stream = "0.1"
 [build-dependencies]
 # Protobuf code generation for the Docling sidecar gRPC client
 tonic-prost-build = "0.14"
+
+[dev-dependencies]
+# Unicode normalisation for the prompt-snapshot bias guard (Layer 2)
+unicode-normalization = "0.1"
+# Cross-crate access for snapshot tests over agent-rs-agent prompts
+agent-rs-agent = { path = "../agent" }
+# Mock HTTP server for WeightedKeywordExtractor integration tests
+mockito = "1"
+# Property-based tests (weighted_bm25_query, adjust_for_weighted_keywords invariants)
+proptest = "1"

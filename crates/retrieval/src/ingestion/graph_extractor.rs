@@ -92,10 +92,14 @@ const MAX_SANITIZED_FALLBACK_CHARS: usize = 10_000;
 /// - Dynamic content (the chunk text) is injected as the user message,
 ///   never inside the system prompt, so it doesn't pollute the cache.
 ///
-/// Optimized for multilingual extraction (Romanian, English, French, German,
-/// etc.) with explicit guidance on legal, scientific, business, and narrative
-/// document types. Few-shot examples cover entity normalization, coreference,
-/// implicit relations, and edge case handling.
+/// Optimised for multilingual extraction with explicit guidance on
+/// scientific, technical, business, and narrative document types. Few-shot
+/// examples cover entity normalisation, coreference, implicit relations, and
+/// edge-case handling — drawn from multiple neutral domains to avoid
+/// anchoring the model to any single domain.
+#[doc(hidden)]
+pub const SYSTEM_PROMPT_FOR_TESTING: &str = SYSTEM_PROMPT;
+
 const SYSTEM_PROMPT: &str = r#"You are an expert knowledge graph extractor.
 Your task: read a text chunk in any language and emit a typed knowledge graph
 of entities (nodes) and relationships (edges) that captures the salient facts.

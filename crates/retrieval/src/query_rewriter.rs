@@ -84,8 +84,12 @@ const MAX_SUB_QUERIES_HARD_LIMIT: usize = 3;
 ///    one aspect of the original intent.
 /// 3. Always include the ORIGINAL query as one of the sub-queries so that
 ///    direct-match retrieval is never lost.
-/// 4. Handle Romanian legal queries: article references, crime definitions,
-///    cross-article penalties, comparative questions, negation rewriting.
+/// 4. Handle common query shapes: numbered-reference lookups, comparative
+///    questions, cross-reference queries, negation rewriting — without
+///    assumptions about domain or language.
+#[doc(hidden)]
+pub const SYSTEM_PROMPT_FOR_TESTING: &str = SYSTEM_PROMPT;
+
 const SYSTEM_PROMPT: &str = r#"You are an expert information-retrieval query analyst.
 
 Your task is to analyse a user query and decide whether to pass it through
