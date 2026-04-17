@@ -468,7 +468,7 @@ async fn run_ingestion(
             .zip(embs.iter())
             .map(|(doc, emb)| VectorPoint {
                 id: doc.id.clone(),
-                embedding: Embedding(emb.0.clone()),
+                embedding: Embedding::from_vec(emb.as_slice().to_vec()),
                 text: doc.content.clone(),
                 payload: serde_json::json!({
                     "title": doc.title,
@@ -681,7 +681,7 @@ async fn run_query_trace(
                 "source_counts": pack.source_counts,
                 "top_scores": pack.documents.iter()
                     .take(3)
-                    .map(|d| d.score.0)
+                    .map(|d| d.score.value())
                     .collect::<Vec<_>>(),
             });
             Ok((out, pack))
@@ -797,7 +797,7 @@ async fn run_query_trace(
                         "index": i + 1,
                         "content_snippet": snippet,
                         "source": source,
-                        "score": doc.score.0,
+                        "score": doc.score.value(),
                     })
                 })
                 .collect()
@@ -922,7 +922,7 @@ async fn main() -> Result<()> {
 
     // 5. Set up test collection name (unique per run to avoid conflicts)
     let collection_name = format!("e2e_test_{}", &test_run_id[..8]);
-    let collection = CollectionName(collection_name.clone());
+    let collection = CollectionName::from_string(collection_name.clone());
 
     // 6. Create retrieval router
     let ranker = ResultRanker::new(settings.ranker.rrf_k);

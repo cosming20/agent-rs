@@ -58,11 +58,13 @@ impl ResponseSynthesizer {
     ///
     /// # Confidence semantics
     ///
-    /// The verifier's confidence is meta-confidence ("how certain am I about
-    /// this grounding assessment"), not answer quality. When the answer is
-    /// ungrounded, high verifier confidence means "I'm very sure this is bad"
-    /// -- we invert for user-facing semantics. Special case: confidence 0.0
-    /// means "no evidence to assess" -- keep at 0.0, don't invert to 1.0.
+    /// User-facing confidence reflects trust in the answer:
+    /// - Grounded answer → verifier confidence (verifier is confident in a grounded answer)
+    /// - Ungrounded answer → 0.0 (do not trust, regardless of verifier certainty)
+    ///
+    /// The prior "invert ungrounded verifier confidence" path was mathematically
+    /// unsound: `1.0 - 0.05` flipped a low-certainty ungrounded verdict to 0.95
+    /// user-facing confidence, producing confident wrong answers.
     #[instrument(skip(self, answer, evidence, verification), fields(
         evidence_count = evidence.len(),
         strategy = %strategy,
@@ -89,35 +91,46 @@ impl ResponseSynthesizer {
                 .collect()
         };
 
-        // Compute user-facing confidence from verifier meta-confidence
+        // User-facing confidence: trust verifier only when it says grounded.
         let answer_confidence = if verification.is_grounded {
             verification.confidence.value()
-        } else if verification.confidence.value() < 1e-9 {
-            0.0 // No evidence to assess -- unknown quality
         } else {
-            1.0 - verification.confidence.value() // Invert: high verifier confidence = bad answer
+            0.0
         };
 
         let confidence = Confidence::new(answer_confidence.clamp(0.0, 1.0))
             .map_err(|e| AgentError::Synthesis(format!("confidence error: {e}")))?;
 
-        // #7 "I don't know" boundary: when evidence is empty or confidence
-        // is near zero AND the answer is ungrounded, replace the synthesized
-        // answer with an honest admission rather than risking hallucination.
-        let final_answer = if evidence.is_empty() && !verification.is_grounded {
+        // "I don't know" boundary: when evidence is empty OR the answer is
+        // ungrounded, replace the synthesized answer with an honest admission
+        // rather than risking hallucination.
+        let final_answer = if evidence.is_empty() {
             tracing::warn!(
                 query,
-                "no evidence found and answer is ungrounded — returning 'I don't know'"
+                strategy = %strategy,
+                "zero evidence reached synthesis — returning 'I don't know'"
             );
             "I don't have enough information in my knowledge base to answer \
              this question reliably. The retrieved evidence was insufficient \
              to support a grounded answer."
                 .to_owned()
-        } else if answer_confidence < 0.15 && !verification.is_grounded {
+        } else if !verification.is_grounded {
+            tracing::warn!(
+                query,
+                strategy = %strategy,
+                "answer ungrounded after retries — returning partial admission"
+            );
+            format!(
+                "I found some potentially relevant information, but I'm not \
+                 confident it fully answers your question. Here's what I found, \
+                 but please verify independently:\n\n{}",
+                answer
+            )
+        } else if answer_confidence < 0.15 {
             tracing::warn!(
                 query,
                 confidence = answer_confidence,
-                "very low confidence + ungrounded — returning partial admission"
+                "very low confidence grounded answer — caveat added"
             );
             format!(
                 "I found some potentially relevant information, but I'm not \

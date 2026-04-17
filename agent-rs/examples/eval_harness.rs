@@ -908,9 +908,9 @@ async fn main() -> Result<()> {
     info!(embedder = %embedder_label, "embedder ready");
 
     // 3. Collection names + pre-run reset (eval-specific: each run starts clean).
-    let collection = CollectionName("eval_harness".into());
-    let triplet_collection = CollectionName("eval_harness_triplets".into());
-    let summaries_collection = CollectionName("eval_harness_summaries".into());
+    let collection = CollectionName::from_string("eval_harness".into());
+    let triplet_collection = CollectionName::from_string("eval_harness_triplets".into());
+    let summaries_collection = CollectionName::from_string("eval_harness_summaries".into());
     reset_collection(&collection, &settings).await?;
     reset_collection(&triplet_collection, &settings).await?;
     reset_collection(&summaries_collection, &settings).await?;

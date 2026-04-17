@@ -128,16 +128,27 @@ impl TryFrom<f64> for Confidence {
 }
 
 /// A numeric score (e.g., search relevance, RRF rank).
+///
+/// NaN and non-finite values are not representable: [`Score::new`] coerces
+/// them to 0.0 with a warning, so `PartialOrd` is total across all `Score`
+/// instances constructed through the public API. This prevents RRF
+/// `sort_unstable_by(|a, b| b.partial_cmp(a).unwrap_or(Equal))` from
+/// producing silently mis-ordered rankings.
 #[derive(Debug, Clone, Copy, PartialEq, PartialOrd, Serialize, Deserialize)]
 pub struct Score(f64);
 
 impl Score {
-    /// Create a new score.
+    /// Create a new score. NaN / infinite values coerce to 0.0 with a warning.
     pub fn new(value: f64) -> Self {
-        Self(value)
+        if value.is_finite() {
+            Self(value)
+        } else {
+            tracing::warn!(raw = value, "Score::new received non-finite value, coercing to 0.0");
+            Self(0.0)
+        }
     }
 
-    /// Return the inner f64 value.
+    /// Return the inner f64 value. Guaranteed finite.
     pub fn value(&self) -> f64 {
         self.0
     }
