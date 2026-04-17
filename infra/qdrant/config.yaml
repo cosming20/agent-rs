@@ -1,0 +1,12 @@
+# ============================================================
+# Qdrant — Production config override
+# ============================================================
+# Mounted to /qdrant/config/production.yaml (read-only).
+# API key is also set via QDRANT__SERVICE__API_KEY env var
+# in docker-compose.yml (env var takes precedence).
+# ============================================================
+
+service:
+  api_key: ${QDRANT_API_KEY}
+
+log_level: INFO
