@@ -24,6 +24,7 @@
 //! Phase 4 will extract seed IDs from the query embedding nearest-neighbours.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use agent_rs_core::{CollectionName, Embedding, RetrievalStrategy};
 use agent_rs_observability::metrics::RetrievalMetrics;
@@ -45,6 +46,10 @@ use crate::{
         vector::{summaries_search, temporal_search, vector_search},
     },
     strategy::get_descriptor,
+    weighted_keywords::{
+        adjust_for_weighted_keywords, WeightedKeywordExtractor,
+        WeightedKeywordIntegrationConfig, WeightedKeywords,
+    },
 };
 use agent_rs_stores::traits::{GraphStore, VectorStore};
 
@@ -144,6 +149,31 @@ pub struct RetrievalRouter {
     /// When `Some`, the router emits metrics for reranker fallback events.
     /// Passed from the top-level startup wiring via [`with_metrics`].
     metrics: Option<Arc<RetrievalMetrics>>,
+
+    /// Optional LLM-backed weighted-keyword extractor.
+    ///
+    /// When `Some`, runs in the pre-dispatch parallel join alongside the
+    /// query rewriter and produces an `Arc<WeightedKeywords>` consumed by
+    /// the rerank adjustment (and, in future commits, by BM25 query
+    /// rewrite and entity-linker candidate prioritisation). Failures and
+    /// branch-local timeouts collapse to `WeightedKeywords::empty()`, so
+    /// every consumer's empty-input path is byte-identical to when this
+    /// extractor is absent.
+    weighted_keyword_extractor: Option<Arc<WeightedKeywordExtractor>>,
+
+    /// Per-consumer integration toggles for the weighted-keyword signal.
+    ///
+    /// Default: all three consumers (BM25, rerank, entity_linker) enabled.
+    /// Set any field to `None` at construction time to disable that
+    /// consumer's integration without touching the extractor.
+    weighted_keyword_integration: WeightedKeywordIntegrationConfig,
+
+    /// Branch-local timeout for the weighted-keyword extraction future.
+    ///
+    /// If the LLM call does not complete within this budget, the branch
+    /// resolves to `WeightedKeywords::empty()` — preventing a slow
+    /// extractor from extending the router's overall deadline.
+    weighted_keyword_branch_budget: Duration,
 }
 
 impl RetrievalRouter {
@@ -179,7 +209,44 @@ impl RetrievalRouter {
             context_expander: None,
             entity_linker: None,
             metrics: None,
+            weighted_keyword_extractor: None,
+            weighted_keyword_integration: WeightedKeywordIntegrationConfig::default(),
+            weighted_keyword_branch_budget: Duration::from_secs(6),
         }
+    }
+
+    /// Attach an LLM-backed weighted-keyword extractor.
+    ///
+    /// The extractor runs in parallel with `query_rewriter`, `entity_linker`,
+    /// and `metadata_filter` (all subject to their own enable conditions)
+    /// and produces weighted terms consumed by the rerank adjustment. See
+    /// [`weighted_keywords`](crate::weighted_keywords) for the integration
+    /// contract.
+    pub fn with_weighted_keyword_extractor(
+        mut self,
+        extractor: Arc<WeightedKeywordExtractor>,
+    ) -> Self {
+        self.weighted_keyword_extractor = Some(extractor);
+        self
+    }
+
+    /// Override the per-consumer integration config for weighted keywords.
+    ///
+    /// Default enables all three consumers with default per-consumer
+    /// sub-configs. Set fields to `None` to disable that consumer's
+    /// integration.
+    pub fn with_weighted_keyword_integration(
+        mut self,
+        cfg: WeightedKeywordIntegrationConfig,
+    ) -> Self {
+        self.weighted_keyword_integration = cfg;
+        self
+    }
+
+    /// Override the branch-local timeout for the weighted-keyword extractor.
+    pub fn with_weighted_keyword_branch_budget(mut self, budget: Duration) -> Self {
+        self.weighted_keyword_branch_budget = budget;
+        self
     }
 
     /// Attach an optional triplet collection to this router.
@@ -458,9 +525,43 @@ impl RetrievalRouter {
             None
         };
 
-        // Run all three in parallel.
-        let (sub_queries_result, _entity_link, qdrant_filter_json) =
-            tokio::join!(rewrite_fut, entity_link_fut, metadata_filter_fut);
+        // Weighted-keyword extraction — soft-optional with branch-local
+        // timeout. Any failure / timeout collapses to empty so consumers
+        // observe byte-identical behaviour to the extractor-absent path.
+        let weighted_keyword_fut = async {
+            let Some(extractor) = self.weighted_keyword_extractor.as_ref() else {
+                return Arc::new(WeightedKeywords::empty());
+            };
+            let budget = self.weighted_keyword_branch_budget;
+            match tokio::time::timeout(budget, extractor.extract(query)).await {
+                Ok(Ok(kw)) => {
+                    tracing::debug!(
+                        terms = kw.terms.len(),
+                        "weighted keyword extraction complete"
+                    );
+                    Arc::new(kw)
+                }
+                Ok(Err(e)) => {
+                    tracing::warn!(error = %e, "weighted keyword extractor returned error; using empty");
+                    Arc::new(WeightedKeywords::empty())
+                }
+                Err(_) => {
+                    tracing::warn!(
+                        budget_ms = budget.as_millis() as u64,
+                        "weighted keyword branch exceeded budget; using empty"
+                    );
+                    Arc::new(WeightedKeywords::empty())
+                }
+            }
+        };
+
+        // Run all four in parallel.
+        let (sub_queries_result, _entity_link, qdrant_filter_json, weighted_keywords) = tokio::join!(
+            rewrite_fut,
+            entity_link_fut,
+            metadata_filter_fut,
+            weighted_keyword_fut,
+        );
         let sub_queries = sub_queries_result?;
 
         // ---- Step 3–4: Embed + dispatch per sub-query ----
@@ -580,7 +681,44 @@ impl RetrievalRouter {
                 "cross-encoder reranking"
             );
             match reranker.rerank(primary_query, candidates, limit).await {
-                Ok(reranked) => {
+                Ok(mut reranked) => {
+                    // Weighted-keyword rerank adjustment (consumer #2).
+                    // Applied on the post-rerank list; empty keywords or
+                    // disabled integration → byte-identical no-op.
+                    if let Some(rerank_cfg) =
+                        self.weighted_keyword_integration.rerank.as_ref()
+                    {
+                        if !weighted_keywords.terms.is_empty() {
+                            let before_top = reranked.first().map(|d| d.score.value());
+                            for doc in reranked.iter_mut() {
+                                let text = doc
+                                    .payload
+                                    .get("chunk_text")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("");
+                                let adjusted = adjust_for_weighted_keywords(
+                                    doc.score.value() as f32,
+                                    text,
+                                    weighted_keywords.as_ref(),
+                                    rerank_cfg,
+                                );
+                                doc.score = agent_rs_core::Score::new(adjusted as f64);
+                            }
+                            reranked.sort_by(|a, b| {
+                                b.score
+                                    .value()
+                                    .partial_cmp(&a.score.value())
+                                    .unwrap_or(std::cmp::Ordering::Equal)
+                            });
+                            let after_top = reranked.first().map(|d| d.score.value());
+                            tracing::debug!(
+                                terms = weighted_keywords.terms.len(),
+                                before_top = ?before_top,
+                                after_top = ?after_top,
+                                "rerank adjusted by weighted keywords"
+                            );
+                        }
+                    }
                     evidence.documents = reranked;
                 }
                 Err(e) => {
