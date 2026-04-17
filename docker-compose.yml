@@ -324,9 +324,11 @@ services:
       - DOCLING_PARSE_TIMEOUT_S=600
       - DOCLING_STREAM_IDLE_TIMEOUT_S=600
       - DOCLING_MAX_CHUNKS_PER_DOC=10000
-      # fast | accurate — "fast" saves ~3-4 GB peak memory vs ACCURATE
-      # and is ~40% quicker. Required on Docker Desktop VMs <12 GB.
-      - DOCLING_TABLEFORMER_MODE=${DOCLING_TABLEFORMER_MODE:-fast}
+      # fast | accurate — "accurate" is the default; slower (~+40%) and
+      # ~3-4 GB more peak memory but significantly better on complex
+      # nested tables (merged cells, multi-row headers). Flip to "fast"
+      # for text-heavy corpora or Docker Desktop VMs <12 GB.
+      - DOCLING_TABLEFORMER_MODE=${DOCLING_TABLEFORMER_MODE:-accurate}
       # cpu | cuda | mps | auto — auto-detects via torch at sidecar
       # startup. NOTE: MPS is NOT available inside Docker on macOS
       # (Linux VM has no Metal API). To use MPS on Apple Silicon, run
