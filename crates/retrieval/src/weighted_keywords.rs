@@ -382,9 +382,7 @@ impl WeightedKeywordExtractor {
             let content = full
                 .pointer("/choices/0/message/content")
                 .and_then(|v| v.as_str())
-                .ok_or_else(|| {
-                    ExtractError::Schema("missing choices[0].message.content".into())
-                })?;
+                .ok_or_else(|| ExtractError::Schema("missing choices[0].message.content".into()))?;
             #[derive(serde::Deserialize)]
             struct Raw {
                 terms: Vec<RawTerm>,
@@ -408,8 +406,8 @@ impl WeightedKeywordExtractor {
             Ok::<_, ExtractError>(WeightedKeywords::from_raw(terms))
         };
 
-        let backoff = ExponentialBuilder::default()
-            .with_max_times(self.config.max_retries as usize);
+        let backoff =
+            ExponentialBuilder::default().with_max_times(self.config.max_retries as usize);
 
         match call.retry(backoff).when(is_retryable).await {
             Ok(kw) => Ok(kw),
@@ -806,7 +804,11 @@ mod tests {
     #[test]
     fn bm25_empty_keywords_returns_original() {
         let q = "what is a monad";
-        let out = weighted_bm25_query(q, &WeightedKeywords::empty(), &BM25WeightingConfig::default());
+        let out = weighted_bm25_query(
+            q,
+            &WeightedKeywords::empty(),
+            &BM25WeightingConfig::default(),
+        );
         assert_eq!(out, q);
     }
 
@@ -886,16 +888,17 @@ mod tests {
         let code_count = out.split_whitespace().filter(|t| *t == "code").count();
         // Phrase expansion at w=1.0, max_repeats=3 → rep = ceil(1*3/2) = 2.
         // Plus 1 occurrence inside the intact phrase.
-        assert!((2..=3).contains(&error_count), "error_count = {error_count}");
+        assert!(
+            (2..=3).contains(&error_count),
+            "error_count = {error_count}"
+        );
         assert!((2..=3).contains(&code_count), "code_count = {code_count}");
     }
 
     #[test]
     fn bm25_token_level_aggregation_caps_at_max_repeats() {
-        let kw = WeightedKeywords::from_raw(vec![
-            raw("foo", 1.0, false),
-            raw("foo bar", 1.0, true),
-        ]);
+        let kw =
+            WeightedKeywords::from_raw(vec![raw("foo", 1.0, false), raw("foo bar", 1.0, true)]);
         let cfg = BM25WeightingConfig {
             phrase_token_expansion: true,
             max_repeats: 3,
@@ -1008,8 +1011,7 @@ mod tests {
     fn overlap_first_empty_weighted_preserves_extracted() {
         let extracted = vec!["a".to_owned(), "b".to_owned()];
         let cfg = EntityLinkerPrioritizationConfig { top_k: 5 };
-        let ordered =
-            order_candidates_overlap_first(&WeightedKeywords::empty(), &extracted, &cfg);
+        let ordered = order_candidates_overlap_first(&WeightedKeywords::empty(), &extracted, &cfg);
         assert_eq!(ordered, extracted);
     }
 
