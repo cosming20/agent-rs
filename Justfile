@@ -52,6 +52,51 @@ logs service:
 status:
     docker compose ps
 
+# ─── Observability stack (opt-in, not part of infra-up) ──────────────────
+
+# Start the observability quartet: otel-collector + jaeger + prometheus + grafana.
+# All four are required for traces/metrics from the Rust binaries to flow
+# anywhere: OTLP → collector → jaeger (traces) + prometheus (metrics),
+# grafana scrapes prometheus.
+obs-up:
+    docker compose up -d otel-collector jaeger prometheus grafana
+
+# Stop observability services (volumes kept; dashboards preserved).
+obs-down:
+    docker compose stop otel-collector jaeger prometheus grafana
+    docker compose rm -f otel-collector jaeger prometheus grafana
+
+# Open the Jaeger trace-search UI in the default browser.
+jaeger:
+    @echo "Opening Jaeger UI: http://localhost:1058"
+    @open http://localhost:1058 2>/dev/null || xdg-open http://localhost:1058 2>/dev/null || echo "Open manually: http://localhost:1058"
+
+# Open the Prometheus query UI.
+prom:
+    @echo "Opening Prometheus UI: http://localhost:1066"
+    @open http://localhost:1066 2>/dev/null || xdg-open http://localhost:1066 2>/dev/null || echo "Open manually: http://localhost:1066"
+
+# Open Grafana (anonymous viewer enabled; admin creds from .env).
+grafana:
+    @echo "Opening Grafana UI: http://localhost:1067"
+    @open http://localhost:1067 2>/dev/null || xdg-open http://localhost:1067 2>/dev/null || echo "Open manually: http://localhost:1067"
+
+# Sanity-check: curl the collector's Prometheus scrape endpoint and the
+# collector health-check. Useful after `just obs-up` to confirm the
+# pipeline is live before running a query.
+obs-smoke:
+    @echo "=== collector health ==="
+    @curl -s http://localhost:13133/ 2>&1 | head -3 || echo "collector NOT responding on :13133"
+    @echo
+    @echo "=== prometheus exporter (first 3 agentic_ra_* metrics) ==="
+    @curl -s http://localhost:8889/metrics 2>&1 | grep -E '^agentic_ra_' | head -3 || echo "no agentic_ra_* metrics yet — run `just query '...'` first"
+    @echo
+    @echo "=== prometheus UI reachable? ==="
+    @curl -sf http://localhost:1066/-/ready && echo "prometheus READY" || echo "prometheus NOT ready"
+    @echo
+    @echo "=== jaeger reachable? ==="
+    @curl -sf http://localhost:1058/ > /dev/null && echo "jaeger UI UP" || echo "jaeger UI DOWN"
+
 # ─── Database ─────────────────────────────────────────────────────────────
 
 _db_url := "postgres://" + env_var_or_default("AGENT_RS__POSTGRES__USER", "agentic_ra") + \

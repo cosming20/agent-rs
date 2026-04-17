@@ -37,6 +37,7 @@ use agent_rs::ingest::{build_ingestion_pipeline, IngestFeatures};
 use agent_rs::stores::connect_stores;
 use agent_rs_core::config::Settings;
 use agent_rs_core::types::CollectionName;
+use agent_rs_observability::tracing::init_tracing;
 use agent_rs_stores::traits::VectorStore;
 use agent_rs_stores::types::CollectionConfig;
 use anyhow::{bail, Context, Result};
@@ -120,20 +121,24 @@ async fn ensure_collection(
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = parse_args()?;
-    // Enable info-level logging by default so the per-phase spans appear live.
     if std::env::var_os("RUST_LOG").is_none() {
         // SAFETY: we only set this when the caller did not.
         unsafe { std::env::set_var("RUST_LOG", "info,agent_rs_retrieval=info") };
     }
-    tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
-        .init();
 
     if !args.pdf_path.exists() {
         bail!("file not found: {}", args.pdf_path.display());
     }
 
     let settings = Settings::load().context("load settings")?;
+
+    // Full OTel pipeline (traces → Jaeger, metrics → Prometheus via the
+    // OTel collector). Guard must live until end of main so the background
+    // exporters flush before shutdown. If the collector is unreachable the
+    // exporters fail silently per-batch; init itself only errors on
+    // subscriber conflicts.
+    let _otel_guard = init_tracing(&settings.otel, "agent-rs-ingest")
+        .context("init_tracing — is the otel-collector running? `just obs-up`")?;
 
     let derived_doc_id = args.doc_id.unwrap_or_else(|| {
         args.pdf_path

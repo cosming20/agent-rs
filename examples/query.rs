@@ -40,6 +40,7 @@ use agent_rs::stores::connect_stores;
 use agent_rs_core::config::Settings;
 use agent_rs_core::types::{CollectionName, RetrievalStrategy};
 use agent_rs_observability::metrics::RetrievalMetrics;
+use agent_rs_observability::tracing::init_tracing;
 use anyhow::{bail, Context, Result};
 
 struct Args {
@@ -117,11 +118,14 @@ async fn main() -> Result<()> {
         // spans (sub-queries, weighted keywords, rerank adjustments).
         unsafe { std::env::set_var("RUST_LOG", "info,agent_rs_retrieval=debug") };
     }
-    tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
-        .init();
 
     let settings = Settings::load().context("load settings")?;
+
+    // Full OTel pipeline (traces → Jaeger, metrics → Prometheus via the
+    // OTel collector). Guard must live until end of main so the background
+    // exporters flush before shutdown.
+    let _otel_guard = init_tracing(&settings.otel, "agent-rs-query")
+        .context("init_tracing — is the otel-collector running? `just obs-up`")?;
     let t_boot = Instant::now();
     let stores = connect_stores(&settings).await?;
     let (embedder, embedder_label) = build_embedder().await?;
