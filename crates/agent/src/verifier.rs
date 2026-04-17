@@ -232,7 +232,16 @@ impl GroundingVerifier {
             ))
         })?;
 
-        let confidence_val = parsed.confidence.clamp(0.0, 1.0);
+        // Guard against NaN/non-finite from LLM output before clamp (f64::clamp panics on NaN).
+        let confidence_val = if parsed.confidence.is_finite() {
+            parsed.confidence.clamp(0.0, 1.0)
+        } else {
+            tracing::warn!(
+                raw = parsed.confidence,
+                "LLM verifier returned non-finite confidence, coercing to 0.0"
+            );
+            0.0
+        };
         let confidence = Confidence::new(confidence_val)
             .map_err(|e| AgentError::Verification(format!("confidence error: {e}")))?;
 
@@ -288,10 +297,11 @@ impl GroundingVerifier {
         }
 
         let overlap = answer_tokens.intersection(&evidence_tokens).count();
-        let confidence_val = overlap as f64 / answer_tokens.len() as f64;
+        // answer_tokens.is_empty() handled above, so division is safe.
+        let confidence_val = (overlap as f64 / answer_tokens.len() as f64).clamp(0.0, 1.0);
         let is_grounded = confidence_val >= self.confidence_threshold;
 
-        let confidence = Confidence::new(confidence_val.clamp(0.0, 1.0))
+        let confidence = Confidence::new(confidence_val)
             .map_err(|e| AgentError::Verification(format!("confidence error: {e}")))?;
 
         info!(
