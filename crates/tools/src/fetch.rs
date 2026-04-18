@@ -190,9 +190,13 @@ impl Tool for FetchUrlTool {
     async fn definition(&self, _prompt: String) -> ToolDefinition {
         ToolDefinition {
             name: Self::NAME.to_string(),
-            description: "Fetch the text content of a web page URL. Use when you need to \
-                          read the content of a specific web page. The URL must be publicly \
-                          accessible (internal/private IPs are blocked)."
+            description: "Fetch and return the plain-text body of a PUBLIC web URL. Use ONLY \
+                          when: (a) the user's message contained a URL, or (b) a prior \
+                          search_web / search_news call returned a URL whose full body is \
+                          needed. Never synthesize a URL. Never use this tool to 'browse' or \
+                          'google' — use search_web for discovery. Private / internal IP ranges \
+                          and non-HTTP(S) schemes are blocked; size is capped; a web-budget \
+                          tracker prevents runaway fetches."
                 .to_string(),
             parameters: json!({
                 "type": "object",
