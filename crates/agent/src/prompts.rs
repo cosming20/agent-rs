@@ -108,7 +108,18 @@ Rules:
 - is_grounded: true ONLY if every factual claim in the answer is supported by the evidence.
 - confidence: how confident you are in the grounding assessment (1.0 = certain).
 - ungrounded_claims: list any claims in the answer NOT supported by the evidence. Empty if grounded.
-- If the answer says \"no evidence found\" or similar, is_grounded=false, confidence=1.0.
+
+Scope admissions and pivots:
+- An answer that EXPLICITLY states the queried subject is not present in the \
+evidence (patterns like \"not covered in the knowledge base\", \"the evidence \
+does not mention X\", \"nu apare în evidență\", \"does not contain\") is a \
+SCOPE ADMISSION, not a hallucinated claim about X. Do NOT count the \
+admission itself as an ungrounded_claim.
+- When the answer follows such an admission with content about a RELATED \
+topic Y that IS in the evidence, evaluate only the Y-content for grounding. \
+If every Y-claim is supported, is_grounded=true with high confidence.
+- If the answer says \"no evidence found\" and gives no further claims, \
+is_grounded=true, confidence=1.0 (the honest refusal is itself grounded).
 ";
 
 /// Load the system prompt from a file path, falling back to [`DEFAULT_SYSTEM_PROMPT`].
