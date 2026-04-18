@@ -93,6 +93,7 @@ impl AgentOrchestrator {
             settings.agent.max_steps,
             &settings.agent.system_prompt_file,
             tool_factory,
+            &settings.agent.reasoning_effort,
         )?;
 
         // Step 3: Evidence fuser

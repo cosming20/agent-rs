@@ -13,6 +13,7 @@ use agent_rs_core::errors::AgentError;
 use agent_rs_stores::types::SearchResult;
 use rig::client::CompletionClient;
 use rig::completion::Prompt;
+use serde_json::json;
 use tracing::{error, info, instrument};
 
 use crate::context::QueryContext;
@@ -34,6 +35,10 @@ pub struct AgentRunner {
     system_prompt: String,
     /// Tool factory for building per-request tool sets.
     tool_factory: Arc<ToolFactory>,
+    /// Extra top-level fields merged into every Chat Completions request
+    /// body (e.g. `{"reasoning_effort": "minimal"}`). `None` = no extras.
+    /// Computed once at construction.
+    additional_params: Option<serde_json::Value>,
 }
 
 impl AgentRunner {
@@ -46,6 +51,10 @@ impl AgentRunner {
     /// - `max_turns` -- Maximum tool-calling turns.
     /// - `system_prompt_file` -- Path to custom system prompt file (empty = default).
     /// - `tool_factory` -- Shared tool factory for building per-request tools.
+    /// - `reasoning_effort` -- Value forwarded as the `reasoning_effort`
+    ///   top-level field on every Chat Completions request. Applies to
+    ///   gpt-5.x / o-series reasoning models; non-reasoning models ignore
+    ///   the unknown field. Empty string disables the override entirely.
     ///
     /// # Errors
     ///
@@ -56,17 +65,24 @@ impl AgentRunner {
         max_turns: usize,
         system_prompt_file: &str,
         tool_factory: Arc<ToolFactory>,
+        reasoning_effort: &str,
     ) -> Result<Self, AgentError> {
         let system_prompt = prompts::load_system_prompt(system_prompt_file);
         let llm_client = rig::providers::openai::Client::new(api_key).map_err(|e| {
             AgentError::Orchestrator(format!("failed to create OpenAI client: {e}"))
         })?;
+        let additional_params = if reasoning_effort.is_empty() {
+            None
+        } else {
+            Some(json!({ "reasoning_effort": reasoning_effort }))
+        };
         Ok(Self {
             llm_client,
             model: model.to_owned(),
             max_turns,
             system_prompt,
             tool_factory,
+            additional_params,
         })
     }
 
@@ -92,13 +108,18 @@ impl AgentRunner {
         // Build the prompt from chat history + current query
         let full_prompt = self.build_prompt(ctx);
 
-        // Build agent with tools
-        let agent = self
+        // Build agent with tools. `additional_params` forwards
+        // `reasoning_effort` (and any other configured fields) to the
+        // Chat Completions body via rig's `#[serde(flatten)]` passthrough.
+        let builder = self
             .llm_client
             .agent(&self.model)
             .preamble(&self.system_prompt)
-            .tools(tools)
-            .build();
+            .tools(tools);
+        let agent = match self.additional_params.as_ref() {
+            Some(params) => builder.additional_params(params.clone()).build(),
+            None => builder.build(),
+        };
 
         let response = agent
             .prompt(&full_prompt)
@@ -142,12 +163,15 @@ impl AgentRunner {
         // Build per-request tools and evidence collector for the retry.
         let (tools, evidence_collector) = self.tool_factory.build(&ctx.user_id);
 
-        let agent = self
+        let builder = self
             .llm_client
             .agent(&self.model)
             .preamble(&self.system_prompt)
-            .tools(tools)
-            .build();
+            .tools(tools);
+        let agent = match self.additional_params.as_ref() {
+            Some(params) => builder.additional_params(params.clone()).build(),
+            None => builder.build(),
+        };
 
         match agent.prompt(retry_prompt).max_turns(self.max_turns).await {
             Ok(response) => {
