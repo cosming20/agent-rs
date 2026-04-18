@@ -4,17 +4,104 @@
 //! If the answer is not grounded and retries remain, rebuilds the prompt
 //! with feedback, re-runs the agent, re-fuses evidence, and re-verifies.
 
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use agent_rs_core::errors::AgentError;
 use agent_rs_core::types::Confidence;
 use agent_rs_observability::metrics::RetrievalMetrics;
+use agent_rs_stores::types::SearchResult;
 use tracing::{error, info, instrument, warn};
 
 use crate::context::QueryContext;
 use crate::steps::agent_runner::AgentRunner;
 use crate::steps::evidence_fuser::EvidenceFuser;
 use crate::verifier::{GroundingVerifier, VerificationResult};
+
+// ---- Subject-absent short-circuit ----
+
+/// Minimum token length considered as a content-bearing word.
+///
+/// Shorter tokens are mostly function words, pronouns, and single-syllable
+/// particles across EN/RO; including them would produce a very high false
+/// positive rate on the subject-absence check.
+const SUBJECT_ABSENT_MIN_TOKEN_LEN: usize = 4;
+
+/// Length of the prefix used when searching for a query token inside chunk
+/// text. A prefix rather than an exact match accepts inflectional endings —
+/// Romanian and other morphologically rich languages routinely change the
+/// trailing syllables across cases and verb conjugations, and pinning the
+/// head of the word is enough to detect corpus presence.
+const SUBJECT_ABSENT_PREFIX_LEN: usize = 4;
+
+/// Stopwords dropped before the subject-absence check.
+///
+/// Intentionally minimal and bilingual (EN + RO) so a universal corpus can
+/// adopt the gate without language-specific tuning. Additions should cover
+/// tokens that carry no topical signal and whose absence from a corpus
+/// would not indicate an out-of-scope query.
+const SUBJECT_ABSENT_STOPWORDS: &[&str] = &[
+    // EN — high-frequency function words
+    "the", "and", "what", "when", "where", "this", "that", "with", "from", "have", "will", "about",
+    "there", "would", "could", "should", "which", "your", "yours",
+    // RO — high-frequency function words
+    "care", "cum", "pentru", "acest", "aceasta", "acea", "sunt", "este", "dintre", "intre", "doar",
+    "chiar", "pana", "catre", "dupa", "inainte",
+];
+
+/// Decide whether the query's subject appears in the retrieved evidence.
+///
+/// Returns `true` when **any** content token from the query is absent from
+/// every retrieved chunk. The rationale is asymmetric: a grounded answer
+/// needs all subject tokens in the evidence; missing even one is a strong
+/// signal that the corpus does not cover the topic. Stemming is
+/// approximated via a fixed-length prefix so inflectional endings
+/// (`histograma` vs `histogramei`) do not cause spurious misses.
+///
+/// Returns `false` (i.e. "subject present — let the pipeline retry") when:
+/// - the query has no content tokens after filtering (no signal to act on);
+/// - the evidence slice is empty (retries won't help, but grounding gate
+///   has its own handling for zero-evidence which we should not bypass);
+/// - every content token prefix is found somewhere in the evidence.
+fn subject_absent_from_evidence(query: &str, evidence: &[SearchResult]) -> bool {
+    if evidence.is_empty() {
+        return false;
+    }
+
+    let stopwords: HashSet<&str> = SUBJECT_ABSENT_STOPWORDS.iter().copied().collect();
+
+    let content_prefixes: Vec<String> = query
+        .split(|c: char| !c.is_alphabetic())
+        .filter(|t| t.chars().count() >= SUBJECT_ABSENT_MIN_TOKEN_LEN)
+        .map(|t| t.to_lowercase())
+        .filter(|t| !stopwords.contains(t.as_str()))
+        .map(|t| {
+            t.chars()
+                .take(SUBJECT_ABSENT_PREFIX_LEN)
+                .collect::<String>()
+        })
+        .collect();
+
+    if content_prefixes.is_empty() {
+        return false;
+    }
+
+    // Concatenate all chunk bodies into a single lowercased haystack so each
+    // prefix lookup is O(|haystack|) with no repeated allocation. Payloads
+    // lacking `chunk_text` are silently skipped; the gate treats them as
+    // empty contributors to the haystack.
+    let mut haystack = String::new();
+    for doc in evidence {
+        if let Some(text) = doc.payload.get("chunk_text").and_then(|v| v.as_str()) {
+            haystack.push_str(&text.to_lowercase());
+            haystack.push(' ');
+        }
+    }
+
+    content_prefixes
+        .iter()
+        .any(|prefix| !haystack.contains(prefix))
+}
 
 /// Verify answer grounding and retry if needed.
 pub struct GroundingGate {
@@ -54,6 +141,26 @@ impl GroundingGate {
         ctx.verification = Some(self.verifier.verify(&ctx.answer, &ctx.evidence).await?);
 
         ctx.retries = 0;
+
+        // Subject-absent short-circuit: if the first-pass retrieval does not
+        // contain any of the query's content tokens, further retries will not
+        // surface evidence (the corpus does not cover the topic). Skip them
+        // to save ~40-80 s per out-of-corpus query and preserve the agent's
+        // honest "not covered" answer instead of running more searches that
+        // will fail the same way.
+        if let Some(ref verification) = ctx.verification {
+            if self.verifier.needs_retry(verification)
+                && subject_absent_from_evidence(&ctx.query, &ctx.evidence)
+            {
+                warn!(
+                    query = %ctx.query,
+                    evidence_count = ctx.evidence.len(),
+                    "grounding gate: subject absent from first-pass evidence — skipping retries"
+                );
+                self.metrics.record_grounding_subject_absent(ctx.strategy);
+                return Ok(());
+            }
+        }
 
         while let Some(ref verification) = ctx.verification {
             if !self.verifier.needs_retry(verification) || ctx.retries >= self.max_retries {
