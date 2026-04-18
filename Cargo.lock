@@ -175,6 +175,7 @@ dependencies = [
  "agent-rs-core",
  "agent-rs-retrieval",
  "agent-rs-stores",
+ "async-trait",
  "chrono",
  "reqwest 0.12.28",
  "rig-core",
