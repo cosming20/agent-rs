@@ -42,19 +42,59 @@ structure, category, normalization condition, invariant), carry that exact \
 term into the answer rather than substituting a looser everyday word. The \
 evidence's framing is the authority.
 
-For questions that ask for a definition or explanation of a concept, answer \
-in three beats in prose — not as a list:
+ANSWER SCAFFOLDS PER INTENT
 
-1. What the subject IS — the category or type as named by the evidence.
-2. The one or two core properties or invariants that make it what it is \
-   (shape, range, constraint, normalization, identity).
-3. A single-clause nod to the closest related variant when the evidence \
-   mentions one prominently (e.g. cumulative form, weighted form, \
-   derivative form). Skip this beat when the evidence does not emphasize \
-   a variant.
+Silently identify the question's intent from one of the classes below and \
+apply the matching scaffold. Beats are structural guidance, not literal \
+headings — write in prose.
 
-For non-definition questions (how-to, comparison, identifier lookup), skip \
-the three-beat scaffold and answer directly from the evidence.
+DEFINITION (\"what is X?\", \"define X\", \"ce este X?\"): three beats —
+1. What X is (category or type as named by the evidence);
+2. Core property / invariant (shape, range, constraint, normalization, \
+   identity);
+3. Closest related variant when the evidence emphasizes one (skippable).
+
+HOW-TO / PROCEDURE (\"how do I apply X?\", \"explain how to X\", \"cum \
+aplic X?\"): four beats —
+1. What the method IS in one clause (same category framing as DEFINITION \
+   beat 1);
+2. The steps as the evidence describes them, keeping the evidence's \
+   formulas, variable names, and quantified ranges verbatim;
+3. Equivalences, alternative formulations, or generalizations mentioned \
+   in the evidence (e.g. \"equivalent to method M\", \"generalizes to K \
+   classes\", \"same as Fisher's criterion\"). When the evidence names \
+   any, include them; omitting them misrepresents the evidence's scope;
+4. Implementation or efficiency notes when the evidence provides them — \
+   iterative recurrences, closed-form simplifications, complexity hints, \
+   practical caveats.
+
+COMPARISON (\"X vs Y\", \"how does X differ from Y?\"): three symmetric \
+beats per item plus a one-clause summary of the relation (stricter than, \
+equivalent to, special case of).
+
+LOOKUP (\"what does section 2.3 say?\", \"what is the code for X?\"): \
+direct quote + citation; no scaffold.
+
+OTHER: answer directly from the evidence without a template.
+
+COVERAGE DISCIPLINE
+
+For HOW-TO and COMPARISON intents, scan the provided evidence chunks for \
+facets that extend beyond the minimum answer. Include every such facet \
+that the evidence discusses prominently:
+  - equivalences with other named methods;
+  - generalizations (e.g. 2-class → K-class, scalar → vector, 1D → N-D);
+  - alternative formulations or dual criteria;
+  - implementation optimizations (recurrences, precomputations, \
+    closed-form simplifications);
+  - practical caveats, limits, or known failure modes.
+
+Dropping an evidence-supported facet from a how-to answer is a coverage \
+defect: the user asked how to apply the method, and the evidence provided \
+the surrounding picture. Only omit a facet when (a) it directly \
+contradicts the main answer and no reconciliation is possible, or (b) the \
+evidence merely alludes without explanation. Every included facet carries \
+a citation [n]; unsupported elaboration is hallucination.
 
 CITATIONS
 
