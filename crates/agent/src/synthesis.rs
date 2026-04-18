@@ -121,29 +121,53 @@ impl ResponseSynthesizer {
              to support a grounded answer."
                 .to_owned()
         } else if !verification.is_grounded {
-            tracing::warn!(
-                query,
-                strategy = %strategy,
-                "answer ungrounded after retries — returning partial admission"
-            );
-            format!(
-                "I found some potentially relevant information, but I'm not \
-                 confident it fully answers your question. Here's what I found, \
-                 but please verify independently:\n\n{}",
-                answer
-            )
+            // Single-hedge guard: when the LLM already admitted scope
+            // ("not in the evidence" / "nu apare în evidență"), the wrapper
+            // adds nothing except confusion. Let the answer stand on its
+            // own honesty — the caller still sees confidence=0 and
+            // is_grounded=false via the struct fields.
+            if answer_self_admits_scope(answer) {
+                tracing::info!(
+                    query,
+                    strategy = %strategy,
+                    "answer ungrounded but self-admits scope — skipping wrapper"
+                );
+                answer.to_owned()
+            } else {
+                tracing::warn!(
+                    query,
+                    strategy = %strategy,
+                    "answer ungrounded after retries — returning partial admission"
+                );
+                format!(
+                    "I found some potentially relevant information, but I'm not \
+                     confident it fully answers your question. Here's what I found, \
+                     but please verify independently:\n\n{}",
+                    answer
+                )
+            }
         } else if answer_confidence < 0.15 {
-            tracing::warn!(
-                query,
-                confidence = answer_confidence,
-                "very low confidence grounded answer — caveat added"
-            );
-            format!(
-                "I found some potentially relevant information, but I'm not \
-                 confident it fully answers your question. Here's what I found, \
-                 but please verify independently:\n\n{}",
-                answer
-            )
+            // Same single-hedge logic for the very-low-confidence grounded path.
+            if answer_self_admits_scope(answer) {
+                tracing::info!(
+                    query,
+                    confidence = answer_confidence,
+                    "low-confidence grounded answer self-admits scope — skipping wrapper"
+                );
+                answer.to_owned()
+            } else {
+                tracing::warn!(
+                    query,
+                    confidence = answer_confidence,
+                    "very low confidence grounded answer — caveat added"
+                );
+                format!(
+                    "I found some potentially relevant information, but I'm not \
+                     confident it fully answers your question. Here's what I found, \
+                     but please verify independently:\n\n{}",
+                    answer
+                )
+            }
         } else {
             answer.to_owned()
         };
@@ -226,4 +250,38 @@ pub(crate) fn strip_chatty_tail(answer: &str) -> String {
     });
     let stripped = TAIL_RE.replace(answer, "");
     stripped.trim_end().to_owned()
+}
+
+/// Detect whether the LLM-written answer already contains an explicit
+/// "the evidence does not cover this" admission.
+///
+/// When this is true, the synthesizer's "I found some potentially relevant
+/// information, but I'm not confident…" wrapper is redundant and produces a
+/// confusing double-hedge — the user reads the model's own scope admission
+/// followed by our generic hedge saying roughly the same thing.
+///
+/// Patterns cover EN + RO phrasings the agent is most likely to emit under
+/// the system prompt's "when evidence is insufficient" clause. New phrasings
+/// should be added here rather than in the caller.
+pub(crate) fn answer_self_admits_scope(answer: &str) -> bool {
+    // Assembled via `concat!` so each alternative lives on its own line for
+    // maintainability; `r"..."` raw strings would otherwise swallow line
+    // continuations as literal backslash + whitespace characters.
+    static SCOPE_RE: std::sync::LazyLock<Regex> = std::sync::LazyLock::new(|| {
+        let pattern = concat!(
+            r"(?i)",
+            r"(?:\bnot (?:covered|mentioned|present|found) (?:in )?(?:the )?",
+            r"(?:evidence|knowledge base|corpus|retrieved material)\b",
+            r"|\bthe (?:retrieved )?evidence (?:does not (?:cover|mention|contain|include)",
+            r"|is (?:insufficient|silent))\b",
+            r"|\bno (?:relevant )?evidence (?:was )?(?:found|returned|retrieved)\b",
+            r"|\b(?:nu apare|nu este (?:prezent|menționat|acoperit|inclus)",
+            r"|nu se (?:regăsește|găsește)|nu conține|lipsește) ",
+            r"(?:în|din) (?:evidență|evidenț[aă]|materialul? recuperat",
+            r"|baza de cunoștințe|corpus)\b",
+            r"|\bmaterialul (?:nu conține|nu acoperă|nu menționează)\b",
+        );
+        Regex::new(pattern).expect("answer_self_admits_scope regex is statically valid")
+    });
+    SCOPE_RE.is_match(answer)
 }
