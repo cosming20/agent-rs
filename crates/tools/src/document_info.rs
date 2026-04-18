@@ -52,11 +52,14 @@ impl Tool for DocumentInfoTool {
     async fn definition(&self, _prompt: String) -> ToolDefinition {
         ToolDefinition {
             name: Self::NAME.to_string(),
-            description: "Get metadata about ingested documents: page count, table count, \
-                          picture count, language, title, file type, ingestion status, and \
-                          Docling version used for parsing. Use this tool when the user asks \
-                          about document properties (e.g., 'how many pages?', 'what language?', \
-                          'when was it ingested?') rather than searching document content."
+            description: "Inventory / metadata tool for the ingested corpus. Returns per-document \
+                          facts: page count, table count, picture count, language, title, file \
+                          type, ingestion status, Docling version. ALWAYS prefer this over \
+                          search_knowledge when the user asks: what documents / sources are \
+                          available, is X ingested, list the corpus, how many pages in doc Y, \
+                          when was Z ingested, is the corpus empty. Do NOT use this tool to \
+                          search document content — for that, use search_knowledge. Omit doc_id \
+                          to list every ingested document."
                 .to_string(),
             parameters: json!({
                 "type": "object",

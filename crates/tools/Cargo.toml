@@ -36,3 +36,7 @@ reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"
 
 # URL parsing (SSRF validation)
 url = "2"
+
+[dev-dependencies]
+# Async trait impls for in-test StateStore mocks.
+async-trait = { workspace = true }

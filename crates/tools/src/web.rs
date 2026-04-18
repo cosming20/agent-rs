@@ -102,8 +102,13 @@ impl Tool for SearchWebTool {
     async fn definition(&self, _prompt: String) -> ToolDefinition {
         ToolDefinition {
             name: Self::NAME.to_string(),
-            description: "Search the web for current information. Use when the knowledge base \
-                          does not contain the answer or when up-to-date information is needed."
+            description: "Web-search fallback via Brave Search. Reach for this ONLY when the \
+                          internal knowledge base is confirmed empty / insufficient on the topic \
+                          after a search_knowledge call, OR when the query is explicitly \
+                          time-sensitive (news, current events, live prices, today's weather) \
+                          and the corpus is static. Never the first retrieval tool in a turn. \
+                          Results are URL + snippet triples; follow up with fetch_url if a \
+                          specific result's full body is needed."
                 .to_string(),
             parameters: json!({
                 "type": "object",
