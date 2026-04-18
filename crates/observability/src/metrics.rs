@@ -36,6 +36,7 @@ const ZERO_EVIDENCE_TOTAL: &str = "pipeline.zero_evidence_total";
 const WEB_BUDGET_EXHAUSTED_TOTAL: &str = "tools.web_budget_exhausted_total";
 const GROUNDING_RETRY_TOTAL: &str = "grounding.retry_total";
 const GROUNDING_RETRIES_EXHAUSTED_TOTAL: &str = "grounding.retries_exhausted_total";
+const GROUNDING_SUBJECT_ABSENT_TOTAL: &str = "grounding.subject_absent_short_circuit_total";
 const QUERY_DURATION_MS: &str = "pipeline.query_duration_ms";
 const VERIFIER_METHOD_TOTAL: &str = "verification.method_total";
 const RERANKER_FALLBACK_TOTAL: &str = "retrieval.reranker_fallback_total";
@@ -132,6 +133,10 @@ pub struct RetrievalMetrics {
     grounding_retry: metrics::Counter<u64>,
     /// Count of queries that exhausted all retries without passing grounding.
     grounding_retries_exhausted: metrics::Counter<u64>,
+    /// Count of queries where the grounding gate short-circuited further
+    /// retries because the query's subject tokens were absent from the
+    /// first-pass evidence — strong signal the topic is out-of-corpus.
+    grounding_subject_absent: metrics::Counter<u64>,
     /// End-to-end query pipeline duration in milliseconds.
     query_duration_ms: metrics::Histogram<f64>,
     /// Count of verifier invocations by method (llm/heuristic/heuristic_fallback/none).
@@ -258,6 +263,15 @@ impl RetrievalMetrics {
             .with_description(
                 "Number of queries that exhausted all grounding retries without passing \
                  the faithfulness check.",
+            )
+            .with_unit("queries")
+            .build();
+
+        let grounding_subject_absent = meter
+            .u64_counter(GROUNDING_SUBJECT_ABSENT_TOTAL)
+            .with_description(
+                "Number of queries where grounding-gate retries were skipped because \
+                 the subject of the query was absent from the first-pass evidence.",
             )
             .with_unit("queries")
             .build();
@@ -409,6 +423,7 @@ impl RetrievalMetrics {
             web_budget_exhausted,
             grounding_retry,
             grounding_retries_exhausted,
+            grounding_subject_absent,
             query_duration_ms,
             verifier_method,
             reranker_fallback,
@@ -500,6 +515,17 @@ impl RetrievalMetrics {
     /// consumed without the answer passing the faithfulness check.
     pub fn record_grounding_retries_exhausted(&self, strategy: RetrievalStrategy) {
         self.grounding_retries_exhausted
+            .add(1, &[strategy_attr(strategy)]);
+    }
+
+    /// Increment the subject-absent short-circuit counter, labelled by strategy.
+    ///
+    /// Call when the grounding gate skipped retries because the query's
+    /// subject tokens were absent from the first-pass evidence — a strong
+    /// signal that additional retries will not produce grounded output and
+    /// would only waste latency and LLM budget.
+    pub fn record_grounding_subject_absent(&self, strategy: RetrievalStrategy) {
+        self.grounding_subject_absent
             .add(1, &[strategy_attr(strategy)]);
     }
 
