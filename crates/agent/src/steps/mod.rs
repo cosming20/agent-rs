@@ -6,6 +6,7 @@
 pub mod agent_runner;
 pub mod context_builder;
 pub mod coverage_planner;
+pub mod coverage_verifier;
 pub mod evidence_fuser;
 pub mod grounding_gate;
 pub mod result_persister;
