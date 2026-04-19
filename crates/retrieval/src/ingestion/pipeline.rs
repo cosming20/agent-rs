@@ -583,7 +583,10 @@ impl IngestionPipeline {
         // configured, generate a 1-2 sentence LLM summary for every chunk,
         // embed the summaries, and upsert them into the summaries collection.
         // This powers the `RetrievalStrategy::Summaries` search path.
-        let summaries_created = self.upsert_summaries_if_enabled(doc_id, &chunks).await?;
+        // The plain-text path has no ingest_run_id so we pass None.
+        let summaries_created = self
+            .upsert_summaries_if_enabled(doc_id, &chunks, None)
+            .await?;
 
         let duration_ms = start.elapsed().as_millis() as u64;
         tracing::info!(doc_id, duration_ms, summaries_created, "ingestion complete");
@@ -701,8 +704,12 @@ impl IngestionPipeline {
     ///
     /// Returns `0` when summarization is disabled (no summarizer or no
     /// collection) or when there are no chunks. LLM failures for individual
-    /// chunks are logged at WARN and silently skipped — the operation is
-    /// best-effort; a partial failure never aborts ingestion.
+    /// chunks are recorded with [`SummaryStatus::Failed`] in the payload
+    /// rather than silently skipped — this lets the outline tool surface
+    /// `[summary unavailable]` instead of a hole.
+    ///
+    /// `ingest_run_id` is forwarded into every summary payload so rollback
+    /// can delete orphan summaries scoped to a single failed run.
     #[tracing::instrument(
         skip(self, chunks),
         fields(doc_id, chunk_count = chunks.len())
@@ -711,6 +718,7 @@ impl IngestionPipeline {
         &self,
         doc_id: &str,
         chunks: &[DocumentChunk],
+        ingest_run_id: Option<&str>,
     ) -> Result<usize, RetrievalError> {
         let (Some(summarizer), Some(summaries_collection)) =
             (self.summarizer.as_ref(), self.summaries_collection.as_ref())
@@ -728,36 +736,42 @@ impl IngestionPipeline {
             return Ok(0);
         }
 
-        // Build (chunk_id, chunk_text) pairs for the batch call.
-        let pairs: Vec<(&str, &str)> = chunks
+        // Build SummarizeItems carrying chunk metadata for the batch call.
+        let items: Vec<super::summarizer::SummarizeItem<'_>> = chunks
             .iter()
-            .map(|c| (c.chunk_id.as_str(), c.content.as_str()))
+            .map(|c| super::summarizer::SummarizeItem {
+                chunk_id: c.chunk_id.as_str(),
+                chunk_text: c.content.as_str(),
+                doc_id: Some(c.doc_id.as_str()),
+                section_id: None, // section UUIDs only exist in the structural graph layer
+                ingest_run_id,
+            })
             .collect();
 
-        let results = summarizer
-            .summarize_batch(&pairs, self.summarizer_concurrency)
+        let summaries = summarizer
+            .summarize_batch(&items, self.summarizer_concurrency)
             .await;
 
-        // Collect successful summaries, skip empty / failed ones.
-        let mut valid_summaries = Vec::with_capacity(results.len());
-        for (idx, result) in results.into_iter().enumerate() {
-            match result {
-                Ok(summary) if !summary.summary_text.is_empty() => {
+        // All summaries are now recorded; log non-Ok ones for observability but
+        // only embed+upsert those with actual text (Ok status).
+        let mut valid_summaries = Vec::with_capacity(summaries.len());
+        for (idx, summary) in summaries.into_iter().enumerate() {
+            match summary.summary_status {
+                super::summarizer::SummaryStatus::Ok => {
                     valid_summaries.push(summary);
                 }
-                Ok(_) => {
+                super::summarizer::SummaryStatus::Empty => {
                     tracing::debug!(
                         doc_id,
                         chunk_index = idx,
-                        "summarizer returned empty text for chunk; skipping"
+                        "summarizer returned empty text for chunk; skipping upsert"
                     );
                 }
-                Err(e) => {
+                super::summarizer::SummaryStatus::Failed => {
                     tracing::warn!(
                         doc_id,
                         chunk_index = idx,
-                        error = %e,
-                        "chunk summarization failed; skipping"
+                        "chunk summarization failed; skipping upsert"
                     );
                 }
             }
@@ -1351,7 +1365,7 @@ impl IngestionPipeline {
 
         // ---- Step 7: Chunk summarization (optional) ----
         let summaries_created = match self
-            .upsert_summaries_if_enabled(doc_id, &pseudo_chunks)
+            .upsert_summaries_if_enabled(doc_id, &pseudo_chunks, Some(ingest_run_id_str.as_str()))
             .await
         {
             Ok(n) => n,
@@ -1519,6 +1533,38 @@ impl IngestionPipeline {
             }
         }
 
+        // Qdrant summaries collection: delete orphan summaries for this run.
+        // Failure here logs but does not fail the rollback — the main collection
+        // deletion is the source of truth.
+        if let Some(ref summaries_coll) = self.summaries_collection {
+            let summaries_filter =
+                agent_rs_stores::types::FilterSpec::eq("ingest_run_id", &run_id_str);
+            match self
+                .vector_store
+                .delete_by_filter(summaries_coll, summaries_filter)
+                .await
+            {
+                Ok(n) => {
+                    tracing::info!(
+                        doc_id,
+                        %ingest_run_id,
+                        collection = %summaries_coll,
+                        summaries_deleted = n,
+                        "rollback: summaries collection points deleted"
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        doc_id,
+                        %ingest_run_id,
+                        collection = %summaries_coll,
+                        error = %e,
+                        "rollback: failed to delete summaries; orphans may remain"
+                    );
+                }
+            }
+        }
+
         // Neo4j: delete structural + entity nodes by ingest_run_id.
         match self.graph_store.rollback_by_run_id(ingest_run_id).await {
             Ok(n) => {
@@ -1671,6 +1717,10 @@ fn build_summary_payload(summary: &super::summarizer::ChunkSummary) -> serde_jso
         "chunk_id": summary.chunk_id,
         "summary_text": summary.summary_text,
         "chunk_text_preview": summary.chunk_text_preview,
+        "doc_id": summary.doc_id,
+        "section_id": summary.section_id,
+        "ingest_run_id": summary.ingest_run_id,
+        "summary_status": summary.summary_status,
     })
 }
 
