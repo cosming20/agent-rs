@@ -25,8 +25,8 @@ use agent_rs_core::config::{BraveConfig, FetchConfig, WebBudgetConfig};
 use agent_rs_stores::traits::StateStore;
 use agent_rs_stores::types::{ChatMessage, EvidenceItem, Memory, QueryRun};
 use agent_rs_tools::{
-    DocumentInfoTool, FetchUrlTool, RememberTool, SearchKnowledgeTool, SearchNewsTool,
-    SearchWebTool, WebBudgetTracker,
+    DocumentInfoTool, FetchUrlTool, OutlineCorpusTool, RememberTool, SearchKnowledgeTool,
+    SearchNewsTool, SearchWebTool, WebBudgetTracker,
 };
 use async_trait::async_trait;
 use rig::tool::Tool;
@@ -388,4 +388,25 @@ async fn search_knowledge_tool_definition_contract() {
             "strategy enum missing advertised value {want:?}; tool enum = {enum_vals:?}"
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// OutlineCorpusTool — definition contract (stores require live backends).
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn outline_corpus_tool_definition_contract() {
+    // All store fields are `#[serde(skip)]`, so `{}` deserializes to `None`
+    // for each. `definition()` never touches the stores.
+    let tool: OutlineCorpusTool = serde_json::from_value(json!({}))
+        .expect("OutlineCorpusTool should deserialize from {}");
+    let def = tool.definition(String::new()).await;
+    assert_eq!(def.name, "outline_corpus");
+    assert_tool_contract(&def.name, &def.description, &def.parameters);
+    assert!(
+        def.description.to_lowercase().contains("outline")
+            && def.description.to_lowercase().contains("section"),
+        "outline_corpus description must reference outline / section: {:?}",
+        def.description
+    );
 }

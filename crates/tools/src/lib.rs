@@ -8,6 +8,7 @@
 //! | Tool | Module | Description |
 //! |------|--------|-------------|
 //! | `search_knowledge` | [`knowledge`] | Query the internal knowledge base |
+//! | `outline_corpus` | [`outline_corpus`] | Hierarchical TOC of the corpus |
 //! | `search_web` | [`web`] | Web search (stub, Phase 5b) |
 //! | `search_news` | [`web`] | News search (stub, Phase 5b) |
 //! | `fetch_url` | [`fetch`] | HTTP GET with SSRF protection |
@@ -31,6 +32,7 @@ pub mod fetch;
 pub mod ingest;
 pub mod knowledge;
 pub mod mcp_client;
+pub mod outline_corpus;
 pub mod remember;
 pub mod web;
 
@@ -39,5 +41,6 @@ pub use document_info::DocumentInfoTool;
 pub use fetch::FetchUrlTool;
 pub use knowledge::SearchKnowledgeTool;
 pub use mcp_client::McpClient;
+pub use outline_corpus::OutlineCorpusTool;
 pub use remember::RememberTool;
 pub use web::{SearchNewsTool, SearchWebTool};
