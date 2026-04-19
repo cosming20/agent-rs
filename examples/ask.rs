@@ -163,6 +163,7 @@ async fn main() -> Result<()> {
 
     let orchestrator = AgentOrchestrator::new(
         &settings,
+        stores.neo4j.clone(),
         stores.postgres.clone(),
         Arc::clone(&router),
         Arc::clone(&metrics),

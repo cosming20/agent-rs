@@ -11,6 +11,7 @@ use agent_rs_core::errors::AgentError;
 use agent_rs_core::types::{MessageRole, RetrievalStrategy, SessionId, UserId};
 use agent_rs_observability::metrics::RetrievalMetrics;
 use agent_rs_retrieval::{ResultRanker, RetrievalRouter};
+use agent_rs_stores::neo4j::Neo4jStore;
 use agent_rs_stores::postgres::PgStore;
 use agent_rs_stores::traits::StateStore;
 use tracing::{info, instrument};
@@ -19,6 +20,8 @@ use crate::context::QueryContext;
 use crate::memory::MemoryManager;
 use crate::steps::agent_runner::AgentRunner;
 use crate::steps::context_builder::ContextBuilder;
+use crate::steps::coverage_planner::CoveragePlanner;
+use crate::steps::coverage_verifier::CoverageVerifier;
 use crate::steps::evidence_fuser::EvidenceFuser;
 use crate::steps::grounding_gate::GroundingGate;
 use crate::steps::result_persister::ResultPersister;
@@ -33,14 +36,18 @@ use crate::verifier::GroundingVerifier;
 /// the step pipeline:
 ///
 /// 1. **ContextBuilder** -- loads history, builds conversation context
-/// 2. **AgentRunner** -- runs the LLM agent with tools, accumulates evidence
-/// 3. **EvidenceFuser** -- merges KB + web evidence via RRF
-/// 4. **GroundingGate** -- verifies grounding, retries if needed
-/// 5. **ResultPersister** -- synthesizes response with citations, persists run
+/// 2. **CoveragePlanner** -- detects exhaustive intent, builds section plan (no-op otherwise)
+/// 3. **AgentRunner** -- runs the LLM agent with tools, accumulates evidence
+/// 4. **EvidenceFuser** -- merges KB + web evidence via RRF
+/// 5. **CoverageVerifier** -- checks plan satisfaction, populates coverage report (no-op when plan is None)
+/// 6. **GroundingGate** -- verifies grounding, retries if needed
+/// 7. **ResultPersister** -- synthesizes response with citations, persists run
 pub struct AgentOrchestrator {
     context_builder: ContextBuilder,
+    coverage_planner: CoveragePlanner,
     agent_runner: AgentRunner,
     evidence_fuser: EvidenceFuser,
+    coverage_verifier: CoverageVerifier,
     grounding_gate: GroundingGate,
     result_persister: ResultPersister,
 }
@@ -51,7 +58,10 @@ impl AgentOrchestrator {
     /// # Parameters
     ///
     /// - `settings` -- application configuration.
-    /// - `store` -- shared state store (Postgres) for history, memory, runs.
+    /// - `neo4j` -- shared Neo4j graph store, used by [`CoveragePlanner`] to
+    ///   enumerate sections for exhaustive-coverage queries.
+    /// - `pg_store` -- shared Postgres store for history, memory, runs, and
+    ///   ingested-document listing.
     /// - `router` -- shared retrieval router for knowledge search.
     /// - `metrics` -- shared metric instruments for the retrieval pipeline.
     ///
@@ -60,6 +70,7 @@ impl AgentOrchestrator {
     /// Returns `AgentError::Orchestrator` if the LLM client cannot be created.
     pub fn new(
         settings: &Settings,
+        neo4j: Arc<Neo4jStore>,
         pg_store: Arc<PgStore>,
         router: Arc<RetrievalRouter>,
         metrics: Arc<RetrievalMetrics>,
@@ -73,6 +84,10 @@ impl AgentOrchestrator {
 
         // Step 1: Context builder
         let context_builder = ContextBuilder::new(Arc::clone(&memory), &settings.context);
+
+        // Step 1.5: Coverage planner — no-op for non-exhaustive queries.
+        let coverage_planner =
+            CoveragePlanner::new(neo4j, Arc::clone(&pg_store), Arc::clone(&metrics));
 
         // Tool factory (shared across requests; creates per-request tool sets).
         // Receives the concrete pg_store so DocumentInfoTool can call
@@ -100,6 +115,9 @@ impl AgentOrchestrator {
         let ranker = ResultRanker::new(settings.ranker.rrf_k);
         let evidence_fuser = EvidenceFuser::new(ranker, Arc::clone(&metrics));
 
+        // Step 3.5: Coverage verifier — no-op when coverage_plan is None.
+        let coverage_verifier = CoverageVerifier::new(Arc::clone(&metrics));
+
         // Step 4: Grounding gate
         let verifier = Arc::new(GroundingVerifier::new(
             settings.verifier.confidence_threshold,
@@ -115,8 +133,10 @@ impl AgentOrchestrator {
 
         Ok(Self {
             context_builder,
+            coverage_planner,
             agent_runner,
             evidence_fuser,
+            coverage_verifier,
             grounding_gate,
             result_persister,
         })
@@ -168,11 +188,20 @@ impl AgentOrchestrator {
         // Step 1: Build context (load history, inject memories, strategy hints)
         self.context_builder.build(&mut ctx).await?;
 
+        // Step 1.5: Coverage planning — detects exhaustive intent and pre-builds
+        // a section plan over Neo4j. No-op (immediate return) for non-exhaustive
+        // queries; adds zero latency on definition / how-to flows.
+        self.coverage_planner.plan(&mut ctx).await;
+
         // Step 2: Run agent with tools (populates answer + kb_evidence)
         self.agent_runner.run(&mut ctx).await?;
 
         // Step 3: Fuse evidence from KB and web sources
         self.evidence_fuser.fuse(&mut ctx);
+
+        // Step 3.5: Verify coverage — compares fused evidence against the plan
+        // and populates ctx.coverage_report. No-op when ctx.coverage_plan is None.
+        self.coverage_verifier.verify(&mut ctx);
 
         // Step 4: Verify grounding, retry if needed
         self.grounding_gate
