@@ -343,7 +343,7 @@ impl Neo4jStore {
         // ------------------------------------------------------------------
         // Phase 3: Section nodes (deduplicated from chunks)
         // ------------------------------------------------------------------
-        let section_rows = collect_section_rows(chunks, &run_id);
+        let section_rows = collect_section_rows(chunks, &run_id, &doc_id);
         upsert_nodes_batch(&self.graph, LABEL_SECTION, &section_rows).await?;
 
         // ------------------------------------------------------------------
@@ -598,20 +598,52 @@ fn page_id(document_id: Uuid, page_no: i64) -> String {
     Uuid::new_v5(&document_id, page_no.to_string().as_bytes()).to_string()
 }
 
+/// Stable id for the synthetic preamble section of a document. Used when
+/// the doc has chunks not attached to any heading (introduction, abstract,
+/// front matter). Idempotent across re-ingest.
+pub fn synthetic_preamble_section_id(doc_id: &str) -> String {
+    format!("preamble:{doc_id}")
+}
+
 /// Collect unique `Section` `NodeRow`s from the chunk slice.
 ///
 /// Each distinct `section_id` in the chunk list becomes one row. Chunks
-/// without a section are skipped.
-fn collect_section_rows(chunks: &[StructuralChunk], run_id: &str) -> Vec<NodeRow> {
+/// without a section (preamble chunks — introduction, abstract, front matter)
+/// are attached to a synthetic preamble section instead of being skipped.
+/// The preamble section id is `preamble:<doc_id>`, which is stable across
+/// re-ingest so the MERGE is idempotent.
+///
+/// New Section properties written on creation:
+/// - `first_chunk_index` — position of the first chunk seen for this section
+/// - `page_start` — `page_start` of that first chunk
+/// - `section_order` — same as `first_chunk_index` (monotonic document order)
+/// - `is_preamble` — `true` for the synthetic preamble section
+fn collect_section_rows(chunks: &[StructuralChunk], run_id: &str, doc_id: &str) -> Vec<NodeRow> {
     use std::collections::HashMap;
 
+    // Track: section_id -> (NodeRow, first_chunk_index, page_start).
+    // We use a Vec to preserve insertion order (= document order).
+    let mut order: Vec<String> = Vec::new();
     let mut seen: HashMap<String, NodeRow> = HashMap::new();
-    for chunk in chunks {
-        let Some(sid) = chunk.section_id else {
-            continue;
+
+    for (chunk_index, chunk) in chunks.iter().enumerate() {
+        let (id_str, is_preamble) = match chunk.section_id {
+            Some(sid) => (sid.to_string(), false),
+            None => (synthetic_preamble_section_id(doc_id), true),
         };
-        let id_str = sid.to_string();
+
         seen.entry(id_str.clone()).or_insert_with(|| {
+            order.push(id_str.clone());
+            let first_chunk_index = chunk_index as i64;
+            let page_start = chunk.page_start;
+            let section_order = if is_preamble { -1i64 } else { first_chunk_index };
+
+            let (heading, depth) = if is_preamble {
+                (Some("(preamble)".to_owned()), Some(0i64))
+            } else {
+                (chunk.section_title.clone(), chunk.heading_level)
+            };
+
             let path_json = Value::Array(
                 chunk
                     .heading_path
@@ -619,18 +651,25 @@ fn collect_section_rows(chunks: &[StructuralChunk], run_id: &str) -> Vec<NodeRow
                     .map(|s| Value::String(s.clone()))
                     .collect(),
             );
+
             NodeRow {
                 id: id_str,
                 run_id: run_id.to_owned(),
                 props: json!({
-                    "title":        chunk.section_title,
-                    "heading_path": path_json,
-                    "depth":        chunk.heading_level,
+                    "title":             heading,
+                    "heading_path":      path_json,
+                    "depth":             depth,
+                    "first_chunk_index": first_chunk_index,
+                    "page_start":        page_start,
+                    "section_order":     section_order,
+                    "is_preamble":       is_preamble,
                 }),
             }
         });
     }
-    seen.into_values().collect()
+
+    // Return in document order (insertion order into `order`).
+    order.into_iter().filter_map(|id| seen.remove(&id)).collect()
 }
 
 /// Collect `PARENT_OF` edges from the heading path hierarchy.
@@ -852,4 +891,87 @@ async fn upsert_edges_batch(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn preamble_section_id_is_stable_per_doc() {
+        let id1 = synthetic_preamble_section_id("doc-abc");
+        let id2 = synthetic_preamble_section_id("doc-abc");
+        assert_eq!(id1, id2);
+        assert_eq!(id1, "preamble:doc-abc");
+        assert_ne!(id1, synthetic_preamble_section_id("doc-xyz"));
+    }
+
+    #[test]
+    fn collect_section_rows_preamble_chunk_gets_synthetic_section() {
+        let chunk = StructuralChunk {
+            chunk_id: uuid::Uuid::new_v4(),
+            page_start: 1,
+            page_end: 1,
+            section_id: None, // preamble — no heading
+            section_title: None,
+            heading_level: None,
+            heading_path: vec![],
+            has_table: false,
+            has_list: false,
+            has_code: false,
+            has_formula: false,
+            has_picture_ref: false,
+            has_footnote: false,
+            has_caption: false,
+            table_refs: vec![],
+            picture_refs: vec![],
+            prev_chunk_id: None,
+        };
+
+        let rows = collect_section_rows(&[chunk], "run-1", "doc-abc");
+        assert_eq!(rows.len(), 1);
+        let row = &rows[0];
+        assert_eq!(row.id, "preamble:doc-abc");
+        assert_eq!(row.props["is_preamble"], serde_json::json!(true));
+        assert_eq!(row.props["title"], serde_json::json!("(preamble)"));
+        assert_eq!(row.props["depth"], serde_json::json!(0));
+        assert_eq!(row.props["section_order"], serde_json::json!(-1));
+        assert_eq!(row.props["first_chunk_index"], serde_json::json!(0));
+        assert_eq!(row.props["page_start"], serde_json::json!(1));
+    }
+
+    #[test]
+    fn collect_section_rows_non_preamble_gets_ordering_props() {
+        let sid = uuid::Uuid::new_v4();
+        let chunk = StructuralChunk {
+            chunk_id: uuid::Uuid::new_v4(),
+            page_start: 3,
+            page_end: 4,
+            section_id: Some(sid),
+            section_title: Some("Introduction".to_owned()),
+            heading_level: Some(1),
+            heading_path: vec!["Introduction".to_owned()],
+            has_table: false,
+            has_list: false,
+            has_code: false,
+            has_formula: false,
+            has_picture_ref: false,
+            has_footnote: false,
+            has_caption: false,
+            table_refs: vec![],
+            picture_refs: vec![],
+            prev_chunk_id: None,
+        };
+
+        let rows = collect_section_rows(&[chunk], "run-1", "doc-xyz");
+        assert_eq!(rows.len(), 1);
+        let row = &rows[0];
+        assert_eq!(row.id, sid.to_string());
+        assert_eq!(row.props["is_preamble"], serde_json::json!(false));
+        assert_eq!(row.props["title"], serde_json::json!("Introduction"));
+        assert_eq!(row.props["depth"], serde_json::json!(1));
+        assert_eq!(row.props["section_order"], serde_json::json!(0));
+        assert_eq!(row.props["first_chunk_index"], serde_json::json!(0));
+        assert_eq!(row.props["page_start"], serde_json::json!(3));
+    }
 }
