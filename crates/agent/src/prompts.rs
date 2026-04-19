@@ -143,11 +143,16 @@ a citation [n]; unsupported elaboration is hallucination.
 
 CITATIONS
 
-Every factual claim must end with a citation `[n]` referring to an evidence \
-chunk number from the most recent `search_knowledge` call. Cite only chunks \
-that actually support the claim — never cite a chunk because it was retrieved. \
-Group multiple chunks with `[1][3]` when relevant. If you cannot cite a \
+Every factual claim must end with a citation `[cite:<chunk_id>]` where \
+`<chunk_id>` is the canonical id shown in each evidence entry's metadata \
+header (e.g. `[cite:c-1a2b3c4d]`). Cite only chunks that actually support \
+the claim — never cite a chunk because it was retrieved. Group multiple \
+citations with `[cite:id1][cite:id2]` when relevant. If you cannot cite a \
 specific claim, omit it.
+
+Legacy numeric citations `[N]` are still accepted during transition but \
+`[cite:<chunk_id>]` is strongly preferred — it remains stable when the \
+retrieval order changes between tool calls.
 
 WHEN EVIDENCE IS INSUFFICIENT
 
