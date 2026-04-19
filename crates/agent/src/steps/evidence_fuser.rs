@@ -59,11 +59,14 @@ impl EvidenceFuser {
 
         // Coverage tier: appended AFTER the ranked tier so the LLM still sees
         // the highest-scoring chunks first. Dedup by `id` prevents double-
-        // counting when a coverage chunk also appears in kb_evidence.
+        // counting when a coverage chunk also appears in kb_evidence OR when
+        // coverage_evidence itself contains duplicates (e.g. from retry rounds
+        // that re-fetch the same sections).
         if !ctx.coverage_evidence.is_empty() {
-            // Collect owned Strings so we don't hold a borrow into ctx.evidence
-            // while pushing new elements into it.
-            let existing_ids: HashSet<String> = ctx
+            // Build the initial set from the ranked tier, then grow it as we
+            // push new coverage chunks so self-duplicates in coverage_evidence
+            // are also filtered out.
+            let mut existing_ids: HashSet<String> = ctx
                 .evidence
                 .iter()
                 .map(|e| e.id.clone())
@@ -71,7 +74,9 @@ impl EvidenceFuser {
 
             let before = ctx.evidence.len();
             for cov in &ctx.coverage_evidence {
-                if !existing_ids.contains(&cov.id) {
+                let id = &cov.id;
+                if !existing_ids.contains(id) {
+                    existing_ids.insert(id.clone());
                     ctx.evidence.push(cov.clone());
                 }
             }
@@ -190,6 +195,26 @@ mod tests {
         assert_eq!(
             count_cov1, 1,
             "cov-1 should appear exactly once after dedup"
+        );
+    }
+
+    #[test]
+    fn fuser_dedupes_duplicates_within_coverage_evidence() {
+        // coverage_evidence contains the same id twice (e.g. fetched in two
+        // retry rounds). The fuser must emit it only once.
+        let mut ctx = ctx_with_kb_and_coverage();
+        // Append a duplicate of cov-1 into coverage_evidence.
+        ctx.coverage_evidence.push(dummy_result("cov-1"));
+        let fuser = make_fuser();
+        fuser.fuse(&mut ctx);
+        let count_cov1 = ctx
+            .evidence
+            .iter()
+            .filter(|e| e.id == "cov-1")
+            .count();
+        assert_eq!(
+            count_cov1, 1,
+            "cov-1 should appear exactly once even when duplicated in coverage_evidence"
         );
     }
 

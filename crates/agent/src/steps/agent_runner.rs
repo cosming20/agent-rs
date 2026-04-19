@@ -163,8 +163,9 @@ impl AgentRunner {
 
         let start = Instant::now();
 
-        // Build per-request tools and evidence collector.
-        let (tools, evidence_collector) = self.tool_factory.build(&ctx.user_id);
+        // Build per-request tools, KB evidence collector, and coverage collector.
+        let (tools, evidence_collector, coverage_collector) =
+            self.tool_factory.build(&ctx.user_id);
 
         // Wrap each tool in a recording adapter that captures (tool_name,
         // args_json) into `tool_call_sink` before delegating to the real tool.
@@ -206,6 +207,10 @@ impl AgentRunner {
         // Drain accumulated evidence from the search_knowledge tool.
         drain_evidence(&evidence_collector, &mut ctx.kb_evidence).await;
 
+        // Drain coverage evidence (fetch_section_chunks + search_sections) into
+        // ctx.coverage_evidence so CoverageVerifier sees what was fetched.
+        drain_evidence(&coverage_collector, &mut ctx.coverage_evidence).await;
+
         // Drain recorded tool call args into ctx.tool_calls for use by
         // the grounding gate (Task 5.1).
         drain_tool_calls(&tool_call_sink, &mut ctx.tool_calls).await;
@@ -232,8 +237,10 @@ impl AgentRunner {
         // `drain_evidence` / `drain_tool_calls` use `append`, so new data
         // merges with existing.
 
-        // Build per-request tools and evidence collector for the retry.
-        let (tools, evidence_collector) = self.tool_factory.build(&ctx.user_id);
+        // Build per-request tools, KB evidence collector, and coverage collector
+        // for the retry. Coverage evidence accumulates across retries via append.
+        let (tools, evidence_collector, coverage_collector) =
+            self.tool_factory.build(&ctx.user_id);
 
         // Wrap tools with recording adapters for this retry round.
         let tool_call_sink: ToolCallSink = Arc::new(Mutex::new(Vec::new()));
@@ -260,8 +267,12 @@ impl AgentRunner {
             }
         }
 
-        // Drain accumulated evidence from the retry.
+        // Drain accumulated KB evidence from the retry.
         drain_evidence(&evidence_collector, &mut ctx.kb_evidence).await;
+
+        // Drain coverage evidence from the retry into ctx.coverage_evidence
+        // (accumulated across retries so CoverageVerifier sees all fetches).
+        drain_evidence(&coverage_collector, &mut ctx.coverage_evidence).await;
 
         // Drain retry tool-call records (accumulated alongside evidence).
         drain_tool_calls(&tool_call_sink, &mut ctx.tool_calls).await;

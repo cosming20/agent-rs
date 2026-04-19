@@ -7,6 +7,7 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 
 use agent_rs_core::config::{BraveConfig, FetchConfig, WebBudgetConfig};
+use agent_rs_core::errors::AgentError;
 use agent_rs_core::types::UserId;
 use agent_rs_retrieval::RetrievalRouter;
 use agent_rs_stores::neo4j::Neo4jStore;
@@ -20,8 +21,17 @@ use agent_rs_tools::{
 };
 use rig::tool::ToolDyn;
 
-/// Per-request tool set: boxed dynamic tools and shared evidence collector.
-pub type ToolSet = (Vec<Box<dyn ToolDyn>>, Arc<Mutex<Vec<SearchResult>>>);
+/// Per-request tool set: boxed dynamic tools, shared KB evidence collector,
+/// and shared coverage evidence collector.
+///
+/// - The KB collector is drained into `ctx.kb_evidence` by `agent_runner`.
+/// - The coverage collector is drained into `ctx.coverage_evidence` by
+///   `agent_runner` after the tool-calling loop completes.
+pub type ToolSet = (
+    Vec<Box<dyn ToolDyn>>,
+    Arc<Mutex<Vec<SearchResult>>>,
+    Arc<Mutex<Vec<SearchResult>>>,
+);
 
 /// Builds per-request tool sets for the Rig agent.
 ///
@@ -77,6 +87,11 @@ impl ToolFactory {
     /// - `brave_config` -- Brave Search API configuration.
     /// - `fetch_config` -- URL fetch configuration.
     /// - `web_budget_config` -- per-query web budget limits.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AgentError::Orchestrator`] if the shared HTTP client cannot
+    /// be constructed (e.g. invalid TLS configuration).
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         router: Arc<RetrievalRouter>,
@@ -88,13 +103,15 @@ impl ToolFactory {
         brave_config: BraveConfig,
         fetch_config: FetchConfig,
         web_budget_config: WebBudgetConfig,
-    ) -> Self {
+    ) -> Result<Self, AgentError> {
         let http_client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(brave_config.timeout_s))
             .build()
-            .expect("failed to build shared HTTP client");
+            .map_err(|e| {
+                AgentError::Orchestrator(format!("failed to build shared HTTP client: {e}"))
+            })?;
         let store: Arc<dyn StateStore> = Arc::clone(&pg_store) as _;
-        Self {
+        Ok(Self {
             router,
             store,
             pg_store,
@@ -106,24 +123,28 @@ impl ToolFactory {
             fetch_config,
             web_budget_config,
             http_client,
-        }
+        })
     }
 
-    /// Build a vector of boxed dynamic tools and the shared evidence collector
+    /// Build a vector of boxed dynamic tools and the shared evidence collectors
     /// for a single query.
     ///
-    /// Each call creates a fresh [`WebBudgetTracker`] and evidence collector,
-    /// ensuring per-query isolation.
+    /// Each call creates a fresh [`WebBudgetTracker`], KB evidence collector,
+    /// and coverage evidence collector, ensuring per-query isolation.
     ///
     /// # Returns
     ///
     /// A tuple of:
     /// - `Vec<Box<dyn ToolDyn>>` -- tools to register with the Rig agent.
-    /// - `Arc<Mutex<Vec<SearchResult>>>` -- shared KB evidence collector
-    ///   populated by the `search_knowledge` tool during execution.
+    /// - `Arc<Mutex<Vec<SearchResult>>>` -- KB evidence collector populated by
+    ///   the `search_knowledge` tool.
+    /// - `Arc<Mutex<Vec<SearchResult>>>` -- coverage evidence collector populated
+    ///   by `fetch_section_chunks` and `search_sections` tools; drained into
+    ///   `ctx.coverage_evidence` by `agent_runner` after execution.
     pub fn build(&self, user_id: &UserId) -> ToolSet {
         let budget = Arc::new(WebBudgetTracker::new(&self.web_budget_config));
         let evidence_collector: Arc<Mutex<Vec<SearchResult>>> = Arc::new(Mutex::new(Vec::new()));
+        let coverage_collector: Arc<Mutex<Vec<SearchResult>>> = Arc::new(Mutex::new(Vec::new()));
 
         let tools: Vec<Box<dyn ToolDyn>> = vec![
             Box::new(SearchKnowledgeTool::new(
@@ -161,22 +182,30 @@ impl ToolFactory {
                 self.summaries_collection.clone(),
             )),
             // fetch_section_chunks — exhaustive, non-ranked chunk retrieval
-            // for a single known section_id.
-            Box::new(FetchSectionChunksTool::new(
-                Arc::clone(&self.neo4j),
-                Arc::clone(&self.qdrant),
-                self.default_collection.clone(),
-            )),
+            // for a single known section_id. Wired with coverage_collector so
+            // retrieved chunks reach ctx.coverage_evidence.
+            Box::new(
+                FetchSectionChunksTool::new(
+                    Arc::clone(&self.neo4j),
+                    Arc::clone(&self.qdrant),
+                    self.default_collection.clone(),
+                )
+                .with_coverage_collector(Arc::clone(&coverage_collector)),
+            ),
             // search_sections — batched parallel retrieval over multiple
             // section_ids in one tool call (keeps exhaustive flows inside
-            // the max_turns budget).
-            Box::new(SearchSectionsTool::new(
-                Arc::clone(&self.neo4j),
-                Arc::clone(&self.qdrant),
-                self.default_collection.clone(),
-            )),
+            // the max_turns budget). Wired with coverage_collector so
+            // retrieved chunks reach ctx.coverage_evidence.
+            Box::new(
+                SearchSectionsTool::new(
+                    Arc::clone(&self.neo4j),
+                    Arc::clone(&self.qdrant),
+                    self.default_collection.clone(),
+                )
+                .with_coverage_collector(Arc::clone(&coverage_collector)),
+            ),
         ];
 
-        (tools, evidence_collector)
+        (tools, evidence_collector, coverage_collector)
     }
 }

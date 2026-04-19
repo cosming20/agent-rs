@@ -17,12 +17,15 @@
 use std::sync::Arc;
 
 use agent_rs_core::ToolError;
+use agent_rs_core::types::Score;
 use agent_rs_stores::neo4j::Neo4jStore;
 use agent_rs_stores::qdrant::QdrantStore;
+use agent_rs_stores::types::SearchResult;
 use rig::completion::ToolDefinition;
 use rig::tool::Tool;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use tokio::sync::Mutex;
 
 // ---- Args ----
 
@@ -54,6 +57,14 @@ pub struct FetchSectionChunksTool {
     qdrant: Option<Arc<QdrantStore>>,
     #[serde(skip)]
     collection: Option<String>,
+    /// Optional shared collector for populating `ctx.coverage_evidence`.
+    ///
+    /// When present, every retrieved [`SearchResult`] is pushed into this
+    /// collector so the downstream [`CoverageVerifier`] can inspect what
+    /// the tool actually fetched. Mirrors the `evidence_collector` pattern
+    /// in [`SearchKnowledgeTool`].
+    #[serde(skip)]
+    coverage_collector: Option<Arc<Mutex<Vec<SearchResult>>>>,
 }
 
 impl FetchSectionChunksTool {
@@ -66,7 +77,21 @@ impl FetchSectionChunksTool {
             neo4j: Some(neo4j),
             qdrant: Some(qdrant),
             collection: Some(collection),
+            coverage_collector: None,
         }
+    }
+
+    /// Attach a shared coverage collector.
+    ///
+    /// Each [`SearchResult`] fetched by this tool is pushed into the collector
+    /// so the orchestrator can drain it into `ctx.coverage_evidence` for the
+    /// [`CoverageVerifier`] step.
+    pub fn with_coverage_collector(
+        mut self,
+        collector: Arc<Mutex<Vec<SearchResult>>>,
+    ) -> Self {
+        self.coverage_collector = Some(collector);
+        self
     }
 }
 
@@ -171,6 +196,20 @@ impl Tool for FetchSectionChunksTool {
             .retrieve_chunks_by_ids(collection, &chunk_ids)
             .await
             .map_err(|e| ToolError::McpClient(format!("fetch_section_chunks: retrieve: {e}")))?;
+
+        // Accumulate raw results as SearchResults for downstream coverage
+        // verification — mirrors the evidence_collector pattern in
+        // SearchKnowledgeTool. Score is 1.0 for exhaustive (unranked) fetches.
+        if let Some(collector) = &self.coverage_collector {
+            let mut guard = collector.lock().await;
+            for p in &payloads {
+                guard.push(SearchResult {
+                    id: p.id.clone(),
+                    score: Score::new(1.0),
+                    payload: p.payload.clone(),
+                });
+            }
+        }
 
         // Concatenate chunk_text fields, respecting the optional char cap.
         let max_chars = args.max_chars.unwrap_or(usize::MAX);

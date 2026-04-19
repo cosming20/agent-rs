@@ -17,14 +17,16 @@
 use std::sync::Arc;
 
 use agent_rs_core::ToolError;
+use agent_rs_core::types::Score;
 use agent_rs_stores::neo4j::Neo4jStore;
 use agent_rs_stores::qdrant::QdrantStore;
+use agent_rs_stores::types::{PointPayload, SearchResult};
 use futures::future::join_all;
 use rig::completion::ToolDefinition;
 use rig::tool::Tool;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use tokio::sync::Semaphore;
+use tokio::sync::{Mutex, Semaphore};
 
 /// Maximum number of concurrent per-section retrievals.
 const DEFAULT_FAN_OUT_CONCURRENCY: usize = 8;
@@ -59,6 +61,14 @@ pub struct SearchSectionsTool {
     qdrant: Option<Arc<QdrantStore>>,
     #[serde(skip)]
     collection: Option<String>,
+    /// Optional shared collector for populating `ctx.coverage_evidence`.
+    ///
+    /// When present, every retrieved [`SearchResult`] is pushed into this
+    /// collector so the downstream [`CoverageVerifier`] can inspect what
+    /// the tool actually fetched. Mirrors the `evidence_collector` pattern
+    /// in [`SearchKnowledgeTool`].
+    #[serde(skip)]
+    coverage_collector: Option<Arc<Mutex<Vec<SearchResult>>>>,
 }
 
 impl SearchSectionsTool {
@@ -72,7 +82,21 @@ impl SearchSectionsTool {
             neo4j: Some(neo4j),
             qdrant: Some(qdrant),
             collection: Some(collection),
+            coverage_collector: None,
         }
+    }
+
+    /// Attach a shared coverage collector.
+    ///
+    /// Each [`SearchResult`] fetched by this tool is pushed into the collector
+    /// so the orchestrator can drain it into `ctx.coverage_evidence` for the
+    /// [`CoverageVerifier`] step.
+    pub fn with_coverage_collector(
+        mut self,
+        collector: Arc<Mutex<Vec<SearchResult>>>,
+    ) -> Self {
+        self.coverage_collector = Some(collector);
+        self
     }
 }
 
@@ -162,11 +186,28 @@ impl Tool for SearchSectionsTool {
 
         let results = join_all(futs).await;
 
+        // Accumulate raw results for downstream coverage verification.
+        // Score is 1.0 for exhaustive (unranked) fetches.
+        if let Some(collector) = &self.coverage_collector {
+            let mut guard = collector.lock().await;
+            for res in &results {
+                if let Ok((_, payloads)) = res {
+                    for p in payloads {
+                        guard.push(SearchResult {
+                            id: p.id.clone(),
+                            score: Score::new(1.0),
+                            payload: p.payload.clone(),
+                        });
+                    }
+                }
+            }
+        }
+
         let mut out = String::new();
         for (sid, res) in args.section_ids.iter().zip(results.iter()) {
             out.push_str(&format!("=== section {sid} ===\n"));
             match res {
-                Ok(text) => out.push_str(text),
+                Ok((text, _)) => out.push_str(text),
                 Err(e) => out.push_str(&format!("[error: {e}]\n")),
             }
             out.push('\n');
@@ -178,8 +219,9 @@ impl Tool for SearchSectionsTool {
 
 /// Fetch all chunks for one `section_id`.
 ///
-/// Returns the concatenated `chunk_text` fields from Qdrant, truncated at
-/// `max_chars`. Per-section errors are propagated as `Err(String)` and
+/// Returns the concatenated `chunk_text` fields from Qdrant (truncated at
+/// `max_chars`) alongside the raw [`PointPayload`]s for coverage evidence
+/// accumulation. Per-section errors are propagated as `Err(String)` and
 /// embedded inline by the caller.
 async fn fetch_one(
     neo4j: &Neo4jStore,
@@ -187,14 +229,14 @@ async fn fetch_one(
     collection: &str,
     section_id: &str,
     max_chars: usize,
-) -> Result<String, String> {
+) -> Result<(String, Vec<PointPayload>), String> {
     let chunk_ids = neo4j
         .chunks_in_sections(&[section_id.to_string()])
         .await
         .map_err(|e| format!("neo4j chunks_in_sections({section_id}): {e}"))?;
 
     if chunk_ids.is_empty() {
-        return Ok(format!("(no chunks in {section_id})\n"));
+        return Ok((format!("(no chunks in {section_id})\n"), Vec::new()));
     }
 
     let payloads = qdrant
@@ -205,7 +247,7 @@ async fn fetch_one(
     let mut s = String::new();
     let mut written = 0usize;
 
-    for p in payloads {
+    for p in &payloads {
         let text = p
             .payload
             .get("chunk_text")
@@ -222,5 +264,5 @@ async fn fetch_one(
         s.push_str("\n\n");
     }
 
-    Ok(s)
+    Ok((s, payloads))
 }
