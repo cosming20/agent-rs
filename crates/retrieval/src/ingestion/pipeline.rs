@@ -583,7 +583,10 @@ impl IngestionPipeline {
         // configured, generate a 1-2 sentence LLM summary for every chunk,
         // embed the summaries, and upsert them into the summaries collection.
         // This powers the `RetrievalStrategy::Summaries` search path.
-        let summaries_created = self.upsert_summaries_if_enabled(doc_id, &chunks).await?;
+        // The plain-text path has no ingest_run_id so we pass None.
+        let summaries_created = self
+            .upsert_summaries_if_enabled(doc_id, &chunks, None)
+            .await?;
 
         let duration_ms = start.elapsed().as_millis() as u64;
         tracing::info!(doc_id, duration_ms, summaries_created, "ingestion complete");
@@ -701,8 +704,12 @@ impl IngestionPipeline {
     ///
     /// Returns `0` when summarization is disabled (no summarizer or no
     /// collection) or when there are no chunks. LLM failures for individual
-    /// chunks are logged at WARN and silently skipped — the operation is
-    /// best-effort; a partial failure never aborts ingestion.
+    /// chunks are recorded with [`SummaryStatus::Failed`] in the payload
+    /// rather than silently skipped — this lets the outline tool surface
+    /// `[summary unavailable]` instead of a hole.
+    ///
+    /// `ingest_run_id` is forwarded into every summary payload so rollback
+    /// can delete orphan summaries scoped to a single failed run.
     #[tracing::instrument(
         skip(self, chunks),
         fields(doc_id, chunk_count = chunks.len())
@@ -711,6 +718,7 @@ impl IngestionPipeline {
         &self,
         doc_id: &str,
         chunks: &[DocumentChunk],
+        ingest_run_id: Option<&str>,
     ) -> Result<usize, RetrievalError> {
         let (Some(summarizer), Some(summaries_collection)) =
             (self.summarizer.as_ref(), self.summaries_collection.as_ref())
@@ -728,59 +736,91 @@ impl IngestionPipeline {
             return Ok(0);
         }
 
-        // Build (chunk_id, chunk_text) pairs for the batch call.
-        let pairs: Vec<(&str, &str)> = chunks
+        // Build SummarizeItems carrying chunk metadata for the batch call.
+        let items: Vec<super::summarizer::SummarizeItem<'_>> = chunks
             .iter()
-            .map(|c| (c.chunk_id.as_str(), c.content.as_str()))
+            .map(|c| super::summarizer::SummarizeItem {
+                chunk_id: c.chunk_id.as_str(),
+                chunk_text: c.content.as_str(),
+                doc_id: Some(c.doc_id.as_str()),
+                section_id: c.section_id.as_deref(),
+                ingest_run_id,
+            })
             .collect();
 
-        let results = summarizer
-            .summarize_batch(&pairs, self.summarizer_concurrency)
+        let summaries = summarizer
+            .summarize_batch(&items, self.summarizer_concurrency)
             .await;
 
-        // Collect successful summaries, skip empty / failed ones.
-        let mut valid_summaries = Vec::with_capacity(results.len());
-        for (idx, result) in results.into_iter().enumerate() {
-            match result {
-                Ok(summary) if !summary.summary_text.is_empty() => {
-                    valid_summaries.push(summary);
+        // Partition summaries: Ok ones get real embeddings; Empty/Failed get a
+        // placeholder text so the embedder never sees an empty string but their
+        // summary_status payload field lets outline_corpus skip them for display.
+        const UNAVAILABLE_PLACEHOLDER: &str = "[summary unavailable]";
+
+        let mut ok_summaries: Vec<super::summarizer::ChunkSummary> =
+            Vec::with_capacity(summaries.len());
+        let mut non_ok_summaries: Vec<super::summarizer::ChunkSummary> = Vec::new();
+        for (idx, summary) in summaries.into_iter().enumerate() {
+            match summary.summary_status {
+                super::summarizer::SummaryStatus::Ok => {
+                    ok_summaries.push(summary);
                 }
-                Ok(_) => {
+                super::summarizer::SummaryStatus::Empty => {
                     tracing::debug!(
                         doc_id,
                         chunk_index = idx,
-                        "summarizer returned empty text for chunk; skipping"
+                        "summarizer returned empty text for chunk; upserting with placeholder"
                     );
+                    non_ok_summaries.push(summary);
                 }
-                Err(e) => {
+                super::summarizer::SummaryStatus::Failed => {
                     tracing::warn!(
                         doc_id,
                         chunk_index = idx,
-                        error = %e,
-                        "chunk summarization failed; skipping"
+                        "chunk summarization failed; upserting with placeholder"
                     );
+                    non_ok_summaries.push(summary);
                 }
             }
         }
 
-        if valid_summaries.is_empty() {
-            tracing::debug!(doc_id, "no valid summaries produced; skipping upsert");
+        if ok_summaries.is_empty() && non_ok_summaries.is_empty() {
+            tracing::debug!(doc_id, "no summaries produced; skipping upsert");
             return Ok(0);
         }
 
-        // Embed the summary texts via the passage path.
-        let summary_texts: Vec<&str> = valid_summaries
+        // Embed Ok summaries; placeholder text is used for Empty/Failed so the
+        // outline tool can surface "summary unavailable" rather than a gap.
+        let ok_texts: Vec<&str> = ok_summaries
             .iter()
             .map(|s| s.summary_text.as_str())
             .collect();
-        let summary_embeddings = self.embedder.embed_documents(&summary_texts).await?;
+        let non_ok_texts: Vec<&str> = non_ok_summaries
+            .iter()
+            .map(|_| UNAVAILABLE_PLACEHOLDER)
+            .collect();
 
-        if summary_embeddings.len() != valid_summaries.len() {
+        let all_texts: Vec<&str> = ok_texts
+            .iter()
+            .copied()
+            .chain(non_ok_texts.iter().copied())
+            .collect();
+
+        let all_summaries_len = ok_summaries.len() + non_ok_summaries.len();
+
+        if all_texts.is_empty() {
+            tracing::debug!(doc_id, "no summary texts to embed; skipping upsert");
+            return Ok(0);
+        }
+
+        let all_embeddings = self.embedder.embed_documents(&all_texts).await?;
+
+        if all_embeddings.len() != all_summaries_len {
             return Err(RetrievalError::Ingestion {
                 reason: format!(
                     "summary embedding count mismatch: got {} embeddings for {} summaries",
-                    summary_embeddings.len(),
-                    valid_summaries.len()
+                    all_embeddings.len(),
+                    all_summaries_len
                 ),
             });
         }
@@ -810,9 +850,10 @@ impl IngestionPipeline {
             );
         }
 
-        let points: Vec<VectorPoint> = valid_summaries
+        // Build points for Ok summaries (real embedding) then non-Ok (placeholder embedding).
+        let points: Vec<VectorPoint> = ok_summaries
             .iter()
-            .zip(summary_embeddings.into_iter())
+            .zip(all_embeddings.iter().cloned())
             .map(|(summary, embedding)| VectorPoint {
                 id: summary.summary_id.clone(),
                 embedding,
@@ -820,6 +861,17 @@ impl IngestionPipeline {
                 text: String::new(),
                 payload: build_summary_payload(summary),
             })
+            .chain(
+                non_ok_summaries
+                    .iter()
+                    .zip(all_embeddings.iter().skip(ok_summaries.len()).cloned())
+                    .map(|(summary, embedding)| VectorPoint {
+                        id: summary.summary_id.clone(),
+                        embedding,
+                        text: String::new(),
+                        payload: build_summary_payload(summary),
+                    }),
+            )
             .collect();
 
         let count = points.len();
@@ -1351,12 +1403,14 @@ impl IngestionPipeline {
 
         // ---- Step 7: Chunk summarization (optional) ----
         let summaries_created = match self
-            .upsert_summaries_if_enabled(doc_id, &pseudo_chunks)
+            .upsert_summaries_if_enabled(doc_id, &pseudo_chunks, Some(ingest_run_id_str.as_str()))
             .await
         {
             Ok(n) => n,
             Err(e) => {
                 let reason = e.to_string();
+                // Rollback: all prior steps (Qdrant + Neo4j) have written data.
+                self.try_rollback_stores(doc_id, ingest_run_id).await;
                 if let Some(pg) = &self.pg_store {
                     if let Err(pg_err) = pg.mark_partial_failure(ingest_run_id, &reason).await {
                         tracing::warn!(error = %pg_err, %ingest_run_id, "mark_partial_failure failed — row may be stuck in_progress");
@@ -1410,6 +1464,9 @@ impl IngestionPipeline {
                 )
                 .await
             {
+                // All store writes have completed but the postgres commit failed.
+                // Roll back Qdrant + Neo4j so the run leaves no orphaned data.
+                self.try_rollback_stores(doc_id, ingest_run_id).await;
                 return Err(RetrievalError::PostgresCommitFailed {
                     ingest_run_id: ingest_run_id.to_string(),
                     reason: e.to_string(),
@@ -1516,6 +1573,38 @@ impl IngestionPipeline {
             }
             Err(e) => {
                 tracing::warn!(doc_id, %ingest_run_id, error = %e, "rollback: Qdrant delete_by_filter failed")
+            }
+        }
+
+        // Qdrant summaries collection: delete orphan summaries for this run.
+        // Failure here logs but does not fail the rollback — the main collection
+        // deletion is the source of truth.
+        if let Some(ref summaries_coll) = self.summaries_collection {
+            let summaries_filter =
+                agent_rs_stores::types::FilterSpec::eq("ingest_run_id", &run_id_str);
+            match self
+                .vector_store
+                .delete_by_filter(summaries_coll, summaries_filter)
+                .await
+            {
+                Ok(n) => {
+                    tracing::info!(
+                        doc_id,
+                        %ingest_run_id,
+                        collection = %summaries_coll,
+                        summaries_deleted = n,
+                        "rollback: summaries collection points deleted"
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        doc_id,
+                        %ingest_run_id,
+                        collection = %summaries_coll,
+                        error = %e,
+                        "rollback: failed to delete summaries; orphans may remain"
+                    );
+                }
             }
         }
 
@@ -1636,12 +1725,19 @@ fn proto_chunk_to_document_chunk(
     // heading_path contains the full heading hierarchy root-first.
     let headings: Vec<String> = chunk.heading_path.clone();
 
+    let section_id = if chunk.section_id.is_empty() {
+        None
+    } else {
+        Some(chunk.section_id.clone())
+    };
+
     DocumentChunk {
         chunk_id: chunk.chunk_id.clone(),
         doc_id: doc_id.to_owned(),
         content: chunk.embed_text.clone(),
         chunk_index: index,
         total_chunks,
+        section_id,
         metadata: ChunkMetadata {
             source: source.to_owned(),
             page_number: if chunk.page_start > 0 {
@@ -1671,6 +1767,10 @@ fn build_summary_payload(summary: &super::summarizer::ChunkSummary) -> serde_jso
         "chunk_id": summary.chunk_id,
         "summary_text": summary.summary_text,
         "chunk_text_preview": summary.chunk_text_preview,
+        "doc_id": summary.doc_id,
+        "section_id": summary.section_id,
+        "ingest_run_id": summary.ingest_run_id,
+        "summary_status": summary.summary_status,
     })
 }
 

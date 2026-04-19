@@ -41,6 +41,9 @@ const QUERY_DURATION_MS: &str = "pipeline.query_duration_ms";
 const VERIFIER_METHOD_TOTAL: &str = "verification.method_total";
 const RERANKER_FALLBACK_TOTAL: &str = "retrieval.reranker_fallback_total";
 const GRAPH_EXTRACTION_FAILURE_TOTAL: &str = "ingestion.graph_extraction_failure_total";
+const COVERAGE_PLANNER_UNMATCHED_TOTAL: &str = "agent.coverage_planner_unmatched_total";
+const COVERAGE_VERIFIED_FETCHED_TOTAL: &str = "agent.coverage_verified_fetched_total";
+const COVERAGE_VERIFIED_EXPECTED_TOTAL: &str = "agent.coverage_verified_expected_total";
 
 // ---- Tier 1 — cost + per-stage time ----
 const LLM_CALLS_TOTAL: &str = "llm.calls_total";
@@ -179,6 +182,17 @@ pub struct RetrievalMetrics {
     /// Chunks whose embed_text is empty or whitespace-only — a silent
     /// ingestion regression symptom if the rate climbs above baseline.
     chunk_empty_embed: metrics::Counter<u64>,
+    /// Count of CoveragePlanner soft-heuristic firings where the strict
+    /// hard-token rules did not promote the query to exhaustive/partial mode.
+    /// Labelled by `reason` (heuristic name). Used to tune the rule set.
+    coverage_planner_unmatched: metrics::Counter<u64>,
+    /// Total section count that was fetched (present in evidence) across all
+    /// CoverageVerifier runs. Divide by `coverage_verified_expected` to get
+    /// the coverage ratio in a Grafana expression.
+    coverage_verified_fetched: metrics::Counter<u64>,
+    /// Total section count expected (plan target) across all CoverageVerifier
+    /// runs.
+    coverage_verified_expected: metrics::Counter<u64>,
 }
 
 impl RetrievalMetrics {
@@ -412,6 +426,33 @@ impl RetrievalMetrics {
             .with_unit("chunks")
             .build();
 
+        let coverage_planner_unmatched = meter
+            .u64_counter(COVERAGE_PLANNER_UNMATCHED_TOTAL)
+            .with_description(
+                "CoveragePlanner soft-heuristic fired but strict rules did not match. \
+                 Labelled by reason (heuristic name). Use to tune the bilingual token set.",
+            )
+            .with_unit("events")
+            .build();
+
+        let coverage_verified_fetched = meter
+            .u64_counter(COVERAGE_VERIFIED_FETCHED_TOTAL)
+            .with_description(
+                "Total number of sections present in evidence across all CoverageVerifier \
+                 runs. Divide by coverage_verified_expected to compute the coverage ratio.",
+            )
+            .with_unit("sections")
+            .build();
+
+        let coverage_verified_expected = meter
+            .u64_counter(COVERAGE_VERIFIED_EXPECTED_TOTAL)
+            .with_description(
+                "Total number of target sections across all CoverageVerifier runs \
+                 (plan size summed over all exhaustive queries).",
+            )
+            .with_unit("sections")
+            .build();
+
         Self {
             retrieval_latency,
             retrieval_results,
@@ -441,6 +482,9 @@ impl RetrievalMetrics {
             chunk_heading_depth,
             chunk_flag,
             chunk_empty_embed,
+            coverage_planner_unmatched,
+            coverage_verified_fetched,
+            coverage_verified_expected,
         }
     }
 
@@ -665,6 +709,30 @@ impl RetrievalMetrics {
     /// chunker regression when the rate climbs above baseline.
     pub fn record_chunk_empty_embed(&self) {
         self.chunk_empty_embed.add(1, &[]);
+    }
+
+    /// Increment the coverage-planner-unmatched counter.
+    ///
+    /// Call when the `CoveragePlanner` soft heuristic fires but the strict
+    /// hard-token rules did not promote the query to exhaustive/partial mode.
+    ///
+    /// `reason` is the stable heuristic name used as the `reason` label —
+    /// e.g. `"soft_quantifier_single"`.
+    pub fn coverage_planner_unmatched(&self, reason: &'static str) {
+        self.coverage_planner_unmatched
+            .add(1, &[KeyValue::new("reason", reason)]);
+    }
+
+    /// Record the outcome of one `CoverageVerifier` run.
+    ///
+    /// Increments two cumulative counters so a Grafana expression can derive
+    /// the coverage ratio as `fetched_total / expected_total`:
+    ///
+    /// * `fetched` — number of target sections present in evidence.
+    /// * `expected` — number of target sections in the plan.
+    pub fn coverage_verified(&self, fetched: usize, expected: usize) {
+        self.coverage_verified_fetched.add(fetched as u64, &[]);
+        self.coverage_verified_expected.add(expected as u64, &[]);
     }
 }
 

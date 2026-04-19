@@ -10,6 +10,7 @@ use regex::Regex;
 use serde::{Deserialize, Serialize};
 use tracing::instrument;
 
+use crate::coverage::CoverageReport;
 use crate::verifier::VerificationResult;
 
 /// A citation linking a claim to its source evidence.
@@ -17,6 +18,11 @@ use crate::verifier::VerificationResult;
 pub struct Citation {
     /// Citation number (1-based).
     pub index: usize,
+    /// Stable chunk identifier from retrieval (UUID or content-hash).
+    ///
+    /// Populated from `SearchResult.id` so that citations remain stable even
+    /// when RRF fusion reorders evidence between the tool call and synthesis.
+    pub chunk_id: String,
     /// Relevant excerpt from the source document.
     pub content_snippet: String,
     /// Origin of the evidence (e.g., "qdrant", "brave").
@@ -40,6 +46,12 @@ pub struct SynthesizedResponse {
     pub is_grounded: bool,
     /// Retrieval strategy used.
     pub strategy: RetrievalStrategy,
+    /// Coverage report when the query was exhaustive-mode.
+    ///
+    /// `None` for standard (non-exhaustive) flows. Callers use this field
+    /// instead of inspecting `QueryContext` directly, so the coverage signal
+    /// travels cleanly through the public API.
+    pub coverage_report: Option<CoverageReport>,
 }
 
 /// Builds final responses with citations and provenance metadata.
@@ -65,7 +77,7 @@ impl ResponseSynthesizer {
     /// The prior "invert ungrounded verifier confidence" path was mathematically
     /// unsound: `1.0 - 0.05` flipped a low-certainty ungrounded verdict to 0.95
     /// user-facing confidence, producing confident wrong answers.
-    #[instrument(skip(self, answer, evidence, verification), fields(
+    #[instrument(skip(self, answer, evidence, verification, coverage_report), fields(
         evidence_count = evidence.len(),
         strategy = %strategy,
     ))]
@@ -76,6 +88,7 @@ impl ResponseSynthesizer {
         query: &str,
         verification: &VerificationResult,
         strategy: RetrievalStrategy,
+        coverage_report: Option<&CoverageReport>,
     ) -> Result<SynthesizedResponse, AgentError> {
         // Clean the LLM's answer before further processing — system prompt
         // tries to suppress chatty tails, but a defence-in-depth strip keeps
@@ -83,18 +96,21 @@ impl ResponseSynthesizer {
         let answer = strip_chatty_tail(answer);
         let answer = answer.as_str();
 
-        let all_citations = self.build_citations(evidence);
-
-        // Only include citations the LLM actually referenced in the answer
-        let referenced = find_referenced_indices(answer);
-        let citations = if referenced.is_empty() {
-            // If no explicit references found, keep top 5 for context
-            all_citations.into_iter().take(5).collect()
-        } else {
-            all_citations
-                .into_iter()
-                .filter(|c| referenced.contains(&c.index))
-                .collect()
+        // Resolve citations by stable chunk_id first ([cite:<id>]), with
+        // fallback to legacy [N] positional markers during transition.
+        // When the LLM cited nothing, fall back to the top-5 evidence items.
+        let citations = {
+            let resolved = resolve_cite_markers(answer, evidence);
+            if resolved.is_empty() {
+                evidence
+                    .iter()
+                    .enumerate()
+                    .take(5)
+                    .map(|(i, ev)| make_citation(i + 1, ev, self.max_snippet_length))
+                    .collect()
+            } else {
+                resolved
+            }
         };
 
         // User-facing confidence: trust verifier only when it says grounded.
@@ -121,12 +137,25 @@ impl ResponseSynthesizer {
              to support a grounded answer."
                 .to_owned()
         } else if !verification.is_grounded {
-            // Single-hedge guard: when the LLM already admitted scope
-            // ("not in the evidence" / "nu apare în evidență"), the wrapper
-            // adds nothing except confusion. Let the answer stand on its
-            // own honesty — the caller still sees confidence=0 and
-            // is_grounded=false via the struct fields.
-            if answer_self_admits_scope(answer) {
+            if coverage_report.is_some() {
+                // Coverage path: the report itself carries the truth signal
+                // (expected vs fetched sections, missing IDs). A prose hedge
+                // here would double-communicate and confuse the user.
+                // Per spec §14 Q4 — never append wrapper when coverage_report
+                // is present; callers read coverage_report from the response
+                // struct for any gate / UX decision.
+                tracing::info!(
+                    query,
+                    strategy = %strategy,
+                    "answer ungrounded but coverage_report present — skipping wrapper"
+                );
+                answer.to_owned()
+            } else if answer_self_admits_scope(answer) {
+                // Single-hedge guard: when the LLM already admitted scope
+                // ("not in the evidence" / "nu apare în evidență"), the wrapper
+                // adds nothing except confusion. Let the answer stand on its
+                // own honesty — the caller still sees confidence=0 and
+                // is_grounded=false via the struct fields.
                 tracing::info!(
                     query,
                     strategy = %strategy,
@@ -179,56 +208,111 @@ impl ResponseSynthesizer {
             confidence,
             is_grounded: verification.is_grounded,
             strategy,
+            coverage_report: coverage_report.cloned(),
         })
     }
 
-    /// Extract citations from evidence documents.
-    fn build_citations(&self, evidence: &[SearchResult]) -> Vec<Citation> {
-        evidence
-            .iter()
-            .enumerate()
-            .map(|(idx, doc)| {
-                let content = doc
-                    .payload
-                    .get("chunk_text")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("");
-
-                let snippet = if content.chars().count() > self.max_snippet_length {
-                    format!(
-                        "{}...",
-                        truncate_to_char_boundary(content, self.max_snippet_length)
-                    )
-                } else {
-                    content.to_owned()
-                };
-
-                let source = doc
-                    .payload
-                    .get("source")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("unknown")
-                    .to_owned();
-
-                Citation {
-                    index: idx + 1,
-                    content_snippet: snippet,
-                    source,
-                    score: doc.score.value(),
-                }
-            })
-            .collect()
-    }
 }
 
-/// Extract citation indices like [1], [4] from the answer text.
-fn find_referenced_indices(answer: &str) -> Vec<usize> {
-    static CITATION_RE: std::sync::LazyLock<Regex> =
-        std::sync::LazyLock::new(|| Regex::new(r"\[(\d+)\]").unwrap());
-    CITATION_RE
-        .captures_iter(answer)
-        .filter_map(|cap| cap[1].parse::<usize>().ok())
-        .collect()
+/// Resolve citation markers in the answer text into [`Citation`]s.
+///
+/// Supports two forms (UUID-first, with `[N]` fallback for transition):
+///
+/// - `[cite:<chunk-id>]` — preferred. Looks up evidence by `chunk_id`
+///   payload field (also matches `SearchResult.id` for safety).
+/// - `[N]` — legacy 1-based index into evidence array. Only used when
+///   **no** `[cite:...]` markers are present in the answer.
+///
+/// Unknown UUID markers are logged at WARN and dropped — better than
+/// silently emitting a citation with bogus content.
+///
+/// Duplicate `[cite:<id>]` references within the same answer are
+/// deduplicated; the first occurrence wins.
+pub(crate) fn resolve_cite_markers(answer: &str, evidence: &[SearchResult]) -> Vec<Citation> {
+    static UUID_RE: std::sync::LazyLock<Regex> = std::sync::LazyLock::new(|| {
+        Regex::new(r"\[cite:([A-Za-z0-9_-]+)\]")
+            .expect("resolve_cite_markers UUID regex is statically valid")
+    });
+    static IDX_RE: std::sync::LazyLock<Regex> = std::sync::LazyLock::new(|| {
+        Regex::new(r"\[(\d+)\]")
+            .expect("resolve_cite_markers index regex is statically valid")
+    });
+
+    // Determine the natural snippet length — use a conservative default when
+    // called from outside the synthesizer (e.g., unit tests).
+    const DEFAULT_SNIPPET_LEN: usize = 200;
+
+    let mut out: Vec<Citation> = Vec::new();
+    let mut seen_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+    // UUID-based citations first (preferred form).
+    for cap in UUID_RE.captures_iter(answer) {
+        let id = &cap[1];
+        if seen_ids.contains(id) {
+            continue;
+        }
+        if let Some((idx, ev)) = evidence.iter().enumerate().find(|(_, e)| {
+            e.id == id
+                || e.payload
+                    .get("chunk_id")
+                    .and_then(|v| v.as_str())
+                    == Some(id)
+        }) {
+            seen_ids.insert(id.to_string());
+            out.push(make_citation(idx + 1, ev, DEFAULT_SNIPPET_LEN));
+        } else {
+            tracing::warn!(cite_id = %id, "cite marker references unknown chunk_id — dropped");
+        }
+    }
+
+    // Backwards-compat: legacy [N] markers — only used if no UUID markers.
+    if out.is_empty() {
+        for cap in IDX_RE.captures_iter(answer) {
+            if let Ok(n) = cap[1].parse::<usize>() {
+                if let Some(ev) = evidence.get(n.saturating_sub(1)) {
+                    out.push(make_citation(n, ev, DEFAULT_SNIPPET_LEN));
+                }
+            }
+        }
+    }
+
+    out
+}
+
+/// Build a [`Citation`] from a single evidence entry.
+///
+/// Centralises construction so both the UUID and legacy paths produce
+/// identical shapes.
+fn make_citation(index: usize, ev: &SearchResult, max_snippet_len: usize) -> Citation {
+    let content = ev
+        .payload
+        .get("chunk_text")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+
+    let snippet = if content.chars().count() > max_snippet_len {
+        format!(
+            "{}...",
+            truncate_to_char_boundary(content, max_snippet_len)
+        )
+    } else {
+        content.to_owned()
+    };
+
+    let source = ev
+        .payload
+        .get("source")
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown")
+        .to_owned();
+
+    Citation {
+        index,
+        chunk_id: ev.id.clone(),
+        content_snippet: snippet,
+        source,
+        score: ev.score.value(),
+    }
 }
 
 /// Strip trailing "chatty tails" that common LLM outputs append — follow-up
@@ -280,8 +364,145 @@ pub(crate) fn answer_self_admits_scope(answer: &str) -> bool {
             r"(?:în|din) (?:evidență|evidenț[aă]|materialul? recuperat",
             r"|baza de cunoștințe|corpus)\b",
             r"|\bmaterialul (?:nu conține|nu acoperă|nu menționează)\b",
+            r")",
         );
         Regex::new(pattern).expect("answer_self_admits_scope regex is statically valid")
     });
     SCOPE_RE.is_match(answer)
+}
+
+#[cfg(test)]
+mod tests_cite_v2 {
+    use super::*;
+    use agent_rs_core::types::Score;
+    use agent_rs_stores::types::SearchResult;
+
+    /// Build a minimal `SearchResult` whose `id` and `payload.chunk_id` both
+    /// equal `id`. Used to verify UUID-based citation resolution.
+    fn ev_with_chunk_id(id: &str) -> SearchResult {
+        SearchResult {
+            id: id.to_string(),
+            score: Score::new(0.5),
+            payload: serde_json::json!({
+                "chunk_id": id,
+                "chunk_text": "..."
+            }),
+        }
+    }
+
+    #[test]
+    fn cite_uuid_resolves_back_to_evidence() {
+        let evidence = vec![
+            ev_with_chunk_id("c-1234abcd"),
+            ev_with_chunk_id("c-5678ef01"),
+        ];
+        let answer = "Otsu separates classes [cite:c-1234abcd]. \
+                      Bhattacharya is gaussian mixture-based [cite:c-5678ef01].";
+        let cites = resolve_cite_markers(answer, &evidence);
+        assert_eq!(cites.len(), 2);
+        assert_eq!(cites[0].chunk_id, "c-1234abcd");
+        assert_eq!(cites[1].chunk_id, "c-5678ef01");
+    }
+
+    #[test]
+    fn legacy_bracket_index_still_resolves_during_transition() {
+        let evidence = vec![ev_with_chunk_id("c-1234")];
+        let answer = "Otsu separates classes [1].";
+        let cites = resolve_cite_markers(answer, &evidence);
+        assert_eq!(cites.len(), 1);
+        assert_eq!(cites[0].chunk_id, "c-1234");
+    }
+
+    #[test]
+    fn unknown_cite_uuid_is_dropped_with_warn() {
+        let evidence = vec![ev_with_chunk_id("c-1234")];
+        let answer = "Bogus reference [cite:does-not-exist].";
+        let cites = resolve_cite_markers(answer, &evidence);
+        assert!(cites.is_empty());
+    }
+
+    #[test]
+    fn duplicate_cite_uuid_is_deduplicated() {
+        let evidence = vec![ev_with_chunk_id("c-abc")];
+        let answer = "First mention [cite:c-abc] and second mention [cite:c-abc].";
+        let cites = resolve_cite_markers(answer, &evidence);
+        assert_eq!(cites.len(), 1, "duplicate cite markers should be collapsed");
+    }
+
+    #[test]
+    fn uuid_markers_take_priority_over_legacy() {
+        // When BOTH [cite:...] and [N] are present, only UUID form is used.
+        let evidence = vec![
+            ev_with_chunk_id("id-a"),
+            ev_with_chunk_id("id-b"),
+        ];
+        let answer = "UUID [cite:id-a] and legacy [1].";
+        let cites = resolve_cite_markers(answer, &evidence);
+        // Only the UUID hit should be returned (out.is_empty() guard blocks
+        // the legacy path when UUID markers resolved successfully).
+        assert_eq!(cites.len(), 1);
+        assert_eq!(cites[0].chunk_id, "id-a");
+    }
+
+    #[test]
+    fn resolve_cite_markers_regex_compiles() {
+        // Force both LazyLocks to initialise — turns silent panics into CI
+        // failures in the same way as the regex_compile_tests module.
+        let result = resolve_cite_markers("", &[]);
+        assert!(result.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod regex_compile_tests {
+    //! Regex compilation smoke tests.
+    //!
+    //! The production regexes in this module are built behind
+    //! `LazyLock` + `.expect(...)`, which means a malformed pattern
+    //! does not panic at compile time or at binary startup — it
+    //! panics on the first code path that evaluates it, i.e. only
+    //! when a real query runs through synthesis. That failure mode
+    //! is unacceptable, so these tests force every regex to be
+    //! built at `cargo test` time, which turns a production crash
+    //! into a CI failure.
+    use super::*;
+
+    #[test]
+    fn answer_self_admits_scope_regex_compiles() {
+        // Force the `LazyLock` behind `answer_self_admits_scope` to
+        // initialise; this surfaces any malformed pattern here
+        // instead of on the first production query.
+        assert!(!answer_self_admits_scope(""));
+    }
+
+    #[test]
+    fn strip_chatty_tail_regex_compiles() {
+        // Same reasoning as above for `strip_chatty_tail`.
+        let _ = strip_chatty_tail("");
+    }
+
+    #[test]
+    fn answer_self_admits_scope_matches_ro_evidence_missing() {
+        // Positive case — the Romanian admission the default prompt
+        // tends to emit on out-of-corpus queries. Guards the outer
+        // non-capturing group from regressing again (last incident:
+        // missing trailing `)` that the unit test would have caught).
+        assert!(answer_self_admits_scope(
+            "Nu apare în evidență nicio mențiune despre acest subiect."
+        ));
+    }
+
+    #[test]
+    fn answer_self_admits_scope_matches_en_evidence_missing() {
+        assert!(answer_self_admits_scope(
+            "The retrieved evidence does not cover this topic."
+        ));
+    }
+
+    #[test]
+    fn answer_self_admits_scope_ignores_unrelated_text() {
+        assert!(!answer_self_admits_scope(
+            "Metoda Otsu este o metodă de segmentare."
+        ));
+    }
 }

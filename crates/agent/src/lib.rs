@@ -16,6 +16,7 @@
 //! - [`steps`] -- Pipeline step implementations
 
 pub mod context;
+pub mod coverage;
 pub mod memory;
 pub mod orchestrator;
 pub mod prompts;

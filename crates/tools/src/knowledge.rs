@@ -9,7 +9,7 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 
 use agent_rs_core::{RetrievalStrategy, ToolError};
-use agent_rs_retrieval::RetrievalRouter;
+use agent_rs_retrieval::{RetrievalRouter, router::SectionFilter};
 use agent_rs_stores::types::SearchResult;
 use rig::completion::ToolDefinition;
 use rig::tool::Tool;
@@ -18,6 +18,30 @@ use serde_json::json;
 
 /// Default number of documents to retrieve when the caller does not specify.
 const DEFAULT_LIMIT: usize = 10;
+
+// ---- SearchMode ----
+
+/// How to retrieve chunks for a `search_knowledge` call.
+///
+/// `Ranked` is the default — runs the full retrieval router (vector +
+/// keyword + graph fusion + rerank). `AllInSection` bypasses ranking and
+/// returns every chunk in the requested `section_id` (requires `section_id`
+/// to be set; otherwise falls back to `Ranked` with a tracing warn).
+#[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SearchMode {
+    /// Full retrieval router: dense + BM25 + graph fusion + cross-encoder rerank.
+    Ranked,
+    /// Bypass ranking; return every chunk whose payload `section_id` matches.
+    /// Falls back to `Ranked` (with a warning) when `section_id` is absent.
+    AllInSection,
+}
+
+impl Default for SearchMode {
+    fn default() -> Self {
+        SearchMode::Ranked
+    }
+}
 
 // ---- Args ----
 
@@ -30,6 +54,17 @@ pub struct SearchKnowledgeArgs {
     pub strategy: Option<String>,
     /// Maximum number of results to return. Defaults to 10.
     pub limit: Option<usize>,
+    /// Restrict retrieval to chunks whose payload `section_id` matches.
+    /// Combine with `mode = AllInSection` to bypass ranking entirely.
+    #[serde(default)]
+    pub section_id: Option<String>,
+    /// Restrict retrieval to chunks whose payload `doc_id` matches.
+    /// Useful for "in document X, …" multi-doc queries.
+    #[serde(default)]
+    pub doc_id: Option<String>,
+    /// How to retrieve. Default `Ranked`. `AllInSection` bypasses ranking.
+    #[serde(default)]
+    pub mode: SearchMode,
 }
 
 // ---- Tool struct ----
@@ -114,6 +149,26 @@ impl Tool for SearchKnowledgeTool {
 
     #[tracing::instrument(skip(self), fields(tool = Self::NAME))]
     async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
+        // AllInSection mode: if a section_id is provided, warn and fall back
+        // to Ranked path until Task 4.6 wires the Neo4j handle.
+        // TODO(Task 4.6): when Neo4jStore handle is available, route
+        // AllInSection through Neo4jStore::chunks_in_sections + QdrantStore.
+        if args.mode == SearchMode::AllInSection {
+            if args.section_id.is_some() {
+                tracing::warn!(
+                    section_id = ?args.section_id,
+                    "AllInSection mode not yet fully implemented; falling back to Ranked"
+                );
+            } else {
+                tracing::warn!(
+                    mode = "all_in_section",
+                    section_id = "missing",
+                    fallback = "ranked",
+                    "AllInSection mode requested without section_id; falling back to Ranked"
+                );
+            }
+        }
+
         let router = self.router.as_ref().ok_or_else(|| {
             ToolError::McpClient("search_knowledge: router not initialized".into())
         })?;
@@ -129,15 +184,29 @@ impl Tool for SearchKnowledgeTool {
 
         let limit = args.limit.unwrap_or(DEFAULT_LIMIT);
 
+        // Build the hard post-fusion predicate from the caller-supplied
+        // doc_id / section_id fields (Task 3.6 — Codex audit gap #10).
+        // An empty filter is passed as `None` so the router skips the retain
+        // loop entirely in the common case.
+        let section_filter = {
+            let f = SectionFilter {
+                doc_id: args.doc_id.clone(),
+                section_id: args.section_id.clone(),
+            };
+            if f.is_empty() { None } else { Some(f) }
+        };
+
         tracing::info!(
             query = %args.query,
             strategy = %strategy,
             limit,
+            doc_id = ?args.doc_id,
+            section_id = ?args.section_id,
             "executing knowledge search"
         );
 
         let evidence_pack = router
-            .retrieve(&args.query, strategy, limit)
+            .retrieve_filtered(&args.query, strategy, limit, section_filter)
             .await
             .map_err(|e| ToolError::McpClient(format!("knowledge retrieval failed: {e}")))?;
 

@@ -96,6 +96,11 @@ pub struct DocumentChunk {
     pub chunk_index: usize,
     /// Total number of chunks the document was split into.
     pub total_chunks: usize,
+    /// Section identifier from the structural layer (e.g. a Neo4j section UUID).
+    ///
+    /// Populated by the Docling ingestion path via `proto_chunk_to_document_chunk`;
+    /// `None` on the legacy plain-text path where section structure is not available.
+    pub section_id: Option<String>,
 }
 
 // ---- Public API ----
@@ -196,6 +201,7 @@ pub fn chunk_document(
                 metadata: meta,
                 chunk_index,
                 total_chunks,
+                section_id: None,
             }
         })
         .collect()

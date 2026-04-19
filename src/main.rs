@@ -61,7 +61,11 @@ async fn main() -> Result<()> {
     // 5. Create agent orchestrator, passing the shared metrics handle.
     let orchestrator = AgentOrchestrator::new(
         &settings,
+        stores.neo4j.clone(),
         stores.postgres.clone(),
+        stores.qdrant.clone(),
+        collection.as_str().to_owned(),
+        summaries_collection.as_str().to_owned(),
         Arc::clone(&router),
         Arc::clone(&metrics),
     )
