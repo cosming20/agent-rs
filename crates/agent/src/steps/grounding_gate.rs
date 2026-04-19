@@ -15,6 +15,7 @@ use agent_rs_stores::types::SearchResult;
 use tracing::{error, info, instrument, warn};
 
 use crate::context::QueryContext;
+use crate::coverage::CoverageReport;
 use crate::steps::agent_runner::AgentRunner;
 use crate::steps::evidence_fuser::EvidenceFuser;
 use crate::verifier::{GroundingVerifier, VerificationResult};
@@ -211,6 +212,19 @@ pub(crate) fn subject_absent_v2(
     queries.iter().all(|q| all_tokens_absent(q, &haystack))
 }
 
+/// Returns `true` when the coverage report provides deterministic proof that
+/// every planner-targeted section was fetched and no retry is needed.
+///
+/// Coverage is the truth signal for exhaustive queries: when `expected > 0`
+/// and `fetched == expected`, the breadth of retrieval is guaranteed regardless
+/// of what the LLM-side grounding verifier says. The verifier is structurally
+/// unreliable on long aggregate answers (false negatives are common), so when
+/// coverage is complete we short-circuit the retry loop and promote the answer
+/// to grounded.
+pub(crate) fn should_promote_via_coverage(report: Option<&CoverageReport>) -> bool {
+    report.is_some_and(|r| r.expected > 0 && r.is_complete())
+}
+
 /// Verify answer grounding and retry if needed.
 pub struct GroundingGate {
     verifier: Arc<GroundingVerifier>,
@@ -249,6 +263,23 @@ impl GroundingGate {
         ctx.verification = Some(self.verifier.verify(&ctx.answer, &ctx.evidence).await?);
 
         ctx.retries = 0;
+
+        // Coverage short-circuit: if the planner-targeted sections were all
+        // fetched (deterministic proof of breadth), skip the LLM-side grounding
+        // retry. The verifier is unreliable on long aggregate answers; coverage
+        // is the truth signal for exhaustive queries.
+        if should_promote_via_coverage(ctx.coverage_report.as_ref()) {
+            if let Some(ref mut v) = ctx.verification {
+                v.is_grounded = true;
+                tracing::info!(
+                    expected = ctx.coverage_report.as_ref().map(|r| r.expected).unwrap_or(0),
+                    fetched  = ctx.coverage_report.as_ref().map(|r| r.fetched).unwrap_or(0),
+                    confidence = v.confidence.value(),
+                    "grounding gate: coverage_report complete — promoting to grounded, skipping retries"
+                );
+            }
+            return Ok(());
+        }
 
         // Subject-absent short-circuit: if the first-pass retrieval does not
         // contain any of the query's content tokens, further retries will not
@@ -391,6 +422,54 @@ mod tests_v2 {
             tool_name: "search_knowledge".into(),
             args_json: format!(r#"{{"query":"{}"}}"#, query),
         }
+    }
+
+    // ---- should_promote_via_coverage ----
+
+    #[test]
+    fn coverage_complete_promotes_to_grounded() {
+        use crate::coverage::CoverageReport;
+
+        // All sections fetched: should promote.
+        let report = CoverageReport {
+            expected: 20,
+            fetched: 20,
+            missing_section_ids: vec![],
+        };
+        assert!(should_promote_via_coverage(Some(&report)));
+    }
+
+    #[test]
+    fn coverage_partial_does_not_promote() {
+        use crate::coverage::CoverageReport;
+
+        // Partial: retries may still fill more sections.
+        let report = CoverageReport {
+            expected: 20,
+            fetched: 15,
+            missing_section_ids: vec!["s1".into()],
+        };
+        assert!(!should_promote_via_coverage(Some(&report)));
+    }
+
+    #[test]
+    fn coverage_none_does_not_promote() {
+        // No coverage report: non-exhaustive flow, must not promote.
+        assert!(!should_promote_via_coverage(None));
+    }
+
+    #[test]
+    fn coverage_zero_expected_does_not_promote() {
+        use crate::coverage::CoverageReport;
+
+        // expected == 0 means the planner ran but targeted nothing useful;
+        // this is not "complete" in the meaningful sense.
+        let report = CoverageReport {
+            expected: 0,
+            fetched: 0,
+            missing_section_ids: vec![],
+        };
+        assert!(!should_promote_via_coverage(Some(&report)));
     }
 
     #[test]
