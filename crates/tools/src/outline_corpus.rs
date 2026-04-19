@@ -139,12 +139,15 @@ impl Tool for OutlineCorpusTool {
             return Ok("No documents have been ingested yet.".into());
         }
 
+        // Treat an empty string the same as no filter — the LLM often emits
+        // `doc_id: ""` when it has no specific document in mind.
+        let doc_id_filter = args.doc_id.as_deref().filter(|s| !s.is_empty());
+
         let mut out = String::new();
-        for doc in docs.iter().filter(|d| {
-            args.doc_id.as_deref().is_none_or(|want| {
-                d.document_id.to_string() == want || d.source == want
-            })
-        }) {
+        for doc in docs
+            .iter()
+            .filter(|d| doc_id_filter.is_none_or(|w| d.document_id.to_string() == w || d.source == w))
+        {
             out.push_str(&format!(
                 "Document: {} ({})\n",
                 doc.title.as_deref().unwrap_or("untitled"),
@@ -201,4 +204,28 @@ async fn lookup_section_summary(
             );
             None
         })
+}
+
+#[cfg(test)]
+mod tests {
+    /// Verifies that the `doc_id_filter` normalisation treats an empty string
+    /// identically to `None`, so the LLM passing `{"doc_id": ""}` does not
+    /// accidentally filter out all documents.
+    #[test]
+    fn empty_doc_id_string_means_no_filter() {
+        // Some("") → None after normalisation
+        let want_some_empty: Option<&str> = Some("");
+        let normalized = want_some_empty.filter(|s| !s.is_empty());
+        assert!(normalized.is_none(), "empty doc_id must normalize to None");
+
+        // Some("doc-abc") stays Some("doc-abc")
+        let want_some_real: Option<&str> = Some("doc-abc");
+        let normalized = want_some_real.filter(|s| !s.is_empty());
+        assert_eq!(normalized, Some("doc-abc"));
+
+        // None stays None
+        let want_none: Option<&str> = None;
+        let normalized = want_none.filter(|s| !s.is_empty());
+        assert!(normalized.is_none());
+    }
 }
