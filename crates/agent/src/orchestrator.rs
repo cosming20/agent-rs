@@ -117,7 +117,7 @@ impl AgentOrchestrator {
             settings.brave.clone(),
             settings.fetch.clone(),
             settings.web_budget.clone(),
-        ));
+        )?);
 
         // Step 2: Agent runner
         let agent_runner = AgentRunner::new(
@@ -225,6 +225,14 @@ impl AgentOrchestrator {
         self.grounding_gate
             .verify_and_retry(&mut ctx, &self.agent_runner, &self.evidence_fuser)
             .await?;
+
+        // Step 4.5: Re-run CoverageVerifier when the grounding gate performed
+        // at least one retry. Each retry drains a fresh coverage_collector into
+        // ctx.coverage_evidence (accumulated), so the stale pre-retry report
+        // must be refreshed to reflect the full post-retry evidence set.
+        if ctx.retries > 0 {
+            self.coverage_verifier.verify(&mut ctx);
+        }
 
         // Step 5: Synthesize response with citations, persist run
         let response = self.result_persister.persist(&ctx).await?;
