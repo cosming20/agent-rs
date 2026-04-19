@@ -26,7 +26,8 @@ use agent_rs_stores::traits::StateStore;
 use agent_rs_stores::types::{ChatMessage, EvidenceItem, Memory, QueryRun};
 use agent_rs_tools::{
     DocumentInfoTool, FetchSectionChunksTool, FetchUrlTool, OutlineCorpusTool, RememberTool,
-    SearchKnowledgeTool, SearchNewsTool, SearchSectionsTool, SearchWebTool, WebBudgetTracker,
+    SearchKnowledgeArgs, SearchKnowledgeTool, SearchMode, SearchNewsTool, SearchSectionsTool,
+    SearchWebTool, WebBudgetTracker,
 };
 use async_trait::async_trait;
 use rig::tool::Tool;
@@ -467,4 +468,28 @@ async fn outline_corpus_tool_definition_contract() {
         "outline_corpus description must reference outline / section: {:?}",
         def.description
     );
+}
+
+// ---------------------------------------------------------------------------
+// SearchKnowledgeArgs — schema evolution tests (Task 3.4)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn search_knowledge_args_accept_optional_section_id_doc_id_mode() {
+    let v = json!({"query": "x", "section_id": "s", "doc_id": "d", "mode": "all_in_section"});
+    let parsed: SearchKnowledgeArgs = serde_json::from_value(v).expect("must parse");
+    // existing query field still works
+    assert_eq!(parsed.query, "x");
+    assert_eq!(parsed.section_id.as_deref(), Some("s"));
+    assert_eq!(parsed.doc_id.as_deref(), Some("d"));
+    assert!(matches!(parsed.mode, SearchMode::AllInSection));
+}
+
+#[tokio::test]
+async fn search_knowledge_args_default_mode_is_ranked_when_omitted() {
+    let parsed: SearchKnowledgeArgs =
+        serde_json::from_value(json!({"query": "x"})).expect("must parse");
+    assert!(matches!(parsed.mode, SearchMode::Ranked));
+    assert!(parsed.section_id.is_none());
+    assert!(parsed.doc_id.is_none());
 }

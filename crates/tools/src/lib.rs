@@ -44,7 +44,7 @@ pub use budget::WebBudgetTracker;
 pub use document_info::DocumentInfoTool;
 pub use fetch::FetchUrlTool;
 pub use fetch_section_chunks::FetchSectionChunksTool;
-pub use knowledge::SearchKnowledgeTool;
+pub use knowledge::{SearchKnowledgeArgs, SearchKnowledgeTool, SearchMode};
 pub use mcp_client::McpClient;
 pub use outline_corpus::OutlineCorpusTool;
 pub use remember::RememberTool;
