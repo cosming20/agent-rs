@@ -58,13 +58,15 @@ impl ResultPersister {
         self.metrics
             .record_query_duration_ms(ctx.elapsed_ms() as f64, ctx.strategy);
 
-        // Synthesize citations
+        // Synthesize citations, passing the coverage report so the synthesizer
+        // can suppress the hedging wrapper when coverage data is available.
         let response = self.synthesizer.synthesize(
             &ctx.answer,
             &ctx.evidence,
             &ctx.query,
             verification,
             ctx.strategy,
+            ctx.coverage_report.as_ref(),
         )?;
 
         info!(
