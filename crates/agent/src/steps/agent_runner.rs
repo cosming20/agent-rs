@@ -12,13 +12,73 @@ use tokio::sync::Mutex;
 use agent_rs_core::errors::AgentError;
 use agent_rs_stores::types::SearchResult;
 use rig::client::CompletionClient;
-use rig::completion::Prompt;
+use rig::completion::{Prompt, ToolDefinition};
+use rig::tool::{ToolDyn, ToolError};
+use rig::wasm_compat::WasmBoxedFuture;
 use serde_json::json;
 use tracing::{error, info, instrument};
 
 use crate::context::QueryContext;
+use crate::coverage::ToolCallRecord;
 use crate::prompts;
 use crate::steps::tool_factory::ToolFactory;
+
+// ---- Tool-call recording -----------------------------------------------
+
+/// Shared sink that `RecordingToolDyn` writes into after each tool call.
+type ToolCallSink = Arc<Mutex<Vec<ToolCallRecord>>>;
+
+/// Object-safe wrapper around any `Box<dyn ToolDyn>` that records
+/// each invocation's name and raw JSON args into a shared sink before
+/// delegating to the inner tool.
+///
+/// Because [`ToolDyn::call`] already receives `args` as a raw JSON `String`,
+/// no `Serialize` bound is required on the tool's concrete `Args` type.
+struct RecordingToolDyn {
+    inner: Box<dyn ToolDyn>,
+    sink: ToolCallSink,
+}
+
+impl ToolDyn for RecordingToolDyn {
+    fn name(&self) -> String {
+        self.inner.name()
+    }
+
+    fn definition<'a>(&'a self, prompt: String) -> WasmBoxedFuture<'a, ToolDefinition> {
+        self.inner.definition(prompt)
+    }
+
+    fn call<'a>(&'a self, args: String) -> WasmBoxedFuture<'a, Result<String, ToolError>> {
+        Box::pin(async move {
+            // Capture before delegating so we record even if the tool errors.
+            let record = ToolCallRecord {
+                tool_name: self.inner.name(),
+                args_json: args.clone(),
+            };
+            {
+                let mut guard = self.sink.lock().await;
+                guard.push(record);
+            }
+            self.inner.call(args).await
+        })
+    }
+}
+
+/// Wrap every tool in the given vector with a `RecordingToolDyn` that writes
+/// into `sink`. Returns the new vec of boxed tools.
+fn wrap_tools(tools: Vec<Box<dyn ToolDyn>>, sink: ToolCallSink) -> Vec<Box<dyn ToolDyn>> {
+    tools
+        .into_iter()
+        .map(|inner| -> Box<dyn ToolDyn> {
+            Box::new(RecordingToolDyn {
+                inner,
+                sink: Arc::clone(&sink),
+            })
+        })
+        .collect()
+}
+
+// ---- AgentRunner -------------------------------------------------------
 
 /// Runs the Rig agent with tools and extracts the answer.
 ///
@@ -99,11 +159,17 @@ impl AgentRunner {
     pub async fn run(&self, ctx: &mut QueryContext) -> Result<(), AgentError> {
         ctx.kb_evidence.clear();
         ctx.web_evidence.clear();
+        ctx.tool_calls.clear();
 
         let start = Instant::now();
 
         // Build per-request tools and evidence collector.
         let (tools, evidence_collector) = self.tool_factory.build(&ctx.user_id);
+
+        // Wrap each tool in a recording adapter that captures (tool_name,
+        // args_json) into `tool_call_sink` before delegating to the real tool.
+        let tool_call_sink: ToolCallSink = Arc::new(Mutex::new(Vec::new()));
+        let recording_tools = wrap_tools(tools, Arc::clone(&tool_call_sink));
 
         // Build the prompt from chat history + current query
         let full_prompt = self.build_prompt(ctx);
@@ -115,7 +181,7 @@ impl AgentRunner {
             .llm_client
             .agent(&self.model)
             .preamble(&self.system_prompt)
-            .tools(tools);
+            .tools(recording_tools);
         let agent = match self.additional_params.as_ref() {
             Some(params) => builder.additional_params(params.clone()).build(),
             None => builder.build(),
@@ -140,6 +206,10 @@ impl AgentRunner {
         // Drain accumulated evidence from the search_knowledge tool.
         drain_evidence(&evidence_collector, &mut ctx.kb_evidence).await;
 
+        // Drain recorded tool call args into ctx.tool_calls for use by
+        // the grounding gate (Task 5.1).
+        drain_tool_calls(&tool_call_sink, &mut ctx.tool_calls).await;
+
         ctx.agent_latency_ms = start.elapsed().as_millis() as u64;
         Ok(())
     }
@@ -156,18 +226,24 @@ impl AgentRunner {
         ctx: &mut QueryContext,
         retry_prompt: &str,
     ) -> Result<(), AgentError> {
-        // NOTE: Do NOT clear ctx.kb_evidence / ctx.web_evidence here.
-        // Unlike `run()`, retries must ACCUMULATE evidence from all rounds.
-        // `drain_evidence` uses `append`, so new evidence merges with existing.
+        // NOTE: Do NOT clear ctx.kb_evidence / ctx.web_evidence / ctx.tool_calls here.
+        // Unlike `run()`, retries must ACCUMULATE evidence and tool-call records
+        // from all rounds so the grounding gate sees the full picture.
+        // `drain_evidence` / `drain_tool_calls` use `append`, so new data
+        // merges with existing.
 
         // Build per-request tools and evidence collector for the retry.
         let (tools, evidence_collector) = self.tool_factory.build(&ctx.user_id);
+
+        // Wrap tools with recording adapters for this retry round.
+        let tool_call_sink: ToolCallSink = Arc::new(Mutex::new(Vec::new()));
+        let recording_tools = wrap_tools(tools, Arc::clone(&tool_call_sink));
 
         let builder = self
             .llm_client
             .agent(&self.model)
             .preamble(&self.system_prompt)
-            .tools(tools);
+            .tools(recording_tools);
         let agent = match self.additional_params.as_ref() {
             Some(params) => builder.additional_params(params.clone()).build(),
             None => builder.build(),
@@ -186,6 +262,9 @@ impl AgentRunner {
 
         // Drain accumulated evidence from the retry.
         drain_evidence(&evidence_collector, &mut ctx.kb_evidence).await;
+
+        // Drain retry tool-call records (accumulated alongside evidence).
+        drain_tool_calls(&tool_call_sink, &mut ctx.tool_calls).await;
 
         Ok(())
     }
@@ -223,4 +302,143 @@ impl AgentRunner {
 async fn drain_evidence(collector: &Arc<Mutex<Vec<SearchResult>>>, target: &mut Vec<SearchResult>) {
     let mut collected = collector.lock().await;
     target.append(&mut collected);
+}
+
+/// Drain recorded tool-call records from the shared sink into `ctx.tool_calls`.
+///
+/// `append` is used so that retry rounds accumulate on top of the initial run's
+/// records — the grounding gate (Task 5.1) needs the full picture across turns.
+async fn drain_tool_calls(sink: &ToolCallSink, target: &mut Vec<ToolCallRecord>) {
+    let mut guard = sink.lock().await;
+    target.append(&mut guard);
+}
+
+// ---- Unit tests --------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rig::completion::ToolDefinition;
+    use serde_json::json;
+
+    // Minimal stand-in tool that echoes its raw JSON args back.
+    struct EchoTool {
+        name: String,
+    }
+
+    impl ToolDyn for EchoTool {
+        fn name(&self) -> String {
+            self.name.clone()
+        }
+
+        fn definition<'a>(&'a self, _prompt: String) -> WasmBoxedFuture<'a, ToolDefinition> {
+            let name = self.name.clone();
+            Box::pin(async move {
+                ToolDefinition {
+                    name,
+                    description: "Echo tool".into(),
+                    parameters: json!({}),
+                }
+            })
+        }
+
+        fn call<'a>(&'a self, args: String) -> WasmBoxedFuture<'a, Result<String, ToolError>> {
+            Box::pin(async move { Ok(args) })
+        }
+    }
+
+    #[tokio::test]
+    async fn recording_tool_captures_args_json_into_sink() {
+        let sink: ToolCallSink = Arc::new(Mutex::new(Vec::new()));
+        let recording = RecordingToolDyn {
+            inner: Box::new(EchoTool {
+                name: "echo".to_string(),
+            }),
+            sink: Arc::clone(&sink),
+        };
+
+        let args_json = r#"{"query":"segmentare metode"}"#;
+        let result = recording.call(args_json.to_string()).await;
+
+        // The inner echo tool returns the args unchanged.
+        assert!(result.is_ok(), "expected Ok from echo tool");
+        assert_eq!(result.unwrap(), args_json);
+
+        // The sink must contain exactly one record with the correct fields.
+        let guard = sink.lock().await;
+        assert_eq!(guard.len(), 1, "expected one recorded tool call");
+        assert_eq!(guard[0].tool_name, "echo");
+        assert_eq!(guard[0].args_json, args_json);
+    }
+
+    #[tokio::test]
+    async fn recording_tool_captures_multiple_calls() {
+        let sink: ToolCallSink = Arc::new(Mutex::new(Vec::new()));
+        let recording = RecordingToolDyn {
+            inner: Box::new(EchoTool {
+                name: "search_knowledge".to_string(),
+            }),
+            sink: Arc::clone(&sink),
+        };
+
+        recording
+            .call(r#"{"query":"first"}"#.to_string())
+            .await
+            .unwrap();
+        recording
+            .call(r#"{"query":"second"}"#.to_string())
+            .await
+            .unwrap();
+
+        let guard = sink.lock().await;
+        assert_eq!(guard.len(), 2);
+        assert_eq!(guard[0].args_json, r#"{"query":"first"}"#);
+        assert_eq!(guard[1].args_json, r#"{"query":"second"}"#);
+    }
+
+    #[tokio::test]
+    async fn drain_tool_calls_appends_to_existing() {
+        let sink: ToolCallSink = Arc::new(Mutex::new(vec![ToolCallRecord {
+            tool_name: "search_knowledge".into(),
+            args_json: r#"{"query":"new"}"#.into(),
+        }]));
+
+        let mut target = vec![ToolCallRecord {
+            tool_name: "search_web".into(),
+            args_json: r#"{"q":"existing"}"#.into(),
+        }];
+
+        drain_tool_calls(&sink, &mut target).await;
+
+        assert_eq!(target.len(), 2);
+        assert_eq!(target[0].tool_name, "search_web");
+        assert_eq!(target[1].tool_name, "search_knowledge");
+
+        // Sink must be empty after drain.
+        let guard = sink.lock().await;
+        assert!(guard.is_empty());
+    }
+
+    #[tokio::test]
+    async fn wrap_tools_records_into_shared_sink() {
+        let sink: ToolCallSink = Arc::new(Mutex::new(Vec::new()));
+        let tools: Vec<Box<dyn ToolDyn>> = vec![
+            Box::new(EchoTool {
+                name: "tool_a".to_string(),
+            }),
+            Box::new(EchoTool {
+                name: "tool_b".to_string(),
+            }),
+        ];
+        let wrapped = wrap_tools(tools, Arc::clone(&sink));
+
+        // Call each wrapped tool once.
+        wrapped[0].call(r#"{"a":1}"#.to_string()).await.unwrap();
+        wrapped[1].call(r#"{"b":2}"#.to_string()).await.unwrap();
+
+        let guard = sink.lock().await;
+        assert_eq!(guard.len(), 2);
+        assert_eq!(guard[0].tool_name, "tool_a");
+        assert_eq!(guard[1].tool_name, "tool_b");
+    }
 }
