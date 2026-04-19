@@ -59,6 +59,25 @@ pub struct QueryContext {
     pub(crate) verification: Option<VerificationResult>,
     /// Number of retry attempts performed.
     pub(crate) retries: usize,
+
+    // ---- Coverage-aware RAG fields (Phase 4) ----
+    /// Plan emitted by `CoveragePlanner` (Task 4.1).
+    /// `None` for non-exhaustive flows (current default).
+    pub coverage_plan: Option<crate::coverage::CoveragePlan>,
+
+    /// Untruncated evidence merged in by exhaustive-mode tool calls.
+    /// `EvidenceFuser` (Task 4.3) will preserve this set verbatim alongside
+    /// the reranked tier in `evidence`.
+    pub coverage_evidence: Vec<agent_rs_stores::types::SearchResult>,
+
+    /// Verifier output. Populated by `CoverageVerifier` (Task 4.2). `None` when
+    /// the query was non-exhaustive or no plan existed.
+    pub coverage_report: Option<crate::coverage::CoverageReport>,
+
+    /// Captured tool invocations (args + tool name). Used by the grounding
+    /// gate (Task 5.1) to extract subject tokens from the rewritten query
+    /// rather than from the raw user prompt.
+    pub tool_calls: Vec<crate::coverage::ToolCallRecord>,
 }
 
 impl QueryContext {
@@ -91,6 +110,10 @@ impl QueryContext {
             fused_pack: None,
             verification: None,
             retries: 0,
+            coverage_plan: None,
+            coverage_evidence: Vec::new(),
+            coverage_report: None,
+            tool_calls: Vec::new(),
         }
     }
 
