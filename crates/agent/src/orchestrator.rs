@@ -13,6 +13,7 @@ use agent_rs_observability::metrics::RetrievalMetrics;
 use agent_rs_retrieval::{ResultRanker, RetrievalRouter};
 use agent_rs_stores::neo4j::Neo4jStore;
 use agent_rs_stores::postgres::PgStore;
+use agent_rs_stores::qdrant::QdrantStore;
 use agent_rs_stores::traits::StateStore;
 use tracing::{info, instrument};
 
@@ -58,20 +59,28 @@ impl AgentOrchestrator {
     /// # Parameters
     ///
     /// - `settings` -- application configuration.
-    /// - `neo4j` -- shared Neo4j graph store, used by [`CoveragePlanner`] to
-    ///   enumerate sections for exhaustive-coverage queries.
+    /// - `neo4j` -- shared Neo4j graph store, used by [`CoveragePlanner`] and
+    ///   the coverage-aware tools (`outline_corpus`, `fetch_section_chunks`,
+    ///   `search_sections`).
     /// - `pg_store` -- shared Postgres store for history, memory, runs, and
     ///   ingested-document listing.
+    /// - `qdrant` -- shared Qdrant vector store for coverage-aware tools.
+    /// - `default_collection` -- name of the primary Qdrant chunk collection.
+    /// - `summaries_collection` -- name of the per-section summaries collection.
     /// - `router` -- shared retrieval router for knowledge search.
     /// - `metrics` -- shared metric instruments for the retrieval pipeline.
     ///
     /// # Errors
     ///
     /// Returns `AgentError::Orchestrator` if the LLM client cannot be created.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         settings: &Settings,
         neo4j: Arc<Neo4jStore>,
         pg_store: Arc<PgStore>,
+        qdrant: Arc<QdrantStore>,
+        default_collection: String,
+        summaries_collection: String,
         router: Arc<RetrievalRouter>,
         metrics: Arc<RetrievalMetrics>,
     ) -> Result<Self, AgentError> {
@@ -86,16 +95,25 @@ impl AgentOrchestrator {
         let context_builder = ContextBuilder::new(Arc::clone(&memory), &settings.context);
 
         // Step 1.5: Coverage planner — no-op for non-exhaustive queries.
-        let coverage_planner =
-            CoveragePlanner::new(neo4j, Arc::clone(&pg_store), Arc::clone(&metrics));
+        // Clone before passing so neo4j remains available for the tool factory.
+        let coverage_planner = CoveragePlanner::new(
+            Arc::clone(&neo4j),
+            Arc::clone(&pg_store),
+            Arc::clone(&metrics),
+        );
 
         // Tool factory (shared across requests; creates per-request tool sets).
-        // Receives the concrete pg_store so DocumentInfoTool can call
-        // PgStore::list_ingested_documents() which isn't part of the
-        // StateStore trait.
+        // Receives the concrete pg_store so DocumentInfoTool/OutlineCorpusTool
+        // can call PgStore::list_ingested_documents(), which isn't part of the
+        // StateStore trait. Also receives neo4j and qdrant for the
+        // coverage-aware tools registered in Phase 4.6.
         let tool_factory = Arc::new(ToolFactory::new(
             Arc::clone(&router),
             Arc::clone(&pg_store),
+            neo4j,
+            qdrant,
+            default_collection,
+            summaries_collection,
             settings.brave.clone(),
             settings.fetch.clone(),
             settings.web_budget.clone(),
