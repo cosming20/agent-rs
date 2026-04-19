@@ -51,9 +51,9 @@ const BATCH_SIZE: usize = 100;
 // ---------------------------------------------------------------------------
 
 // Structural node label tokens.
-const LABEL_DOCUMENT: &str = "Document";
-const LABEL_PAGE: &str = "Page";
-const LABEL_SECTION: &str = "Section";
+pub(crate) const LABEL_DOCUMENT: &str = "Document";
+pub(crate) const LABEL_PAGE: &str = "Page";
+pub(crate) const LABEL_SECTION: &str = "Section";
 const LABEL_TABLE: &str = "Table";
 const LABEL_PICTURE: &str = "Picture";
 

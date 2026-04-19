@@ -4,6 +4,7 @@
 //! The connection pool is managed internally by `neo4rs::Graph`, which is
 //! cheap to clone and share across tasks.
 
+pub mod coverage;
 mod queries;
 pub mod structural;
 
