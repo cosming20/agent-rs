@@ -136,7 +136,7 @@ impl Neo4jStore {
         let ids_bolt = neo4rs::BoltType::try_from(ids_json)
             .map_err(|e| StoreError::Serialization(format!("section_ids serialize: {e}")))?;
         let cypher = format!(
-            "MATCH (s:{LABEL_SECTION})-[:HAS_CHUNK]->(c:Chunk) \
+            "MATCH (c:Chunk)-[:IN_SECTION]->(s:{LABEL_SECTION}) \
              WHERE s.id IN $ids \
              RETURN c.id AS chunk_id, coalesce(c.chunk_index, 0) AS chunk_index \
              ORDER BY chunk_index ASC"
