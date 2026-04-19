@@ -9,12 +9,14 @@ use tokio::sync::Mutex;
 use agent_rs_core::config::{BraveConfig, FetchConfig, WebBudgetConfig};
 use agent_rs_core::types::UserId;
 use agent_rs_retrieval::RetrievalRouter;
+use agent_rs_stores::neo4j::Neo4jStore;
 use agent_rs_stores::postgres::PgStore;
+use agent_rs_stores::qdrant::QdrantStore;
 use agent_rs_stores::traits::StateStore;
 use agent_rs_stores::types::SearchResult;
 use agent_rs_tools::{
-    DocumentInfoTool, FetchUrlTool, RememberTool, SearchKnowledgeTool, SearchNewsTool,
-    SearchWebTool, WebBudgetTracker,
+    DocumentInfoTool, FetchSectionChunksTool, FetchUrlTool, OutlineCorpusTool, RememberTool,
+    SearchKnowledgeTool, SearchNewsTool, SearchSectionsTool, SearchWebTool, WebBudgetTracker,
 };
 use rig::tool::ToolDyn;
 
@@ -31,8 +33,24 @@ pub struct ToolFactory {
     store: Arc<dyn StateStore>,
     /// Concrete Postgres handle for tools that need PgStore-specific methods
     /// (currently `DocumentInfoTool` which calls `list_ingested_documents`,
-    /// not part of the StateStore trait surface).
+    /// and `OutlineCorpusTool` which calls `list_ingested_documents` — neither
+    /// method is part of the `StateStore` trait surface).
     pg_store: Arc<PgStore>,
+    /// Neo4j graph store used by coverage-aware tools
+    /// (`OutlineCorpusTool`, `FetchSectionChunksTool`, `SearchSectionsTool`).
+    neo4j: Arc<Neo4jStore>,
+    /// Qdrant vector store used by coverage-aware tools.
+    qdrant: Arc<QdrantStore>,
+    /// Name of the primary Qdrant collection (chunks).
+    ///
+    /// Shared with `search_knowledge`, `fetch_section_chunks`, and
+    /// `search_sections`.
+    default_collection: String,
+    /// Name of the per-section summaries Qdrant collection.
+    ///
+    /// Written by `ChunkSummarizer` at ingest time and consumed by
+    /// `outline_corpus` to display 1-line section summaries.
+    summaries_collection: String,
     brave_config: BraveConfig,
     fetch_config: FetchConfig,
     web_budget_config: WebBudgetConfig,
@@ -50,13 +68,23 @@ impl ToolFactory {
     /// # Parameters
     ///
     /// - `router` -- shared retrieval router for knowledge search.
-    /// - `store` -- shared state store for the remember tool.
+    /// - `pg_store` -- shared Postgres handle (used by `DocumentInfoTool` and
+    ///   `OutlineCorpusTool` for `list_ingested_documents`).
+    /// - `neo4j` -- shared Neo4j store for coverage-aware tools.
+    /// - `qdrant` -- shared Qdrant store for coverage-aware tools.
+    /// - `default_collection` -- primary Qdrant chunk collection name.
+    /// - `summaries_collection` -- per-section summaries Qdrant collection name.
     /// - `brave_config` -- Brave Search API configuration.
     /// - `fetch_config` -- URL fetch configuration.
     /// - `web_budget_config` -- per-query web budget limits.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         router: Arc<RetrievalRouter>,
         pg_store: Arc<PgStore>,
+        neo4j: Arc<Neo4jStore>,
+        qdrant: Arc<QdrantStore>,
+        default_collection: String,
+        summaries_collection: String,
         brave_config: BraveConfig,
         fetch_config: FetchConfig,
         web_budget_config: WebBudgetConfig,
@@ -70,6 +98,10 @@ impl ToolFactory {
             router,
             store,
             pg_store,
+            neo4j,
+            qdrant,
+            default_collection,
+            summaries_collection,
             brave_config,
             fetch_config,
             web_budget_config,
@@ -117,6 +149,32 @@ impl ToolFactory {
             // language, ingest date, etc.) for meta-questions that don't
             // need a content search.
             Box::new(DocumentInfoTool::new(Arc::clone(&self.pg_store))),
+            // Coverage-aware tools (Phase 3.1–3.3).
+            // outline_corpus — hierarchical TOC (Doc→Section→summary) so the
+            // LLM can discover what exists before deciding which sections to
+            // pull. Constructed once per build() since they hold only
+            // Arc clones to shared stores.
+            Box::new(OutlineCorpusTool::new(
+                Arc::clone(&self.neo4j),
+                Arc::clone(&self.pg_store),
+                Arc::clone(&self.qdrant),
+                self.summaries_collection.clone(),
+            )),
+            // fetch_section_chunks — exhaustive, non-ranked chunk retrieval
+            // for a single known section_id.
+            Box::new(FetchSectionChunksTool::new(
+                Arc::clone(&self.neo4j),
+                Arc::clone(&self.qdrant),
+                self.default_collection.clone(),
+            )),
+            // search_sections — batched parallel retrieval over multiple
+            // section_ids in one tool call (keeps exhaustive flows inside
+            // the max_turns budget).
+            Box::new(SearchSectionsTool::new(
+                Arc::clone(&self.neo4j),
+                Arc::clone(&self.qdrant),
+                self.default_collection.clone(),
+            )),
         ];
 
         (tools, evidence_collector)
