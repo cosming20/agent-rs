@@ -60,6 +60,51 @@ use agent_rs_stores::traits::{GraphStore, VectorStore};
 /// Shallower traversals are faster and typically sufficient for Phase 3.
 /// Phase 4 will make this configurable per-query.
 const DEFAULT_GRAPH_DEPTH: usize = 2;
+
+// ---- SectionFilter ----
+
+/// Optional payload filter applied as a hard post-fusion predicate so that
+/// keyword and graph branches honour the same constraint as the vector
+/// branch (Codex audit gap #10).
+///
+/// Applied AFTER RRF fusion and BEFORE cross-encoder reranking so that
+/// off-section/off-document chunks are dropped regardless of which search
+/// branch surfaced them.
+#[derive(Debug, Clone, Default)]
+pub struct SectionFilter {
+    /// Restrict results to chunks whose payload `doc_id` matches this value.
+    pub doc_id: Option<String>,
+    /// Restrict results to chunks whose payload `section_id` matches this value.
+    pub section_id: Option<String>,
+}
+
+impl SectionFilter {
+    /// Returns `true` when neither `doc_id` nor `section_id` is set, meaning
+    /// the filter is a no-op and can be skipped entirely.
+    pub fn is_empty(&self) -> bool {
+        self.doc_id.is_none() && self.section_id.is_none()
+    }
+}
+
+/// Returns `true` when `payload` satisfies all non-`None` constraints in
+/// `filter`.
+///
+/// Each field is checked independently; a `None` constraint always passes.
+/// Missing or non-string payload fields fail the corresponding constraint.
+pub(crate) fn matches_section_filter(
+    payload: &serde_json::Value,
+    filter: &SectionFilter,
+) -> bool {
+    let doc_ok = filter
+        .doc_id
+        .as_deref()
+        .is_none_or(|want| payload.get("doc_id").and_then(|v| v.as_str()) == Some(want));
+    let sec_ok = filter
+        .section_id
+        .as_deref()
+        .is_none_or(|want| payload.get("section_id").and_then(|v| v.as_str()) == Some(want));
+    doc_ok && sec_ok
+}
 // ---- RetrievalRouter ----
 
 /// Routes queries to the appropriate search back-ends and returns fused results.
@@ -465,17 +510,8 @@ impl RetrievalRouter {
 
     /// Embed, dispatch, rank, and return an [`EvidencePack`] for `query`.
     ///
-    /// # Algorithm
-    ///
-    /// 1. LLM query rewriting (if [`QueryRewriter`] configured): decompose into sub-queries.
-    /// 2. Extract metadata filter hints (if [`MetadataFilterExtractor`] configured).
-    /// 3. Embed dense (always required).
-    /// 4. For each sub-query (1 when not decomposed, 2-3 when decomposed):
-    ///    a. Dispatch to the correct search function(s) based on strategy.
-    /// 5. Fuse all result lists (across sub-queries) via RRF.
-    /// 6. Optional cross-encoder reranking.
-    /// 7. Optional post-retrieval context expansion (if [`ContextExpander`] configured).
-    /// 8. Return the assembled [`EvidencePack`].
+    /// Convenience wrapper around [`retrieve_filtered`] that applies no section
+    /// or document filter — existing call sites remain unchanged.
     ///
     /// # Errors
     ///
@@ -487,6 +523,29 @@ impl RetrievalRouter {
         query: &str,
         strategy: RetrievalStrategy,
         limit: usize,
+    ) -> Result<EvidencePack, RetrievalError> {
+        self.retrieve_filtered(query, strategy, limit, None).await
+    }
+
+    /// Full retrieval pipeline with an optional hard post-fusion predicate.
+    ///
+    /// When `section_filter` is `Some` and non-empty, any fused result whose
+    /// payload does not match the requested `doc_id` / `section_id` is dropped
+    /// *after* RRF fusion but *before* cross-encoder reranking (Codex audit
+    /// gap #10). This ensures keyword (BM25) and graph branches honour the
+    /// same constraint as the vector branch.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RetrievalError::Embedding`] on embedding failure, or
+    /// [`RetrievalError::Store`] on any search back-end failure.
+    #[instrument(skip(self), fields(strategy = %strategy, limit))]
+    pub async fn retrieve_filtered(
+        &self,
+        query: &str,
+        strategy: RetrievalStrategy,
+        limit: usize,
+        section_filter: Option<SectionFilter>,
     ) -> Result<EvidencePack, RetrievalError> {
         let descriptor = get_descriptor(strategy);
 
@@ -715,6 +774,28 @@ impl RetrievalRouter {
         let mut evidence = self
             .ranker
             .rank(all_result_lists, primary_query, strategy, rrf_limit);
+
+        // ---- Step 5b: Hard post-fusion section/doc predicate (Codex gap #10) ----
+        //
+        // Applied after RRF fusion and BEFORE reranking so that keyword (BM25)
+        // and graph branches honour the same doc_id / section_id constraint
+        // that the vector branch satisfies via its Qdrant payload filter.
+        if let Some(ref filter) = section_filter {
+            if !filter.is_empty() {
+                let before = evidence.documents.len();
+                evidence
+                    .documents
+                    .retain(|r| matches_section_filter(&r.payload, filter));
+                let after = evidence.documents.len();
+                tracing::debug!(
+                    doc_id = ?filter.doc_id,
+                    section_id = ?filter.section_id,
+                    before,
+                    after,
+                    "router: applied hard section/doc predicate"
+                );
+            }
+        }
 
         // ---- Step 6: Optional cross-encoder reranking ----
         if let Some(reranker) = self.reranker.as_ref() {
@@ -1242,4 +1323,111 @@ fn filter_conditions_to_json(conditions: &[FilterCondition]) -> serde_json::Valu
         .collect();
 
     serde_json::json!({ "must": must })
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn section_filter_is_empty_when_both_none() {
+        let f = SectionFilter::default();
+        assert!(f.is_empty());
+    }
+
+    #[test]
+    fn section_filter_not_empty_with_doc_id_only() {
+        let f = SectionFilter {
+            doc_id: Some("d1".into()),
+            section_id: None,
+        };
+        assert!(!f.is_empty());
+    }
+
+    #[test]
+    fn section_filter_not_empty_with_section_id_only() {
+        let f = SectionFilter {
+            doc_id: None,
+            section_id: Some("s1".into()),
+        };
+        assert!(!f.is_empty());
+    }
+
+    #[test]
+    fn matches_filter_passes_when_filter_empty() {
+        let payload = serde_json::json!({"chunk_text": "hello"});
+        let filter = SectionFilter::default();
+        assert!(matches_section_filter(&payload, &filter));
+    }
+
+    #[test]
+    fn matches_filter_passes_matching_section_id() {
+        let payload =
+            serde_json::json!({"section_id": "s1", "doc_id": "d1", "chunk_text": "text"});
+        let filter = SectionFilter {
+            doc_id: None,
+            section_id: Some("s1".into()),
+        };
+        assert!(matches_section_filter(&payload, &filter));
+    }
+
+    #[test]
+    fn matches_filter_drops_off_section_chunks() {
+        let payload =
+            serde_json::json!({"section_id": "s1", "doc_id": "d1", "chunk_text": "text"});
+        let filter = SectionFilter {
+            doc_id: None,
+            section_id: Some("s2".into()),
+        };
+        assert!(!matches_section_filter(&payload, &filter));
+    }
+
+    #[test]
+    fn matches_filter_drops_off_doc_chunks() {
+        let payload =
+            serde_json::json!({"section_id": "s1", "doc_id": "d1", "chunk_text": "text"});
+        let filter = SectionFilter {
+            doc_id: Some("d2".into()),
+            section_id: None,
+        };
+        assert!(!matches_section_filter(&payload, &filter));
+    }
+
+    #[test]
+    fn matches_filter_requires_both_when_both_set() {
+        let payload =
+            serde_json::json!({"section_id": "s1", "doc_id": "d1", "chunk_text": "text"});
+        // doc_id matches but section_id doesn't → must fail
+        let filter = SectionFilter {
+            doc_id: Some("d1".into()),
+            section_id: Some("s2".into()),
+        };
+        assert!(!matches_section_filter(&payload, &filter));
+    }
+
+    #[test]
+    fn matches_filter_passes_when_both_match() {
+        let payload =
+            serde_json::json!({"section_id": "s1", "doc_id": "d1", "chunk_text": "text"});
+        let filter = SectionFilter {
+            doc_id: Some("d1".into()),
+            section_id: Some("s1".into()),
+        };
+        assert!(matches_section_filter(&payload, &filter));
+    }
+
+    #[test]
+    fn matches_filter_missing_payload_field_fails_constraint() {
+        // payload has no "section_id" key — constraint should fail
+        let payload = serde_json::json!({"doc_id": "d1", "chunk_text": "text"});
+        let filter = SectionFilter {
+            doc_id: None,
+            section_id: Some("s1".into()),
+        };
+        assert!(!matches_section_filter(&payload, &filter));
+    }
 }

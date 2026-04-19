@@ -9,7 +9,7 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 
 use agent_rs_core::{RetrievalStrategy, ToolError};
-use agent_rs_retrieval::RetrievalRouter;
+use agent_rs_retrieval::{RetrievalRouter, router::SectionFilter};
 use agent_rs_stores::types::SearchResult;
 use rig::completion::ToolDefinition;
 use rig::tool::Tool;
@@ -181,20 +181,29 @@ impl Tool for SearchKnowledgeTool {
 
         let limit = args.limit.unwrap_or(DEFAULT_LIMIT);
 
-        // TODO(Task 3.6): wire doc_id/section_id filter through retrieval router
-        // when router accepts hard predicates (vector filter + keyword filter).
-        let _doc_id_filter = args.doc_id.as_deref();
-        let _section_id_filter = args.section_id.as_deref();
+        // Build the hard post-fusion predicate from the caller-supplied
+        // doc_id / section_id fields (Task 3.6 — Codex audit gap #10).
+        // An empty filter is passed as `None` so the router skips the retain
+        // loop entirely in the common case.
+        let section_filter = {
+            let f = SectionFilter {
+                doc_id: args.doc_id.clone(),
+                section_id: args.section_id.clone(),
+            };
+            if f.is_empty() { None } else { Some(f) }
+        };
 
         tracing::info!(
             query = %args.query,
             strategy = %strategy,
             limit,
+            doc_id = ?args.doc_id,
+            section_id = ?args.section_id,
             "executing knowledge search"
         );
 
         let evidence_pack = router
-            .retrieve(&args.query, strategy, limit)
+            .retrieve_filtered(&args.query, strategy, limit, section_filter)
             .await
             .map_err(|e| ToolError::McpClient(format!("knowledge retrieval failed: {e}")))?;
 
