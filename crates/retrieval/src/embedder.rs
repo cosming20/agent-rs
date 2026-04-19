@@ -360,7 +360,17 @@ impl Embedder for FastEmbedder {
         // E5 multilingual models require "query: " or "passage: " prefix.
         // embed_batch is used for queries (retrieval path); embed_documents
         // should be used for passage/document embedding.
-        let owned: Vec<String> = texts.iter().map(|t| format!("query: {t}")).collect();
+        //
+        // Normalise to the search form (cedilla → comma-below fold + Docling
+        // spacing-mark repair) so query text is symmetric with corpus text.
+        let owned: Vec<String> = texts
+            .iter()
+            .map(|t| {
+                let normalised =
+                    crate::ingestion::text_normalize::normalize_search_form(t);
+                format!("query: {normalised}")
+            })
+            .collect();
         let model = Arc::clone(&self.dense);
         let batch_size = self.dense_batch_size;
 
@@ -431,7 +441,12 @@ impl Embedder for FastEmbedder {
             return Ok(Vec::new());
         }
 
-        let owned: Vec<String> = texts.iter().map(|t| t.to_string()).collect();
+        // Normalise to the search form so sparse query tokens match the
+        // corpus-side form (cedilla → comma-below fold).
+        let owned: Vec<String> = texts
+            .iter()
+            .map(|t| crate::ingestion::text_normalize::normalize_search_form(t))
+            .collect();
         let model = Arc::clone(&self.sparse);
         let batch_size = self.sparse_batch_size;
 
