@@ -10,6 +10,7 @@
 //! - Collection existence checks.
 
 mod collections;
+pub mod section_filter;
 
 use std::collections::HashMap;
 
