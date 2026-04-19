@@ -41,6 +41,7 @@ const QUERY_DURATION_MS: &str = "pipeline.query_duration_ms";
 const VERIFIER_METHOD_TOTAL: &str = "verification.method_total";
 const RERANKER_FALLBACK_TOTAL: &str = "retrieval.reranker_fallback_total";
 const GRAPH_EXTRACTION_FAILURE_TOTAL: &str = "ingestion.graph_extraction_failure_total";
+const COVERAGE_PLANNER_UNMATCHED_TOTAL: &str = "agent.coverage_planner_unmatched_total";
 
 // ---- Tier 1 — cost + per-stage time ----
 const LLM_CALLS_TOTAL: &str = "llm.calls_total";
@@ -179,6 +180,10 @@ pub struct RetrievalMetrics {
     /// Chunks whose embed_text is empty or whitespace-only — a silent
     /// ingestion regression symptom if the rate climbs above baseline.
     chunk_empty_embed: metrics::Counter<u64>,
+    /// Count of CoveragePlanner soft-heuristic firings where the strict
+    /// hard-token rules did not promote the query to exhaustive/partial mode.
+    /// Labelled by `reason` (heuristic name). Used to tune the rule set.
+    coverage_planner_unmatched: metrics::Counter<u64>,
 }
 
 impl RetrievalMetrics {
@@ -412,6 +417,15 @@ impl RetrievalMetrics {
             .with_unit("chunks")
             .build();
 
+        let coverage_planner_unmatched = meter
+            .u64_counter(COVERAGE_PLANNER_UNMATCHED_TOTAL)
+            .with_description(
+                "CoveragePlanner soft-heuristic fired but strict rules did not match. \
+                 Labelled by reason (heuristic name). Use to tune the bilingual token set.",
+            )
+            .with_unit("events")
+            .build();
+
         Self {
             retrieval_latency,
             retrieval_results,
@@ -441,6 +455,7 @@ impl RetrievalMetrics {
             chunk_heading_depth,
             chunk_flag,
             chunk_empty_embed,
+            coverage_planner_unmatched,
         }
     }
 
@@ -665,6 +680,18 @@ impl RetrievalMetrics {
     /// chunker regression when the rate climbs above baseline.
     pub fn record_chunk_empty_embed(&self) {
         self.chunk_empty_embed.add(1, &[]);
+    }
+
+    /// Increment the coverage-planner-unmatched counter.
+    ///
+    /// Call when the `CoveragePlanner` soft heuristic fires but the strict
+    /// hard-token rules did not promote the query to exhaustive/partial mode.
+    ///
+    /// `reason` is the stable heuristic name used as the `reason` label —
+    /// e.g. `"soft_quantifier_single"`.
+    pub fn coverage_planner_unmatched(&self, reason: &'static str) {
+        self.coverage_planner_unmatched
+            .add(1, &[KeyValue::new("reason", reason)]);
     }
 }
 
