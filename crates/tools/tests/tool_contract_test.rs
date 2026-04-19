@@ -25,7 +25,8 @@ use agent_rs_core::config::{BraveConfig, FetchConfig, WebBudgetConfig};
 use agent_rs_stores::traits::StateStore;
 use agent_rs_stores::types::{ChatMessage, EvidenceItem, Memory, QueryRun};
 use agent_rs_tools::{
-    DocumentInfoTool, FetchUrlTool, RememberTool, SearchKnowledgeTool, SearchNewsTool,
+    DocumentInfoTool, FetchSectionChunksTool, FetchUrlTool, OutlineCorpusTool, RememberTool,
+    SearchKnowledgeArgs, SearchKnowledgeTool, SearchMode, SearchNewsTool, SearchSectionsTool,
     SearchWebTool, WebBudgetTracker,
 };
 use async_trait::async_trait;
@@ -388,4 +389,107 @@ async fn search_knowledge_tool_definition_contract() {
             "strategy enum missing advertised value {want:?}; tool enum = {enum_vals:?}"
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// FetchSectionChunksTool — definition contract (stores require live backends).
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn fetch_section_chunks_tool_definition_contract() {
+    // All store fields are `#[serde(skip)]`, so `{}` deserializes to `None`
+    // for each. `definition()` never touches the stores.
+    let tool: FetchSectionChunksTool = serde_json::from_value(json!({}))
+        .expect("FetchSectionChunksTool should deserialize from {}");
+    let def = tool.definition(String::new()).await;
+    assert_eq!(def.name, "fetch_section_chunks");
+    assert_tool_contract(&def.name, &def.description, &def.parameters);
+
+    let desc_lc = def.description.to_lowercase();
+    assert!(
+        desc_lc.contains("section"),
+        "fetch_section_chunks description must contain 'section': {:?}",
+        def.description
+    );
+    assert!(
+        desc_lc.contains("exhaustive") || desc_lc.contains("all"),
+        "fetch_section_chunks description must mention exhaustive retrieval: {:?}",
+        def.description
+    );
+
+    // section_id must be a required field.
+    let required = def
+        .parameters
+        .get("required")
+        .and_then(Value::as_array)
+        .expect("fetch_section_chunks must declare required fields");
+    let req_vals: Vec<&str> = required.iter().filter_map(Value::as_str).collect();
+    assert!(
+        req_vals.contains(&"section_id"),
+        "fetch_section_chunks must list section_id as required; got: {req_vals:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// SearchSectionsTool — definition contract (stores require live backends).
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn search_sections_tool_definition_contract() {
+    let tool: SearchSectionsTool = serde_json::from_value(json!({}))
+        .expect("SearchSectionsTool should deserialize from {}");
+    let def = tool.definition(String::new()).await;
+    assert_eq!(def.name, "search_sections");
+    assert_tool_contract(&def.name, &def.description, &def.parameters);
+    let desc_lc = def.description.to_lowercase();
+    assert!(
+        desc_lc.contains("batch") || desc_lc.contains("multiple"),
+        "search_sections description must mention batch or multiple: {:?}",
+        def.description
+    );
+}
+
+// ---------------------------------------------------------------------------
+// OutlineCorpusTool — definition contract (stores require live backends).
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn outline_corpus_tool_definition_contract() {
+    // All store fields are `#[serde(skip)]`, so `{}` deserializes to `None`
+    // for each. `definition()` never touches the stores.
+    let tool: OutlineCorpusTool = serde_json::from_value(json!({}))
+        .expect("OutlineCorpusTool should deserialize from {}");
+    let def = tool.definition(String::new()).await;
+    assert_eq!(def.name, "outline_corpus");
+    assert_tool_contract(&def.name, &def.description, &def.parameters);
+    assert!(
+        def.description.to_lowercase().contains("outline")
+            && def.description.to_lowercase().contains("section"),
+        "outline_corpus description must reference outline / section: {:?}",
+        def.description
+    );
+}
+
+// ---------------------------------------------------------------------------
+// SearchKnowledgeArgs — schema evolution tests (Task 3.4)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn search_knowledge_args_accept_optional_section_id_doc_id_mode() {
+    let v = json!({"query": "x", "section_id": "s", "doc_id": "d", "mode": "all_in_section"});
+    let parsed: SearchKnowledgeArgs = serde_json::from_value(v).expect("must parse");
+    // existing query field still works
+    assert_eq!(parsed.query, "x");
+    assert_eq!(parsed.section_id.as_deref(), Some("s"));
+    assert_eq!(parsed.doc_id.as_deref(), Some("d"));
+    assert!(matches!(parsed.mode, SearchMode::AllInSection));
+}
+
+#[tokio::test]
+async fn search_knowledge_args_default_mode_is_ranked_when_omitted() {
+    let parsed: SearchKnowledgeArgs =
+        serde_json::from_value(json!({"query": "x"})).expect("must parse");
+    assert!(matches!(parsed.mode, SearchMode::Ranked));
+    assert!(parsed.section_id.is_none());
+    assert!(parsed.doc_id.is_none());
 }

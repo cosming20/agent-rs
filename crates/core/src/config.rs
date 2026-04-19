@@ -133,6 +133,15 @@ pub struct AgentConfig {
     pub max_steps: usize,
     pub max_retries: usize,
     pub system_prompt_file: String,
+    /// Reasoning-effort hint forwarded to OpenAI Chat Completions for
+    /// gpt-5.x / o-series models. Valid values: `"minimal"`, `"low"`,
+    /// `"medium"`, `"high"`. Empty string disables the field (older
+    /// non-reasoning models simply ignore unknown fields, so leaving the
+    /// default is safe). `"minimal"` skips most hidden thinking tokens,
+    /// which is the largest single lever on final-answer latency for
+    /// reasoning models.
+    #[serde(default)]
+    pub reasoning_effort: String,
 }
 
 /// Context window management configuration.
@@ -481,14 +490,16 @@ impl Default for Settings {
                 password: "neo4j".into(),
             },
             agent: AgentConfig {
-                // Most RAG queries finish in 1 tool call. Two-step ceiling
-                // leaves room for one focused retry when the first attempt
-                // returns thin evidence; anything beyond that is usually
-                // the agent flailing. Raise explicitly via config when a
-                // workload genuinely needs deeper tool chains.
-                max_steps: 4,
+                // Raised from 4 to 5 for the coverage-aware-rag design.
+                // Typical exhaustive path: outline_corpus -> search_sections
+                // -> synthesize (3 turns); the extra turn provides headroom
+                // for one targeted follow-up search_knowledge call when the
+                // planner partially missed. Non-exhaustive flows still
+                // finish in <=2 turns.
+                max_steps: 5,
                 max_retries: 1,
                 system_prompt_file: String::new(),
+                reasoning_effort: "minimal".into(),
             },
             context: ContextConfig {
                 max_messages: 10,

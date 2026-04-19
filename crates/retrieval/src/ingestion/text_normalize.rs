@@ -226,35 +226,73 @@ pub fn normalize_docling_text(raw: &str) -> String {
     // Step 2: NFC compose combining-mark sequences into precomposed glyphs.
     let composed: String = buf.nfc().collect();
 
-    // Step 3 (OPT-IN): map legacy cedilla forms to modern comma-below forms.
+    // Step 3: map legacy cedilla forms to modern comma-below forms.
     //
     // Romanian orthography (Unicode 3.0+) uses U+0219 / U+021B (comma-below)
     // rather than U+015F / U+0163 (cedilla). Docling's input PDFs often
     // carry the legacy forms; BM25 won't match a user query spelled in
     // modern form against a corpus stored in legacy form.
     //
-    // Gated behind an env flag because Turkish / Azerbaijani documents
-    // legitimately use the cedilla forms — a universal RAG system cannot
-    // assume Romanian.
-    let modern_diacritics = matches!(
-        std::env::var("AGENT_RS__INGEST__ROMANIAN_COMMA_BELOW").as_deref(),
-        Ok("1") | Ok("true") | Ok("TRUE") | Ok("yes")
-    );
-    let diacritics_applied: String = if modern_diacritics {
-        composed
-            .replace('\u{015F}', "\u{0219}") // ş → ș
-            .replace('\u{015E}', "\u{0218}") // Ş → Ș
-            .replace('\u{0163}', "\u{021B}") // ţ → ț
-            .replace('\u{0162}', "\u{021A}") // Ţ → Ț
-    } else {
-        composed
-    };
+    // Applied unconditionally because the fold is reversible and symmetric:
+    // query text is also normalised via `normalize_search_form`, so both sides
+    // of the index always share the same form regardless of the source script.
+    let diacritics_applied = fold_cedilla_to_comma_below(&composed);
 
     // Step 4: collapse runs of ASCII spaces left behind by step 1.
     //
     // We don't touch other whitespace (newlines, tabs, non-breaking spaces);
     // chunk boundaries and line formatting downstream rely on those.
     collapse_ascii_runs(&diacritics_applied)
+}
+
+/// Normalise text for indexing and retrieval so that ingested chunks and query
+/// text share a canonical search form.
+///
+/// Wraps [`normalize_docling_text`] (which handles Docling spacing-mark
+/// artefacts, NFC composition, and space collapsing) and unconditionally folds
+/// legacy cedilla codepoints to their modern comma-below equivalents so that
+/// BM25 and dense-embedding lookup are symmetric across both sides of the
+/// index.
+///
+/// Call this function for **both** corpus text (at ingest time) and user query
+/// text (before embedding); do **not** call [`normalize_docling_text`] directly
+/// for the query side.
+///
+/// # Examples
+///
+/// ```
+/// use agent_rs_retrieval::ingestion::text_normalize::normalize_search_form;
+///
+/// // Comma-below and cedilla variants normalise to the same form.
+/// let comma_below = "func\u{021B}ie"; // t with comma-below (U+021B)
+/// let cedilla     = "func\u{0163}ie"; // t with cedilla    (U+0163)
+/// assert_eq!(normalize_search_form(comma_below), normalize_search_form(cedilla));
+/// ```
+pub fn normalize_search_form(input: &str) -> String {
+    let stage1 = normalize_docling_text(input);
+    fold_cedilla_to_comma_below(&stage1)
+}
+
+/// Map the four legacy cedilla codepoints used in Romanian/Turkish typography
+/// to their modern comma-below counterparts so that corpus and query text
+/// share a single form.
+///
+/// | Input (cedilla)             | Output (comma-below)              |
+/// |-----------------------------|-----------------------------------|
+/// | U+015E LATIN CAPITAL S WITH CEDILLA | U+0218 LATIN CAPITAL S WITH COMMA BELOW |
+/// | U+015F LATIN SMALL S WITH CEDILLA   | U+0219 LATIN SMALL S WITH COMMA BELOW   |
+/// | U+0162 LATIN CAPITAL T WITH CEDILLA | U+021A LATIN CAPITAL T WITH COMMA BELOW |
+/// | U+0163 LATIN SMALL T WITH CEDILLA   | U+021B LATIN SMALL T WITH COMMA BELOW   |
+fn fold_cedilla_to_comma_below(s: &str) -> String {
+    s.chars()
+        .map(|c| match c {
+            '\u{015E}' => '\u{0218}', // Ş → Ș
+            '\u{015F}' => '\u{0219}', // ş → ș
+            '\u{0162}' => '\u{021A}', // Ţ → Ț
+            '\u{0163}' => '\u{021B}', // ţ → ț
+            other => other,
+        })
+        .collect()
 }
 
 /// Replace every run of two-or-more ASCII spaces with a single space.
@@ -274,4 +312,38 @@ fn collapse_ascii_runs(s: &str) -> String {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn comma_below_and_cedilla_normalize_to_same_form() {
+        // Romanian "ț" with comma-below (U+021B) vs legacy "ţ" with cedilla (U+0163).
+        let cb = "func\u{021B}ie"; // t with comma-below
+        let ce = "func\u{0163}ie"; // t with cedilla
+        assert_eq!(normalize_search_form(cb), normalize_search_form(ce));
+    }
+
+    #[test]
+    fn normalize_search_form_passes_clean_text_unchanged() {
+        let clean = "already clean";
+        assert_eq!(normalize_search_form(clean), clean);
+    }
+
+    #[test]
+    fn fold_cedilla_to_comma_below_covers_all_four_codepoints() {
+        // ş Ş ţ Ţ  →  ș Ș ț Ț
+        let input = "\u{015F}\u{015E}\u{0163}\u{0162}";
+        let expected = "\u{0219}\u{0218}\u{021B}\u{021A}";
+        assert_eq!(fold_cedilla_to_comma_below(input), expected);
+    }
+
+    #[test]
+    fn normalize_search_form_wraps_docling_spacing_marks() {
+        // Docling artefact: spacing breve + letter should still compose via
+        // the inner normalize_docling_text call.
+        assert_eq!(normalize_search_form("histogram \u{02D8} a"), "histogramă");
+    }
 }

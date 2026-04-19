@@ -79,6 +79,27 @@ const SYSTEM_PROMPT: &str = "Summarize the following text in 1-2 sentences, focu
 // Public types
 // ---------------------------------------------------------------------------
 
+/// Outcome of a per-chunk summary attempt. Recorded in the summaries payload
+/// so the outline tool can surface `[summary unavailable]` instead of silently
+/// hiding chunks whose summary failed to generate.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum SummaryStatus {
+    /// LLM returned a non-empty summary.
+    Ok,
+    /// LLM returned an empty / whitespace-only response.
+    Empty,
+    /// LLM call failed (after retries).
+    Failed,
+}
+
+impl SummaryStatus {
+    /// Serde default used for legacy payloads that pre-date this field.
+    fn default_ok() -> Self {
+        Self::Ok
+    }
+}
+
 /// The summary produced for a single chunk.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChunkSummary {
@@ -93,6 +114,43 @@ pub struct ChunkSummary {
     pub summary_text: String,
     /// First [`PREVIEW_CHARS`] characters of the source chunk for inspection.
     pub chunk_text_preview: String,
+    /// Document id of the source chunk; populated by `summarize_batch`
+    /// from the chunk metadata. `None` only for legacy summaries from
+    /// before this field was added.
+    #[serde(default)]
+    pub doc_id: Option<String>,
+    /// Section id of the source chunk; same provenance / nullability as
+    /// `doc_id`.
+    #[serde(default)]
+    pub section_id: Option<String>,
+    /// Ingest run that produced this summary; used by rollback to delete
+    /// orphan summaries when an ingest run fails.
+    #[serde(default)]
+    pub ingest_run_id: Option<String>,
+    /// Outcome marker (`Ok` / `Empty` / `Failed`). Replaces the previous
+    /// silent-drop behaviour where empty/failed summaries vanished.
+    #[serde(default = "SummaryStatus::default_ok")]
+    pub summary_status: SummaryStatus,
+}
+
+/// Metadata supplied per chunk to [`ChunkSummarizer::summarize_batch`].
+///
+/// Carries identifiers that are propagated into the resulting [`ChunkSummary`]
+/// payload so downstream tools (rollback, outline corpus) can join on them.
+pub struct SummarizeItem<'a> {
+    /// Unique identifier for this chunk.
+    pub chunk_id: &'a str,
+    /// Raw text content to summarize.
+    pub chunk_text: &'a str,
+    /// Parent document identifier; forwarded into [`ChunkSummary::doc_id`].
+    pub doc_id: Option<&'a str>,
+    /// Section identifier (e.g. a Neo4j section UUID); forwarded into
+    /// [`ChunkSummary::section_id`]. May be `None` when section structure is
+    /// not available (e.g. plain-text ingestion path).
+    pub section_id: Option<&'a str>,
+    /// Ingest run identifier; forwarded into [`ChunkSummary::ingest_run_id`]
+    /// so rollback can delete orphan summaries by run.
+    pub ingest_run_id: Option<&'a str>,
 }
 
 // ---------------------------------------------------------------------------
@@ -314,79 +372,113 @@ impl ChunkSummarizer {
         Ok(trimmed_summary)
     }
 
-    /// Generate summaries for a batch of `(chunk_id, chunk_text)` pairs with
-    /// bounded concurrency.
+    /// Generate summaries for a batch of [`SummarizeItem`]s with bounded concurrency.
     ///
-    /// The returned `Vec` has the same length and ordering as `chunks`.
-    /// A failed or empty summary entry records an empty `summary_text` so the
-    /// caller can decide whether to skip upsert for that chunk.
+    /// The returned `Vec` has the same length and ordering as `items`.
+    /// Every entry is `Ok(ChunkSummary)` — failures and empty responses are
+    /// recorded as `SummaryStatus::Failed` / `SummaryStatus::Empty` respectively
+    /// rather than being dropped, so callers can distinguish "never tried" from
+    /// "tried and got nothing".
     ///
     /// `concurrency` bounds the number of in-flight LLM requests and should
     /// be tuned to match provider rate limits.
-    #[instrument(skip(self, chunks), fields(total = chunks.len(), concurrency))]
-    pub async fn summarize_batch(
+    #[instrument(skip(self, items), fields(total = items.len(), concurrency))]
+    pub async fn summarize_batch<'a>(
         &self,
-        chunks: &[(&str, &str)], // (chunk_id, chunk_text)
+        items: &[SummarizeItem<'a>],
         concurrency: usize,
-    ) -> Vec<Result<ChunkSummary, RetrievalError>> {
-        if chunks.is_empty() {
+    ) -> Vec<ChunkSummary> {
+        if items.is_empty() {
             return Vec::new();
         }
 
         let limit = concurrency.max(1);
         let semaphore = Arc::new(Semaphore::new(limit));
-        let mut handles = Vec::with_capacity(chunks.len());
+        let mut handles = Vec::with_capacity(items.len());
 
-        for (idx, &(chunk_id, chunk_text)) in chunks.iter().enumerate() {
+        for (idx, item) in items.iter().enumerate() {
             let summarizer = self.clone();
-            let chunk_id_owned = chunk_id.to_owned();
-            let chunk_text_owned = chunk_text.to_owned();
+            let chunk_id_owned = item.chunk_id.to_owned();
+            let chunk_text_owned = item.chunk_text.to_owned();
+            let doc_id_owned = item.doc_id.map(str::to_owned);
+            let section_id_owned = item.section_id.map(str::to_owned);
+            let ingest_run_id_owned = item.ingest_run_id.map(str::to_owned);
             let permit_sem = Arc::clone(&semaphore);
 
             let handle = tokio::spawn(async move {
                 let _permit = match permit_sem.acquire_owned().await {
                     Ok(p) => p,
                     Err(e) => {
+                        tracing::warn!(error = %e, "semaphore closed during summarization");
+                        let key = format!("{chunk_id_owned}|summary");
+                        let summary_id =
+                            uuid::Uuid::new_v5(&SUMMARY_UUID_NAMESPACE, key.as_bytes())
+                                .to_string();
+                        let preview: String =
+                            chunk_text_owned.chars().take(PREVIEW_CHARS).collect();
                         return (
                             idx,
-                            Err(RetrievalError::Ingestion {
-                                reason: format!("semaphore closed during summarization: {e}"),
-                            }),
+                            ChunkSummary {
+                                chunk_id: chunk_id_owned,
+                                summary_id,
+                                summary_text: String::new(),
+                                chunk_text_preview: preview,
+                                doc_id: doc_id_owned,
+                                section_id: section_id_owned,
+                                ingest_run_id: ingest_run_id_owned,
+                                summary_status: SummaryStatus::Failed,
+                            },
                         );
                     }
                 };
 
-                let result = summarizer.summarize(&chunk_text_owned).await.map(|text| {
-                    let key = format!("{chunk_id_owned}|summary");
-                    let summary_id =
-                        uuid::Uuid::new_v5(&SUMMARY_UUID_NAMESPACE, key.as_bytes()).to_string();
-                    let preview: String = chunk_text_owned.chars().take(PREVIEW_CHARS).collect();
+                let key = format!("{chunk_id_owned}|summary");
+                let summary_id =
+                    uuid::Uuid::new_v5(&SUMMARY_UUID_NAMESPACE, key.as_bytes()).to_string();
+                let preview: String = chunk_text_owned.chars().take(PREVIEW_CHARS).collect();
+
+                let (summary_text, summary_status) =
+                    match summarizer.summarize(&chunk_text_owned).await {
+                        Ok(text) if text.is_empty() => (String::new(), SummaryStatus::Empty),
+                        Ok(text) => (text, SummaryStatus::Ok),
+                        Err(e) => {
+                            tracing::warn!(
+                                error = %e,
+                                chunk_id = %chunk_id_owned,
+                                "chunk summarization failed"
+                            );
+                            (String::new(), SummaryStatus::Failed)
+                        }
+                    };
+
+                (
+                    idx,
                     ChunkSummary {
-                        chunk_id: chunk_id_owned.clone(),
+                        chunk_id: chunk_id_owned,
                         summary_id,
-                        summary_text: text,
+                        summary_text,
                         chunk_text_preview: preview,
-                    }
-                });
-                (idx, result)
+                        doc_id: doc_id_owned,
+                        section_id: section_id_owned,
+                        ingest_run_id: ingest_run_id_owned,
+                        summary_status,
+                    },
+                )
             });
             handles.push(handle);
         }
 
-        // Collect into an ordered vec.
-        let mut results: Vec<Result<ChunkSummary, RetrievalError>> = (0..chunks.len())
-            .map(|_| {
-                Err(RetrievalError::Ingestion {
-                    reason: "summarization task did not complete".to_owned(),
-                })
-            })
-            .collect();
+        // Collect into an ordered vec. Slots are pre-filled with a Failed
+        // sentinel so any panicked task produces a recorded failure instead
+        // of a gap in the output.
+        let item_count = items.len();
+        let mut results: Vec<Option<ChunkSummary>> = (0..item_count).map(|_| None).collect();
 
         for handle in handles {
             match handle.await {
-                Ok((idx, result)) => {
+                Ok((idx, summary)) => {
                     if let Some(slot) = results.get_mut(idx) {
-                        *slot = result;
+                        *slot = Some(summary);
                     }
                 }
                 Err(e) => {
@@ -395,7 +487,24 @@ impl ChunkSummarizer {
             }
         }
 
+        // Any slot still None means the spawn panicked — unwrap to a Failed
+        // sentinel using an empty chunk_id (should be extremely rare).
         results
+            .into_iter()
+            .enumerate()
+            .map(|(idx, opt)| {
+                opt.unwrap_or_else(|| ChunkSummary {
+                    chunk_id: format!("unknown-{idx}"),
+                    summary_id: String::new(),
+                    summary_text: String::new(),
+                    chunk_text_preview: String::new(),
+                    doc_id: None,
+                    section_id: None,
+                    ingest_run_id: None,
+                    summary_status: SummaryStatus::Failed,
+                })
+            })
+            .collect()
     }
 
     /// POST to `/v1/chat/completions` with retry on 429 / 5xx.
@@ -473,5 +582,62 @@ fn parse_api_error(bytes: &[u8], status: StatusCode) -> String {
             let preview: String = String::from_utf8_lossy(bytes).chars().take(200).collect();
             format!("HTTP {status}: {preview}")
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn chunk_summary_serializes_doc_section_ingest_run_id_and_status() {
+        let summary = ChunkSummary {
+            summary_id: "uuid-s".into(),
+            chunk_id: "uuid-c".into(),
+            summary_text: "...".into(),
+            chunk_text_preview: String::new(),
+            doc_id: Some("d1".into()),
+            section_id: Some("sec1".into()),
+            ingest_run_id: Some("run-7".into()),
+            summary_status: SummaryStatus::Ok,
+        };
+        let json = serde_json::to_value(&summary).expect("serialize");
+        assert_eq!(json["doc_id"], "d1");
+        assert_eq!(json["section_id"], "sec1");
+        assert_eq!(json["ingest_run_id"], "run-7");
+        assert_eq!(json["summary_status"], "ok");
+    }
+
+    #[test]
+    fn summary_status_empty_serializes_correctly() {
+        let status = SummaryStatus::Empty;
+        let json = serde_json::to_value(&status).expect("serialize");
+        assert_eq!(json, "empty");
+    }
+
+    #[test]
+    fn summary_status_failed_serializes_correctly() {
+        let status = SummaryStatus::Failed;
+        let json = serde_json::to_value(&status).expect("serialize");
+        assert_eq!(json, "failed");
+    }
+
+    #[test]
+    fn chunk_summary_deserializes_with_serde_defaults() {
+        let json = serde_json::json!({
+            "chunk_id": "c1",
+            "summary_id": "s1",
+            "summary_text": "text",
+            "chunk_text_preview": "preview",
+        });
+        let summary: ChunkSummary = serde_json::from_value(json).expect("deserialize");
+        assert_eq!(summary.doc_id, None);
+        assert_eq!(summary.section_id, None);
+        assert_eq!(summary.ingest_run_id, None);
+        assert_eq!(summary.summary_status, SummaryStatus::Ok);
     }
 }

@@ -10,6 +10,7 @@
 //! - Collection existence checks.
 
 mod collections;
+pub mod section_filter;
 
 use std::collections::HashMap;
 
@@ -18,8 +19,8 @@ use async_trait::async_trait;
 use qdrant_client::Qdrant;
 use qdrant_client::qdrant::{
     DeletePointsBuilder, DenseVector, Document, GetPointsBuilder, NamedVectors, PointId,
-    PointStruct, PointsIdsList, PrefetchQueryBuilder, QueryPointsBuilder, UpsertPointsBuilder,
-    Vector, Vectors,
+    PointStruct, PointsIdsList, PrefetchQueryBuilder, QueryPointsBuilder, ScrollPointsBuilder,
+    UpsertPointsBuilder, Vector, Vectors,
 };
 use tracing::instrument;
 
@@ -439,6 +440,89 @@ impl VectorStore for QdrantStore {
             });
         }
         Ok(out)
+    }
+}
+
+// ---- QdrantStore inherent methods ----
+
+impl QdrantStore {
+    /// Fetch payload-only projections for a list of chunk ids.
+    ///
+    /// Thin wrapper around [`VectorStore::get_by_ids`] that accepts a plain
+    /// `&str` collection name, sparing callers from constructing a
+    /// [`CollectionName`] themselves. Used by `fetch_section_chunks` and
+    /// similar tools that already know the ids they want and do not need
+    /// vector data.
+    ///
+    /// Ids that do not resolve to a stored point are silently dropped; the
+    /// caller sees only hits.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError`] on Qdrant gRPC failure.
+    #[instrument(skip(self, ids), fields(collection, n_ids = ids.len()))]
+    pub async fn retrieve_chunks_by_ids(
+        &self,
+        collection: &str,
+        ids: &[String],
+    ) -> Result<Vec<crate::types::PointPayload>, StoreError> {
+        use crate::traits::VectorStore as _;
+
+        let coll = agent_rs_core::CollectionName::from_string(collection.to_owned());
+        self.get_by_ids(&coll, ids).await
+    }
+
+    /// Return the `summary_text` of the first stored summary whose payload
+    /// matches `section_id`. Returns `Ok(None)` when no matching point exists.
+    ///
+    /// Uses the scroll API (no vector required) with a payload filter on
+    /// `section_id` and a limit of 1 so only the first summary chunk is read.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError`] on Qdrant gRPC failure.
+    #[instrument(skip(self), fields(collection = %collection, section_id = %section_id))]
+    pub async fn first_summary_by_section(
+        &self,
+        collection: &str,
+        section_id: &str,
+    ) -> Result<Option<String>, StoreError> {
+        use crate::qdrant::section_filter::build_section_filter;
+
+        let Some(filter) = build_section_filter(None, Some(section_id)) else {
+            return Ok(None);
+        };
+
+        let response = self
+            .client
+            .scroll(
+                ScrollPointsBuilder::new(collection)
+                    .filter(filter)
+                    .limit(1u32)
+                    .with_payload(true)
+                    .with_vectors(false),
+            )
+            .await
+            .map_err(StoreError::from)?;
+
+        let summary = response
+            .result
+            .into_iter()
+            .next()
+            .and_then(|point| {
+                point
+                    .payload
+                    .get("summary_text")
+                    .and_then(|v| {
+                        use qdrant_client::qdrant::value::Kind;
+                        match v.kind.as_ref() {
+                            Some(Kind::StringValue(s)) => Some(s.clone()),
+                            _ => None,
+                        }
+                    })
+            });
+
+        Ok(summary)
     }
 }
 
