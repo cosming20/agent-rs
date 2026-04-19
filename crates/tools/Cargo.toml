@@ -16,6 +16,7 @@ rig-core = { workspace = true }
 
 # Async
 tokio = { workspace = true }
+futures = { workspace = true }
 
 # Serialization
 serde      = { workspace = true }

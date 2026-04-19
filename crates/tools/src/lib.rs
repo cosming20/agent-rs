@@ -10,6 +10,7 @@
 //! | `search_knowledge` | [`knowledge`] | Query the internal knowledge base |
 //! | `outline_corpus` | [`outline_corpus`] | Hierarchical TOC of the corpus |
 //! | `fetch_section_chunks` | [`fetch_section_chunks`] | Exhaustive, non-ranked chunk retrieval per section |
+//! | `search_sections` | [`search_sections`] | Batched parallel retrieval over multiple section_ids |
 //! | `search_web` | [`web`] | Web search (stub, Phase 5b) |
 //! | `search_news` | [`web`] | News search (stub, Phase 5b) |
 //! | `fetch_url` | [`fetch`] | HTTP GET with SSRF protection |
@@ -36,6 +37,7 @@ pub mod knowledge;
 pub mod mcp_client;
 pub mod outline_corpus;
 pub mod remember;
+pub mod search_sections;
 pub mod web;
 
 pub use budget::WebBudgetTracker;
@@ -46,4 +48,5 @@ pub use knowledge::SearchKnowledgeTool;
 pub use mcp_client::McpClient;
 pub use outline_corpus::OutlineCorpusTool;
 pub use remember::RememberTool;
+pub use search_sections::SearchSectionsTool;
 pub use web::{SearchNewsTool, SearchWebTool};
