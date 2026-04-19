@@ -58,7 +58,7 @@ impl Neo4jStore {
     ) -> Result<Vec<SectionRow>, StoreError> {
         let cypher = format!(
             "MATCH (d:{LABEL_DOCUMENT} {{id: $doc_id}})-[:HAS_SECTION*1..]->(s:{LABEL_SECTION}) \
-             RETURN s.id AS section_id, d.id AS doc_id, s.heading AS heading, \
+             RETURN s.id AS section_id, d.id AS doc_id, coalesce(s.title, s.heading) AS heading, \
                     s.section_order AS section_order, s.first_chunk_index AS first_chunk_index, \
                     s.page_start AS page_start, coalesce(s.is_preamble, false) AS is_preamble"
         );

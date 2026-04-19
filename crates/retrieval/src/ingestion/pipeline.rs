@@ -743,7 +743,7 @@ impl IngestionPipeline {
                 chunk_id: c.chunk_id.as_str(),
                 chunk_text: c.content.as_str(),
                 doc_id: Some(c.doc_id.as_str()),
-                section_id: None, // section UUIDs only exist in the structural graph layer
+                section_id: c.section_id.as_deref(),
                 ingest_run_id,
             })
             .collect();
@@ -752,49 +752,75 @@ impl IngestionPipeline {
             .summarize_batch(&items, self.summarizer_concurrency)
             .await;
 
-        // All summaries are now recorded; log non-Ok ones for observability but
-        // only embed+upsert those with actual text (Ok status).
-        let mut valid_summaries = Vec::with_capacity(summaries.len());
+        // Partition summaries: Ok ones get real embeddings; Empty/Failed get a
+        // placeholder text so the embedder never sees an empty string but their
+        // summary_status payload field lets outline_corpus skip them for display.
+        const UNAVAILABLE_PLACEHOLDER: &str = "[summary unavailable]";
+
+        let mut ok_summaries: Vec<super::summarizer::ChunkSummary> =
+            Vec::with_capacity(summaries.len());
+        let mut non_ok_summaries: Vec<super::summarizer::ChunkSummary> = Vec::new();
         for (idx, summary) in summaries.into_iter().enumerate() {
             match summary.summary_status {
                 super::summarizer::SummaryStatus::Ok => {
-                    valid_summaries.push(summary);
+                    ok_summaries.push(summary);
                 }
                 super::summarizer::SummaryStatus::Empty => {
                     tracing::debug!(
                         doc_id,
                         chunk_index = idx,
-                        "summarizer returned empty text for chunk; skipping upsert"
+                        "summarizer returned empty text for chunk; upserting with placeholder"
                     );
+                    non_ok_summaries.push(summary);
                 }
                 super::summarizer::SummaryStatus::Failed => {
                     tracing::warn!(
                         doc_id,
                         chunk_index = idx,
-                        "chunk summarization failed; skipping upsert"
+                        "chunk summarization failed; upserting with placeholder"
                     );
+                    non_ok_summaries.push(summary);
                 }
             }
         }
 
-        if valid_summaries.is_empty() {
-            tracing::debug!(doc_id, "no valid summaries produced; skipping upsert");
+        if ok_summaries.is_empty() && non_ok_summaries.is_empty() {
+            tracing::debug!(doc_id, "no summaries produced; skipping upsert");
             return Ok(0);
         }
 
-        // Embed the summary texts via the passage path.
-        let summary_texts: Vec<&str> = valid_summaries
+        // Embed Ok summaries; placeholder text is used for Empty/Failed so the
+        // outline tool can surface "summary unavailable" rather than a gap.
+        let ok_texts: Vec<&str> = ok_summaries
             .iter()
             .map(|s| s.summary_text.as_str())
             .collect();
-        let summary_embeddings = self.embedder.embed_documents(&summary_texts).await?;
+        let non_ok_texts: Vec<&str> = non_ok_summaries
+            .iter()
+            .map(|_| UNAVAILABLE_PLACEHOLDER)
+            .collect();
 
-        if summary_embeddings.len() != valid_summaries.len() {
+        let all_texts: Vec<&str> = ok_texts
+            .iter()
+            .copied()
+            .chain(non_ok_texts.iter().copied())
+            .collect();
+
+        let all_summaries_len = ok_summaries.len() + non_ok_summaries.len();
+
+        if all_texts.is_empty() {
+            tracing::debug!(doc_id, "no summary texts to embed; skipping upsert");
+            return Ok(0);
+        }
+
+        let all_embeddings = self.embedder.embed_documents(&all_texts).await?;
+
+        if all_embeddings.len() != all_summaries_len {
             return Err(RetrievalError::Ingestion {
                 reason: format!(
                     "summary embedding count mismatch: got {} embeddings for {} summaries",
-                    summary_embeddings.len(),
-                    valid_summaries.len()
+                    all_embeddings.len(),
+                    all_summaries_len
                 ),
             });
         }
@@ -824,9 +850,10 @@ impl IngestionPipeline {
             );
         }
 
-        let points: Vec<VectorPoint> = valid_summaries
+        // Build points for Ok summaries (real embedding) then non-Ok (placeholder embedding).
+        let points: Vec<VectorPoint> = ok_summaries
             .iter()
-            .zip(summary_embeddings.into_iter())
+            .zip(all_embeddings.iter().cloned())
             .map(|(summary, embedding)| VectorPoint {
                 id: summary.summary_id.clone(),
                 embedding,
@@ -834,6 +861,17 @@ impl IngestionPipeline {
                 text: String::new(),
                 payload: build_summary_payload(summary),
             })
+            .chain(
+                non_ok_summaries
+                    .iter()
+                    .zip(all_embeddings.iter().skip(ok_summaries.len()).cloned())
+                    .map(|(summary, embedding)| VectorPoint {
+                        id: summary.summary_id.clone(),
+                        embedding,
+                        text: String::new(),
+                        payload: build_summary_payload(summary),
+                    }),
+            )
             .collect();
 
         let count = points.len();
@@ -1371,6 +1409,8 @@ impl IngestionPipeline {
             Ok(n) => n,
             Err(e) => {
                 let reason = e.to_string();
+                // Rollback: all prior steps (Qdrant + Neo4j) have written data.
+                self.try_rollback_stores(doc_id, ingest_run_id).await;
                 if let Some(pg) = &self.pg_store {
                     if let Err(pg_err) = pg.mark_partial_failure(ingest_run_id, &reason).await {
                         tracing::warn!(error = %pg_err, %ingest_run_id, "mark_partial_failure failed — row may be stuck in_progress");
@@ -1424,6 +1464,9 @@ impl IngestionPipeline {
                 )
                 .await
             {
+                // All store writes have completed but the postgres commit failed.
+                // Roll back Qdrant + Neo4j so the run leaves no orphaned data.
+                self.try_rollback_stores(doc_id, ingest_run_id).await;
                 return Err(RetrievalError::PostgresCommitFailed {
                     ingest_run_id: ingest_run_id.to_string(),
                     reason: e.to_string(),
@@ -1682,12 +1725,19 @@ fn proto_chunk_to_document_chunk(
     // heading_path contains the full heading hierarchy root-first.
     let headings: Vec<String> = chunk.heading_path.clone();
 
+    let section_id = if chunk.section_id.is_empty() {
+        None
+    } else {
+        Some(chunk.section_id.clone())
+    };
+
     DocumentChunk {
         chunk_id: chunk.chunk_id.clone(),
         doc_id: doc_id.to_owned(),
         content: chunk.embed_text.clone(),
         chunk_index: index,
         total_chunks,
+        section_id,
         metadata: ChunkMetadata {
             source: source.to_owned(),
             page_number: if chunk.page_start > 0 {
