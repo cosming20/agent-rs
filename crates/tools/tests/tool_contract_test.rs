@@ -26,7 +26,7 @@ use agent_rs_stores::traits::StateStore;
 use agent_rs_stores::types::{ChatMessage, EvidenceItem, Memory, QueryRun};
 use agent_rs_tools::{
     DocumentInfoTool, FetchSectionChunksTool, FetchUrlTool, OutlineCorpusTool, RememberTool,
-    SearchKnowledgeTool, SearchNewsTool, SearchWebTool, WebBudgetTracker,
+    SearchKnowledgeTool, SearchNewsTool, SearchSectionsTool, SearchWebTool, WebBudgetTracker,
 };
 use async_trait::async_trait;
 use rig::tool::Tool;
@@ -426,6 +426,25 @@ async fn fetch_section_chunks_tool_definition_contract() {
     assert!(
         req_vals.contains(&"section_id"),
         "fetch_section_chunks must list section_id as required; got: {req_vals:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// SearchSectionsTool — definition contract (stores require live backends).
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn search_sections_tool_definition_contract() {
+    let tool: SearchSectionsTool = serde_json::from_value(json!({}))
+        .expect("SearchSectionsTool should deserialize from {}");
+    let def = tool.definition(String::new()).await;
+    assert_eq!(def.name, "search_sections");
+    assert_tool_contract(&def.name, &def.description, &def.parameters);
+    let desc_lc = def.description.to_lowercase();
+    assert!(
+        desc_lc.contains("batch") || desc_lc.contains("multiple"),
+        "search_sections description must mention batch or multiple: {:?}",
+        def.description
     );
 }
 
