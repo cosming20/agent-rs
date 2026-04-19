@@ -10,7 +10,7 @@
 use std::sync::Arc;
 
 use agent_rs_core::ToolError;
-use agent_rs_stores::postgres::PgStore;
+use agent_rs_stores::postgres::{IngestedDocumentRow, PgStore};
 use rig::completion::ToolDefinition;
 use rig::tool::Tool;
 use serde::{Deserialize, Serialize};
@@ -150,5 +150,100 @@ impl Tool for DocumentInfoTool {
         }
 
         Ok(output)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// resolve_document — free function usable by CoveragePlanner (Task 4.1)
+// ---------------------------------------------------------------------------
+
+/// Find the first ingested document whose `source`, `title`, or
+/// `document_id` (string form) contains `name_or_alias`
+/// (case-insensitive substring). Returns `None` when no document matches.
+///
+/// Used by `CoveragePlanner` (Task 4.1) to resolve user-supplied document
+/// references like "the segmentare PDF" into a concrete `document_id`.
+///
+/// # Examples
+///
+/// ```rust,ignore
+/// let matched = resolve_document(&docs, "segmentare");
+/// assert!(matched.is_some());
+/// ```
+pub fn resolve_document<'a>(
+    docs: &'a [IngestedDocumentRow],
+    name_or_alias: &str,
+) -> Option<&'a IngestedDocumentRow> {
+    let needle = name_or_alias.to_lowercase();
+    docs.iter().find(|d| {
+        d.source.to_lowercase().contains(&needle)
+            || d.title
+                .as_deref()
+                .map_or(false, |t| t.to_lowercase().contains(&needle))
+            || d.document_id.to_string().to_lowercase().contains(&needle)
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use chrono::NaiveDateTime;
+    use uuid::Uuid;
+
+    use super::*;
+
+    /// Build a minimal [`IngestedDocumentRow`] for testing.
+    fn row(source: &str, title: Option<&str>) -> IngestedDocumentRow {
+        let now = NaiveDateTime::default();
+        IngestedDocumentRow {
+            document_id: Uuid::new_v4(),
+            sha256: "abc123".to_string(),
+            source: source.to_string(),
+            ingest_status: "complete".to_string(),
+            ingest_run_id: Uuid::new_v4(),
+            failure_reason: None,
+            docling_version: None,
+            docling_core_version: None,
+            schema_version: None,
+            n_pages: None,
+            n_chunks: None,
+            n_tables: None,
+            n_pictures: None,
+            n_formulas: None,
+            language: None,
+            title: title.map(String::from),
+            mimetype: None,
+            parse_latency_ms: None,
+            total_ingest_latency_ms: None,
+            started_at: now,
+            completed_at: None,
+            updated_at: now,
+        }
+    }
+
+    #[test]
+    fn resolve_document_matches_by_source_substring_case_insensitive() {
+        let docs = vec![
+            row("segmentare.pdf", Some("Segmentare imagini")),
+            row("histograme.pdf", None),
+        ];
+        let r = resolve_document(&docs, "segmentare").expect("expected match");
+        assert_eq!(r.source, "segmentare.pdf");
+    }
+
+    #[test]
+    fn resolve_document_matches_by_title_substring() {
+        let docs = vec![row("foo.pdf", Some("Image Segmentation"))];
+        let r = resolve_document(&docs, "image segmentation").expect("expected match");
+        assert_eq!(r.source, "foo.pdf");
+    }
+
+    #[test]
+    fn resolve_document_returns_none_when_no_match() {
+        let docs = vec![row("foo.pdf", None)];
+        assert!(resolve_document(&docs, "irrelevant").is_none());
     }
 }
