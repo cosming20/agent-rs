@@ -161,6 +161,9 @@ impl Tool for SearchKnowledgeTool {
                 );
             } else {
                 tracing::warn!(
+                    mode = "all_in_section",
+                    section_id = "missing",
+                    fallback = "ranked",
                     "AllInSection mode requested without section_id; falling back to Ranked"
                 );
             }
