@@ -5,6 +5,8 @@
 
 use tracing::warn;
 
+use crate::coverage::{CoverageMode, CoveragePlan};
+
 /// Default system prompt for the RAG agent.
 ///
 /// Three-phase discipline: THINK (silently plan the minimum call sequence),
@@ -20,11 +22,29 @@ THINK (silent). Before calling any tool, identify the specific fact or \
 explanation the user wants, the right tool, and the shortest query that would \
 surface it. Prefer one strong call over many weak ones.
 
-ACT. Match the request to exactly one tool using the decision table below, \
-then issue the call. Prefer one strong call over many weak ones. If the \
-first search returns thin or off-topic results, retry ONCE with a better \
-query or a different strategy — do not loop. If after two attempts the \
-evidence is still weak, answer with the available material and say so.
+ACT. Match the request to the right tool using the routing rules below. \
+Two modes are in effect depending on whether a COVERAGE_PLAN block is \
+present in this prompt.
+
+TOOL ROUTING
+
+Default discipline (single-call): for definition, how-to, lookup, and \
+comparative queries, issue exactly ONE search_knowledge call with a focused \
+query, then synthesize. Do not loop.
+
+EXHAUSTIVE MODE — when a COVERAGE_PLAN block is present in this prompt, \
+the upstream coverage planner has already enumerated every section the user \
+wants covered. You MUST:
+
+  1. Issue exactly ONE search_sections call with section_ids = the section \
+ids listed in the COVERAGE_PLAN block below. Do NOT call search_knowledge \
+first; the plan is authoritative.
+  2. After search_sections returns, synthesize from the merged evidence.
+  3. If a section comes back empty (marked \"(no chunks)\"), you MAY issue \
+ONE targeted follow-up search_knowledge call with the missing section's \
+heading as the query.
+
+BUDGET: max 5 turns total. The exhaustive path uses 2-3 turns by design.
 
 TOOL DECISION TABLE
 
@@ -212,6 +232,44 @@ If every Y-claim is supported, is_grounded=true with high confidence.
 is_grounded=true, confidence=1.0 (the honest refusal is itself grounded).
 ";
 
+/// Build the `COVERAGE_PLAN` prompt block from an optional [`CoveragePlan`].
+///
+/// Returns `None` when the plan is absent or its mode is [`CoverageMode::None`]
+/// (i.e., default single-call discipline applies). Returns `Some(block)` when
+/// the mode is `Exhaustive` or `Partial`, in which case the block is appended
+/// to the system/user prompt so the model can copy section_ids verbatim into
+/// its `search_sections` call.
+///
+/// # Examples
+///
+/// ```rust
+/// use agent_rs_agent::prompts::build_coverage_plan_block;
+/// let block = build_coverage_plan_block(None);
+/// assert!(block.is_none());
+/// ```
+pub fn build_coverage_plan_block(plan: Option<&CoveragePlan>) -> Option<String> {
+    let plan = plan?;
+    if plan.mode == CoverageMode::None {
+        return None;
+    }
+    if plan.target_sections.is_empty() {
+        return None;
+    }
+    let lines: Vec<String> = plan
+        .target_sections
+        .iter()
+        .map(|s| format!("  - section_id: {}  (heading: \"{}\")", s.section_id, s.heading))
+        .collect();
+    Some(format!(
+        "\n\n# COVERAGE_PLAN (mode: {:?}, {} sections)\n\n\
+         You MUST cover the following sections via a SINGLE search_sections \
+         call:\n\n{}\n",
+        plan.mode,
+        plan.target_sections.len(),
+        lines.join("\n")
+    ))
+}
+
 /// Load the system prompt from a file path, falling back to [`DEFAULT_SYSTEM_PROMPT`].
 ///
 /// If `file_path` is empty or the file cannot be read, returns the default.
@@ -238,5 +296,90 @@ pub fn load_system_prompt(file_path: &str) -> String {
             );
             DEFAULT_SYSTEM_PROMPT.to_owned()
         }
+    }
+}
+
+#[cfg(test)]
+mod tests_coverage_plan_in_prompt {
+    use super::*;
+    use crate::coverage::{CoverageMode, CoveragePlan, SectionRef};
+
+    #[test]
+    fn coverage_plan_block_omitted_when_no_plan() {
+        let block = build_coverage_plan_block(None);
+        assert!(block.is_none());
+    }
+
+    #[test]
+    fn coverage_plan_block_omitted_when_mode_none() {
+        let plan = CoveragePlan::default();
+        let block = build_coverage_plan_block(Some(&plan));
+        assert!(block.is_none());
+    }
+
+    #[test]
+    fn coverage_plan_block_omitted_when_mode_none_even_with_sections() {
+        let plan = CoveragePlan {
+            mode: CoverageMode::None,
+            target_sections: vec![SectionRef {
+                section_id: "s1".into(),
+                doc_id: "d".into(),
+                heading: "Intro".into(),
+            }],
+        };
+        let block = build_coverage_plan_block(Some(&plan));
+        assert!(block.is_none());
+    }
+
+    #[test]
+    fn coverage_plan_block_omitted_when_exhaustive_but_no_sections() {
+        let plan = CoveragePlan {
+            mode: CoverageMode::Exhaustive,
+            target_sections: vec![],
+        };
+        let block = build_coverage_plan_block(Some(&plan));
+        assert!(block.is_none());
+    }
+
+    #[test]
+    fn coverage_plan_block_lists_section_ids_and_headings() {
+        let plan = CoveragePlan {
+            mode: CoverageMode::Exhaustive,
+            target_sections: vec![
+                SectionRef {
+                    section_id: "s1".into(),
+                    doc_id: "d".into(),
+                    heading: "5.1 Foo".into(),
+                },
+                SectionRef {
+                    section_id: "s2".into(),
+                    doc_id: "d".into(),
+                    heading: "5.2 Bar".into(),
+                },
+            ],
+        };
+        let block = build_coverage_plan_block(Some(&plan)).expect("plan present");
+        assert!(block.contains("s1"), "block must contain s1");
+        assert!(block.contains("5.1 Foo"), "block must contain heading 5.1 Foo");
+        assert!(block.contains("s2"), "block must contain s2");
+        assert!(block.contains("5.2 Bar"), "block must contain heading 5.2 Bar");
+        assert!(block.contains("search_sections"), "block must mention search_sections");
+        assert!(block.to_lowercase().contains("must"), "block must contain 'must'");
+        assert!(block.contains("2 sections"), "block must state section count");
+    }
+
+    #[test]
+    fn coverage_plan_block_partial_mode_included() {
+        let plan = CoveragePlan {
+            mode: CoverageMode::Partial,
+            target_sections: vec![SectionRef {
+                section_id: "s3".into(),
+                doc_id: "d".into(),
+                heading: "Ch3".into(),
+            }],
+        };
+        let block = build_coverage_plan_block(Some(&plan)).expect("partial plan should produce block");
+        assert!(block.contains("s3"));
+        assert!(block.contains("Partial"));
     }
 }
