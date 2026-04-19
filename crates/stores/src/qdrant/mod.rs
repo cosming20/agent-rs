@@ -446,6 +446,32 @@ impl VectorStore for QdrantStore {
 // ---- QdrantStore inherent methods ----
 
 impl QdrantStore {
+    /// Fetch payload-only projections for a list of chunk ids.
+    ///
+    /// Thin wrapper around [`VectorStore::get_by_ids`] that accepts a plain
+    /// `&str` collection name, sparing callers from constructing a
+    /// [`CollectionName`] themselves. Used by `fetch_section_chunks` and
+    /// similar tools that already know the ids they want and do not need
+    /// vector data.
+    ///
+    /// Ids that do not resolve to a stored point are silently dropped; the
+    /// caller sees only hits.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError`] on Qdrant gRPC failure.
+    #[instrument(skip(self, ids), fields(collection, n_ids = ids.len()))]
+    pub async fn retrieve_chunks_by_ids(
+        &self,
+        collection: &str,
+        ids: &[String],
+    ) -> Result<Vec<crate::types::PointPayload>, StoreError> {
+        use crate::traits::VectorStore as _;
+
+        let coll = agent_rs_core::CollectionName::from_string(collection.to_owned());
+        self.get_by_ids(&coll, ids).await
+    }
+
     /// Return the `summary_text` of the first stored summary whose payload
     /// matches `section_id`. Returns `Ok(None)` when no matching point exists.
     ///

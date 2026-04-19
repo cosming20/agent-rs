@@ -25,8 +25,8 @@ use agent_rs_core::config::{BraveConfig, FetchConfig, WebBudgetConfig};
 use agent_rs_stores::traits::StateStore;
 use agent_rs_stores::types::{ChatMessage, EvidenceItem, Memory, QueryRun};
 use agent_rs_tools::{
-    DocumentInfoTool, FetchUrlTool, OutlineCorpusTool, RememberTool, SearchKnowledgeTool,
-    SearchNewsTool, SearchWebTool, WebBudgetTracker,
+    DocumentInfoTool, FetchSectionChunksTool, FetchUrlTool, OutlineCorpusTool, RememberTool,
+    SearchKnowledgeTool, SearchNewsTool, SearchWebTool, WebBudgetTracker,
 };
 use async_trait::async_trait;
 use rig::tool::Tool;
@@ -388,6 +388,45 @@ async fn search_knowledge_tool_definition_contract() {
             "strategy enum missing advertised value {want:?}; tool enum = {enum_vals:?}"
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// FetchSectionChunksTool — definition contract (stores require live backends).
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn fetch_section_chunks_tool_definition_contract() {
+    // All store fields are `#[serde(skip)]`, so `{}` deserializes to `None`
+    // for each. `definition()` never touches the stores.
+    let tool: FetchSectionChunksTool = serde_json::from_value(json!({}))
+        .expect("FetchSectionChunksTool should deserialize from {}");
+    let def = tool.definition(String::new()).await;
+    assert_eq!(def.name, "fetch_section_chunks");
+    assert_tool_contract(&def.name, &def.description, &def.parameters);
+
+    let desc_lc = def.description.to_lowercase();
+    assert!(
+        desc_lc.contains("section"),
+        "fetch_section_chunks description must contain 'section': {:?}",
+        def.description
+    );
+    assert!(
+        desc_lc.contains("exhaustive") || desc_lc.contains("all"),
+        "fetch_section_chunks description must mention exhaustive retrieval: {:?}",
+        def.description
+    );
+
+    // section_id must be a required field.
+    let required = def
+        .parameters
+        .get("required")
+        .and_then(Value::as_array)
+        .expect("fetch_section_chunks must declare required fields");
+    let req_vals: Vec<&str> = required.iter().filter_map(Value::as_str).collect();
+    assert!(
+        req_vals.contains(&"section_id"),
+        "fetch_section_chunks must list section_id as required; got: {req_vals:?}"
+    );
 }
 
 // ---------------------------------------------------------------------------
