@@ -280,10 +280,19 @@ impl AgentRunner {
         Ok(())
     }
 
-    /// Build a full prompt from chat history context.
+    /// Build a full prompt from chat history context, injecting the
+    /// `COVERAGE_PLAN` block when the query context carries an exhaustive or
+    /// partial coverage plan.
+    ///
+    /// The coverage block is appended **after** the user query so the model
+    /// sees the list of section ids it must call `search_sections` with
+    /// immediately before it decides which tool to invoke.
     fn build_prompt(&self, ctx: &QueryContext) -> String {
+        let coverage_suffix = prompts::build_coverage_plan_block(ctx.coverage_plan.as_ref())
+            .unwrap_or_default();
+
         if ctx.chat_messages.is_empty() {
-            return ctx.query.clone();
+            return format!("{}{}", ctx.query, coverage_suffix);
         }
 
         let mut parts: Vec<String> = Vec::new();
@@ -302,7 +311,8 @@ impl AgentRunner {
             parts.push(ctx.query.clone());
         }
 
-        parts.join("\n\n")
+        let base = parts.join("\n\n");
+        format!("{}{}", base, coverage_suffix)
     }
 }
 
@@ -329,6 +339,9 @@ async fn drain_tool_calls(sink: &ToolCallSink, target: &mut Vec<ToolCallRecord>)
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::context::QueryContext;
+    use crate::coverage::{CoverageMode, CoveragePlan, SectionRef};
+    use agent_rs_core::types::{MessageRole, RetrievalStrategy, SessionId, UserId};
     use rig::completion::ToolDefinition;
     use serde_json::json;
 
@@ -451,5 +464,85 @@ mod tests {
         assert_eq!(guard.len(), 2);
         assert_eq!(guard[0].tool_name, "tool_a");
         assert_eq!(guard[1].tool_name, "tool_b");
+    }
+
+    // ---- build_prompt + coverage plan injection tests -----
+
+    fn make_ctx(query: &str) -> QueryContext {
+        QueryContext::new(
+            query.to_owned(),
+            SessionId::new(),
+            UserId::from_string("test-user".into()),
+            RetrievalStrategy::GraphHybrid,
+            10,
+            MessageRole::User,
+        )
+    }
+
+    #[test]
+    fn build_prompt_no_coverage_plan_returns_query() {
+        // Create a minimal AgentRunner-like struct to call build_prompt.
+        // We can't construct AgentRunner without a real API key, so we test
+        // the helper function directly via the free function below.
+        let ctx = make_ctx("what is segmentation?");
+        let prompt = build_prompt_for_test(&ctx);
+        assert_eq!(prompt, "what is segmentation?");
+        assert!(!prompt.contains("COVERAGE_PLAN"));
+    }
+
+    #[test]
+    fn build_prompt_with_coverage_plan_appends_block() {
+        let mut ctx = make_ctx("explain all segmentation methods");
+        ctx.coverage_plan = Some(CoveragePlan {
+            mode: CoverageMode::Exhaustive,
+            target_sections: vec![
+                SectionRef {
+                    section_id: "sec-1".into(),
+                    doc_id: "doc-a".into(),
+                    heading: "5.1 Region Growing".into(),
+                },
+                SectionRef {
+                    section_id: "sec-2".into(),
+                    doc_id: "doc-a".into(),
+                    heading: "5.2 Watershed".into(),
+                },
+            ],
+        });
+        let prompt = build_prompt_for_test(&ctx);
+        assert!(prompt.starts_with("explain all segmentation methods"));
+        assert!(prompt.contains("COVERAGE_PLAN"));
+        assert!(prompt.contains("sec-1"));
+        assert!(prompt.contains("5.1 Region Growing"));
+        assert!(prompt.contains("sec-2"));
+        assert!(prompt.contains("search_sections"));
+    }
+
+    #[test]
+    fn build_prompt_mode_none_no_coverage_block() {
+        let mut ctx = make_ctx("what is X?");
+        ctx.coverage_plan = Some(CoveragePlan::default());
+        let prompt = build_prompt_for_test(&ctx);
+        assert_eq!(prompt, "what is X?");
+        assert!(!prompt.contains("COVERAGE_PLAN"));
+    }
+
+    /// Free function mirroring `AgentRunner::build_prompt` logic for test
+    /// access without constructing a live `AgentRunner`.
+    fn build_prompt_for_test(ctx: &QueryContext) -> String {
+        let coverage_suffix =
+            prompts::build_coverage_plan_block(ctx.coverage_plan.as_ref()).unwrap_or_default();
+        if ctx.chat_messages.is_empty() {
+            return format!("{}{}", ctx.query, coverage_suffix);
+        }
+        let mut parts: Vec<String> = Vec::new();
+        if !ctx.conversation_context.is_empty() {
+            parts.push(format!("[Conversation context]\n{}", ctx.conversation_context));
+        }
+        if let Some(last) = ctx.chat_messages.last() {
+            parts.push(last.clone());
+        } else {
+            parts.push(ctx.query.clone());
+        }
+        format!("{}{}", parts.join("\n\n"), coverage_suffix)
     }
 }
