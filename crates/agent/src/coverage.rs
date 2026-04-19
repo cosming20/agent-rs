@@ -1,10 +1,14 @@
 //! Coverage planning & verification types.
 //!
-//! `CoveragePlan` is built by [`crate::steps::coverage_planner::CoveragePlanner`]
-//! when an exhaustive-intent query is detected. It enumerates the sections the
-//! pipeline must cover. After tool calls complete, [`crate::steps::coverage_verifier::CoverageVerifier`]
-//! produces a [`CoverageReport`] showing how much of the plan was actually
-//! satisfied by retrieved evidence.
+//! `CoveragePlan` is built by `CoveragePlanner` (added in Task 4.1) when an
+//! exhaustive-intent query is detected. It enumerates the sections the
+//! pipeline must cover. After tool calls complete, `CoverageVerifier`
+//! (added in Task 4.2) produces a [`CoverageReport`] showing how much of the
+//! plan was actually satisfied by retrieved evidence.
+//!
+//! Intra-doc links to those types intentionally use plain backticks rather
+//! than `[crate::steps::…]` paths until the modules land — `cargo doc`
+//! would otherwise emit broken-link warnings during the staged rollout.
 
 use std::collections::HashSet;
 
@@ -87,6 +91,19 @@ impl CoverageReport {
 
 /// Captured tool invocation (args + which tool) used by the grounding gate to
 /// extract the rewritten subject query rather than the raw user prompt.
+///
+/// `args_json` is the **JSON-serialised tool arguments** as the agent emitted
+/// them — i.e. the same payload the tool's `Args` deserialiser consumed.
+/// Consumers that need a specific field (typically `query` for
+/// `search_knowledge` / `search_sections` / `fetch_section_chunks`) should
+/// `serde_json::from_str` it into a small purpose-built struct rather than
+/// regex-scanning the string.
+///
+/// Producer: `crate::steps::agent_runner` (Task 4.5) records one entry per
+/// tool invocation in `QueryContext::tool_calls`.
+/// Consumer: `crate::steps::grounding_gate::subject_absent_v2` (Task 5.1)
+/// reads each record's `query` field to derive the subject phrase used for
+/// the phrase-presence check.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolCallRecord {
     pub tool_name: String,
