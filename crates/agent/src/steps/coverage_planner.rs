@@ -105,16 +105,26 @@ impl CoveragePlanner {
             return;
         }
 
-        // Resolve target docs. Today: every ingested doc.
-        // Future: use document_info::resolve_document if the query references
-        // a specific doc name.
-        let docs = match self.pg.list_ingested_documents().await {
+        // Resolve target docs. If the query names specific ingested
+        // documents (by `source` filename or `title` substring, case-
+        // insensitive), target only those. Otherwise fall back to every
+        // ingested doc — preserves the previous single-corpus behaviour.
+        let all_docs = match self.pg.list_ingested_documents().await {
             Ok(d) => d,
             Err(e) => {
                 warn!(error = %e, "coverage_planner: failed to list docs; skipping plan");
                 return;
             }
         };
+
+        let docs = filter_docs_by_query(&ctx.query, &all_docs);
+        if docs.len() < all_docs.len() {
+            tracing::info!(
+                matched = docs.len(),
+                total = all_docs.len(),
+                "coverage_planner: query references specific documents"
+            );
+        }
 
         let mut targets: Vec<SectionRef> = Vec::new();
         for doc in docs {
@@ -253,6 +263,71 @@ pub(crate) fn detect_intent_with_signal(q: &str) -> IntentSignal {
     }
 }
 
+// ---- Multi-document scoping ----
+
+/// Minimum token length considered as a document-name hint.
+///
+/// Shorter substrings ("a", "pe", "the") match everything and would
+/// cause every ingested document to look "named" in the query.
+const DOC_NAME_MIN_LEN: usize = 4;
+
+/// Filter `all_docs` to only those whose `source` filename stem or
+/// `title` substring appears in the query (case-insensitive, normalised
+/// on non-alphanumeric boundaries). If the query names no ingested
+/// document, returns the full slice — preserves the previous
+/// "all-corpus exhaustive" behaviour so single-doc deployments keep
+/// working unchanged.
+pub(crate) fn filter_docs_by_query<'a>(
+    query: &str,
+    all_docs: &'a [agent_rs_stores::postgres::IngestedDocumentRow],
+) -> Vec<&'a agent_rs_stores::postgres::IngestedDocumentRow> {
+    let lc_query = query.to_lowercase();
+
+    let matched: Vec<&agent_rs_stores::postgres::IngestedDocumentRow> = all_docs
+        .iter()
+        .filter(|d| doc_referenced_in_query(&lc_query, d))
+        .collect();
+
+    if matched.is_empty() {
+        all_docs.iter().collect()
+    } else {
+        matched
+    }
+}
+
+/// True when `lc_query` references this document by filename stem or
+/// title substring. All comparisons are case-insensitive; candidate
+/// strings below [`DOC_NAME_MIN_LEN`] are ignored to avoid matching
+/// every doc on high-frequency short tokens.
+fn doc_referenced_in_query(
+    lc_query: &str,
+    doc: &agent_rs_stores::postgres::IngestedDocumentRow,
+) -> bool {
+    // Source filename: strip extension, take the stem.
+    let stem: String = doc
+        .source
+        .rsplit_once('.')
+        .map(|(pre, _)| pre.to_lowercase())
+        .unwrap_or_else(|| doc.source.to_lowercase());
+    if stem.chars().count() >= DOC_NAME_MIN_LEN && lc_query.contains(&stem) {
+        return true;
+    }
+
+    // Title: split on non-alphanumeric into candidate tokens, require
+    // at least one ≥4-char token of the title to appear in the query.
+    if let Some(title) = doc.title.as_deref() {
+        let lc_title = title.to_lowercase();
+        let any_hit = lc_title
+            .split(|c: char| !c.is_alphanumeric())
+            .any(|t| t.chars().count() >= DOC_NAME_MIN_LEN && lc_query.contains(t));
+        if any_hit {
+            return true;
+        }
+    }
+
+    false
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -277,5 +352,89 @@ mod tests {
         let r = detect_intent_with_signal("give me the complete picture");
         assert_eq!(r.mode, CoverageMode::None);
         assert!(r.soft_heuristic_fired);
+    }
+
+    // ---- Multi-document scoping tests ----
+
+    fn doc_row(source: &str, title: Option<&str>) -> agent_rs_stores::postgres::IngestedDocumentRow {
+        agent_rs_stores::postgres::IngestedDocumentRow {
+            document_id: uuid::Uuid::nil(),
+            sha256: String::new(),
+            source: source.to_string(),
+            ingest_status: "complete".to_string(),
+            ingest_run_id: uuid::Uuid::nil(),
+            failure_reason: None,
+            docling_version: None,
+            docling_core_version: None,
+            schema_version: None,
+            n_pages: None,
+            n_chunks: None,
+            n_tables: None,
+            n_pictures: None,
+            n_formulas: None,
+            language: None,
+            title: title.map(String::from),
+            mimetype: None,
+            parse_latency_ms: None,
+            total_ingest_latency_ms: None,
+            started_at: chrono::NaiveDateTime::default(),
+            completed_at: None,
+            updated_at: chrono::NaiveDateTime::default(),
+        }
+    }
+
+    #[test]
+    fn filter_returns_all_docs_when_query_names_none() {
+        let docs = vec![
+            doc_row("segmentare.pdf", Some("Image Segmentation")),
+            doc_row("histograme.pdf", None),
+        ];
+        let filtered = filter_docs_by_query("ce este metoda Otsu", &docs);
+        assert_eq!(filtered.len(), 2, "fallback must preserve all-corpus behaviour");
+    }
+
+    #[test]
+    fn filter_matches_source_filename_stem() {
+        let docs = vec![
+            doc_row("segmentare.pdf", None),
+            doc_row("histograme.pdf", None),
+        ];
+        let filtered = filter_docs_by_query("vreau lista din segmentare", &docs);
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].source, "segmentare.pdf");
+    }
+
+    #[test]
+    fn filter_matches_title_substring_case_insensitive() {
+        let docs = vec![
+            doc_row("a.pdf", Some("Image Segmentation handbook")),
+            doc_row("b.pdf", Some("Network Protocols")),
+        ];
+        let filtered = filter_docs_by_query("enumerate methods from the segmentation paper", &docs);
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].source, "a.pdf");
+    }
+
+    #[test]
+    fn filter_ignores_tokens_shorter_than_four_chars() {
+        let docs = vec![doc_row("a.pdf", Some("API Guide"))];
+        // "api" is 3 chars — must NOT match alone.
+        let filtered = filter_docs_by_query("explain the api", &docs);
+        // Fallback kicks in (no doc matched) → returns all docs.
+        assert_eq!(filtered.len(), 1);
+    }
+
+    #[test]
+    fn filter_returns_multiple_when_query_names_both() {
+        let docs = vec![
+            doc_row("segmentare.pdf", None),
+            doc_row("histograme.pdf", None),
+            doc_row("preprocessing.pdf", None),
+        ];
+        let filtered = filter_docs_by_query(
+            "compară metodele din segmentare cu cele din histograme",
+            &docs,
+        );
+        assert_eq!(filtered.len(), 2);
     }
 }
