@@ -140,6 +140,19 @@ impl Tool for SearchKnowledgeTool {
                     "limit": {
                         "type": "integer",
                         "description": "Max evidence chunks to return (default 10). Use 5 for focused definition queries, 10 for exploratory, 15-20 only when you need breadth."
+                    },
+                    "doc_id": {
+                        "type": "string",
+                        "description": "Optional. Restrict retrieval to chunks from ONE specific document. Pass the UUID you discovered via document_info or outline_corpus. Use when the user names a document ('in the segmentare PDF', 'from doc X') or compares documents."
+                    },
+                    "section_id": {
+                        "type": "string",
+                        "description": "Optional. Restrict retrieval to chunks from ONE specific section. Pass a section UUID from outline_corpus. Prefer fetch_section_chunks if you want the WHOLE section; this field narrows a ranked query to that section."
+                    },
+                    "mode": {
+                        "type": "string",
+                        "enum": ["ranked", "all_in_section"],
+                        "description": "Retrieval mode. Default 'ranked' runs the full router (vector + BM25 + graph + rerank). Use 'all_in_section' with a section_id to bypass ranking entirely — returns every chunk in that section, unranked."
                     }
                 },
                 "required": ["query"]
