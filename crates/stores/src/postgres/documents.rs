@@ -16,7 +16,7 @@
 //!
 //! All queries use Diesel's typed DSL — no raw SQL string interpolation.
 
-use agent_rs_core::{IngestStatus, StoreError};
+use agent_rs_core::{IngestStatus, StoreError, UserId};
 use chrono::Utc;
 use diesel::prelude::*;
 use diesel_async::RunQueryDsl;
@@ -72,10 +72,13 @@ pub struct HeaderMetadata {
 
 impl PgStore {
     /// Open a new ingestion record for `new_doc` or determine the state of an
-    /// existing record for the same SHA-256.
+    /// existing record for the same `(user_id, sha256)` pair.
     ///
-    /// Uses `INSERT … ON CONFLICT (sha256) DO NOTHING` to serialize concurrent
-    /// attempts for the same document without taking a lock.
+    /// Dedup is scoped per-tenant: two different users uploading the same
+    /// file each receive a distinct `document_id` and independent lifecycle.
+    ///
+    /// Uses `INSERT … ON CONFLICT (user_id, sha256) DO NOTHING` to serialise
+    /// concurrent attempts for the same (user, document) without taking a lock.
     ///
     /// # Returns
     ///
@@ -93,18 +96,19 @@ impl PgStore {
     /// Returns [`StoreError::Postgres`] on any database error, or
     /// [`StoreError::InvalidState`] if `ingest_status` contains an
     /// unrecognised value.
-    #[instrument(skip(self, new_doc), fields(sha256 = %new_doc.sha256))]
+    #[instrument(skip(self, new_doc), fields(sha256 = %new_doc.sha256, user_id = %user_id.as_str()))]
     pub async fn begin_ingestion(
         &self,
+        user_id: &UserId,
         new_doc: NewIngestedDocument,
     ) -> Result<BeginIngestionOutcome, StoreError> {
         let mut conn = self.conn().await?;
 
-        // Attempt insert; on conflict (duplicate sha256) do nothing and
-        // return no row, which we detect via `.optional()`.
+        // Attempt insert; on conflict (duplicate (user_id, sha256)) do nothing
+        // and return no row, which we detect via `.optional()`.
         let inserted: Option<IngestedDocumentRow> = diesel::insert_into(ingested_documents::table)
             .values(&new_doc)
-            .on_conflict(ingested_documents::sha256)
+            .on_conflict((ingested_documents::user_id, ingested_documents::sha256))
             .do_nothing()
             .returning(IngestedDocumentRow::as_returning())
             .get_result(&mut conn)
@@ -117,8 +121,10 @@ impl PgStore {
                 ingest_run_id: row.ingest_run_id,
             }),
             None => {
-                // Row already exists; fetch it to inspect status.
+                // Row already exists for this (user_id, sha256); fetch it to
+                // inspect status.
                 let existing: IngestedDocumentRow = ingested_documents::table
+                    .filter(ingested_documents::user_id.eq(user_id.as_str()))
                     .filter(ingested_documents::sha256.eq(&new_doc.sha256))
                     .select(IngestedDocumentRow::as_select())
                     .first(&mut conn)
@@ -139,6 +145,7 @@ impl PgStore {
                         if age_minutes >= 15 {
                             tracing::warn!(
                                 sha256 = %existing.sha256,
+                                user_id = %user_id.as_str(),
                                 age_minutes,
                                 old_run_id = %existing.ingest_run_id,
                                 "in_progress row older than 15 min — treating as abandoned"
@@ -146,6 +153,7 @@ impl PgStore {
                             let new_run_id = Uuid::new_v4();
                             let now = Utc::now().naive_utc();
                             diesel::update(ingested_documents::table)
+                                .filter(ingested_documents::user_id.eq(user_id.as_str()))
                                 .filter(ingested_documents::sha256.eq(&new_doc.sha256))
                                 .set((
                                     ingested_documents::ingest_run_id.eq(new_run_id),
@@ -168,6 +176,7 @@ impl PgStore {
                         let now = Utc::now().naive_utc();
 
                         diesel::update(ingested_documents::table)
+                            .filter(ingested_documents::user_id.eq(user_id.as_str()))
                             .filter(ingested_documents::sha256.eq(&new_doc.sha256))
                             .set((
                                 ingested_documents::ingest_status
@@ -266,7 +275,45 @@ impl PgStore {
         Ok(())
     }
 
-    /// Return `true` if a document with `sha256` has `ingest_status = 'complete'`.
+    /// Persist the MinIO object key for an `ingested_documents` row identified
+    /// by `(user_id, document_id)`.
+    ///
+    /// Called by the ingest CLI after a successful `MinioStore::put_object` so
+    /// the object key is recorded in Postgres alongside the pipeline metadata.
+    /// The update is idempotent: re-running the CLI for a document that was
+    /// already uploaded just overwrites the key with the same value.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::Postgres`] on any database error.
+    #[instrument(skip(self), fields(document_id = %document_id, user_id = %user_id.as_str()))]
+    pub async fn set_minio_object_key(
+        &self,
+        user_id: &UserId,
+        document_id: Uuid,
+        object_key: &str,
+    ) -> Result<(), StoreError> {
+        let mut conn = self.conn().await?;
+        let now = Utc::now().naive_utc();
+
+        diesel::update(ingested_documents::table)
+            .filter(ingested_documents::user_id.eq(user_id.as_str()))
+            .filter(ingested_documents::document_id.eq(document_id))
+            .set((
+                ingested_documents::minio_object_key.eq(Some(object_key)),
+                ingested_documents::updated_at.eq(now),
+            ))
+            .execute(&mut conn)
+            .await
+            .map_err(StoreError::from)?;
+
+        Ok(())
+    }
+
+    /// Return `true` if a document with `sha256` has `ingest_status = 'complete'`
+    /// **and** is owned by `user_id`.
+    ///
+    /// Scoped to a single tenant: bob cannot probe alice's sha256 fingerprint.
     ///
     /// This is the fast-path dedup check: callers can skip ingestion entirely
     /// when this returns `true`.
@@ -274,8 +321,12 @@ impl PgStore {
     /// # Errors
     ///
     /// Returns [`StoreError::Postgres`] on any database error.
-    #[instrument(skip(self), fields(sha256 = %sha256))]
-    pub async fn is_already_ingested_complete(&self, sha256: &str) -> Result<bool, StoreError> {
+    #[instrument(skip(self), fields(sha256 = %sha256, user_id = %user_id.as_str()))]
+    pub async fn is_already_ingested_complete(
+        &self,
+        user_id: &UserId,
+        sha256: &str,
+    ) -> Result<bool, StoreError> {
         use diesel::dsl::exists;
         use diesel::select;
 
@@ -283,6 +334,7 @@ impl PgStore {
 
         let found: bool = select(exists(
             ingested_documents::table
+                .filter(ingested_documents::user_id.eq(user_id.as_str()))
                 .filter(ingested_documents::sha256.eq(sha256))
                 .filter(ingested_documents::ingest_status.eq(IngestStatus::Complete.as_str())),
         ))
@@ -293,10 +345,12 @@ impl PgStore {
         Ok(found)
     }
 
-    /// Fetch the `ingested_documents` row identified by `sha256`.
+    /// Fetch the `ingested_documents` row identified by `(user_id, sha256)`.
     ///
-    /// Returns `None` if no row exists for the given sha256 (i.e., the document
-    /// was never ingested or was already deleted).
+    /// Returns `None` if no row exists for the given user + sha256 (i.e., the
+    /// document was never ingested by this user, or was already deleted).
+    ///
+    /// Scoped to a single tenant: bob cannot retrieve alice's row by sha256.
     ///
     /// Used by `IngestCoordinator::cleanup_partial` (W3) to fetch the
     /// `ingest_run_id` needed to roll back Qdrant and Neo4j before deleting
@@ -305,14 +359,16 @@ impl PgStore {
     /// # Errors
     ///
     /// Returns [`StoreError::Postgres`] on any database error.
-    #[instrument(skip(self), fields(sha256 = %sha256))]
+    #[instrument(skip(self), fields(sha256 = %sha256, user_id = %user_id.as_str()))]
     pub async fn get_ingested_document_by_sha256(
         &self,
+        user_id: &UserId,
         sha256: &str,
     ) -> Result<Option<IngestedDocumentRow>, StoreError> {
         let mut conn = self.conn().await?;
 
         ingested_documents::table
+            .filter(ingested_documents::user_id.eq(user_id.as_str()))
             .filter(ingested_documents::sha256.eq(sha256))
             .select(IngestedDocumentRow::as_select())
             .first(&mut conn)
@@ -343,15 +399,140 @@ impl PgStore {
         Ok(())
     }
 
-    /// List all ingested documents (for the `document_info` tool).
-    #[instrument(skip(self))]
-    pub async fn list_ingested_documents(&self) -> Result<Vec<IngestedDocumentRow>, StoreError> {
+    /// List every ingested document owned by `user_id` that has
+    /// `ingest_status = 'complete'`.
+    ///
+    /// Partial, failed, in-progress, and deleting rows are never visible to
+    /// the caller — they represent transient pipeline state, not user-owned
+    /// data.  Results are ordered newest-first by `started_at`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::Postgres`] on any database error.
+    #[instrument(skip(self), fields(user_id = %user_id.as_str()))]
+    pub async fn list_ingested_documents(
+        &self,
+        user_id: &UserId,
+    ) -> Result<Vec<IngestedDocumentRow>, StoreError> {
         let mut conn = self.conn().await?;
 
         ingested_documents::table
+            .filter(ingested_documents::user_id.eq(user_id.as_str()))
+            .filter(ingested_documents::ingest_status.eq(IngestStatus::Complete.as_str()))
             .select(IngestedDocumentRow::as_select())
             .order(ingested_documents::started_at.desc())
             .load(&mut conn)
+            .await
+            .map_err(StoreError::from)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Test helpers
+// ---------------------------------------------------------------------------
+
+#[cfg(any(test, feature = "integration-tests"))]
+impl PgStore {
+    /// Insert a minimal `ingest_status='complete'` row, bypassing the full
+    /// ingest saga.  Intended for security / multi-tenant integration tests
+    /// where the pipeline itself is out of scope.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::Postgres`] on any database error.
+    pub async fn test_insert_document_complete(
+        &self,
+        user_id: &UserId,
+        source: &str,
+    ) -> Result<IngestedDocumentRow, StoreError> {
+        self.test_insert_document_with_status(user_id, source, "complete")
+            .await
+    }
+
+    /// Insert a row with an arbitrary `ingest_status` value.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::Postgres`] on any database error.
+    pub async fn test_insert_document_with_status(
+        &self,
+        user_id: &UserId,
+        source: &str,
+        status: &str,
+    ) -> Result<IngestedDocumentRow, StoreError> {
+        use chrono::Utc;
+        let mut conn = self.conn().await?;
+        let new_id = Uuid::new_v4();
+        let new_run = Uuid::new_v4();
+        // Build a deterministic 64-char hex string from the UUID (no dashes,
+        // padded/trimmed to exactly 64 chars to satisfy the `bpchar(64)` column).
+        let raw = new_id.as_simple().to_string(); // 32 hex chars
+        let sha = format!("{raw:0>64}"); // left-pad with '0' to 64 chars
+        let sha = &sha[..64];
+        let now = Utc::now().naive_utc();
+
+        diesel::insert_into(ingested_documents::table)
+            .values((
+                ingested_documents::document_id.eq(new_id),
+                ingested_documents::sha256.eq(sha),
+                ingested_documents::source.eq(source),
+                ingested_documents::ingest_status.eq(status),
+                ingested_documents::ingest_run_id.eq(new_run),
+                ingested_documents::user_id.eq(user_id.as_str()),
+                ingested_documents::started_at.eq(now),
+                ingested_documents::updated_at.eq(now),
+            ))
+            .execute(&mut conn)
+            .await
+            .map_err(StoreError::from)?;
+
+        ingested_documents::table
+            .filter(ingested_documents::document_id.eq(new_id))
+            .select(IngestedDocumentRow::as_select())
+            .first(&mut conn)
+            .await
+            .map_err(StoreError::from)
+    }
+
+    /// Insert a `complete` row with an explicit `sha256` value.
+    ///
+    /// Used for the cross-user same-SHA dedup test: callers supply the same
+    /// sha for two different users and assert they get separate `document_id`s.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::Postgres`] on any database error.
+    pub async fn test_insert_document_with_sha(
+        &self,
+        user_id: &UserId,
+        source: &str,
+        sha256: &str,
+    ) -> Result<IngestedDocumentRow, StoreError> {
+        use chrono::Utc;
+        let mut conn = self.conn().await?;
+        let new_id = Uuid::new_v4();
+        let new_run = Uuid::new_v4();
+        let now = Utc::now().naive_utc();
+
+        diesel::insert_into(ingested_documents::table)
+            .values((
+                ingested_documents::document_id.eq(new_id),
+                ingested_documents::sha256.eq(sha256),
+                ingested_documents::source.eq(source),
+                ingested_documents::ingest_status.eq("complete"),
+                ingested_documents::ingest_run_id.eq(new_run),
+                ingested_documents::user_id.eq(user_id.as_str()),
+                ingested_documents::started_at.eq(now),
+                ingested_documents::updated_at.eq(now),
+            ))
+            .execute(&mut conn)
+            .await
+            .map_err(StoreError::from)?;
+
+        ingested_documents::table
+            .filter(ingested_documents::document_id.eq(new_id))
+            .select(IngestedDocumentRow::as_select())
+            .first(&mut conn)
             .await
             .map_err(StoreError::from)
     }

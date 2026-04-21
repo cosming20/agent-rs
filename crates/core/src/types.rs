@@ -63,14 +63,97 @@ impl fmt::Display for SessionId {
 pub struct UserId(String);
 
 impl UserId {
+    /// Maximum length of a user id in characters.
+    ///
+    /// Chosen to accommodate UUIDs, email addresses, and short-form account
+    /// slugs with headroom. Anything longer is rejected as malformed input.
+    pub const MAX_LEN: usize = 128;
+
     /// Create a user ID from a string.
     pub fn from_string(id: String) -> Self {
         Self(id)
     }
 
+    /// Construct a [`UserId`] after validating the string.
+    ///
+    /// Accepts only the ASCII character set `[A-Za-z0-9_-]` with length in
+    /// `1..=MAX_LEN`. This is intentionally strict to prevent user-controlled
+    /// strings from reaching SQL, Cypher, or payload-filter contexts where
+    /// they could cause injection, collision, or ambient-authorisation bugs.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::errors::AgentError::InvalidUserId`] with the offending
+    /// input when validation fails.
+    pub fn try_new(raw: &str) -> Result<Self, crate::errors::AgentError> {
+        if raw.is_empty() {
+            return Err(crate::errors::AgentError::InvalidUserId(
+                "user id must be non-empty".into(),
+            ));
+        }
+        if raw.chars().count() > Self::MAX_LEN {
+            return Err(crate::errors::AgentError::InvalidUserId(format!(
+                "user id exceeds max length {}",
+                Self::MAX_LEN
+            )));
+        }
+        if !raw
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+        {
+            return Err(crate::errors::AgentError::InvalidUserId(format!(
+                "user id contains disallowed characters: {raw:?}"
+            )));
+        }
+        Ok(Self(raw.to_owned()))
+    }
+
     /// Borrow the inner string.
     pub fn as_str(&self) -> &str {
         &self.0
+    }
+}
+
+#[cfg(test)]
+mod user_id_tests {
+    use super::*;
+
+    #[test]
+    fn user_id_accepts_alphanumeric_dash_underscore() {
+        assert!(UserId::try_new("alice_01").is_ok());
+        assert!(UserId::try_new("user-123").is_ok());
+        assert!(UserId::try_new("ABC").is_ok());
+    }
+
+    #[test]
+    fn user_id_rejects_empty() {
+        assert!(UserId::try_new("").is_err());
+    }
+
+    #[test]
+    fn user_id_rejects_sql_injection_attempts() {
+        assert!(UserId::try_new("' OR 1=1 --").is_err());
+        assert!(UserId::try_new("'; DROP TABLE users;").is_err());
+        assert!(UserId::try_new("admin'--").is_err());
+    }
+
+    #[test]
+    fn user_id_rejects_whitespace_and_control_chars() {
+        assert!(UserId::try_new("user one").is_err());
+        assert!(UserId::try_new("user\n").is_err());
+        assert!(UserId::try_new("user\t01").is_err());
+    }
+
+    #[test]
+    fn user_id_rejects_too_long_input() {
+        let long = "a".repeat(129);
+        assert!(UserId::try_new(&long).is_err());
+    }
+
+    #[test]
+    fn user_id_accepts_exactly_128_chars() {
+        let max_len = "a".repeat(128);
+        assert!(UserId::try_new(&max_len).is_ok());
     }
 }
 

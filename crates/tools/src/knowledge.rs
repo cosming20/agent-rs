@@ -8,7 +8,7 @@
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
-use agent_rs_core::{RetrievalStrategy, ToolError};
+use agent_rs_core::{RetrievalStrategy, ToolError, UserId};
 use agent_rs_retrieval::{RetrievalRouter, router::SectionFilter};
 use agent_rs_stores::types::SearchResult;
 use rig::completion::ToolDefinition;
@@ -27,20 +27,15 @@ const DEFAULT_LIMIT: usize = 10;
 /// keyword + graph fusion + rerank). `AllInSection` bypasses ranking and
 /// returns every chunk in the requested `section_id` (requires `section_id`
 /// to be set; otherwise falls back to `Ranked` with a tracing warn).
-#[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum SearchMode {
     /// Full retrieval router: dense + BM25 + graph fusion + cross-encoder rerank.
+    #[default]
     Ranked,
     /// Bypass ranking; return every chunk whose payload `section_id` matches.
     /// Falls back to `Ranked` (with a warning) when `section_id` is absent.
     AllInSection,
-}
-
-impl Default for SearchMode {
-    fn default() -> Self {
-        SearchMode::Ranked
-    }
 }
 
 // ---- Args ----
@@ -84,22 +79,38 @@ pub struct SearchKnowledgeTool {
     router: Option<Arc<RetrievalRouter>>,
     #[serde(skip)]
     evidence_collector: Option<Arc<Mutex<Vec<SearchResult>>>>,
+    /// Tenant scope baked in at construction time. The LLM never sees or
+    /// controls this field — it is excluded from the JSON schema.
+    #[serde(skip, default = "default_unset_user_id")]
+    user_id: UserId,
+}
+
+/// Sentinel `UserId` used only when the struct is deserialised from `{}`
+/// in contract tests that call `definition()` exclusively. Any real request
+/// path uses [`SearchKnowledgeTool::new_for_user`] which supplies the actual
+/// tenant id.
+fn default_unset_user_id() -> UserId {
+    UserId::try_new("_unset_test_only").expect("sentinel must pass validator")
 }
 
 impl SearchKnowledgeTool {
-    /// Create a new `SearchKnowledgeTool`.
+    /// Create a new `SearchKnowledgeTool` scoped to `user_id`.
     ///
     /// # Parameters
     ///
     /// - `router` -- the shared retrieval router that dispatches to search backends.
     /// - `evidence_collector` -- shared mutable vec where raw results are accumulated.
-    pub fn new(
+    /// - `user_id` -- tenant id baked into every store call; never exposed in the
+    ///   tool JSON schema.
+    pub fn new_for_user(
         router: Arc<RetrievalRouter>,
         evidence_collector: Arc<Mutex<Vec<SearchResult>>>,
+        user_id: UserId,
     ) -> Self {
         Self {
             router: Some(router),
             evidence_collector: Some(evidence_collector),
+            user_id,
         }
     }
 }
@@ -160,8 +171,15 @@ impl Tool for SearchKnowledgeTool {
         }
     }
 
-    #[tracing::instrument(skip(self), fields(tool = Self::NAME))]
+    #[tracing::instrument(skip(self), fields(tool = Self::NAME, user_id = %self.user_id))]
     async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
+        // Sentinel guard: fails fast if the tool was constructed via the
+        // serde-skip default path (contract tests) rather than new_for_user().
+        assert!(
+            self.user_id.as_str() != "_unset_test_only",
+            "search_knowledge: call() reached with sentinel user_id — use new_for_user()"
+        );
+
         // AllInSection mode: if a section_id is provided, warn and fall back
         // to Ranked path until Task 4.6 wires the Neo4j handle.
         // TODO(Task 4.6): when Neo4jStore handle is available, route
@@ -219,7 +237,7 @@ impl Tool for SearchKnowledgeTool {
         );
 
         let evidence_pack = router
-            .retrieve_filtered(&args.query, strategy, limit, section_filter)
+            .retrieve_filtered(&self.user_id, &args.query, strategy, limit, section_filter)
             .await
             .map_err(|e| ToolError::McpClient(format!("knowledge retrieval failed: {e}")))?;
 

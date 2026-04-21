@@ -77,9 +77,14 @@ impl MemoryManager {
     }
 
     /// Store a user or assistant message in the session history.
-    #[instrument(skip(self, content), fields(%session_id, ?role))]
+    ///
+    /// `user_id` is persisted alongside the message so that
+    /// [`PgStore::list_chat_messages`] and the snapshot query can enforce
+    /// per-tenant ownership at the SQL level.
+    #[instrument(skip(self, content), fields(%session_id, %user_id, ?role))]
     pub async fn store_message(
         &self,
+        user_id: &UserId,
         session_id: &SessionId,
         role: MessageRole,
         content: &str,
@@ -87,6 +92,7 @@ impl MemoryManager {
         let message = ChatMessage {
             id: Uuid::new_v4(),
             session_id: session_id.clone(),
+            user_id: user_id.clone(),
             role,
             content: content.to_owned(),
             created_at: Utc::now().naive_utc(),
@@ -100,13 +106,14 @@ impl MemoryManager {
     /// Store both the user query and assistant response in one call.
     pub async fn store_interaction(
         &self,
+        user_id: &UserId,
         session_id: &SessionId,
         user_query: &str,
         assistant_response: &str,
     ) -> Result<(), AgentError> {
-        self.store_message(session_id, MessageRole::User, user_query)
+        self.store_message(user_id, session_id, MessageRole::User, user_query)
             .await?;
-        self.store_message(session_id, MessageRole::Assistant, assistant_response)
+        self.store_message(user_id, session_id, MessageRole::Assistant, assistant_response)
             .await
     }
 

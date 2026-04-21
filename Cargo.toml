@@ -58,6 +58,7 @@ regex      = "1"
 qdrant-client = "1"
 dotenvy    = "0.15"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+sha2       = "0.10"
 
 [workspace.package]
 edition = "2024"
@@ -140,3 +141,11 @@ backon = "1"
 # Hashing — deterministic IDs and document integrity checks
 blake3 = "1"
 sha2 = "0.10"
+
+# S3-compatible object storage (MinIO)
+# Default features include the hyper+rustls HTTP stack; disabling them
+# leaves the SDK with no transport and every request fails with
+# "dispatch failure". Keep defaults on. We construct credentials
+# manually via aws_sdk_s3::config::Credentials::new so aws-config is
+# not required.
+aws-sdk-s3 = "1.60"

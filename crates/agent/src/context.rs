@@ -8,6 +8,7 @@ use std::time::Instant;
 use agent_rs_core::types::{MessageRole, RetrievalStrategy, SessionId, UserId};
 use agent_rs_retrieval::EvidencePack;
 use agent_rs_stores::types::SearchResult;
+use uuid::Uuid;
 
 use crate::verifier::VerificationResult;
 
@@ -37,6 +38,12 @@ pub struct QueryContext {
     pub(crate) chat_messages: Vec<String>,
     /// Conversation context string for search augmentation.
     pub(crate) conversation_context: String,
+    /// Document IDs active in this session.
+    ///
+    /// `None` when the session has no active-document filter, which causes
+    /// [`CoveragePlanner`] to fall back to the user's full document library.
+    /// `Some(ids)` restricts coverage planning and retrieval to those documents.
+    pub active_document_ids: Option<Vec<Uuid>>,
 
     // ---- Accumulated by AgentRunner ----
     /// Knowledge-base evidence accumulated by tool calls.
@@ -102,6 +109,7 @@ impl QueryContext {
             start_time: Instant::now(),
             chat_messages: Vec::new(),
             conversation_context: String::new(),
+            active_document_ids: None,
             kb_evidence: Vec::new(),
             web_evidence: Vec::new(),
             answer: String::new(),

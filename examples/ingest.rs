@@ -3,30 +3,33 @@
 //! Usage:
 //!
 //! ```bash
-//! # PDF, default doc_id derived from filename, default source "cli"
-//! cargo run --release --example ingest -- test.pdf
+//! # 2 positional args: user_id and document path
+//! just ingest "alice" test.pdf
 //!
-//! # Override doc_id / source
-//! cargo run --release --example ingest -- --doc-id mypdf --source manual test.pdf
-//!
-//! # Plain text file (detected by .txt extension; anything else goes through Docling)
-//! cargo run --release --example ingest -- notes.txt
+//! # Plain text file (detected by .txt / .md extension)
+//! just ingest "alice" notes.txt
 //! ```
 //!
 //! Prerequisites: `.env` loaded, `docker compose up -d qdrant postgres neo4j
-//! docling-sidecar`, `OPENAI_API_KEY` (or `LLM_API_KEY`) set.
+//! docling-sidecar minio`, `OPENAI_API_KEY` (or `LLM_API_KEY`) set.
+//!
+//! Flow:
+//! 1. Parse user_id (validated) + document path.
+//! 2. Read file bytes; compute sha256 to derive a deterministic document_id.
+//! 3. Upload bytes to MinIO under `users/{user_id}/docs/{document_id}.{ext}`.
+//! 4. Call the ingest pipeline (Docling + embedder + Qdrant + Neo4j + Postgres).
+//! 5. Update `ingested_documents.minio_object_key` in Postgres.
+//!
+//! If MinIO upload succeeds but the pipeline fails, the MinIO object is kept
+//! in place as an upload record — the user can retry and dedup will resume.
 //!
 //! Prints a detailed summary at the end:
-//! - doc_id
+//! - user_id, document_id, sha256, minio_object_key
 //! - chunks created
 //! - vectors upserted (dense + sparse via Qdrant server-side BM25)
 //! - knowledge graph: nodes, edges, triplets
 //! - summaries generated
 //! - wall-clock duration per stage + total
-//!
-//! Stage timings come from the pipeline's per-phase `#[instrument]` spans,
-//! surfaced via `RUST_LOG=info`. This example enables info-level logging
-//! by default so the stages are visible live.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -36,63 +39,81 @@ use agent_rs::embedder::build_embedder;
 use agent_rs::ingest::{IngestFeatures, build_ingestion_pipeline};
 use agent_rs::stores::connect_stores;
 use agent_rs_core::config::Settings;
-use agent_rs_core::types::CollectionName;
+use agent_rs_core::types::{CollectionName, UserId};
+use agent_rs_retrieval::ingestion::derive_document_id;
 use agent_rs_observability::metrics::RetrievalMetrics;
 use agent_rs_observability::tracing::init_tracing;
+use agent_rs_stores::minio::MinioStore;
 use agent_rs_stores::traits::VectorStore;
 use agent_rs_stores::types::CollectionConfig;
 use anyhow::{Context, Result, bail};
+use sha2::{Digest, Sha256};
 use tracing::{info, warn};
 
 struct Args {
+    user_id: UserId,
     pdf_path: PathBuf,
-    doc_id: Option<String>,
     source: String,
 }
 
 fn parse_args() -> Result<Args> {
-    let mut args = std::env::args().skip(1);
-    let mut path: Option<PathBuf> = None;
-    let mut doc_id: Option<String> = None;
+    let mut positional: Vec<String> = Vec::new();
     let mut source: Option<String> = None;
-    while let Some(a) = args.next() {
+    let mut iter = std::env::args().skip(1);
+    while let Some(a) = iter.next() {
         match a.as_str() {
-            "--doc-id" => {
-                doc_id = Some(args.next().context("--doc-id needs a value")?);
-            }
             "--source" => {
-                source = Some(args.next().context("--source needs a value")?);
+                source = Some(iter.next().context("--source needs a value")?);
             }
             "-h" | "--help" => {
-                println!("Usage: ingest [--doc-id <id>] [--source <label>] <path>");
+                println!(
+                    "Usage: ingest <user_id> <path/to/doc>\n\
+                     Options:\n\
+                       --source <label>  Override the source label (default: filename stem)"
+                );
                 std::process::exit(0);
             }
             flag if flag.starts_with("--") => {
                 bail!("unknown flag: {flag}");
             }
-            positional => {
-                if path.is_some() {
-                    bail!("extra positional argument: {positional}");
-                }
-                path = Some(PathBuf::from(positional));
-            }
+            arg => positional.push(arg.to_owned()),
         }
     }
-    let pdf_path = path.context("missing document path; see --help")?;
+    if positional.len() != 2 {
+        bail!(
+            "usage: just ingest \"<user_id>\" \"<path>\" — got {} positional arg(s)",
+            positional.len()
+        );
+    }
+    let user_id = UserId::try_new(&positional[0]).context("invalid user_id")?;
+    let pdf_path = PathBuf::from(&positional[1]);
+    let source = source.unwrap_or_else(|| {
+        pdf_path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("cli")
+            .to_owned()
+    });
     Ok(Args {
+        user_id,
         pdf_path,
-        doc_id,
-        source: source.unwrap_or_else(|| "cli".to_owned()),
+        source,
     })
 }
+
+/// Compute the SHA-256 hex digest of `bytes`.
+fn sha256_hex(bytes: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    format!("{:x}", hasher.finalize())
+}
+
 
 async fn ensure_collection(
     store: &(dyn VectorStore + Send + Sync),
     collection: &CollectionName,
     dense_dim: usize,
 ) -> Result<()> {
-    // Idempotent wrapper: the store trait's create_collection errors when
-    // the collection already exists; treat that as success.
     let cfg = CollectionConfig {
         dense_vector_size: dense_dim,
         enable_sparse: true,
@@ -105,9 +126,6 @@ async fn ensure_collection(
             Ok(())
         }
         Err(e) => {
-            // Qdrant responds with a gRPC 6 (ALREADY_EXISTS) that the
-            // store layer surfaces as a StoreError::Backend with a
-            // message mentioning "already exists". Tolerate that.
             let msg = e.to_string().to_lowercase();
             if msg.contains("already exists") || msg.contains("conflict") {
                 warn!(%collection, "collection already exists — reusing");
@@ -116,6 +134,17 @@ async fn ensure_collection(
                 Err(e).with_context(|| format!("create_collection {collection}"))
             }
         }
+    }
+}
+
+/// Content-type string for a given file extension.
+fn content_type_for_ext(ext: &str) -> &'static str {
+    match ext {
+        "pdf" => "application/pdf",
+        "txt" => "text/plain",
+        "md" | "markdown" => "text/markdown",
+        "html" | "htm" => "text/html",
+        _ => "application/octet-stream",
     }
 }
 
@@ -135,22 +164,12 @@ async fn main() -> Result<()> {
 
     // Full OTel pipeline (traces → Jaeger, metrics → Prometheus via the
     // OTel collector). Guard must live until end of main so the background
-    // exporters flush before shutdown. If the collector is unreachable the
-    // exporters fail silently per-batch; init itself only errors on
-    // subscriber conflicts.
+    // exporters flush before shutdown.
     let _otel_guard = init_tracing(&settings.otel, "agent-rs-ingest")
         .context("init_tracing — is the otel-collector running? `just obs-up`")?;
 
-    let derived_doc_id = args.doc_id.unwrap_or_else(|| {
-        args.pdf_path
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .unwrap_or("doc")
-            .to_owned()
-    });
-
     info!(
-        doc_id = %derived_doc_id,
+        user_id = %args.user_id,
         source = %args.source,
         path = %args.pdf_path.display(),
         "ingest CLI starting"
@@ -166,7 +185,50 @@ async fn main() -> Result<()> {
         "stores + embedder ready"
     );
 
-    // ---- Derive collection names the same way main.rs does ----
+    // ---- Read file bytes + derive document_id from sha256 ----
+    let ext = args
+        .pdf_path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    let is_text_like = matches!(ext.as_str(), "txt" | "md" | "markdown");
+
+    let bytes = std::fs::read(&args.pdf_path)
+        .with_context(|| format!("read file {}", args.pdf_path.display()))?;
+
+    let sha256 = sha256_hex(&bytes);
+    let document_id = derive_document_id(&args.user_id, &sha256);
+
+    info!(
+        user_id = %args.user_id,
+        document_id = %document_id,
+        sha256 = %sha256,
+        "derived document_id from sha256"
+    );
+
+    // ---- Step 1: Upload to MinIO ----
+    // The upload is attempted before the pipeline so the object exists in
+    // storage regardless of whether chunking/embedding succeeds.  This
+    // preserves the file for debugging or retry without re-upload.
+    let minio_store = MinioStore::new(settings.minio.clone())
+        .await
+        .context("connect MinioStore")?;
+
+    let content_type = content_type_for_ext(&ext);
+    let minio_object_key = minio_store
+        .put_object(&args.user_id, document_id, &bytes, content_type)
+        .await
+        .context("MinioStore::put_object")?;
+
+    info!(
+        user_id = %args.user_id,
+        document_id = %document_id,
+        object_key = %minio_object_key,
+        "uploaded to MinIO"
+    );
+
+    // ---- Derive collection names ----
     let collection = CollectionName::from_string(settings.retrieval.dataset.clone());
     let triplet_collection =
         CollectionName::from_string(format!("{}_triplets", collection.as_str()));
@@ -180,9 +242,7 @@ async fn main() -> Result<()> {
     ensure_collection(&*stores.qdrant, &summaries_collection, dense_dim).await?;
     info!(%collection, %triplet_collection, %summaries_collection, "collections ready");
 
-    // ---- Build ingestion pipeline (all features on unless EVAL_SKIP_* is set) ----
-    // Construct RetrievalMetrics so per-call LLM cost/tokens/latency flow
-    // through graph_extractor + summarizer into Prometheus/Grafana.
+    // ---- Build ingestion pipeline ----
     let metrics = Arc::new(RetrievalMetrics::new("agent-rs-ingest"));
     let pipeline = build_ingestion_pipeline(
         &settings,
@@ -196,43 +256,51 @@ async fn main() -> Result<()> {
     )
     .await?;
 
-    // ---- Run ingest ----
-    let ext = args
-        .pdf_path
-        .extension()
-        .and_then(|e| e.to_str())
-        .unwrap_or("")
-        .to_ascii_lowercase();
-    let is_text_like = matches!(ext.as_str(), "txt" | "md" | "markdown");
-
+    // ---- Step 2: Run ingest pipeline ----
+    let doc_id_str = document_id.to_string();
     let t_ingest = Instant::now();
     let result = if is_text_like {
-        let text = std::fs::read_to_string(&args.pdf_path)
-            .with_context(|| format!("read text file {}", args.pdf_path.display()))?;
+        let text = std::str::from_utf8(&bytes)
+            .with_context(|| format!("text file is not valid UTF-8: {}", args.pdf_path.display()))?;
         pipeline
-            .ingest_text(&text, &derived_doc_id, &args.source)
+            .ingest_text(text, &doc_id_str, &args.source, args.user_id.as_str())
             .await
             .context("ingest_text")?
     } else {
-        let bytes = std::fs::read(&args.pdf_path)
-            .with_context(|| format!("read PDF {}", args.pdf_path.display()))?;
         pipeline
-            .ingest_pdf(&bytes, &derived_doc_id, &args.source)
+            .ingest_pdf(&bytes, &doc_id_str, &args.source, args.user_id.as_str())
             .await
             .context("ingest_pdf")?
     };
     let ingest_ms = t_ingest.elapsed().as_millis() as u64;
 
-    // Emit total ingest time to OTel (Jaeger traces already show the
-    // per-stage breakdown via #[instrument] spans on docling_client,
-    // graph_extractor.extract_batch, summarizer.summarize_batch, embedder).
     metrics.record_ingest_stage_ms("total", ingest_ms as f64);
     metrics.record_ingest_stage_ms("pipeline", result.duration_ms as f64);
+
+    // ---- Step 3: Persist the MinIO object key in Postgres ----
+    // The pipeline's begin_ingestion inserts the row with minio_object_key = NULL;
+    // we update it here now that both the upload and ingest have succeeded.
+    stores
+        .postgres
+        .set_minio_object_key(&args.user_id, document_id, &minio_object_key)
+        .await
+        .context("set_minio_object_key")?;
+
+    info!(
+        user_id = %args.user_id,
+        document_id = %document_id,
+        object_key = %minio_object_key,
+        "persisted MinIO key in Postgres"
+    );
 
     // ---- Pretty summary ----
     println!();
     println!("================ INGEST SUMMARY ================");
-    println!("  doc_id              : {}", result.doc_id);
+    println!("  user_id             : {}", args.user_id);
+    println!("  document_id         : {}", document_id);
+    println!("  sha256              : {}", sha256);
+    println!("  minio_object_key    : {}", minio_object_key);
+    println!("  status              : complete");
     println!("  source              : {}", args.source);
     println!("  path                : {}", args.pdf_path.display());
     println!("  chunks created      : {}", result.chunks_created);

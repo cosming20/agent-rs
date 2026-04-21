@@ -366,8 +366,7 @@ impl Embedder for FastEmbedder {
         let owned: Vec<String> = texts
             .iter()
             .map(|t| {
-                let normalised =
-                    crate::ingestion::text_normalize::normalize_search_form(t);
+                let normalised = crate::ingestion::text_normalize::normalize_search_form(t);
                 format!("query: {normalised}")
             })
             .collect();
