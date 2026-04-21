@@ -7,6 +7,7 @@ diesel::table! {
         role -> Text,
         content -> Text,
         created_at -> Timestamp,
+        user_id -> Text,
     }
 }
 
@@ -46,6 +47,8 @@ diesel::table! {
         started_at -> Timestamp,
         completed_at -> Nullable<Timestamp>,
         updated_at -> Timestamp,
+        user_id -> Text,
+        minio_object_key -> Nullable<Text>,
     }
 }
 
@@ -73,6 +76,23 @@ diesel::table! {
 }
 
 diesel::table! {
+    session_active_documents (session_id, document_id) {
+        session_id -> Uuid,
+        document_id -> Uuid,
+        activated_at -> Timestamptz,
+    }
+}
+
+diesel::table! {
+    sessions (session_id) {
+        session_id -> Uuid,
+        user_id -> Text,
+        created_at -> Timestamptz,
+        updated_at -> Timestamptz,
+    }
+}
+
+diesel::table! {
     strategy_performance (id) {
         id -> Int8,
         #[max_length = 64]
@@ -95,6 +115,8 @@ diesel::table! {
 }
 
 diesel::joinable!(evidence_items -> query_runs (run_id));
+diesel::joinable!(session_active_documents -> ingested_documents (document_id));
+diesel::joinable!(session_active_documents -> sessions (session_id));
 
 diesel::allow_tables_to_appear_in_same_query!(
     chat_messages,
@@ -102,5 +124,7 @@ diesel::allow_tables_to_appear_in_same_query!(
     ingested_documents,
     memories,
     query_runs,
+    session_active_documents,
+    sessions,
     strategy_performance,
 );
