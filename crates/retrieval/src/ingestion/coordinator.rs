@@ -12,7 +12,7 @@
 
 use std::sync::Arc;
 
-use agent_rs_core::CollectionName;
+use agent_rs_core::{CollectionName, UserId};
 use agent_rs_stores::postgres::PgStore;
 use agent_rs_stores::traits::{GraphStore, VectorStore};
 use agent_rs_stores::types::FilterSpec;
@@ -73,16 +73,17 @@ impl IngestCoordinator {
     /// - [`RetrievalError::Ingestion`] if the row is in `complete` status.
     /// - [`RetrievalError::Store`] if Postgres lookup fails.
     /// - The first error from steps 4–6 if any backend operation fails.
-    #[instrument(skip(self), fields(sha256 = %sha256, collection = %collection))]
+    #[instrument(skip(self), fields(sha256 = %sha256, collection = %collection, user_id = %user_id.as_str()))]
     pub async fn cleanup_partial(
         &self,
+        user_id: &UserId,
         sha256: &str,
         collection: &CollectionName,
     ) -> Result<(), RetrievalError> {
-        // Step 1: look up the row.
+        // Step 1: look up the row scoped to user_id (dedup is per-tenant).
         let row = self
             .pg_store
-            .get_ingested_document_by_sha256(sha256)
+            .get_ingested_document_by_sha256(user_id, sha256)
             .await
             .map_err(RetrievalError::Store)?;
 

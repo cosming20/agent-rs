@@ -19,7 +19,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
 
-use agent_rs_core::{CollectionName, IngestBackend, NAMESPACE_OID};
+use agent_rs_core::{CollectionName, IngestBackend, NAMESPACE_OID, UserId};
 use agent_rs_stores::postgres::PgStore;
 use agent_rs_stores::postgres::documents::HeaderMetadata;
 use agent_rs_stores::postgres::models::{BeginIngestionOutcome, NewIngestedDocument};
@@ -586,7 +586,7 @@ impl IngestionPipeline {
         // This powers the `RetrievalStrategy::Summaries` search path.
         // The plain-text path has no ingest_run_id so we pass None.
         let summaries_created = self
-            .upsert_summaries_if_enabled(doc_id, &chunks, None)
+            .upsert_summaries_if_enabled(doc_id, user_id, &chunks, None)
             .await?;
 
         let duration_ms = start.elapsed().as_millis() as u64;
@@ -718,6 +718,7 @@ impl IngestionPipeline {
     async fn upsert_summaries_if_enabled(
         &self,
         doc_id: &str,
+        user_id: &str,
         chunks: &[DocumentChunk],
         ingest_run_id: Option<&str>,
     ) -> Result<usize, RetrievalError> {
@@ -860,7 +861,7 @@ impl IngestionPipeline {
                 embedding,
                 // Summaries collections use dense-only search; no BM25 needed.
                 text: String::new(),
-                payload: build_summary_payload(summary),
+                payload: build_summary_payload(summary, user_id),
             })
             .chain(
                 non_ok_summaries
@@ -870,7 +871,7 @@ impl IngestionPipeline {
                         id: summary.summary_id.clone(),
                         embedding,
                         text: String::new(),
-                        payload: build_summary_payload(summary),
+                        payload: build_summary_payload(summary, user_id),
                     }),
             )
             .collect();
@@ -1017,10 +1018,12 @@ impl IngestionPipeline {
                 ingest_run_id: Uuid::new_v4(),
                 started_at: now,
                 updated_at: now,
+                user_id: user_id.to_owned(),
             };
 
+            let pg_user_id = agent_rs_core::UserId::from_string(user_id.to_owned());
             match pg
-                .begin_ingestion(new_doc)
+                .begin_ingestion(&pg_user_id, new_doc)
                 .await
                 .map_err(RetrievalError::Store)?
             {
@@ -1361,8 +1364,13 @@ impl IngestionPipeline {
         // All new nodes are tagged with `ingest_run_id` so rollback by run_id
         // can target exactly this ingestion without touching pre-existing data.
         let structural_result: Result<(), RetrievalError> = async {
-            let snapshot =
-                proto_header_to_snapshot(header, &docling_response.footer, ingest_run_id, source);
+            let snapshot = proto_header_to_snapshot(
+                header,
+                &docling_response.footer,
+                ingest_run_id,
+                source,
+                user_id,
+            );
             let doc_uuid = snapshot.document_id;
 
             // Build ordered StructuralChunk list with FOLLOWS back-pointers.
@@ -1420,7 +1428,12 @@ impl IngestionPipeline {
 
         // ---- Step 7: Chunk summarization (optional) ----
         let summaries_created = match self
-            .upsert_summaries_if_enabled(doc_id, &pseudo_chunks, Some(ingest_run_id_str.as_str()))
+            .upsert_summaries_if_enabled(
+                doc_id,
+                user_id,
+                &pseudo_chunks,
+                Some(ingest_run_id_str.as_str()),
+            )
             .await
         {
             Ok(n) => n,
@@ -1785,7 +1798,13 @@ fn proto_chunk_to_document_chunk(
 }
 
 /// Build the JSON payload for a summary point stored in the summaries collection.
-fn build_summary_payload(summary: &super::summarizer::ChunkSummary) -> serde_json::Value {
+///
+/// `user_id` is stored as a top-level field so that [`QdrantStore::first_summary_by_section`]
+/// can filter by both `user_id` and `section_id` without a cross-tenant scan.
+fn build_summary_payload(
+    summary: &super::summarizer::ChunkSummary,
+    user_id: &str,
+) -> serde_json::Value {
     json!({
         "summary_id": summary.summary_id,
         "chunk_id": summary.chunk_id,
@@ -1795,6 +1814,7 @@ fn build_summary_payload(summary: &super::summarizer::ChunkSummary) -> serde_jso
         "section_id": summary.section_id,
         "ingest_run_id": summary.ingest_run_id,
         "summary_status": summary.summary_status,
+        "user_id": user_id,
     })
 }
 
@@ -1809,6 +1829,7 @@ fn proto_header_to_snapshot(
     footer: &ProtoDocumentFooter,
     ingest_run_id: Uuid,
     source: &str,
+    user_id: &str,
 ) -> DocumentHeaderSnapshot {
     let document_id = Uuid::new_v5(&NAMESPACE_OID, header.sha256.as_bytes());
 
@@ -1833,6 +1854,7 @@ fn proto_header_to_snapshot(
     DocumentHeaderSnapshot {
         document_id,
         ingest_run_id,
+        user_id: UserId::from_string(user_id.to_owned()),
         sha256: header.sha256.clone(),
         source: source.to_owned(),
         docling_version: none_if_empty(&header.docling_version),

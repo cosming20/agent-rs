@@ -77,11 +77,7 @@ pub fn build_section_filter(doc_id: Option<&str>, section_id: Option<&str>) -> O
 /// let f2 = build_user_filter("alice", Some("doc-1"), Some("sec-1"));
 /// assert_eq!(f2.must.len(), 3);
 /// ```
-pub fn build_user_filter(
-    user_id: &str,
-    doc_id: Option<&str>,
-    section_id: Option<&str>,
-) -> Filter {
+pub fn build_user_filter(user_id: &str, doc_id: Option<&str>, section_id: Option<&str>) -> Filter {
     assert!(
         !user_id.is_empty(),
         "user_id must not be empty for Qdrant user filter"
