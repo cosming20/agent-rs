@@ -116,6 +116,13 @@ pub enum AgentError {
     Synthesis(String),
     #[error("memory store: {0}")]
     MemoryStore(String),
+    /// Invalid user id — rejected by [`crate::types::UserId::try_new`].
+    ///
+    /// Message is verbose for logs but callers must NOT propagate it back to
+    /// user-facing output; return a generic "invalid user id" at API
+    /// boundaries instead.
+    #[error("invalid user id: {0}")]
+    InvalidUserId(String),
     #[error("max retries ({max}) exceeded")]
     MaxRetriesExceeded { max: usize },
     #[error("retrieval error: {0}")]
