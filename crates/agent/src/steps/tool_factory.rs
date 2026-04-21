@@ -147,9 +147,10 @@ impl ToolFactory {
         let coverage_collector: Arc<Mutex<Vec<SearchResult>>> = Arc::new(Mutex::new(Vec::new()));
 
         let tools: Vec<Box<dyn ToolDyn>> = vec![
-            Box::new(SearchKnowledgeTool::new(
+            Box::new(SearchKnowledgeTool::new_for_user(
                 Arc::clone(&self.router),
                 Arc::clone(&evidence_collector),
+                user_id.clone(),
             )),
             Box::new(SearchWebTool::new(
                 Arc::clone(&budget),
@@ -165,30 +166,38 @@ impl ToolFactory {
                 self.fetch_config.clone(),
                 Arc::clone(&budget),
             )),
-            Box::new(RememberTool::new(Arc::clone(&self.store), user_id.clone())),
+            Box::new(RememberTool::new_for_user(
+                Arc::clone(&self.store),
+                user_id.clone(),
+            )),
             // document_info — metadata about ingested docs (page count,
             // language, ingest date, etc.) for meta-questions that don't
             // need a content search.
-            Box::new(DocumentInfoTool::new(Arc::clone(&self.pg_store))),
+            Box::new(DocumentInfoTool::new_for_user(
+                Arc::clone(&self.pg_store),
+                user_id.clone(),
+            )),
             // Coverage-aware tools (Phase 3.1–3.3).
             // outline_corpus — hierarchical TOC (Doc→Section→summary) so the
             // LLM can discover what exists before deciding which sections to
             // pull. Constructed once per build() since they hold only
             // Arc clones to shared stores.
-            Box::new(OutlineCorpusTool::new(
+            Box::new(OutlineCorpusTool::new_for_user(
                 Arc::clone(&self.neo4j),
                 Arc::clone(&self.pg_store),
                 Arc::clone(&self.qdrant),
                 self.summaries_collection.clone(),
+                user_id.clone(),
             )),
             // fetch_section_chunks — exhaustive, non-ranked chunk retrieval
             // for a single known section_id. Wired with coverage_collector so
             // retrieved chunks reach ctx.coverage_evidence.
             Box::new(
-                FetchSectionChunksTool::new(
+                FetchSectionChunksTool::new_for_user(
                     Arc::clone(&self.neo4j),
                     Arc::clone(&self.qdrant),
                     self.default_collection.clone(),
+                    user_id.clone(),
                 )
                 .with_coverage_collector(Arc::clone(&coverage_collector)),
             ),
@@ -197,10 +206,11 @@ impl ToolFactory {
             // the max_turns budget). Wired with coverage_collector so
             // retrieved chunks reach ctx.coverage_evidence.
             Box::new(
-                SearchSectionsTool::new(
+                SearchSectionsTool::new_for_user(
                     Arc::clone(&self.neo4j),
                     Arc::clone(&self.qdrant),
                     self.default_collection.clone(),
+                    user_id.clone(),
                 )
                 .with_coverage_collector(Arc::clone(&coverage_collector)),
             ),

@@ -187,7 +187,7 @@ impl StateStore for InMemoryStateStore {
 #[tokio::test]
 async fn remember_tool_definition_contract() {
     let store: Arc<dyn StateStore> = Arc::new(InMemoryStateStore::default());
-    let tool = RememberTool::new(store, UserId::from_string("test-user".to_owned()));
+    let tool = RememberTool::new_for_user(store, UserId::from_string("test-user".to_owned()));
     let def = tool.definition(String::new()).await;
 
     assert_eq!(def.name, "remember");
@@ -211,6 +211,14 @@ async fn remember_tool_definition_contract() {
             .collect::<Vec<_>>(),
         vec!["content"]
     );
+
+    // user_id must NOT appear in the schema — it is baked in at construction
+    // time and the LLM must never be able to choose or override it.
+    let props = def.parameters.get("properties").and_then(Value::as_object);
+    assert!(
+        props.is_some_and(|p| !p.contains_key("user_id")),
+        "tool schema must NOT expose user_id to the LLM"
+    );
 }
 
 #[tokio::test]
@@ -218,7 +226,7 @@ async fn remember_tool_stores_memory_round_trip() {
     let store_impl = Arc::new(InMemoryStateStore::default());
     let store: Arc<dyn StateStore> = store_impl.clone();
     let user = UserId::from_string("alice".to_owned());
-    let tool = RememberTool::new(store, user.clone());
+    let tool = RememberTool::new_for_user(store, user.clone());
 
     let args_json = json!({ "content": "prefers concise answers" });
     let args: agent_rs_tools::remember::RememberArgs = serde_json::from_value(args_json).unwrap();

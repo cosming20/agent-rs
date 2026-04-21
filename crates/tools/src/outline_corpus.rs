@@ -6,7 +6,7 @@
 
 use std::sync::Arc;
 
-use agent_rs_core::ToolError;
+use agent_rs_core::{ToolError, UserId};
 use agent_rs_stores::neo4j::Neo4jStore;
 use agent_rs_stores::neo4j::coverage::SectionRow;
 use agent_rs_stores::postgres::PgStore;
@@ -44,24 +44,35 @@ pub struct OutlineCorpusTool {
     qdrant: Option<Arc<QdrantStore>>,
     #[serde(skip)]
     summaries_collection: Option<String>,
+    /// Tenant scope baked in at construction time. The LLM never sees or
+    /// controls this field — it is excluded from the JSON schema.
+    #[serde(skip, default = "default_unset_user_id")]
+    user_id: UserId,
+}
+
+/// Sentinel `UserId` for contract-test deserialization path.
+fn default_unset_user_id() -> UserId {
+    UserId::try_new("_unset_test_only").expect("sentinel must pass validator")
 }
 
 impl OutlineCorpusTool {
-    /// Construct an [`OutlineCorpusTool`] with all backing stores wired up.
+    /// Construct an [`OutlineCorpusTool`] scoped to `user_id`.
     ///
     /// `summaries_collection` is the name of the Qdrant collection that holds
     /// per-section summary points written by `ChunkSummarizer` at ingest time.
-    pub fn new(
+    pub fn new_for_user(
         neo4j: Arc<Neo4jStore>,
         pg: Arc<PgStore>,
         qdrant: Arc<QdrantStore>,
         summaries_collection: String,
+        user_id: UserId,
     ) -> Self {
         Self {
             neo4j: Some(neo4j),
             pg: Some(pg),
             qdrant: Some(qdrant),
             summaries_collection: Some(summaries_collection),
+            user_id,
         }
     }
 }
@@ -107,8 +118,15 @@ impl Tool for OutlineCorpusTool {
     ///
     /// Returns [`ToolError`] when any backing store is uninitialised or
     /// when a store query fails.
-    #[tracing::instrument(skip(self), fields(tool = Self::NAME))]
+    #[tracing::instrument(skip(self), fields(tool = Self::NAME, user_id = %self.user_id))]
     async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
+        // Sentinel guard: fails fast if the tool was constructed via the
+        // serde-skip default path (contract tests) rather than new_for_user().
+        assert!(
+            self.user_id.as_str() != "_unset_test_only",
+            "outline_corpus: call() reached with sentinel user_id — use new_for_user()"
+        );
+
         let neo4j = self
             .neo4j
             .as_ref()
@@ -131,7 +149,7 @@ impl Tool for OutlineCorpusTool {
         let max = args.max_sections.unwrap_or(DEFAULT_MAX_SECTIONS);
 
         let docs = pg
-            .list_ingested_documents()
+            .list_ingested_documents(&self.user_id)
             .await
             .map_err(|e| ToolError::McpClient(format!("outline_corpus: list docs: {e}")))?;
 
@@ -155,7 +173,7 @@ impl Tool for OutlineCorpusTool {
             ));
 
             let mut rows: Vec<SectionRow> = neo4j
-                .list_sections_for_doc(&doc.document_id.to_string())
+                .list_sections_for_doc(&self.user_id, &doc.document_id.to_string())
                 .await
                 .map_err(|e| ToolError::McpClient(format!("outline_corpus: sections: {e}")))?;
 
@@ -164,7 +182,7 @@ impl Tool for OutlineCorpusTool {
 
             for row in &rows {
                 let summary =
-                    lookup_section_summary(qdrant, summaries_coll, &row.section_id).await;
+                    lookup_section_summary(qdrant, summaries_coll, &self.user_id, &row.section_id).await;
                 let preamble_marker = if row.is_preamble { " [preamble]" } else { "" };
                 out.push_str(&format!(
                     "  - [{}] {}{} -> {}\n",
@@ -191,10 +209,11 @@ impl Tool for OutlineCorpusTool {
 async fn lookup_section_summary(
     qdrant: &Arc<QdrantStore>,
     collection: &str,
+    user_id: &UserId,
     section_id: &str,
 ) -> Option<String> {
     qdrant
-        .first_summary_by_section(collection, section_id)
+        .first_summary_by_section(collection, user_id, section_id)
         .await
         .unwrap_or_else(|e| {
             tracing::debug!(
