@@ -9,7 +9,10 @@
 //! ownership check inside the same Postgres transaction so that concurrent
 //! callers see serialised results.
 
-use agent_rs_core::{StoreError, types::{SessionId, UserId}};
+use agent_rs_core::{
+    StoreError,
+    types::{SessionId, UserId},
+};
 use diesel::prelude::*;
 use diesel_async::{AsyncConnection, RunQueryDsl, scoped_futures::ScopedFutureExt};
 use tracing::instrument;

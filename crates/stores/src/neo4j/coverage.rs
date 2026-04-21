@@ -1,11 +1,15 @@
 //! Section-level read queries used by the coverage planner / outline tool.
+//!
+//! Every read path that touches a `Document` node carries a `user_id` guard.
+//! Descendant nodes (Section, Chunk) inherit authorisation by structural
+//! inclusion — they are only reachable through the Document owner check.
 
 use neo4rs::query;
 use serde_json::Value;
 use tracing::instrument;
 
 use crate::neo4j::structural::{LABEL_DOCUMENT, LABEL_SECTION};
-use agent_rs_core::StoreError;
+use agent_rs_core::{StoreError, UserId};
 
 use super::Neo4jStore;
 
@@ -47,24 +51,33 @@ impl Neo4jStore {
     /// List all sections (real + synthetic preamble) of a document, ordered
     /// for outline display.
     ///
+    /// The `user_id` guard on the `Document` node ensures that only documents
+    /// owned by `user_id` are reachable; an unknown or cross-tenant `doc_id`
+    /// returns an empty list instead of an error.
+    ///
     /// # Errors
     ///
     /// Returns [`StoreError`] if the Neo4j query fails or the driver returns
     /// a connection-level error.
-    #[instrument(skip(self), fields(doc_id = %doc_id))]
+    #[instrument(skip(self), fields(doc_id = %doc_id, user_id = %user_id))]
     pub async fn list_sections_for_doc(
         &self,
+        user_id: &UserId,
         doc_id: &str,
     ) -> Result<Vec<SectionRow>, StoreError> {
         let cypher = format!(
-            "MATCH (d:{LABEL_DOCUMENT} {{id: $doc_id}})-[:HAS_SECTION*1..]->(s:{LABEL_SECTION}) \
+            "MATCH (d:{LABEL_DOCUMENT} {{id: $doc_id, user_id: $user_id}})-[:HAS_SECTION*1..]->(s:{LABEL_SECTION}) \
              RETURN s.id AS section_id, d.id AS doc_id, coalesce(s.title, s.heading) AS heading, \
                     s.section_order AS section_order, s.first_chunk_index AS first_chunk_index, \
                     s.page_start AS page_start, coalesce(s.is_preamble, false) AS is_preamble"
         );
         let mut rs = self
             .graph
-            .execute(query(&cypher).param("doc_id", doc_id))
+            .execute(
+                query(&cypher)
+                    .param("doc_id", doc_id)
+                    .param("user_id", user_id.as_str()),
+            )
             .await
             .map_err(StoreError::from)?;
         let mut out = Vec::new();
@@ -86,21 +99,34 @@ impl Neo4jStore {
     /// Recursively collect descendant section ids (used when the outline
     /// agent says "all of 5.1 including 5.1.1, 5.1.2, ...").
     ///
+    /// The `user_id` guard anchors through the root section back to its owning
+    /// `Document`, preventing cross-tenant traversal. If the root section does
+    /// not belong to a document owned by `user_id`, the result is empty.
+    ///
     /// # Errors
     ///
     /// Returns [`StoreError`] if the Neo4j query fails.
-    #[instrument(skip(self), fields(section_id = %section_id))]
+    #[instrument(skip(self), fields(section_id = %section_id, user_id = %user_id))]
     pub async fn list_descendant_sections(
         &self,
+        user_id: &UserId,
         section_id: &str,
     ) -> Result<Vec<String>, StoreError> {
         let cypher = format!(
-            "MATCH (root:{LABEL_SECTION} {{id: $sid}})-[:PARENT_OF*0..]->(s:{LABEL_SECTION}) \
+            "MATCH (root:{LABEL_SECTION} {{id: $sid}}) \
+             WITH root \
+             MATCH (root)<-[:HAS_SECTION*0..]-(d:{LABEL_DOCUMENT} {{user_id: $user_id}}) \
+             WITH root, d \
+             MATCH (root)-[:PARENT_OF*0..]->(s:{LABEL_SECTION}) \
              RETURN s.id AS section_id"
         );
         let mut rs = self
             .graph
-            .execute(query(&cypher).param("sid", section_id))
+            .execute(
+                query(&cypher)
+                    .param("sid", section_id)
+                    .param("user_id", user_id.as_str()),
+            )
             .await
             .map_err(StoreError::from)?;
         let mut out = Vec::new();
@@ -116,12 +142,17 @@ impl Neo4jStore {
     /// by `chunk_index` so `fetch_section_chunks` reads the section
     /// linearly. Caller uses these ids to fetch full payloads from Qdrant.
     ///
+    /// The `user_id` guard joins each section back to its owning `Document`
+    /// before returning chunks, so chunks from a different tenant's sections
+    /// (if section ids were somehow guessed) are not returned.
+    ///
     /// # Errors
     ///
     /// Returns [`StoreError`] if serialization or the Neo4j query fails.
-    #[instrument(skip(self, section_ids), fields(n_sections = section_ids.len()))]
+    #[instrument(skip(self, section_ids), fields(n_sections = section_ids.len(), user_id = %user_id))]
     pub async fn chunks_in_sections(
         &self,
+        user_id: &UserId,
         section_ids: &[String],
     ) -> Result<Vec<String>, StoreError> {
         if section_ids.is_empty() {
@@ -137,13 +168,19 @@ impl Neo4jStore {
             .map_err(|e| StoreError::Serialization(format!("section_ids serialize: {e}")))?;
         let cypher = format!(
             "MATCH (c:Chunk)-[:IN_SECTION]->(s:{LABEL_SECTION}) \
+             WITH c, s \
+             MATCH (s)<-[:HAS_SECTION*0..]-(d:{LABEL_DOCUMENT} {{user_id: $user_id}}) \
              WHERE s.id IN $ids \
              RETURN c.id AS chunk_id, coalesce(c.chunk_index, 0) AS chunk_index \
              ORDER BY chunk_index ASC"
         );
         let mut rs = self
             .graph
-            .execute(query(&cypher).param("ids", ids_bolt))
+            .execute(
+                query(&cypher)
+                    .param("ids", ids_bolt)
+                    .param("user_id", user_id.as_str()),
+            )
             .await
             .map_err(StoreError::from)?;
         let mut out = Vec::new();

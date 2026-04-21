@@ -23,7 +23,7 @@
 //! - Therefore a rollback cannot accidentally destroy data from a different
 //!   ingestion run or from the LLM KG path.
 
-use agent_rs_core::StoreError;
+use agent_rs_core::{StoreError, UserId};
 use neo4rs::{Graph, query};
 use serde_json::{Value, json};
 use tracing::instrument;
@@ -88,6 +88,9 @@ pub struct DocumentHeaderSnapshot {
     pub document_id: Uuid,
     /// Run-specific identifier for rollback targeting.
     pub ingest_run_id: Uuid,
+    /// Owning user — written as `user_id` on the `Document` node via
+    /// `ON CREATE SET` (idempotent on re-ingest for the same `document_id`).
+    pub user_id: UserId,
     /// SHA-256 hex digest of the original file.
     pub sha256: String,
     /// Human-readable source URI / file path.
@@ -280,6 +283,7 @@ impl Neo4jStore {
         fields(
             doc_id  = %header.document_id,
             run_id  = %header.ingest_run_id,
+            user_id = %header.user_id,
             n_chunks = chunks.len(),
             n_tables = tables.len(),
             n_pictures = pictures.len(),
@@ -294,29 +298,31 @@ impl Neo4jStore {
     ) -> Result<(), StoreError> {
         let doc_id = header.document_id.to_string();
         let run_id = header.ingest_run_id.to_string();
+        let user_id_str = header.user_id.as_str().to_owned();
 
         // ------------------------------------------------------------------
         // Phase 1: Document node
+        //
+        // `user_id` is written via ON CREATE SET (idempotent on re-ingest —
+        // the owning user never changes for a given document_id).
         // ------------------------------------------------------------------
-        upsert_nodes_batch(
+        upsert_document_node(
             &self.graph,
-            LABEL_DOCUMENT,
-            &[NodeRow {
-                id: doc_id.clone(),
-                run_id: run_id.clone(),
-                props: json!({
-                    "sha256":           header.sha256,
-                    "source":           header.source,
-                    "n_pages":          header.n_pages,
-                    "n_chunks":         header.n_chunks,
-                    "n_tables":         header.n_tables,
-                    "n_pictures":       header.n_pictures,
-                    "language":         header.language,
-                    "title":            header.title,
-                    "mimetype":         header.mimetype,
-                    "docling_version":  header.docling_version,
-                }),
-            }],
+            &doc_id,
+            &run_id,
+            &user_id_str,
+            json!({
+                "sha256":           header.sha256,
+                "source":           header.source,
+                "n_pages":          header.n_pages,
+                "n_chunks":         header.n_chunks,
+                "n_tables":         header.n_tables,
+                "n_pictures":       header.n_pictures,
+                "language":         header.language,
+                "title":            header.title,
+                "mimetype":         header.mimetype,
+                "docling_version":  header.docling_version,
+            }),
         )
         .await?;
 
@@ -636,7 +642,11 @@ fn collect_section_rows(chunks: &[StructuralChunk], run_id: &str, doc_id: &str) 
             order.push(id_str.clone());
             let first_chunk_index = chunk_index as i64;
             let page_start = chunk.page_start;
-            let section_order = if is_preamble { -1i64 } else { first_chunk_index };
+            let section_order = if is_preamble {
+                -1i64
+            } else {
+                first_chunk_index
+            };
 
             let (heading, depth) = if is_preamble {
                 (Some("(preamble)".to_owned()), Some(0i64))
@@ -669,7 +679,10 @@ fn collect_section_rows(chunks: &[StructuralChunk], run_id: &str, doc_id: &str) 
     }
 
     // Return in document order (insertion order into `order`).
-    order.into_iter().filter_map(|id| seen.remove(&id)).collect()
+    order
+        .into_iter()
+        .filter_map(|id| seen.remove(&id))
+        .collect()
 }
 
 /// Collect `PARENT_OF` edges from the heading path hierarchy.
@@ -778,6 +791,46 @@ async fn update_chunk_structural_props(
             .map_err(StoreError::from)?;
         txn.commit().await.map_err(StoreError::from)?;
     }
+    Ok(())
+}
+
+/// Upsert the `Document` node with its `user_id` property.
+///
+/// Uses `MERGE … ON CREATE SET` so that both `user_id` and `ingest_run_id`
+/// are written only when the node is first created. Re-ingesting the same
+/// `doc_id` leaves the original `user_id` intact (idempotent per the
+/// additive-only invariant).
+///
+/// Extra payload properties (sha256, title, etc.) are merged separately via
+/// `ON CREATE SET n += props` so they follow the same one-shot pattern.
+async fn upsert_document_node(
+    graph: &Graph,
+    doc_id: &str,
+    run_id: &str,
+    user_id: &str,
+    props: serde_json::Value,
+) -> Result<(), StoreError> {
+    const CYPHER: &str = "\
+        MERGE (n:Document {id: $doc_id}) \
+        ON CREATE SET \
+            n += $props, \
+            n.user_id = $user_id, \
+            n.ingest_run_id = $run_id";
+
+    let bolt_props = neo4rs::BoltType::try_from(props)
+        .map_err(|e| StoreError::Serialization(format!("Document props serialize: {e}")))?;
+
+    let mut txn = graph.start_txn().await.map_err(StoreError::from)?;
+    txn.run(
+        query(CYPHER)
+            .param("doc_id", doc_id)
+            .param("props", bolt_props)
+            .param("user_id", user_id)
+            .param("run_id", run_id),
+    )
+    .await
+    .map_err(StoreError::from)?;
+    txn.commit().await.map_err(StoreError::from)?;
     Ok(())
 }
 
