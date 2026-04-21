@@ -20,17 +20,26 @@ default:
 env:
     @if [ ! -f .env ]; then cp .env.example .env && echo "Created .env — edit OPENAI_API_KEY and AGENT_RS__LLM__API_KEY"; else echo ".env already exists"; fi
 
-# Full first-time setup: copy .env, start infra, wait for health, run migrations.
+# Full first-time setup: copy .env, start infra, wait for health, run migrations, create MinIO bucket.
 bootstrap: env infra-up
     @echo "Waiting ~20s for services to be healthy..."
     @sleep 20
     just migrations
+    just minio-bootstrap
     @echo
     @echo "Bootstrap complete. Verify:"
     @echo "  docker compose ps"
     @echo "  just ingest test.pdf"
 
 # ─── Infrastructure ───────────────────────────────────────────────────────
+
+# Create (or re-verify) the MinIO bucket used for document storage.
+# Idempotent: mc alias set runs on every call; mc mb --ignore-existing is a no-op
+# when the bucket already exists. Safe to run against a live MinIO instance.
+minio-bootstrap:
+    docker compose exec -T minio mc alias set local http://localhost:9000 ${MINIO_ROOT_USER:-minioadmin} ${MINIO_ROOT_PASSWORD:-minioadmin} >/dev/null
+    docker compose exec -T minio mc mb --ignore-existing local/${MINIO_BUCKET:-agent-rs-docs}
+    @echo "MinIO bucket ${MINIO_BUCKET:-agent-rs-docs} ready"
 
 # Start all core services (qdrant, postgres, neo4j, docling-sidecar).
 infra-up:
