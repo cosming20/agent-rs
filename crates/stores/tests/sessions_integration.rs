@@ -138,24 +138,33 @@ async fn list_ingested_documents_filters_out_non_complete() {
 #[tokio::test]
 async fn two_users_same_sha_get_separate_document_ids() {
     let pg = test_pg().await;
-    let alice = UserId::try_new("alice-test-3-2c").expect("valid");
-    let bob = UserId::try_new("bob-test-3-2c").expect("valid");
 
-    // Both users upload a doc with the SAME sha256 content. Per-user
-    // dedup means each gets a distinct document_id.
-    let shared_sha = "abc123def456abc123def456abc123def456abc123def456abc123def456abcd";
+    // Unique user ids + sha per run so re-running the test doesn't
+    // hit the (user_id, sha256) unique index from a prior attempt.
+    // The test validates per-user dedup, not idempotency of the test
+    // fixture itself; prefixing with a UUID gives each run a fresh
+    // namespace.
+    let run = uuid::Uuid::new_v4();
+    let run_hex = run.simple().to_string();
+    let alice = UserId::try_new(&format!("alice-3-2c-{}", &run_hex[..8])).expect("valid");
+    let bob = UserId::try_new(&format!("bob-3-2c-{}", &run_hex[..8])).expect("valid");
+    // sha256 is bpchar(64); compose a 64-char hex string from the run uuid.
+    let shared_sha: String = format!("{run_hex}{run_hex}").chars().take(64).collect();
+
     let a = pg
-        .test_insert_document_with_sha(&alice, "same.pdf", shared_sha)
+        .test_insert_document_with_sha(&alice, "same.pdf", &shared_sha)
         .await
         .unwrap();
     let b = pg
-        .test_insert_document_with_sha(&bob, "same.pdf", shared_sha)
+        .test_insert_document_with_sha(&bob, "same.pdf", &shared_sha)
         .await
         .unwrap();
 
     assert_ne!(a.document_id, b.document_id);
     assert_eq!(a.user_id, alice.as_str());
     assert_eq!(b.user_id, bob.as_str());
+    assert_eq!(a.sha256.trim(), shared_sha);
+    assert_eq!(b.sha256.trim(), shared_sha);
 }
 
 // ---------------------------------------------------------------------------
