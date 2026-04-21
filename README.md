@@ -225,6 +225,24 @@ EVAL_SKIP_ENTITY_LINKER=1     # Skip entity -> KG linking
 | 1062 | Neo4j HTTP |
 | 1063 | Brave Search MCP |
 | 1068 | Docling sidecar gRPC |
+| 1069 | MinIO S3 API |
+| 1070 | MinIO Console UI |
+
+## Multi-tenant rollout (April 2026)
+
+This release introduces strict per-user document scoping across Postgres, Qdrant, Neo4j, and MinIO. Documents uploaded under one `user_id` are invisible to any other `user_id` at every retrieval layer. Upgrade steps (destroys all existing data — reingest required):
+
+```bash
+just infra-reset      # wipes Postgres/Qdrant/Neo4j volumes
+just migrations       # applies all diesel migrations (incl. multi_tenant)
+just minio-bootstrap  # creates the agent-rs-docs bucket
+just ingest "<user_id>" "<path/to/doc.pdf>"
+just ask "<user_id>" "" "<question>"   # empty session_id = fresh UUID
+```
+
+`<user_id>` accepts `[A-Za-z0-9_-]{1,128}` and is validated at every entry point. PDF bytes are uploaded to MinIO at `users/{user_id}/docs/{document_id}.pdf` before Docling runs; the object persists even if Docling fails so retries don't require re-upload.
+
+The three stores (Qdrant / Neo4j / Postgres / MinIO) enforce user scoping independently — defence in depth. See the spec at `docs/superpowers/specs/2026-04-21-multi-tenant-docs-design.md` for the full threat model, transactional guarantees, and security matrix.
 
 ## Performance
 
