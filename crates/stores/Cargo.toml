@@ -22,3 +22,5 @@ diesel = { workspace = true }
 diesel-async = { workspace = true }
 qdrant-client = { workspace = true }
 neo4rs = { workspace = true }
+aws-sdk-s3 = { workspace = true }
+aws-config = { workspace = true }
