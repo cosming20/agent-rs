@@ -1,0 +1,62 @@
+[package]
+name = "agent-rs-agent-service"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+
+# The crate builds a single binary that runs the tonic gRPC server
+# exposing the Agent service. Consumers (agent-rs-web) link against
+# the generated client code via their own tonic-build invocation
+# against the same proto submodule; no shared library is needed.
+[[bin]]
+name = "agent-service"
+path = "src/main.rs"
+
+[dependencies]
+# gRPC + codegen runtime
+tonic     = "0.12"
+prost     = "0.13"
+# Use google.protobuf.Empty etc. if a future RPC needs it — currently
+# every response has a bespoke message so prost-types is unused; keep
+# the dep out of the build graph to cut compile time.
+
+# Async
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "signal"] }
+tokio-stream = "0.1"
+futures = "0.3"
+
+# Observability — reuse the workspace tracing stack
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+# Configuration / errors
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+
+# Value types (UserId, SessionId validator live here)
+agent-rs-core = { path = "../core" }
+
+# Stores (PgStore, Neo4jStore, QdrantStore, MinioStore)
+agent-rs-stores = { path = "../stores" }
+
+# Agent orchestrator (AgentOrchestrator::process_query)
+agent-rs-agent = { path = "../agent" }
+
+# Retrieval router (used by orchestrator internally; re-imported here
+# only if the service constructs its own router outside the agent — not
+# expected, but kept for symmetry with the existing bin targets)
+agent-rs-retrieval = { path = "../retrieval" }
+
+# Tools — needed for the ToolFactory; AgentOrchestrator needs a tool set
+agent-rs-tools = { path = "../tools" }
+
+# Observability registry (metrics / tracing init)
+agent-rs-observability = { path = "../observability" }
+
+uuid = { workspace = true }
+chrono = { workspace = true }
+
+[build-dependencies]
+# tonic-build compiles the proto from the submodule into OUT_DIR.
+tonic-build = "0.12"
