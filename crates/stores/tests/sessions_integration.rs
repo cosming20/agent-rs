@@ -221,3 +221,94 @@ async fn chat_messages_cross_user_read_returns_empty() {
     let bob_view = pg.list_chat_messages(&bob, &session).await.unwrap();
     assert!(bob_view.is_empty(), "bob must not see alice's chat");
 }
+
+// ---------------------------------------------------------------------------
+// Task 3.4: session_active_documents with ownership-verified INSERT
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn activate_document_for_session_with_valid_owner() {
+    let pg = test_pg().await;
+    let run = uuid::Uuid::new_v4().simple().to_string();
+    let alice = UserId::try_new(&format!("alice-3-4a-{}", &run[..8])).expect("valid");
+    let session = SessionId::from_uuid(Uuid::new_v4());
+
+    pg.create_or_fetch_session(&alice, &session).await.unwrap();
+    let doc = pg.test_insert_document_complete(&alice, "alice-3-4.pdf").await.unwrap();
+
+    pg.activate_document_for_session(&alice, &session, &doc.document_id)
+        .await
+        .expect("valid owner");
+
+    let active = pg.list_active_documents(&alice, &session).await.unwrap();
+    assert_eq!(active.len(), 1);
+    assert_eq!(active[0].document_id, doc.document_id);
+}
+
+#[tokio::test]
+async fn activate_document_rejects_cross_user() {
+    let pg = test_pg().await;
+    let run = uuid::Uuid::new_v4().simple().to_string();
+    let alice = UserId::try_new(&format!("alice-3-4b-{}", &run[..8])).expect("valid");
+    let bob = UserId::try_new(&format!("bob-3-4b-{}", &run[..8])).expect("valid");
+    let bob_session = SessionId::from_uuid(Uuid::new_v4());
+
+    pg.create_or_fetch_session(&bob, &bob_session).await.unwrap();
+    let alice_doc = pg
+        .test_insert_document_complete(&alice, "alice-3-4b.pdf")
+        .await
+        .unwrap();
+
+    let err = pg
+        .activate_document_for_session(&bob, &bob_session, &alice_doc.document_id)
+        .await
+        .expect_err("bob cannot activate alice's doc");
+
+    match err {
+        StoreError::DocumentNotOwnedByUser { .. } => {}
+        other => panic!("expected DocumentNotOwnedByUser, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn activate_document_idempotent() {
+    let pg = test_pg().await;
+    let run = uuid::Uuid::new_v4().simple().to_string();
+    let alice = UserId::try_new(&format!("alice-3-4c-{}", &run[..8])).expect("valid");
+    let session = SessionId::from_uuid(Uuid::new_v4());
+
+    pg.create_or_fetch_session(&alice, &session).await.unwrap();
+    let doc = pg.test_insert_document_complete(&alice, "alice-3-4c.pdf").await.unwrap();
+
+    // First activation succeeds.
+    pg.activate_document_for_session(&alice, &session, &doc.document_id).await.unwrap();
+    // Second activation (same session + doc) must NOT error — idempotent.
+    pg.activate_document_for_session(&alice, &session, &doc.document_id).await.unwrap();
+
+    let active = pg.list_active_documents(&alice, &session).await.unwrap();
+    assert_eq!(active.len(), 1, "duplicate activations must collapse to one row");
+}
+
+#[tokio::test]
+async fn activate_document_rejects_non_complete_status() {
+    let pg = test_pg().await;
+    let run = uuid::Uuid::new_v4().simple().to_string();
+    let alice = UserId::try_new(&format!("alice-3-4d-{}", &run[..8])).expect("valid");
+    let session = SessionId::from_uuid(Uuid::new_v4());
+
+    pg.create_or_fetch_session(&alice, &session).await.unwrap();
+    let pending = pg
+        .test_insert_document_with_status(&alice, "pending.pdf", "pending")
+        .await
+        .unwrap();
+
+    let err = pg
+        .activate_document_for_session(&alice, &session, &pending.document_id)
+        .await
+        .expect_err("cannot activate pending doc");
+
+    match err {
+        StoreError::DocumentNotOwnedByUser { .. } => {}
+        other => panic!("expected DocumentNotOwnedByUser (doc not 'complete'), got {other:?}"),
+    }
+}

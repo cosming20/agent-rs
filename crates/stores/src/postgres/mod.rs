@@ -32,6 +32,7 @@ use crate::types::{ChatMessage, EvidenceItem, Memory, QueryRun};
 pub mod documents;
 pub mod models;
 pub mod schema;
+pub mod session_docs;
 pub mod sessions;
 
 pub use documents::HeaderMetadata;
