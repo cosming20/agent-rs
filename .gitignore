@@ -7,3 +7,4 @@
 .env
 # Python venv for running the Docling sidecar natively (MPS on macOS).
 .venv/
+*.pdf
