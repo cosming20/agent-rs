@@ -20,6 +20,8 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use agent_rs_core::{CollectionName, IngestBackend, NAMESPACE_OID, UserId};
+
+use super::document_id::derive_document_id;
 use agent_rs_stores::postgres::PgStore;
 use agent_rs_stores::postgres::documents::HeaderMetadata;
 use agent_rs_stores::postgres::models::{BeginIngestionOutcome, NewIngestedDocument};
@@ -1010,8 +1012,9 @@ impl IngestionPipeline {
         // ---- Step 2: Dedup via Postgres ----
         let maybe_run_id: Option<Uuid> = if let Some(pg) = &self.pg_store {
             let now = Utc::now().naive_utc();
+            let pg_user_id_for_doc = agent_rs_core::UserId::from_string(user_id.to_owned());
             let new_doc = NewIngestedDocument {
-                document_id: Uuid::new_v5(&NAMESPACE_OID, sha256.as_bytes()),
+                document_id: derive_document_id(&pg_user_id_for_doc, &sha256),
                 sha256: sha256.clone(),
                 source: source.to_owned(),
                 ingest_status: agent_rs_core::IngestStatus::InProgress.as_str().to_owned(),
@@ -1024,9 +1027,8 @@ impl IngestionPipeline {
                 minio_object_key: None,
             };
 
-            let pg_user_id = agent_rs_core::UserId::from_string(user_id.to_owned());
             match pg
-                .begin_ingestion(&pg_user_id, new_doc)
+                .begin_ingestion(&pg_user_id_for_doc, new_doc)
                 .await
                 .map_err(RetrievalError::Store)?
             {
@@ -1825,8 +1827,9 @@ fn build_summary_payload(
 
 /// Build a `DocumentHeaderSnapshot` from a proto `DocumentHeader` + `DocumentFooter`.
 ///
-/// The document UUID is derived deterministically from the sha256 via UUIDv5
-/// so the same source bytes always produce the same document node.
+/// The document UUID is derived deterministically from `(user_id, sha256)` via
+/// UUIDv5, salted with the tenant so two users uploading the same bytes receive
+/// distinct `document_id` values.
 fn proto_header_to_snapshot(
     header: &ProtoDocumentHeader,
     footer: &ProtoDocumentFooter,
@@ -1834,7 +1837,8 @@ fn proto_header_to_snapshot(
     source: &str,
     user_id: &str,
 ) -> DocumentHeaderSnapshot {
-    let document_id = Uuid::new_v5(&NAMESPACE_OID, header.sha256.as_bytes());
+    let uid = UserId::from_string(user_id.to_owned());
+    let document_id = derive_document_id(&uid, &header.sha256);
 
     let pages: Vec<StructuralPageInfo> = header
         .pages

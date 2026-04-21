@@ -213,15 +213,13 @@ impl Tool for SearchSectionsTool {
         // Score is 1.0 for exhaustive (unranked) fetches.
         if let Some(collector) = &self.coverage_collector {
             let mut guard = collector.lock().await;
-            for res in &results {
-                if let Ok((_, payloads)) = res {
-                    for p in payloads {
-                        guard.push(SearchResult {
-                            id: p.id.clone(),
-                            score: Score::new(1.0),
-                            payload: p.payload.clone(),
-                        });
-                    }
+            for (_, payloads) in results.iter().flatten() {
+                for p in payloads {
+                    guard.push(SearchResult {
+                        id: p.id.clone(),
+                        score: Score::new(1.0),
+                        payload: p.payload.clone(),
+                    });
                 }
             }
         }

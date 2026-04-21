@@ -63,7 +63,8 @@ CREATE INDEX IF NOT EXISTS idx_session_active_documents_document
 
 -- 4) Widen ingest_status check so new states from spec §11.1 are valid.
 --    Existing statuses: 'pending', 'complete', 'partial_failure'.
---    Add 'failed' (MinIO upload fail) and 'deleting' (spec §11.3).
+--    Add 'in_progress' (begin_ingestion transition), 'failed' (MinIO upload
+--    fail), and 'deleting' (spec §11.3).
 
 ALTER TABLE ingested_documents
     DROP CONSTRAINT IF EXISTS ingested_documents_ingest_status_check;
@@ -71,5 +72,5 @@ ALTER TABLE ingested_documents
 ALTER TABLE ingested_documents
     ADD CONSTRAINT ingested_documents_ingest_status_check
     CHECK (ingest_status IN (
-        'pending', 'complete', 'partial_failure', 'failed', 'deleting'
+        'in_progress', 'pending', 'complete', 'partial_failure', 'failed', 'deleting'
     ));

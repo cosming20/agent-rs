@@ -24,6 +24,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
+use agent_rs_core::types::UserId;
 use agent_rs_stores::traits::GraphStore;
 use tracing::{instrument, warn};
 
@@ -141,10 +142,14 @@ impl ContextExpander {
         }
     }
 
-    /// Expand context for a list of hit chunk IDs.
+    /// Expand context for a list of hit chunk IDs, scoped to `user_id`.
     ///
     /// Each element of `hit_chunks` is a `(chunk_id, original_text)` pair.
     /// Returns one [`ExpandedChunk`] per input hit, preserving order.
+    ///
+    /// All graph traversals are guarded at the `Document` level by `user_id`
+    /// so that cross-tenant chunks are never returned, even when graph edges
+    /// span documents belonging to different users.
     ///
     /// On graph query failure the hit is returned with empty neighbor lists
     /// (graceful degradation) and a warning is logged.
@@ -158,8 +163,9 @@ impl ContextExpander {
     /// backend errors are demoted to warnings and produce degraded output.
     #[instrument(
         name = "context_expander.expand",
-        skip(self, hit_chunks),
+        skip(self, user_id, hit_chunks),
         fields(
+            user_id = %user_id,
             hit_count = hit_chunks.len(),
             follows_depth = self.config.follows_depth,
             expand_section = self.config.expand_section,
@@ -167,6 +173,7 @@ impl ContextExpander {
     )]
     pub async fn expand(
         &self,
+        user_id: &UserId,
         hit_chunks: &[(String, String)],
     ) -> Result<Vec<ExpandedChunk>, RetrievalError> {
         if hit_chunks.is_empty() {
@@ -193,7 +200,7 @@ impl ContextExpander {
                 continue;
             }
 
-            let expanded = self.expand_single(chunk_id, original_text, &hit_ids).await;
+            let expanded = self.expand_single(user_id, chunk_id, original_text, &hit_ids).await;
 
             let neighbor_count = {
                 let e = match &expanded {
@@ -233,12 +240,13 @@ impl ContextExpander {
     }
 
     /// Expand a single chunk: fetch FOLLOWS neighbors and (optionally)
-    /// IN_SECTION siblings.
+    /// IN_SECTION siblings, all guarded to `user_id`.
     ///
     /// Returns `Ok(ExpandedChunk)` on success or logs a warning and returns
     /// an empty-neighbor chunk on graph failure.
     async fn expand_single(
         &self,
+        user_id: &UserId,
         chunk_id: &str,
         original_text: &str,
         all_hit_ids: &HashSet<String>,
@@ -246,7 +254,7 @@ impl ContextExpander {
         let depth = self.config.follows_depth;
 
         // ---- FOLLOWS: chunks before this one ----
-        let context_before = match self.fetch_follows_before(chunk_id, depth).await {
+        let context_before = match self.fetch_follows_before(user_id, chunk_id, depth).await {
             Ok(chunks) => chunks,
             Err(e) => {
                 warn!(
@@ -259,7 +267,7 @@ impl ContextExpander {
         };
 
         // ---- FOLLOWS: chunks after this one ----
-        let context_after = match self.fetch_follows_after(chunk_id, depth).await {
+        let context_after = match self.fetch_follows_after(user_id, chunk_id, depth).await {
             Ok(chunks) => chunks,
             Err(e) => {
                 warn!(
@@ -283,7 +291,7 @@ impl ContextExpander {
 
         // ---- IN_SECTION siblings (optional) ----
         let section_siblings = if self.config.expand_section {
-            match self.fetch_section_siblings(chunk_id, &seen_ids).await {
+            match self.fetch_section_siblings(user_id, chunk_id, &seen_ids).await {
                 Ok(siblings) => siblings,
                 Err(e) => {
                     warn!(
@@ -314,15 +322,20 @@ impl ContextExpander {
     /// Fetch up to `depth` chunks that precede `chunk_id` via FOLLOWS edges,
     /// returned in document order (ascending chunk_index where available,
     /// otherwise in traversal order).
+    ///
+    /// Guards at the `Document` level so only chunks owned by `user_id` are
+    /// returned, preventing cross-tenant leakage via graph edges.
     async fn fetch_follows_before(
         &self,
+        user_id: &UserId,
         chunk_id: &str,
         depth: usize,
     ) -> Result<Vec<ContextChunk>, RetrievalError> {
-        // Walk backwards along FOLLOWS edges: prev -[FOLLOWS]-> target
-        // Multiple hops: (target)<-[:FOLLOWS*1..N]-(prev)
+        // Walk backwards along FOLLOWS edges, then verify Document ownership.
         let cypher = format!(
             "MATCH (target:Chunk {{id: $chunk_id}})<-[:FOLLOWS*1..{depth}]-(prev:Chunk) \
+             WITH prev \
+             MATCH (prev)-[:IN_SECTION]->(:Section)<-[:HAS_SECTION*0..]-(:Document {{user_id: $user_id}}) \
              RETURN prev.id AS id, \
                     prev.chunk_text AS text, \
                     prev.page_start AS page_start, \
@@ -330,7 +343,7 @@ impl ContextExpander {
              ORDER BY prev.chunk_index ASC"
         );
 
-        let params = build_params(chunk_id);
+        let params = build_params_with_user(chunk_id, user_id.as_str());
         let rows = self
             .graph_store
             .query_raw(&cypher, params, EXPANSION_COLUMNS)
@@ -342,14 +355,20 @@ impl ContextExpander {
 
     /// Fetch up to `depth` chunks that follow `chunk_id` via FOLLOWS edges,
     /// returned in document order (ascending chunk_index).
+    ///
+    /// Guards at the `Document` level so only chunks owned by `user_id` are
+    /// returned.
     async fn fetch_follows_after(
         &self,
+        user_id: &UserId,
         chunk_id: &str,
         depth: usize,
     ) -> Result<Vec<ContextChunk>, RetrievalError> {
-        // Walk forwards: target -[FOLLOWS*1..N]-> next
+        // Walk forwards, then verify Document ownership.
         let cypher = format!(
             "MATCH (target:Chunk {{id: $chunk_id}})-[:FOLLOWS*1..{depth}]->(next:Chunk) \
+             WITH next \
+             MATCH (next)-[:IN_SECTION]->(:Section)<-[:HAS_SECTION*0..]-(:Document {{user_id: $user_id}}) \
              RETURN next.id AS id, \
                     next.chunk_text AS text, \
                     next.page_start AS page_start, \
@@ -357,7 +376,7 @@ impl ContextExpander {
              ORDER BY next.chunk_index ASC"
         );
 
-        let params = build_params(chunk_id);
+        let params = build_params_with_user(chunk_id, user_id.as_str());
         let rows = self
             .graph_store
             .query_raw(&cypher, params, EXPANSION_COLUMNS)
@@ -369,8 +388,12 @@ impl ContextExpander {
 
     /// Fetch same-section chunks via IN_SECTION edges, excluding IDs already
     /// in `exclude_ids`.  Limited to 5 siblings to prevent section-wide explosion.
+    ///
+    /// Guards at the `Document` level so only chunks owned by `user_id` are
+    /// returned.
     async fn fetch_section_siblings(
         &self,
+        user_id: &UserId,
         chunk_id: &str,
         exclude_ids: &HashSet<String>,
     ) -> Result<Vec<ContextChunk>, RetrievalError> {
@@ -383,6 +406,8 @@ impl ContextExpander {
             "MATCH (target:Chunk {{id: $chunk_id}})-[:IN_SECTION]->(s:Section) \
              MATCH (sibling:Chunk)-[:IN_SECTION]->(s) \
              WHERE sibling.id <> $chunk_id \
+             WITH sibling, s \
+             MATCH (s)<-[:HAS_SECTION*0..]-(:Document {{user_id: $user_id}}) \
              RETURN sibling.id AS id, \
                     sibling.chunk_text AS text, \
                     sibling.page_start AS page_start, \
@@ -391,7 +416,7 @@ impl ContextExpander {
              LIMIT {SECTION_SIBLING_LIMIT}"
         );
 
-        let params = build_params(chunk_id);
+        let params = build_params_with_user(chunk_id, user_id.as_str());
         let rows = self
             .graph_store
             .query_raw(&cypher, params, EXPANSION_COLUMNS)
@@ -412,10 +437,13 @@ impl ContextExpander {
 // Private helpers
 // ---------------------------------------------------------------------------
 
-/// Build the single-parameter map used by all expansion queries.
-fn build_params(chunk_id: &str) -> HashMap<String, String> {
-    let mut params = HashMap::with_capacity(1);
+/// Build the two-parameter map (`chunk_id` + `user_id`) used by all expansion
+/// queries.  The `user_id` guards Document-level ownership in every Cypher
+/// traversal so cross-tenant chunks are never returned.
+fn build_params_with_user(chunk_id: &str, user_id: &str) -> HashMap<String, String> {
+    let mut params = HashMap::with_capacity(2);
     params.insert("chunk_id".to_owned(), chunk_id.to_owned());
+    params.insert("user_id".to_owned(), user_id.to_owned());
     params
 }
 

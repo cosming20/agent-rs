@@ -926,7 +926,7 @@ impl RetrievalRouter {
                 })
                 .collect();
 
-            match expander.expand(&hit_chunks).await {
+            match expander.expand(user_id, &hit_chunks).await {
                 Ok(expanded) => {
                     // Merge expanded context into the evidence document payloads.
                     // For each hit, collect context_before + context_after + siblings

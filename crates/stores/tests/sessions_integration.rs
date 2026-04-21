@@ -408,3 +408,4 @@ async fn sha256_lookup_is_user_scoped() {
         .unwrap();
     assert!(alice_has, "alice must still find her own doc");
 }
+

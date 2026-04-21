@@ -250,7 +250,7 @@ pub(crate) fn detect_intent_with_signal(q: &str) -> IntentSignal {
         };
     }
 
-    let soft_count = SOFT_QUANTIFIER_TOKENS.iter().filter(|t| contains_word(&lc, *t)).count();
+    let soft_count = SOFT_QUANTIFIER_TOKENS.iter().filter(|t| contains_word(&lc, t)).count();
     if soft_count >= 2 {
         return IntentSignal {
             mode: CoverageMode::Partial,

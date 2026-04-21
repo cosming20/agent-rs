@@ -24,6 +24,10 @@ use super::PgStore;
 use super::models::{ChatMessageRow, IngestedDocumentRow, MemoryRow, NewSession, SessionRow};
 use super::schema::{chat_messages, ingested_documents, memories, session_active_documents, sessions};
 
+/// Return type of [`PgStore::read_context_snapshot`]: chat messages, memories,
+/// and active ingested documents bundled together.
+type ContextSnapshot = (Vec<ChatMessageRow>, Vec<MemoryRow>, Vec<IngestedDocumentRow>);
+
 impl PgStore {
     /// Upsert-with-ownership semantics for a session row.
     ///
@@ -125,7 +129,7 @@ impl PgStore {
         &self,
         user_id: &UserId,
         session_id: &SessionId,
-    ) -> Result<(Vec<ChatMessageRow>, Vec<MemoryRow>, Vec<IngestedDocumentRow>), StoreError> {
+    ) -> Result<ContextSnapshot, StoreError> {
         let mut conn = self.conn().await?;
         let uid = user_id.as_str().to_owned();
         let sid = *session_id.inner();

@@ -197,7 +197,7 @@ pub fn resolve_document<'a>(
         d.source.to_lowercase().contains(&needle)
             || d.title
                 .as_deref()
-                .map_or(false, |t| t.to_lowercase().contains(&needle))
+                .is_some_and(|t| t.to_lowercase().contains(&needle))
             || d.document_id.to_string().to_lowercase().contains(&needle)
     })
 }

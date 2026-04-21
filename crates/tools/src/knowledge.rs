@@ -27,20 +27,15 @@ const DEFAULT_LIMIT: usize = 10;
 /// keyword + graph fusion + rerank). `AllInSection` bypasses ranking and
 /// returns every chunk in the requested `section_id` (requires `section_id`
 /// to be set; otherwise falls back to `Ranked` with a tracing warn).
-#[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum SearchMode {
     /// Full retrieval router: dense + BM25 + graph fusion + cross-encoder rerank.
+    #[default]
     Ranked,
     /// Bypass ranking; return every chunk whose payload `section_id` matches.
     /// Falls back to `Ranked` (with a warning) when `section_id` is absent.
     AllInSection,
-}
-
-impl Default for SearchMode {
-    fn default() -> Self {
-        SearchMode::Ranked
-    }
 }
 
 // ---- Args ----
