@@ -39,7 +39,8 @@ use agent_rs::embedder::build_embedder;
 use agent_rs::ingest::{IngestFeatures, build_ingestion_pipeline};
 use agent_rs::stores::connect_stores;
 use agent_rs_core::config::Settings;
-use agent_rs_core::types::{CollectionName, UserId, NAMESPACE_OID};
+use agent_rs_core::types::{CollectionName, UserId};
+use agent_rs_retrieval::ingestion::derive_document_id;
 use agent_rs_observability::metrics::RetrievalMetrics;
 use agent_rs_observability::tracing::init_tracing;
 use agent_rs_stores::minio::MinioStore;
@@ -48,7 +49,6 @@ use agent_rs_stores::types::CollectionConfig;
 use anyhow::{Context, Result, bail};
 use sha2::{Digest, Sha256};
 use tracing::{info, warn};
-use uuid::Uuid;
 
 struct Args {
     user_id: UserId,
@@ -108,11 +108,6 @@ fn sha256_hex(bytes: &[u8]) -> String {
     format!("{:x}", hasher.finalize())
 }
 
-/// Derive the canonical document UUID the same way the ingest pipeline does:
-/// UUIDv5 of the sha256 string bytes in the `NAMESPACE_OID` namespace.
-fn document_id_from_sha256(sha256: &str) -> Uuid {
-    Uuid::new_v5(&NAMESPACE_OID, sha256.as_bytes())
-}
 
 async fn ensure_collection(
     store: &(dyn VectorStore + Send + Sync),
@@ -203,7 +198,7 @@ async fn main() -> Result<()> {
         .with_context(|| format!("read file {}", args.pdf_path.display()))?;
 
     let sha256 = sha256_hex(&bytes);
-    let document_id = document_id_from_sha256(&sha256);
+    let document_id = derive_document_id(&args.user_id, &sha256);
 
     info!(
         user_id = %args.user_id,
