@@ -323,6 +323,8 @@ pub struct GraphPath {
 pub struct ChatMessage {
     pub id: Uuid,
     pub session_id: SessionId,
+    /// Tenant that authored and owns this message.
+    pub user_id: UserId,
     pub role: MessageRole,
     pub content: String,
     pub created_at: NaiveDateTime,

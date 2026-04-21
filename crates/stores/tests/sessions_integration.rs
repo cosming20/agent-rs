@@ -157,3 +157,58 @@ async fn two_users_same_sha_get_separate_document_ids() {
     assert_eq!(a.user_id, alice.as_str());
     assert_eq!(b.user_id, bob.as_str());
 }
+
+// ---------------------------------------------------------------------------
+// Task 3.3: memories + chat_messages scoped to (user_id, session_id)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn memories_scoped_to_user() {
+    let pg = test_pg().await;
+    let alice = UserId::try_new("alice-test-3-3a").expect("valid");
+    let bob = UserId::try_new("bob-test-3-3a").expect("valid");
+
+    pg.save_memory(&alice, "alice knows Rust").await.unwrap();
+    pg.save_memory(&bob, "bob prefers Python").await.unwrap();
+
+    let alice_mem = pg.list_memories(&alice).await.unwrap();
+    assert!(alice_mem.iter().any(|m| m.content.contains("Rust")));
+    assert!(
+        alice_mem.iter().all(|m| !m.content.contains("Python")),
+        "alice must not see bob's memory"
+    );
+}
+
+#[tokio::test]
+async fn chat_messages_scoped_to_user_and_session() {
+    let pg = test_pg().await;
+    let alice = UserId::try_new("alice-test-3-3b").expect("valid");
+    let session = SessionId::from_uuid(Uuid::new_v4());
+    pg.create_or_fetch_session(&alice, &session).await.unwrap();
+
+    pg.append_chat_message(&alice, &session, "user", "hello from alice")
+        .await
+        .unwrap();
+
+    let msgs = pg.list_chat_messages(&alice, &session).await.unwrap();
+    assert!(msgs.iter().any(|m| m.content == "hello from alice"));
+    assert!(msgs.iter().all(|m| m.user_id.as_str() == alice.as_str()));
+}
+
+#[tokio::test]
+async fn chat_messages_cross_user_read_returns_empty() {
+    let pg = test_pg().await;
+    let alice = UserId::try_new("alice-test-3-3c").expect("valid");
+    let bob = UserId::try_new("bob-test-3-3c").expect("valid");
+    let session = SessionId::from_uuid(Uuid::new_v4());
+
+    pg.create_or_fetch_session(&alice, &session).await.unwrap();
+    pg.append_chat_message(&alice, &session, "user", "private")
+        .await
+        .unwrap();
+
+    // If someone bypasses authz and passes (bob, alice_session) directly,
+    // the filter-by-user_id in the SELECT ensures zero rows — defence in depth.
+    let bob_view = pg.list_chat_messages(&bob, &session).await.unwrap();
+    assert!(bob_view.is_empty(), "bob must not see alice's chat");
+}

@@ -70,6 +70,9 @@ pub(super) fn str_to_strategy(s: &str) -> Result<RetrievalStrategy, StoreError> 
 // ---------------------------------------------------------------------------
 
 /// A row read from the `chat_messages` table.
+///
+/// Column order matches the schema definition in `schema.rs`:
+/// `id`, `session_id`, `role`, `content`, `created_at`, `user_id`.
 #[derive(Debug, Queryable, Selectable)]
 #[diesel(table_name = chat_messages)]
 #[diesel(check_for_backend(diesel::pg::Pg))]
@@ -79,6 +82,8 @@ pub struct ChatMessageRow {
     pub role: String,
     pub content: String,
     pub created_at: NaiveDateTime,
+    /// Tenant that owns this message.  Added in migration 7 (`multi_tenant`).
+    pub user_id: String,
 }
 
 impl ChatMessageRow {
@@ -91,6 +96,7 @@ impl ChatMessageRow {
         Ok(ChatMessage {
             id: self.id,
             session_id: SessionId::from_uuid(self.session_id),
+            user_id: UserId::from_string(self.user_id),
             role,
             content: self.content,
             created_at: self.created_at,
@@ -107,10 +113,12 @@ pub struct NewChatMessage<'a> {
     pub role: &'a str,
     pub content: &'a str,
     pub created_at: NaiveDateTime,
+    /// Tenant that owns this message.
+    pub user_id: &'a str,
 }
 
 impl<'a> NewChatMessage<'a> {
-    /// Build an [`NewChatMessage`] from the domain type.
+    /// Build a [`NewChatMessage`] from the domain type.
     pub fn from_domain(msg: &'a ChatMessage) -> Self {
         Self {
             id: msg.id,
@@ -118,6 +126,7 @@ impl<'a> NewChatMessage<'a> {
             role: role_to_str(msg.role),
             content: &msg.content,
             created_at: msg.created_at,
+            user_id: msg.user_id.as_str(),
         }
     }
 }
