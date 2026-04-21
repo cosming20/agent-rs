@@ -110,7 +110,7 @@ impl QueryRunRow {
         let user_id = UserId::try_new(&self.user_id)
             .map_err(|e| StoreError::InvalidData(e.to_string()))?;
         let strategy = str_to_strategy(&self.strategy)?;
-        let confidence = Confidence::try_new(self.confidence as f32)
+        let confidence = Confidence::new(self.confidence)
             .map_err(|e| StoreError::InvalidData(e.to_string()))?;
         Ok(QueryRun {
             id: self.id,
@@ -148,7 +148,7 @@ impl<'a> NewQueryRun<'a> {
             query: &run.query,
             answer: &run.answer,
             strategy: strategy_to_str(run.strategy),
-            confidence: run.confidence.as_f32() as f64,
+            confidence: run.confidence.value(),
             is_grounded: run.is_grounded,
         }
     }

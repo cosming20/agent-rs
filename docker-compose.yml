@@ -20,6 +20,7 @@ volumes:
   ruvector_data:
   docling_models:
   minio_data:
+  rabbitmq_data:
 
 services:
   # ----------------------------------------------------------
@@ -329,6 +330,35 @@ services:
       timeout: 3s
       retries: 10
       start_period: 10s
+
+  # ----------------------------------------------------------
+  # RabbitMQ — Indexing job queue between the gRPC service
+  # (EnqueueIndex producer) and the IndexerWorker consumer.
+  # AMQP on port 1075, management UI on 1076.
+  # ----------------------------------------------------------
+  rabbitmq:
+    image: rabbitmq:3.13-management
+    container_name: agentic-ra-rabbitmq
+    restart: "on-failure:5"
+    ports:
+      - "${RABBITMQ_AMQP_PORT:-1075}:5672"
+      - "${RABBITMQ_MGMT_PORT:-1076}:15672"
+    environment:
+      - RABBITMQ_DEFAULT_USER=${RABBITMQ_USER:-agentrs}
+      - RABBITMQ_DEFAULT_PASS=${RABBITMQ_PASSWORD:-agentrs-local}
+    volumes:
+      - rabbitmq_data:/var/lib/rabbitmq
+    networks:
+      - agentic-ra-net
+    mem_limit: 512m
+    mem_reservation: 256m
+    cpus: 0.5
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "check_running"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
 
   # ----------------------------------------------------------
   # Docling Sidecar — PDF parsing + structural chunking (gRPC)

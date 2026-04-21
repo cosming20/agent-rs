@@ -23,11 +23,11 @@ use std::sync::Arc;
 use agent_rs_core::UserId;
 use agent_rs_core::config::{BraveConfig, FetchConfig, WebBudgetConfig};
 use agent_rs_stores::traits::StateStore;
-use agent_rs_stores::types::{ChatMessage, EvidenceItem, Memory, QueryRun};
+use agent_rs_stores::types::{EvidenceItem, Memory, QueryRun};
 use agent_rs_tools::{
-    DocumentInfoTool, FetchSectionChunksTool, FetchUrlTool, OutlineCorpusTool, RememberTool,
-    SearchKnowledgeArgs, SearchKnowledgeTool, SearchMode, SearchNewsTool, SearchSectionsTool,
-    SearchWebTool, WebBudgetTracker,
+    FetchSectionChunksTool, FetchUrlTool, OutlineCorpusTool, RememberTool, SearchKnowledgeArgs,
+    SearchKnowledgeTool, SearchMode, SearchNewsTool, SearchSectionsTool, SearchWebTool,
+    WebBudgetTracker,
 };
 use async_trait::async_trait;
 use rig::tool::Tool;
@@ -125,18 +125,6 @@ struct InMemoryStateStore {
 
 #[async_trait]
 impl StateStore for InMemoryStateStore {
-    async fn get_messages(
-        &self,
-        _session_id: &agent_rs_core::SessionId,
-        _limit: usize,
-    ) -> Result<Vec<ChatMessage>, agent_rs_core::StoreError> {
-        unimplemented!("get_messages is not exercised by RememberTool")
-    }
-
-    async fn store_message(&self, _message: &ChatMessage) -> Result<(), agent_rs_core::StoreError> {
-        unimplemented!("store_message is not exercised by RememberTool")
-    }
-
     async fn get_memories(
         &self,
         user_id: &UserId,
@@ -326,29 +314,6 @@ async fn search_news_tool_definition_contract() {
     let def = tool.definition(String::new()).await;
     assert_eq!(def.name, "search_news");
     assert_tool_contract(&def.name, &def.description, &def.parameters);
-}
-
-// ---------------------------------------------------------------------------
-// DocumentInfoTool — definition contract (PgStore requires a live DB).
-// ---------------------------------------------------------------------------
-
-#[tokio::test]
-async fn document_info_tool_definition_contract() {
-    // Only the `definition()` is reachable without a live PgStore, so we
-    // reconstruct the tool via its `#[serde(skip)]` default path, which
-    // yields `store: None`. Calling `definition` never touches the store.
-    let tool: DocumentInfoTool =
-        serde_json::from_value(json!({})).expect("DocumentInfoTool should deserialize from {}");
-    let def = tool.definition(String::new()).await;
-    assert_eq!(def.name, "document_info");
-    assert_tool_contract(&def.name, &def.description, &def.parameters);
-
-    let low = def.description.to_lowercase();
-    assert!(
-        low.contains("document") || low.contains("corpus") || low.contains("ingested"),
-        "document_info description must reference document / corpus / ingested: {:?}",
-        def.description
-    );
 }
 
 // ---------------------------------------------------------------------------

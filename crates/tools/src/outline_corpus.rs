@@ -1,15 +1,23 @@
-//! `outline_corpus` — hierarchical TOC over Doc -> Section -> 1-line summary.
+//! `outline_corpus` — hierarchical TOC over the pinned documents
+//! (Doc → Section → 1-line summary).
 //!
 //! Output is intended to be read by the LLM as a navigable index of what
-//! the corpus contains. Joins Neo4j section structure (via [`Neo4jStore`])
-//! with the summaries Qdrant collection (built by `ChunkSummarizer` at ingest).
+//! the pinned corpus contains. Joins Neo4j section structure (via
+//! [`Neo4jStore`]) with the summaries Qdrant collection (written by the
+//! ingestion worker).
+//!
+//! # Stateless pivot note
+//!
+//! After the 2026-04-21 pivot, the agent never consults a per-user catalogue
+//! in Postgres. The pinned document set is provided per request by the web
+//! layer as a list of MinIO object keys and flows into this tool through
+//! [`OutlineCorpusTool::new_for_user`].
 
 use std::sync::Arc;
 
 use agent_rs_core::{ToolError, UserId};
 use agent_rs_stores::neo4j::Neo4jStore;
 use agent_rs_stores::neo4j::coverage::SectionRow;
-use agent_rs_stores::postgres::PgStore;
 use agent_rs_stores::qdrant::QdrantStore;
 use rig::completion::ToolDefinition;
 use rig::tool::Tool;
@@ -24,7 +32,8 @@ const DEFAULT_MAX_SECTIONS: usize = 200;
 /// Arguments for the `outline_corpus` tool.
 #[derive(Debug, Deserialize)]
 pub struct OutlineCorpusArgs {
-    /// Optional document id. If omitted, returns outline for every ingested doc.
+    /// Optional MinIO object key. If omitted, returns an outline for every
+    /// document pinned to the current turn.
     pub doc_id: Option<String>,
     /// Optional max sections to return per document (default 200).
     pub max_sections: Option<usize>,
@@ -32,18 +41,20 @@ pub struct OutlineCorpusArgs {
 
 // ---- Tool struct ----
 
-/// Hierarchical TOC tool — maps the corpus structure for the LLM before
-/// it decides which sections to drill into.
+/// Hierarchical TOC tool — maps the structure of the pinned documents
+/// for the LLM before it decides which sections to drill into.
 #[derive(Serialize, Deserialize)]
 pub struct OutlineCorpusTool {
     #[serde(skip)]
     neo4j: Option<Arc<Neo4jStore>>,
     #[serde(skip)]
-    pg: Option<Arc<PgStore>>,
-    #[serde(skip)]
     qdrant: Option<Arc<QdrantStore>>,
     #[serde(skip)]
     summaries_collection: Option<String>,
+    /// MinIO object keys pinned to the current turn. Outline is built only
+    /// over these documents — agent-rs never sees the user's full library.
+    #[serde(skip)]
+    active_document_keys: Vec<String>,
     /// Tenant scope baked in at construction time. The LLM never sees or
     /// controls this field — it is excluded from the JSON schema.
     #[serde(skip, default = "default_unset_user_id")]
@@ -56,22 +67,24 @@ fn default_unset_user_id() -> UserId {
 }
 
 impl OutlineCorpusTool {
-    /// Construct an [`OutlineCorpusTool`] scoped to `user_id`.
+    /// Construct an [`OutlineCorpusTool`] scoped to `user_id` and the
+    /// per-turn pinned document set.
     ///
-    /// `summaries_collection` is the name of the Qdrant collection that holds
-    /// per-section summary points written by `ChunkSummarizer` at ingest time.
+    /// `active_document_keys` is the list of MinIO object keys passed in the
+    /// current `AskRequest`; `summaries_collection` names the Qdrant
+    /// collection that holds per-section summary points.
     pub fn new_for_user(
         neo4j: Arc<Neo4jStore>,
-        pg: Arc<PgStore>,
         qdrant: Arc<QdrantStore>,
         summaries_collection: String,
         user_id: UserId,
+        active_document_keys: Vec<String>,
     ) -> Self {
         Self {
             neo4j: Some(neo4j),
-            pg: Some(pg),
             qdrant: Some(qdrant),
             summaries_collection: Some(summaries_collection),
+            active_document_keys,
             user_id,
         }
     }
@@ -86,20 +99,20 @@ impl Tool for OutlineCorpusTool {
     async fn definition(&self, _prompt: String) -> ToolDefinition {
         ToolDefinition {
             name: Self::NAME.to_string(),
-            description: "Hierarchical OUTLINE / table-of-contents of the ingested corpus. \
-                          Returns Document -> Section -> 1-line summary for each section. \
-                          PREFER this BEFORE search_knowledge for any query that asks for \
-                          ALL methods, an enumeration, a cheatsheet, exhaustive coverage, \
+            description: "Hierarchical OUTLINE / table-of-contents of the documents pinned to \
+                          this turn. Returns Document -> Section -> 1-line summary for each \
+                          section. PREFER this BEFORE search_knowledge for any query that asks \
+                          for ALL methods, an enumeration, a cheatsheet, exhaustive coverage, \
                           or 'TOATE' (all). Use it to discover what sections exist, then \
                           target search_knowledge or search_sections at the relevant ids. \
-                          Omit doc_id to get the full corpus outline."
+                          Omit doc_id to get the outline of every pinned document."
                 .to_string(),
             parameters: json!({
                 "type": "object",
                 "properties": {
                     "doc_id": {
                         "type": "string",
-                        "description": "Optional document id; omit for full corpus outline."
+                        "description": "Optional MinIO object key; omit for the full pinned-corpus outline."
                     },
                     "max_sections": {
                         "type": "integer",
@@ -111,8 +124,8 @@ impl Tool for OutlineCorpusTool {
         }
     }
 
-    /// Build a hierarchical outline of the corpus, joining Neo4j section
-    /// structure with Qdrant summary payloads.
+    /// Build a hierarchical outline of the pinned corpus, joining Neo4j
+    /// section structure with Qdrant summary payloads.
     ///
     /// # Errors
     ///
@@ -120,8 +133,6 @@ impl Tool for OutlineCorpusTool {
     /// when a store query fails.
     #[tracing::instrument(skip(self), fields(tool = Self::NAME, user_id = %self.user_id))]
     async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
-        // Sentinel guard: fails fast if the tool was constructed via the
-        // serde-skip default path (contract tests) rather than new_for_user().
         assert!(
             self.user_id.as_str() != "_unset_test_only",
             "outline_corpus: call() reached with sentinel user_id — use new_for_user()"
@@ -131,10 +142,6 @@ impl Tool for OutlineCorpusTool {
             .neo4j
             .as_ref()
             .ok_or_else(|| ToolError::McpClient("outline_corpus: Neo4jStore missing".into()))?;
-        let pg = self
-            .pg
-            .as_ref()
-            .ok_or_else(|| ToolError::McpClient("outline_corpus: PgStore missing".into()))?;
         let qdrant = self
             .qdrant
             .as_ref()
@@ -146,43 +153,35 @@ impl Tool for OutlineCorpusTool {
                 ToolError::McpClient("outline_corpus: summaries_collection missing".into())
             })?;
 
-        let max = args.max_sections.unwrap_or(DEFAULT_MAX_SECTIONS);
-
-        let docs = pg
-            .list_ingested_documents(&self.user_id)
-            .await
-            .map_err(|e| ToolError::McpClient(format!("outline_corpus: list docs: {e}")))?;
-
-        if docs.is_empty() {
-            return Ok("No documents have been ingested yet.".into());
+        if self.active_document_keys.is_empty() {
+            return Ok("No documents are pinned to this turn.".into());
         }
 
-        // Treat an empty string the same as no filter — the LLM often emits
-        // `doc_id: ""` when it has no specific document in mind.
+        let max = args.max_sections.unwrap_or(DEFAULT_MAX_SECTIONS);
+
         let doc_id_filter = args.doc_id.as_deref().filter(|s| !s.is_empty());
 
         let mut out = String::new();
-        for doc in docs
-            .iter()
-            .filter(|d| doc_id_filter.is_none_or(|w| d.document_id.to_string() == w || d.source == w))
-        {
-            out.push_str(&format!(
-                "Document: {} ({})\n",
-                doc.title.as_deref().unwrap_or("untitled"),
-                doc.document_id
-            ));
+        for key in &self.active_document_keys {
+            if let Some(want) = doc_id_filter {
+                if key != want {
+                    continue;
+                }
+            }
+
+            out.push_str(&format!("Document: {key}\n"));
 
             let mut rows: Vec<SectionRow> = neo4j
-                .list_sections_for_doc(&self.user_id, &doc.document_id.to_string())
+                .list_sections_for_doc(&self.user_id, key)
                 .await
                 .map_err(|e| ToolError::McpClient(format!("outline_corpus: sections: {e}")))?;
 
-            // Honour caller-supplied cap.
             rows.truncate(max);
 
             for row in &rows {
                 let summary =
-                    lookup_section_summary(qdrant, summaries_coll, &self.user_id, &row.section_id).await;
+                    lookup_section_summary(qdrant, summaries_coll, &self.user_id, &row.section_id)
+                        .await;
                 let preamble_marker = if row.is_preamble { " [preamble]" } else { "" };
                 out.push_str(&format!(
                     "  - [{}] {}{} -> {}\n",
@@ -194,18 +193,21 @@ impl Tool for OutlineCorpusTool {
             }
             out.push('\n');
         }
+
+        if out.is_empty() {
+            return Ok("No matching documents in the pinned set.".into());
+        }
+
         Ok(out)
     }
 }
 
 /// Pull a 1-line summary for a section by scrolling the summaries Qdrant
 /// collection with a payload filter on `section_id`. Returns the first
-/// `summary_text` found (sections may have many summary chunks — we display
-/// the first for the outline).
+/// `summary_text` found.
 ///
 /// Returns `None` when no summary exists (failed/empty summary during
-/// ingest, pre-this-fix corpus, or Qdrant unavailable). Caller substitutes
-/// a placeholder.
+/// ingest, or Qdrant unavailable). Caller substitutes a placeholder.
 async fn lookup_section_summary(
     qdrant: &Arc<QdrantStore>,
     collection: &str,
@@ -232,17 +234,14 @@ mod tests {
     /// accidentally filter out all documents.
     #[test]
     fn empty_doc_id_string_means_no_filter() {
-        // Some("") → None after normalisation
         let want_some_empty: Option<&str> = Some("");
         let normalized = want_some_empty.filter(|s| !s.is_empty());
         assert!(normalized.is_none(), "empty doc_id must normalize to None");
 
-        // Some("doc-abc") stays Some("doc-abc")
         let want_some_real: Option<&str> = Some("doc-abc");
         let normalized = want_some_real.filter(|s| !s.is_empty());
         assert_eq!(normalized, Some("doc-abc"));
 
-        // None stays None
         let want_none: Option<&str> = None;
         let normalized = want_none.filter(|s| !s.is_empty());
         assert!(normalized.is_none());

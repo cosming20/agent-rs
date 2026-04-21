@@ -42,8 +42,8 @@ pub use entity_linker::{EntityLinkResult, EntityLinker, EntityLinkerConfig, Link
 pub use error::RetrievalError;
 pub use graph_cot::{GraphCotConfig, GraphCotRetriever, IterationLog, SufficiencyCheck};
 pub use ingestion::{
-    ChunkStrategy, ChunkerConfig, DocumentChunk, ExtractedEdge, ExtractedNode, IngestionPipeline,
-    IngestionPipelineConfig, IngestionResult, KnowledgeGraph, LlmGraphExtractor, Triplet,
+    ChunkStrategy, ChunkerConfig, DocumentChunk, ExtractedEdge, ExtractedNode, KnowledgeGraph,
+    LlmGraphExtractor, Triplet,
 };
 pub use metadata_filter::{
     FilterCondition, MetadataFilterConfig, MetadataFilterExtractor, QueryMetadataHints,

@@ -8,14 +8,13 @@
 //! | Tool | Module | Description |
 //! |------|--------|-------------|
 //! | `search_knowledge` | [`knowledge`] | Query the internal knowledge base |
-//! | `outline_corpus` | [`outline_corpus`] | Hierarchical TOC of the corpus |
+//! | `outline_corpus` | [`outline_corpus`] | Hierarchical TOC over the per-request pinned documents |
 //! | `fetch_section_chunks` | [`fetch_section_chunks`] | Exhaustive, non-ranked chunk retrieval per section |
 //! | `search_sections` | [`search_sections`] | Batched parallel retrieval over multiple section_ids |
-//! | `search_web` | [`web`] | Web search (stub, Phase 5b) |
-//! | `search_news` | [`web`] | News search (stub, Phase 5b) |
+//! | `search_web` | [`web`] | Web search |
+//! | `search_news` | [`web`] | News search |
 //! | `fetch_url` | [`fetch`] | HTTP GET with SSRF protection |
 //! | `remember` | [`remember`] | Store facts in long-term memory |
-//! | `ingest` | [`ingest`] | Trigger document ingestion (stub) |
 //!
 //! # Budget tracking
 //!
@@ -25,14 +24,12 @@
 //!
 //! # MCP client
 //!
-//! [`mcp_client::McpClient`] is a stub for Phase 5b integration with
+//! [`mcp_client::McpClient`] is a stub for future integration with
 //! external MCP servers via `rust-mcp-sdk`.
 
 pub mod budget;
-pub mod document_info;
 pub mod fetch;
 pub mod fetch_section_chunks;
-pub mod ingest;
 pub mod knowledge;
 pub mod mcp_client;
 pub mod outline_corpus;
@@ -41,7 +38,6 @@ pub mod search_sections;
 pub mod web;
 
 pub use budget::WebBudgetTracker;
-pub use document_info::DocumentInfoTool;
 pub use fetch::FetchUrlTool;
 pub use fetch_section_chunks::FetchSectionChunksTool;
 pub use knowledge::{SearchKnowledgeArgs, SearchKnowledgeTool, SearchMode};

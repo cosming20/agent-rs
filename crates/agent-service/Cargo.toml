@@ -24,6 +24,7 @@ prost     = "0.13"
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "signal"] }
 tokio-stream = "0.1"
 futures = "0.3"
+async-stream = "0.3"
 
 # Observability — reuse the workspace tracing stack
 tracing = { workspace = true }
@@ -53,6 +54,9 @@ agent-rs-tools = { path = "../tools" }
 
 # Observability registry (metrics / tracing init)
 agent-rs-observability = { path = "../observability" }
+
+# RabbitMQ publisher / consumer for the indexing pipeline
+agent-rs-queue = { path = "../queue" }
 
 # Workspace root: provides connect_stores, build_ingestion_pipeline,
 # build_router, build_embedder, IngestFeatures, RouterFeatures, and the

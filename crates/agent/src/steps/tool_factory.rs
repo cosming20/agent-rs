@@ -16,8 +16,8 @@ use agent_rs_stores::qdrant::QdrantStore;
 use agent_rs_stores::traits::StateStore;
 use agent_rs_stores::types::SearchResult;
 use agent_rs_tools::{
-    DocumentInfoTool, FetchSectionChunksTool, FetchUrlTool, OutlineCorpusTool, RememberTool,
-    SearchKnowledgeTool, SearchNewsTool, SearchSectionsTool, SearchWebTool, WebBudgetTracker,
+    FetchSectionChunksTool, FetchUrlTool, OutlineCorpusTool, RememberTool, SearchKnowledgeTool,
+    SearchNewsTool, SearchSectionsTool, SearchWebTool, WebBudgetTracker,
 };
 use rig::tool::ToolDyn;
 
@@ -41,11 +41,6 @@ pub type ToolSet = (
 pub struct ToolFactory {
     router: Arc<RetrievalRouter>,
     store: Arc<dyn StateStore>,
-    /// Concrete Postgres handle for tools that need PgStore-specific methods
-    /// (currently `DocumentInfoTool` which calls `list_ingested_documents`,
-    /// and `OutlineCorpusTool` which calls `list_ingested_documents` — neither
-    /// method is part of the `StateStore` trait surface).
-    pg_store: Arc<PgStore>,
     /// Neo4j graph store used by coverage-aware tools
     /// (`OutlineCorpusTool`, `FetchSectionChunksTool`, `SearchSectionsTool`).
     neo4j: Arc<Neo4jStore>,
@@ -78,8 +73,7 @@ impl ToolFactory {
     /// # Parameters
     ///
     /// - `router` -- shared retrieval router for knowledge search.
-    /// - `pg_store` -- shared Postgres handle (used by `DocumentInfoTool` and
-    ///   `OutlineCorpusTool` for `list_ingested_documents`).
+    /// - `pg_store` -- shared Postgres handle for memory / telemetry tools.
     /// - `neo4j` -- shared Neo4j store for coverage-aware tools.
     /// - `qdrant` -- shared Qdrant store for coverage-aware tools.
     /// - `default_collection` -- primary Qdrant chunk collection name.
@@ -110,11 +104,10 @@ impl ToolFactory {
             .map_err(|e| {
                 AgentError::Orchestrator(format!("failed to build shared HTTP client: {e}"))
             })?;
-        let store: Arc<dyn StateStore> = Arc::clone(&pg_store) as _;
+        let store: Arc<dyn StateStore> = pg_store as _;
         Ok(Self {
             router,
             store,
-            pg_store,
             neo4j,
             qdrant,
             default_collection,
@@ -141,7 +134,7 @@ impl ToolFactory {
     /// - `Arc<Mutex<Vec<SearchResult>>>` -- coverage evidence collector populated
     ///   by `fetch_section_chunks` and `search_sections` tools; drained into
     ///   `ctx.coverage_evidence` by `agent_runner` after execution.
-    pub fn build(&self, user_id: &UserId) -> ToolSet {
+    pub fn build(&self, user_id: &UserId, active_document_keys: Vec<String>) -> ToolSet {
         let budget = Arc::new(WebBudgetTracker::new(&self.web_budget_config));
         let evidence_collector: Arc<Mutex<Vec<SearchResult>>> = Arc::new(Mutex::new(Vec::new()));
         let coverage_collector: Arc<Mutex<Vec<SearchResult>>> = Arc::new(Mutex::new(Vec::new()));
@@ -170,24 +163,16 @@ impl ToolFactory {
                 Arc::clone(&self.store),
                 user_id.clone(),
             )),
-            // document_info — metadata about ingested docs (page count,
-            // language, ingest date, etc.) for meta-questions that don't
-            // need a content search.
-            Box::new(DocumentInfoTool::new_for_user(
-                Arc::clone(&self.pg_store),
-                user_id.clone(),
-            )),
-            // Coverage-aware tools (Phase 3.1–3.3).
-            // outline_corpus — hierarchical TOC (Doc→Section→summary) so the
-            // LLM can discover what exists before deciding which sections to
-            // pull. Constructed once per build() since they hold only
-            // Arc clones to shared stores.
+            // outline_corpus — hierarchical TOC (Doc→Section→summary) over
+            // the documents pinned to this turn (`active_document_keys`),
+            // so the LLM can discover what exists before deciding which
+            // sections to pull.
             Box::new(OutlineCorpusTool::new_for_user(
                 Arc::clone(&self.neo4j),
-                Arc::clone(&self.pg_store),
                 Arc::clone(&self.qdrant),
                 self.summaries_collection.clone(),
                 user_id.clone(),
+                active_document_keys,
             )),
             // fetch_section_chunks — exhaustive, non-ranked chunk retrieval
             // for a single known section_id. Wired with coverage_collector so

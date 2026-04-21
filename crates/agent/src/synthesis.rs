@@ -25,8 +25,13 @@ pub struct Citation {
     pub chunk_id: String,
     /// Relevant excerpt from the source document.
     pub content_snippet: String,
-    /// Origin of the evidence (e.g., "qdrant", "brave").
-    pub source: String,
+    /// MinIO object key of the source document (stateless pivot: replaces
+    /// the prior opaque `source` field — the web app resolves keys to
+    /// human-readable titles via its own `ingested_documents` table).
+    pub minio_object_key: String,
+    /// Human-readable section path such as `"5.1.2 / Region growing"`,
+    /// populated when Neo4j knows the enclosing section.
+    pub section_path: String,
     /// Relevance score from retrieval.
     pub score: f64,
 }
@@ -299,18 +304,26 @@ fn make_citation(index: usize, ev: &SearchResult, max_snippet_len: usize) -> Cit
         content.to_owned()
     };
 
-    let source = ev
+    let minio_object_key = ev
         .payload
-        .get("source")
+        .get("minio_object_key")
         .and_then(|v| v.as_str())
-        .unwrap_or("unknown")
+        .unwrap_or("")
+        .to_owned();
+
+    let section_path = ev
+        .payload
+        .get("section_path")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
         .to_owned();
 
     Citation {
         index,
         chunk_id: ev.id.clone(),
         content_snippet: snippet,
-        source,
+        minio_object_key,
+        section_path,
         score: ev.score.value(),
     }
 }

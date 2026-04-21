@@ -1,0 +1,26 @@
+[package]
+name = "agent-rs-queue"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "RabbitMQ transport for the agent-rs indexing worker — publisher + consumer over a single IndexJob contract."
+
+[dependencies]
+# RabbitMQ (lapin wrapper with retry + auto-declare + serde typing).
+rust-rabbit = "1.2"
+
+# Async
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+async-trait = { workspace = true }
+futures = { workspace = true }
+
+# Serialization (the rust-rabbit API is serde-typed).
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+
+# Errors + logging
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+# Shared types (UserId)
+agent-rs-core = { workspace = true }

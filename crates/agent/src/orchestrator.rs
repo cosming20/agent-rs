@@ -96,11 +96,8 @@ impl AgentOrchestrator {
 
         // Step 1.5: Coverage planner — no-op for non-exhaustive queries.
         // Clone before passing so neo4j remains available for the tool factory.
-        let coverage_planner = CoveragePlanner::new(
-            Arc::clone(&neo4j),
-            Arc::clone(&pg_store),
-            Arc::clone(&metrics),
-        );
+        let coverage_planner =
+            CoveragePlanner::new(Arc::clone(&neo4j), Arc::clone(&metrics));
 
         // Tool factory (shared across requests; creates per-request tool sets).
         // Receives the concrete pg_store so DocumentInfoTool/OutlineCorpusTool

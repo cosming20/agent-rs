@@ -4,6 +4,19 @@
 //! Neo4j: `Document`, `Page`, `Section`, `Table`, `Picture`, and `Chunk`
 //! nodes connected by typed edges (`ON_PAGE`, `IN_SECTION`, `HAS_PAGE`, etc.).
 //!
+//! # Document identity (post 2026-04-21 stateless pivot)
+//!
+//! The `Document.id` property is the authoritative document handle across
+//! the system and carries the **MinIO object key** (matching the
+//! `AskRequest.active_document_keys` wire shape). Readers
+//! (`Neo4jStore::list_sections_for_doc`, `list_descendant_sections`,
+//! `chunks_in_sections`) accept this key as an opaque string; the
+//! RabbitMQ `IndexerWorker` writes it into `Document.id` on every upsert.
+//! `DocumentHeaderSnapshot.document_id` stays a `Uuid` because the
+//! structural sub-node ids (Page, Section) are derived from it via
+//! UUIDv5 for content-addressing stability — that derivation is an
+//! internal detail and never leaves the graph.
+//!
 //! # INVARIANT — `ingest_run_id` is additive-only
 //!
 //! Every node created by this module carries an `ingest_run_id` property

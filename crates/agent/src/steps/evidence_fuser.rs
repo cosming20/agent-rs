@@ -120,7 +120,7 @@ impl EvidenceFuser {
 mod tests {
     use std::sync::Arc;
 
-    use agent_rs_core::types::{MessageRole, RetrievalStrategy, Score, SessionId, UserId};
+    use agent_rs_core::types::{RetrievalStrategy, Score, UserId};
     use agent_rs_observability::metrics::RetrievalMetrics;
     use agent_rs_retrieval::ResultRanker;
     use agent_rs_stores::types::SearchResult;
@@ -140,11 +140,12 @@ mod tests {
     fn ctx_with_kb_and_coverage() -> QueryContext {
         let mut ctx = QueryContext::new(
             "test query".to_string(),
-            SessionId::new(),
             UserId::from_string("user".to_string()),
+            Vec::new(),
+            Vec::new(),
             RetrievalStrategy::Semantic,
             8,
-            MessageRole::User,
+            None,
         );
         ctx.kb_evidence = vec![dummy_result("kb-a"), dummy_result("kb-b")];
         ctx.coverage_evidence = vec![dummy_result("cov-1"), dummy_result("cov-2")];

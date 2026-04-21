@@ -133,6 +133,48 @@ impl MinioStore {
         Ok(body.to_vec())
     }
 
+    /// Download the object at `key`, verifying it belongs to `user_id`.
+    ///
+    /// Unlike [`Self::get_object`] this takes the full stored key, which
+    /// is the shape the IndexerWorker receives from RabbitMQ and the
+    /// `AskRequest.active_document_keys` field. The key format is
+    /// `users/{user_id}/docs/{uuid}.{ext}` — we require the prefix to
+    /// match the supplied `user_id` as a defence-in-depth ownership check:
+    /// a forged key that points at another user's object is rejected
+    /// before the S3 round-trip.
+    ///
+    /// # Errors
+    ///
+    /// - [`StoreError::DocumentNotOwnedByUser`] — key prefix mismatch.
+    /// - [`StoreError::Minio`] — S3 call failure (includes `NoSuchKey`).
+    pub async fn get_bytes_by_key(
+        &self,
+        user_id: &UserId,
+        key: &str,
+    ) -> Result<Vec<u8>, StoreError> {
+        let required_prefix = format!("users/{}/docs/", user_id.as_str());
+        if !key.starts_with(&required_prefix) {
+            return Err(StoreError::DocumentNotOwnedByUser {
+                document_id: key.to_owned(),
+                user_id: user_id.as_str().to_owned(),
+            });
+        }
+        let resp = self
+            .client
+            .get_object()
+            .bucket(&self.bucket)
+            .key(key)
+            .send()
+            .await
+            .map_err(|e| StoreError::Minio(format!("get_object {key}: {e}")))?;
+        let body = resp
+            .body
+            .collect()
+            .await
+            .map_err(|e| StoreError::Minio(format!("collect {key}: {e}")))?;
+        Ok(body.to_vec())
+    }
+
     /// Delete the document object for `user_id`. Idempotent — returns
     /// `Ok(())` even if the object never existed.
     ///

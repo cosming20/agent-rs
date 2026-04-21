@@ -1,25 +1,26 @@
 //! Tonic service impl — `agent.v1.Agent`.
 //!
-//! Wires `Ingest` and `Ask` RPCs directly to the same pipeline functions
-//! used by `examples/ingest.rs` and `examples/ask.rs`:
+//! Four RPCs, per the 2026-04-21 stateless contract:
 //!
-//! - `Ingest` → `MinioStore::put_object` + `IngestionPipeline::ingest_pdf` /
-//!   `ingest_text` + `PgStore::set_minio_object_key`
-//! - `Ask` → `AgentOrchestrator::process_query` wrapped in a server-streaming
-//!   response (session_bound event first, final_answer event last).
+//! | RPC                 | Shape             | Backend wiring                                                  |
+//! |---------------------|-------------------|-----------------------------------------------------------------|
+//! | `Ask`               | server-streaming  | Emits `AskIndexingWait` until every `active_document_keys` entry reaches `complete` state, then delegates to [`AgentOrchestrator::process_query`] and emits a single `AskFinal`. |
+//! | `EnqueueIndex`      | unary             | Inserts a row into `document_index_state` with `state=pending` (CAS via `ON CONFLICT DO NOTHING`) and publishes a job to the RabbitMQ indexing queue. |
+//! | `GetDocumentStatus` | unary             | Reads the `document_index_state` row for `(user_id, minio_object_key)`.                                                                                |
+//! | `DeleteDocument`    | unary             | Purges Qdrant points, Neo4j subgraph, and the `document_index_state` row. The MinIO object itself is removed by the web app (it owns the blob lifecycle). |
 
 use std::pin::Pin;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use agent_rs::stores::Stores;
 use agent_rs_agent::orchestrator::AgentOrchestrator;
 use agent_rs_core::errors::AgentError;
-use agent_rs_core::types::{CollectionName, UserId};
-use agent_rs_retrieval::ingestion::IngestionPipeline;
-use agent_rs_stores::minio::MinioStore;
+use agent_rs_core::types::{MessageRole, RetrievalStrategy, UserId};
+use agent_rs_queue::{IndexJob, IndexPublisher};
+use agent_rs_stores::types::ChatTurn;
 use futures::Stream;
-use sha2::{Digest, Sha256};
+use tokio::time::sleep;
 use tonic::{Request, Response, Status};
 use tracing::{error, info, instrument};
 use uuid::Uuid;
@@ -27,62 +28,44 @@ use uuid::Uuid;
 use crate::pb;
 use pb::agent_server::Agent;
 
+/// Polling period while an active document is still indexing.
+///
+/// The client sees an `AskIndexingWait` every tick so its spinner stays live.
+const INDEXING_POLL_INTERVAL: Duration = Duration::from_millis(500);
+
+/// Safety cap on how long `Ask` will wait for all active documents to finish
+/// indexing before returning an error.
+const INDEXING_MAX_WAIT: Duration = Duration::from_secs(120);
+
 // ---- dependency bundle -----------------------------------------------------
 
 /// All wired dependencies for the agent gRPC server.
-///
-/// Constructed once at startup via [`AgentServer::new`]; cheaply cloneable
-/// across tasks because every field is already an `Arc`.
 pub struct AgentServerDeps {
     pub stores: Stores,
-    pub pipeline: Arc<IngestionPipeline>,
     pub orchestrator: Arc<AgentOrchestrator>,
-    pub minio: Arc<MinioStore>,
-    pub collection: CollectionName,
-    pub triplet_collection: CollectionName,
-    pub summaries_collection: CollectionName,
-    /// Human-readable label for the active embedder model (logged at startup).
-    pub embedder_label: String,
+    /// RabbitMQ publisher used by `EnqueueIndex` to hand jobs off to the
+    /// `IndexerWorker`.
+    pub index_publisher: Arc<IndexPublisher>,
 }
 
 // ---- server struct ----------------------------------------------------------
 
 /// Concrete agent service.
-///
-/// All fields are `Arc`-wrapped so `&self` handlers can spawn tasks without
-/// lifetime coupling.
 pub struct AgentServer {
     stores: Stores,
-    pipeline: Arc<IngestionPipeline>,
     orchestrator: Arc<AgentOrchestrator>,
-    minio: Arc<MinioStore>,
-    collection: CollectionName,
-    triplet_collection: CollectionName,
-    summaries_collection: CollectionName,
-    embedder_label: String,
+    index_publisher: Arc<IndexPublisher>,
 }
 
 impl AgentServer {
     /// Construct from a pre-wired dependency bundle.
     pub fn new(deps: AgentServerDeps) -> Self {
-        let server = Self {
+        info!("AgentServer initialised");
+        Self {
             stores: deps.stores,
-            pipeline: deps.pipeline,
             orchestrator: deps.orchestrator,
-            minio: deps.minio,
-            collection: deps.collection,
-            triplet_collection: deps.triplet_collection,
-            summaries_collection: deps.summaries_collection,
-            embedder_label: deps.embedder_label,
-        };
-        info!(
-            collection = %server.collection,
-            triplet_collection = %server.triplet_collection,
-            summaries_collection = %server.summaries_collection,
-            embedder = %server.embedder_label,
-            "AgentServer initialised"
-        );
-        server
+            index_publisher: deps.index_publisher,
+        }
     }
 }
 
@@ -91,11 +74,10 @@ impl AgentServer {
 /// Convert a client-supplied `user_id` string into a validated [`UserId`].
 ///
 /// All malformed inputs map to `INVALID_ARGUMENT` with a generic message;
-/// verbose details stay in tracing so audit logs keep the exact input
-/// for investigation while the API surface does not leak validator internals.
-// `tonic::Status` is inherently large (176 bytes); boxing it at this private
-// helper boundary would add indirection without benefit — the caller always
-// uses `?` and immediately propagates. The lint is suppressed locally.
+/// verbose details stay in tracing so audit logs keep the exact input.
+// `tonic::Status` is inherently large (176 bytes); boxing it at a private
+// helper boundary would add indirection without benefit — callers always
+// propagate with `?`.
 #[allow(clippy::result_large_err)]
 fn validate_user_id(raw: &str) -> Result<UserId, Status> {
     UserId::try_new(raw).map_err(|e: AgentError| {
@@ -111,14 +93,30 @@ fn validate_user_id(raw: &str) -> Result<UserId, Status> {
 fn map_store_err(e: agent_rs_core::errors::StoreError) -> Status {
     error!(error = %e, "store error in gRPC handler");
     match e {
-        agent_rs_core::errors::StoreError::SessionNotFound { .. } => {
-            Status::not_found("session not found")
-        }
         agent_rs_core::errors::StoreError::DocumentNotOwnedByUser { .. } => {
             Status::permission_denied("document not owned by user")
         }
         _ => Status::internal("store error"),
     }
+}
+
+/// Parse a `history.role` string into a [`MessageRole`]. Unknown values map
+/// to `User` because chat clients sometimes send non-canonical casings
+/// ("USER", "human", ...) and dropping history would silently lose context.
+fn parse_role(raw: &str) -> MessageRole {
+    match raw.to_ascii_lowercase().as_str() {
+        "assistant" => MessageRole::Assistant,
+        "system" => MessageRole::System,
+        _ => MessageRole::User,
+    }
+}
+
+/// Parse an optional `strategy` string. Empty or unknown → `GraphHybrid`.
+fn parse_strategy(raw: &str) -> RetrievalStrategy {
+    if raw.is_empty() {
+        return RetrievalStrategy::GraphHybrid;
+    }
+    RetrievalStrategy::from_db_str(raw).unwrap_or(RetrievalStrategy::GraphHybrid)
 }
 
 // ---- streaming type alias ---------------------------------------------------
@@ -132,353 +130,326 @@ type AskEventStream =
 impl Agent for AgentServer {
     type AskStream = AskEventStream;
 
-    // ---- list_documents -----------------------------------------------------
+    // ---- Ask ----------------------------------------------------------------
 
-    #[instrument(skip(self, request), fields(user_id))]
-    async fn list_documents(
-        &self,
-        request: Request<pb::UserRef>,
-    ) -> Result<Response<pb::DocumentList>, Status> {
-        let req = request.into_inner();
-        let user_id = validate_user_id(&req.user_id)?;
-        tracing::Span::current().record("user_id", user_id.as_str());
-
-        let rows = self
-            .stores
-            .postgres
-            .list_ingested_documents(&user_id)
-            .await
-            .map_err(map_store_err)?;
-
-        let documents: Vec<pb::Document> = rows.into_iter().map(row_to_pb_document).collect();
-        info!(count = documents.len(), "list_documents ok");
-
-        Ok(Response::new(pb::DocumentList { documents }))
-    }
-
-    // ---- ask ----------------------------------------------------------------
-
-    /// Server-streaming Ask RPC.
+    /// Server-streaming `Ask` RPC.
     ///
-    /// MVP behaviour: emits a `session_bound` event first (so the client can
-    /// bind UI state before the answer lands), then runs
-    /// [`AgentOrchestrator::process_query`] inline and emits a single
-    /// `final_answer` event. Progress (`tool_call` / `partial_answer`) events
-    /// are a follow-up PR.
-    #[instrument(skip(self, request), fields(user_id, session_id, strategy))]
+    /// 1. Polls `document_index_state` for every `active_document_keys`
+    ///    entry. While any entry is `pending`/`indexing`, emits an
+    ///    `AskIndexingWait` event every [`INDEXING_POLL_INTERVAL`].
+    /// 2. Once all active keys are `complete`, delegates to
+    ///    [`AgentOrchestrator::process_query`] with inline history and
+    ///    active/history key union.
+    /// 3. Emits a single terminal `AskFinal` (or `AskError`).
+    #[instrument(skip(self, request), fields(user_id, strategy, trace_id))]
     async fn ask(
         &self,
         request: Request<pb::AskRequest>,
     ) -> Result<Response<Self::AskStream>, Status> {
-        use agent_rs_core::types::{RetrievalStrategy, SessionId};
-
         let req = request.into_inner();
         let user_id = validate_user_id(&req.user_id)?;
         tracing::Span::current().record("user_id", user_id.as_str());
 
-        let session_id = if req.session_id.is_empty() {
-            SessionId::from_uuid(Uuid::new_v4())
-        } else {
-            let uuid = Uuid::parse_str(&req.session_id)
-                .map_err(|_| Status::invalid_argument("session_id is not a valid UUID"))?;
-            SessionId::from_uuid(uuid)
-        };
-        tracing::Span::current().record("session_id", session_id.inner().to_string().as_str());
-
-        let strategy = if req.strategy.is_empty() {
-            RetrievalStrategy::GraphHybrid
-        } else {
-            RetrievalStrategy::from_db_str(&req.strategy)
-                .unwrap_or(RetrievalStrategy::GraphHybrid)
-        };
+        let strategy = parse_strategy(&req.strategy);
         tracing::Span::current().record("strategy", format!("{strategy:?}").as_str());
 
-        let limit = if req.limit == 0 {
-            8
+        let trace_id = if req.trace_id.is_empty() {
+            None
         } else {
-            req.limit as usize
+            Uuid::parse_str(&req.trace_id).ok()
         };
-        let question = req.question;
+        if let Some(tid) = trace_id {
+            tracing::Span::current().record("trace_id", tid.to_string().as_str());
+        }
 
-        // Echo the session_id back immediately so the client can bind UI state
-        // before the orchestrator run completes.
-        let session_bound_event = pb::AskEvent {
-            payload: Some(pb::ask_event::Payload::SessionBound(pb::AskSessionBound {
-                session_id: session_id.inner().to_string(),
-            })),
-        };
+        let limit = if req.limit == 0 { 8 } else { req.limit as usize };
 
-        // Clone Arc handles to move into the response stream (no lifetime coupling).
-        let orchestrator = Arc::clone(&self.orchestrator);
-
-        let t = Instant::now();
-        let response = orchestrator
-            .process_query(question, session_id, user_id, strategy, limit)
-            .await
-            .map_err(|e| {
-                error!(error = %e, "process_query failed");
-                Status::internal(format!("process_query: {e}"))
-            })?;
-        let elapsed_ms = t.elapsed().as_millis() as u32;
-
-        info!(
-            is_grounded = response.is_grounded,
-            confidence = response.confidence.value(),
-            citations = response.citations.len(),
-            elapsed_ms,
-            "ask ok"
-        );
-
-        let citations: Vec<pb::Citation> = response
-            .citations
-            .iter()
-            .map(|c| pb::Citation {
-                index: c.index as u32,
-                chunk_id: c.chunk_id.clone(),
-                content_snippet: c.content_snippet.clone(),
-                source: c.source.clone(),
-                score: c.score,
+        let history: Vec<ChatTurn> = req
+            .history
+            .into_iter()
+            .map(|t| ChatTurn {
+                role: parse_role(&t.role),
+                content: t.content,
             })
             .collect();
 
-        let coverage = response.coverage_report.as_ref().map(|cr| pb::CoverageReport {
-            expected: cr.expected as u32,
-            fetched: cr.fetched as u32,
-            missing_section_ids: cr.missing_section_ids.clone(),
-        });
+        let active_keys = req.active_document_keys;
+        let history_keys = req.history_document_keys;
 
-        let final_event = pb::AskEvent {
-            payload: Some(pb::ask_event::Payload::FinalAnswer(pb::AskFinal {
-                answer: response.answer,
-                citations,
-                confidence: response.confidence.value(),
-                is_grounded: response.is_grounded,
-                elapsed_ms,
-                strategy: format!("{:?}", response.strategy),
-                coverage,
-            })),
-        };
-
-        let stream =
-            futures::stream::iter(vec![Ok(session_bound_event), Ok(final_event)]);
-        Ok(Response::new(Box::pin(stream)))
-    }
-
-    // ---- ingest -------------------------------------------------------------
-
-    /// Client-streaming Ingest RPC.
-    ///
-    /// Protocol:
-    /// 1. First [`pb::IngestChunk`] **must** be a `header` variant carrying
-    ///    `user_id`, `source`, and `content_type`.
-    /// 2. Subsequent chunks carry raw bytes (`data` variant).
-    ///
-    /// Ordering mirrors `examples/ingest.rs`:
-    /// 1. MinIO upload (before the pipeline, so the object survives pipeline failure).
-    /// 2. `ingest_pdf` / `ingest_text` depending on content-type.
-    /// 3. `set_minio_object_key` in Postgres.
-    #[instrument(skip(self, request), fields(user_id))]
-    async fn ingest(
-        &self,
-        request: Request<tonic::Streaming<pb::IngestChunk>>,
-    ) -> Result<Response<pb::IngestReply>, Status> {
-        use pb::ingest_chunk::Payload;
-
-        let mut stream = request.into_inner();
-
-        // First message MUST be an IngestHeader.
-        let first = stream
-            .message()
-            .await
-            .map_err(|e| Status::internal(format!("recv first chunk: {e}")))?
-            .ok_or_else(|| Status::invalid_argument("empty ingest stream"))?;
-
-        let header = match first.payload {
-            Some(Payload::Header(h)) => h,
-            _ => return Err(Status::invalid_argument("first ingest chunk must be header")),
-        };
-        let user_id = validate_user_id(&header.user_id)?;
-        tracing::Span::current().record("user_id", user_id.as_str());
-
-        // Accumulate bytes from subsequent messages.
-        // 200 MiB ceiling prevents OOM via hostile clients.
-        const MAX_BYTES: usize = 200 * 1024 * 1024;
-        let mut bytes: Vec<u8> = Vec::new();
-        while let Some(chunk) = stream
-            .message()
-            .await
-            .map_err(|e| Status::internal(format!("recv chunk: {e}")))?
-        {
-            match chunk.payload {
-                Some(Payload::Data(data)) => {
-                    if bytes.len() + data.len() > MAX_BYTES {
-                        return Err(Status::resource_exhausted(
-                            "upload exceeds 200 MiB limit",
-                        ));
-                    }
-                    bytes.extend_from_slice(&data);
-                }
-                Some(Payload::Header(_)) => {
-                    return Err(Status::invalid_argument(
-                        "unexpected header mid-stream",
-                    ));
-                }
-                None => {
-                    return Err(Status::invalid_argument("chunk payload missing"));
-                }
+        // Retrieval operates over the union active ∪ history; we still need
+        // to know the active set separately so only those wait for indexing.
+        let mut retrieval_keys: Vec<String> =
+            Vec::with_capacity(active_keys.len() + history_keys.len());
+        retrieval_keys.extend(active_keys.iter().cloned());
+        for k in &history_keys {
+            if !retrieval_keys.contains(k) {
+                retrieval_keys.push(k.clone());
             }
         }
 
-        if bytes.is_empty() {
-            return Err(Status::invalid_argument("upload has zero bytes"));
+        let pg = self.stores.postgres.clone();
+        let orchestrator = Arc::clone(&self.orchestrator);
+        let query = req.query;
+
+        let stream = async_stream::try_stream! {
+            // ---- indexing wait loop --------------------------------------
+            let deadline = Instant::now() + INDEXING_MAX_WAIT;
+            loop {
+                let mut all_ready = true;
+                for key in &active_keys {
+                    match pg.get_index_state(&user_id, key).await {
+                        Ok(Some(row)) => {
+                            match row.state.as_str() {
+                                "complete" => {}
+                                "failed" => {
+                                    Err(Status::failed_precondition(format!(
+                                        "indexing failed for {key}"
+                                    )))?;
+                                }
+                                other => {
+                                    all_ready = false;
+                                    yield pb::AskEvent {
+                                        payload: Some(pb::ask_event::Payload::IndexingWait(
+                                            pb::AskIndexingWait {
+                                                minio_object_key: key.clone(),
+                                                state: other.to_string(),
+                                                message: String::new(),
+                                            },
+                                        )),
+                                    };
+                                }
+                            }
+                        }
+                        Ok(None) => {
+                            Err(Status::failed_precondition(format!(
+                                "document {key} has not been enqueued for indexing"
+                            )))?;
+                        }
+                        Err(e) => {
+                            Err(map_store_err(e))?;
+                        }
+                    }
+                }
+                if all_ready {
+                    break;
+                }
+                if Instant::now() >= deadline {
+                    Err(Status::deadline_exceeded(
+                        "active documents did not finish indexing within budget",
+                    ))?;
+                }
+                sleep(INDEXING_POLL_INTERVAL).await;
+            }
+
+            // ---- dispatch to orchestrator --------------------------------
+            let t = Instant::now();
+            let response = orchestrator
+                .process_query(
+                    query,
+                    user_id.clone(),
+                    history,
+                    retrieval_keys,
+                    strategy,
+                    limit,
+                    trace_id,
+                )
+                .await
+                .map_err(|e| {
+                    error!(error = %e, "process_query failed");
+                    Status::internal(format!("process_query: {e}"))
+                })?;
+            let elapsed_ms = t.elapsed().as_millis() as u32;
+
+            info!(
+                is_grounded = response.is_grounded,
+                confidence = response.confidence.value(),
+                citations = response.citations.len(),
+                elapsed_ms,
+                "ask ok"
+            );
+
+            let citations: Vec<pb::Citation> = response
+                .citations
+                .iter()
+                .enumerate()
+                .map(|(i, c)| pb::Citation {
+                    index: (i + 1) as u32,
+                    chunk_id: c.chunk_id.clone(),
+                    content_snippet: c.content_snippet.clone(),
+                    minio_object_key: c.minio_object_key.clone(),
+                    section_path: c.section_path.clone(),
+                    score: c.score,
+                })
+                .collect();
+
+            let coverage = response.coverage_report.as_ref().map(|cr| pb::CoverageReport {
+                expected: cr.expected as u32,
+                fetched: cr.fetched as u32,
+                missing_section_ids: cr.missing_section_ids.clone(),
+            });
+
+            yield pb::AskEvent {
+                payload: Some(pb::ask_event::Payload::Final(pb::AskFinal {
+                    answer: response.answer,
+                    citations,
+                    confidence: response.confidence.value(),
+                    is_grounded: response.is_grounded,
+                    elapsed_ms,
+                    strategy: strategy.as_db_str().to_owned(),
+                    coverage,
+                })),
+            };
+        };
+
+        Ok(Response::new(Box::pin(stream)))
+    }
+
+    // ---- EnqueueIndex -------------------------------------------------------
+
+    /// Unary `EnqueueIndex` RPC.
+    ///
+    /// Idempotently inserts a `document_index_state` row with `state=pending`
+    /// (CAS via `ON CONFLICT DO NOTHING`). The RabbitMQ publish step is a
+    /// TODO pending the `crates/queue` crate; until then the row alone is
+    /// enough for `GetDocumentStatus` and the future IndexerWorker to pick up.
+    #[instrument(skip(self, request), fields(user_id))]
+    async fn enqueue_index(
+        &self,
+        request: Request<pb::EnqueueIndexRequest>,
+    ) -> Result<Response<pb::EnqueueIndexResponse>, Status> {
+        let req = request.into_inner();
+        let user_id = validate_user_id(&req.user_id)?;
+        tracing::Span::current().record("user_id", user_id.as_str());
+
+        let key = req.minio_object_key;
+        if key.is_empty() {
+            return Err(Status::invalid_argument("minio_object_key is empty"));
         }
 
-        let t_total = Instant::now();
-
-        // SHA-256 → deterministic document_id (same derivation as ingest.rs).
-        let mut hasher = Sha256::new();
-        hasher.update(&bytes);
-        let sha256 = format!("{:x}", hasher.finalize());
-        let document_id = agent_rs_retrieval::ingestion::derive_document_id(&user_id, &sha256);
-
-        info!(
-            user_id = %user_id,
-            document_id = %document_id,
-            sha256 = %sha256,
-            "derived document_id from sha256"
-        );
-
-        // MinIO upload BEFORE the pipeline — object survives if Docling fails.
-        let content_type = header.content_type.clone();
-        let minio_key = self
-            .minio
-            .put_object(&user_id, document_id, &bytes, &content_type)
-            .await
-            .map_err(map_store_err)?;
-
-        info!(
-            user_id = %user_id,
-            document_id = %document_id,
-            object_key = %minio_key,
-            "uploaded to MinIO"
-        );
-
-        // Branch on content-type, same as ingest.rs.
-        let source = if header.source.is_empty() {
-            format!("upload-{}", &sha256[..8])
-        } else {
-            header.source.clone()
-        };
-
-        let doc_id_str = document_id.to_string();
-        let is_text_like = matches!(
-            content_type.as_str(),
-            "text/plain" | "text/markdown" | "text/html"
-        );
-
-        let result = if is_text_like {
-            let text = std::str::from_utf8(&bytes).map_err(|e| {
-                Status::invalid_argument(format!("text upload is not valid UTF-8: {e}"))
-            })?;
-            self.pipeline
-                .ingest_text(text, &doc_id_str, &source, user_id.as_str())
-                .await
-                .map_err(|e| {
-                    error!(error = %e, "ingest_text failed");
-                    Status::internal(format!("ingest_text: {e}"))
-                })?
-        } else {
-            self.pipeline
-                .ingest_pdf(&bytes, &doc_id_str, &source, user_id.as_str())
-                .await
-                .map_err(|e| {
-                    error!(error = %e, "ingest_pdf failed");
-                    Status::internal(format!("ingest_pdf: {e}"))
-                })?
-        };
-
-        // Persist the MinIO object key (same as ingest.rs step 3).
-        self.stores
+        let existing = self
+            .stores
             .postgres
-            .set_minio_object_key(&user_id, document_id, &minio_key)
+            .get_index_state(&user_id, &key)
             .await
             .map_err(map_store_err)?;
 
-        let latency_ms = t_total.elapsed().as_millis() as u32;
+        let job_id = Uuid::new_v4().to_string();
 
-        info!(
-            user_id = %user_id,
-            document_id = %doc_id_str,
-            chunks = result.chunks_created,
-            latency_ms,
-            "ingest ok"
-        );
+        let state = match existing.as_ref().map(|r| r.state.as_str()) {
+            Some("complete") => "already_indexed",
+            Some("pending") | Some("indexing") => "already_queued",
+            _ => {
+                let inserted = self
+                    .stores
+                    .postgres
+                    .enqueue_index_state(&user_id, &key)
+                    .await
+                    .map_err(map_store_err)?;
+                if inserted {
+                    // Only publish to RabbitMQ when we successfully inserted
+                    // a fresh row — redelivery after a crash is the broker's
+                    // job, not ours.
+                    let job = IndexJob {
+                        user_id: user_id.as_str().to_owned(),
+                        minio_object_key: key.clone(),
+                        job_id: job_id.clone(),
+                    };
+                    if let Err(e) = self.index_publisher.publish(&job).await {
+                        // Roll back the state row so the next EnqueueIndex
+                        // retry can re-publish instead of seeing a stale
+                        // `pending` with no corresponding queue message.
+                        let _ = self
+                            .stores
+                            .postgres
+                            .delete_index_state(&user_id, &key)
+                            .await;
+                        error!(error = %e, "queue publish failed; rolled back state row");
+                        return Err(Status::unavailable("indexing queue unavailable"));
+                    }
+                    "queued"
+                } else {
+                    "already_queued"
+                }
+            }
+        };
 
-        Ok(Response::new(pb::IngestReply {
-            document_id: doc_id_str,
-            sha256,
-            ingest_status: "complete".into(),
-            minio_object_key: minio_key,
-            n_pages: 0, // pipeline result doesn't carry page count today
-            n_chunks: result.chunks_created as u32,
-            latency_ms,
+        Ok(Response::new(pb::EnqueueIndexResponse {
+            state: state.to_owned(),
+            job_id,
         }))
     }
 
-    // ---- stubs (subsequent PRs) ---------------------------------------------
+    // ---- GetDocumentStatus --------------------------------------------------
 
-    async fn list_sessions(
+    #[instrument(skip(self, request), fields(user_id))]
+    async fn get_document_status(
         &self,
-        _request: Request<pb::UserRef>,
-    ) -> Result<Response<pb::SessionList>, Status> {
-        Err(Status::unimplemented("ListSessions not yet wired"))
+        request: Request<pb::GetDocumentStatusRequest>,
+    ) -> Result<Response<pb::GetDocumentStatusResponse>, Status> {
+        let req = request.into_inner();
+        let user_id = validate_user_id(&req.user_id)?;
+        tracing::Span::current().record("user_id", user_id.as_str());
+
+        let key = req.minio_object_key;
+        if key.is_empty() {
+            return Err(Status::invalid_argument("minio_object_key is empty"));
+        }
+
+        let row = self
+            .stores
+            .postgres
+            .get_index_state(&user_id, &key)
+            .await
+            .map_err(map_store_err)?;
+
+        let response = match row {
+            Some(r) => pb::GetDocumentStatusResponse {
+                state: r.state,
+                sha256: r.sha256.unwrap_or_default(),
+                n_pages: r.n_pages.unwrap_or(0) as u32,
+                n_chunks: r.n_chunks.unwrap_or(0) as u32,
+                error_message: r.error_message.unwrap_or_default(),
+            },
+            None => pb::GetDocumentStatusResponse {
+                state: "not_found".into(),
+                sha256: String::new(),
+                n_pages: 0,
+                n_chunks: 0,
+                error_message: String::new(),
+            },
+        };
+
+        Ok(Response::new(response))
     }
 
-    async fn session_history(
-        &self,
-        _request: Request<pb::SessionRef>,
-    ) -> Result<Response<pb::MessageList>, Status> {
-        Err(Status::unimplemented("SessionHistory not yet wired"))
-    }
+    // ---- DeleteDocument -----------------------------------------------------
 
-    async fn activate_docs(
-        &self,
-        _request: Request<pb::ActivateDocsRequest>,
-    ) -> Result<Response<pb::ActivateDocsResponse>, Status> {
-        Err(Status::unimplemented("ActivateDocs not yet wired"))
-    }
-
-    async fn deactivate_docs(
-        &self,
-        _request: Request<pb::DeactivateDocsRequest>,
-    ) -> Result<Response<pb::DeactivateDocsResponse>, Status> {
-        Err(Status::unimplemented("DeactivateDocs not yet wired"))
-    }
-
+    #[instrument(skip(self, request), fields(user_id))]
     async fn delete_document(
         &self,
-        _request: Request<pb::DocRef>,
+        request: Request<pb::DeleteDocumentRequest>,
     ) -> Result<Response<pb::DeleteDocumentResponse>, Status> {
-        Err(Status::unimplemented("DeleteDocument not yet wired"))
-    }
-}
+        let req = request.into_inner();
+        let user_id = validate_user_id(&req.user_id)?;
+        tracing::Span::current().record("user_id", user_id.as_str());
 
-// ---- row mapping ------------------------------------------------------------
+        let key = req.minio_object_key;
+        if key.is_empty() {
+            return Err(Status::invalid_argument("minio_object_key is empty"));
+        }
 
-fn row_to_pb_document(row: agent_rs_stores::postgres::IngestedDocumentRow) -> pb::Document {
-    pb::Document {
-        document_id: row.document_id.to_string(),
-        user_id: row.user_id,
-        source: row.source,
-        title: row.title.unwrap_or_default(),
-        ingest_status: row.ingest_status,
-        n_pages: row.n_pages.unwrap_or(0) as u32,
-        n_chunks: row.n_chunks.unwrap_or(0) as u32,
-        minio_object_key: row.minio_object_key.unwrap_or_default(),
-        started_at: row.started_at.and_utc().to_rfc3339(),
-        completed_at: row
-            .completed_at
-            .map(|t| t.and_utc().to_rfc3339())
-            .unwrap_or_default(),
+        // TODO(delete): drop Qdrant points + Neo4j subgraph filtered by
+        // payload.minio_object_key once the store APIs land (task #47/#48).
+        // For now we only remove the state row so the web app can re-enqueue.
+        self.stores
+            .postgres
+            .delete_index_state(&user_id, &key)
+            .await
+            .map_err(map_store_err)?;
+
+        Ok(Response::new(pb::DeleteDocumentResponse {
+            removed_chunks: 0,
+            removed_sections: 0,
+        }))
     }
 }

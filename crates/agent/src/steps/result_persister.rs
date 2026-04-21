@@ -109,7 +109,7 @@ impl ResultPersister {
                     .and_then(|v| v.as_str())
                     .unwrap_or("unknown")
                     .to_owned(),
-                score: doc.score.value() as f64,
+                score: doc.score.value(),
                 created_at: Utc::now().naive_utc(),
             })
             .collect();

@@ -164,8 +164,9 @@ impl AgentRunner {
         let start = Instant::now();
 
         // Build per-request tools, KB evidence collector, and coverage collector.
-        let (tools, evidence_collector, coverage_collector) =
-            self.tool_factory.build(&ctx.user_id);
+        let (tools, evidence_collector, coverage_collector) = self
+            .tool_factory
+            .build(&ctx.user_id, ctx.active_document_keys.clone());
 
         // Wrap each tool in a recording adapter that captures (tool_name,
         // args_json) into `tool_call_sink` before delegating to the real tool.
@@ -239,8 +240,9 @@ impl AgentRunner {
 
         // Build per-request tools, KB evidence collector, and coverage collector
         // for the retry. Coverage evidence accumulates across retries via append.
-        let (tools, evidence_collector, coverage_collector) =
-            self.tool_factory.build(&ctx.user_id);
+        let (tools, evidence_collector, coverage_collector) = self
+            .tool_factory
+            .build(&ctx.user_id, ctx.active_document_keys.clone());
 
         // Wrap tools with recording adapters for this retry round.
         let tool_call_sink: ToolCallSink = Arc::new(Mutex::new(Vec::new()));
@@ -341,7 +343,7 @@ mod tests {
     use super::*;
     use crate::context::QueryContext;
     use crate::coverage::{CoverageMode, CoveragePlan, SectionRef};
-    use agent_rs_core::types::{MessageRole, RetrievalStrategy, SessionId, UserId};
+    use agent_rs_core::types::{RetrievalStrategy, UserId};
     use rig::completion::ToolDefinition;
     use serde_json::json;
 
@@ -471,11 +473,12 @@ mod tests {
     fn make_ctx(query: &str) -> QueryContext {
         QueryContext::new(
             query.to_owned(),
-            SessionId::new(),
             UserId::from_string("test-user".into()),
+            Vec::new(),
+            Vec::new(),
             RetrievalStrategy::GraphHybrid,
             10,
-            MessageRole::User,
+            None,
         )
     }
 

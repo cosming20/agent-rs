@@ -128,7 +128,7 @@ mod tests {
     #[test]
     fn verifier_marks_complete_when_every_target_present() {
         let plan = plan_for(&["s1", "s2"]);
-        let evidence = vec![ev("s1"), ev("s2")];
+        let evidence = [ev("s1"), ev("s2")];
         let refs: Vec<&SearchResult> = evidence.iter().collect();
         let report = CoverageVerifier::build_report(&plan, &refs);
         assert!(report.is_complete());
@@ -140,7 +140,7 @@ mod tests {
     #[test]
     fn verifier_lists_missing_sections() {
         let plan = plan_for(&["s1", "s2", "s3"]);
-        let evidence = vec![ev("s1")];
+        let evidence = [ev("s1")];
         let refs: Vec<&SearchResult> = evidence.iter().collect();
         let report = CoverageVerifier::build_report(&plan, &refs);
         assert!(!report.is_complete());

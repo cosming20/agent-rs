@@ -5,8 +5,8 @@
 //!
 //! After the 2026-04-21 stateless pivot: `session_id` was removed. The
 //! agent no longer owns any session state — conversation history is
-//! supplied by the client inline via the `history` + `active_document_keys`
-//! + `history_document_keys` fields on `AskRequest` and stored directly on
+//! supplied by the client inline via the `history` + `active_document_keys` +
+//! `history_document_keys` fields on `AskRequest` and stored directly on
 //! `QueryContext` at construction time. `trace_id` is an optional
 //! client-supplied correlation UUID with no authorization meaning.
 
