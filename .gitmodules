@@ -1,0 +1,3 @@
+[submodule "proto/agent-rs-proto"]
+	path = proto/agent-rs-proto
+	url = https://github.com/cosming20/agent-rs-proto.git

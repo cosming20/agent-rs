@@ -66,6 +66,31 @@ dependencies = [
 ]
 
 [[package]]
+name = "agent-rs-agent-service"
+version = "0.1.0"
+dependencies = [
+ "agent-rs-agent",
+ "agent-rs-core",
+ "agent-rs-observability",
+ "agent-rs-retrieval",
+ "agent-rs-stores",
+ "agent-rs-tools",
+ "anyhow",
+ "chrono",
+ "futures",
+ "prost 0.13.5",
+ "serde",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-stream",
+ "tonic 0.12.3",
+ "tonic-build 0.12.3",
+ "tracing",
+ "tracing-subscriber",
+ "uuid",
+]
+
+[[package]]
 name = "agent-rs-core"
 version = "0.1.0"
 dependencies = [
@@ -3758,6 +3783,16 @@ checksum = "9b4f627cb1b25917193a259e49bdad08f671f8d9708acfd5fe0a8c1455d87220"
 
 [[package]]
 name = "petgraph"
+version = "0.7.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3672b37090dbd86368a4145bc067582552b29c27377cad4e0a306c97f9bd7772"
+dependencies = [
+ "fixedbitset",
+ "indexmap 2.13.1",
+]
+
+[[package]]
+name = "petgraph"
 version = "0.8.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8701b58ea97060d5e5b155d383a69952a60943f0e6dfe30b04c287beb0b27455"
@@ -4078,6 +4113,26 @@ dependencies = [
 
 [[package]]
 name = "prost-build"
+version = "0.13.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "be769465445e8c1474e9c5dac2018218498557af32d9ed057325ec9a41ae81bf"
+dependencies = [
+ "heck 0.5.0",
+ "itertools",
+ "log",
+ "multimap",
+ "once_cell",
+ "petgraph 0.7.1",
+ "prettyplease",
+ "prost 0.13.5",
+ "prost-types 0.13.5",
+ "regex",
+ "syn 2.0.117",
+ "tempfile",
+]
+
+[[package]]
+name = "prost-build"
 version = "0.14.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "343d3bd7056eda839b03204e68deff7d1b13aba7af2b2fd16890697274262ee7"
@@ -4086,7 +4141,7 @@ dependencies = [
  "itertools",
  "log",
  "multimap",
- "petgraph",
+ "petgraph 0.8.3",
  "prettyplease",
  "prost 0.14.3",
  "prost-types 0.14.3",
@@ -5816,6 +5871,20 @@ dependencies = [
 
 [[package]]
 name = "tonic-build"
+version = "0.12.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9557ce109ea773b399c9b9e5dca39294110b74f1f342cb347a80d1fce8c26a11"
+dependencies = [
+ "prettyplease",
+ "proc-macro2",
+ "prost-build 0.13.5",
+ "prost-types 0.13.5",
+ "quote",
+ "syn 2.0.117",
+]
+
+[[package]]
+name = "tonic-build"
 version = "0.14.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1882ac3bf5ef12877d7ed57aad87e75154c11931c2ba7e6cde5e22d63522c734"
@@ -5845,12 +5914,12 @@ checksum = "f3144df636917574672e93d0f56d7edec49f90305749c668df5101751bb8f95a"
 dependencies = [
  "prettyplease",
  "proc-macro2",
- "prost-build",
+ "prost-build 0.14.3",
  "prost-types 0.14.3",
  "quote",
  "syn 2.0.117",
  "tempfile",
- "tonic-build",
+ "tonic-build 0.14.5",
 ]
 
 [[package]]
