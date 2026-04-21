@@ -16,7 +16,7 @@
 
 use std::sync::Arc;
 
-use agent_rs_core::ToolError;
+use agent_rs_core::{ToolError, UserId};
 use agent_rs_core::types::Score;
 use agent_rs_stores::neo4j::Neo4jStore;
 use agent_rs_stores::qdrant::QdrantStore;
@@ -69,20 +69,35 @@ pub struct SearchSectionsTool {
     /// in [`SearchKnowledgeTool`].
     #[serde(skip)]
     coverage_collector: Option<Arc<Mutex<Vec<SearchResult>>>>,
+    /// Tenant scope baked in at construction time. The LLM never sees or
+    /// controls this field — it is excluded from the JSON schema.
+    #[serde(skip, default = "default_unset_user_id")]
+    user_id: UserId,
+}
+
+/// Sentinel `UserId` for contract-test deserialization path.
+fn default_unset_user_id() -> UserId {
+    UserId::try_new("_unset_test_only").expect("sentinel must pass validator")
 }
 
 impl SearchSectionsTool {
-    /// Construct a wired-up [`SearchSectionsTool`].
+    /// Construct a wired-up [`SearchSectionsTool`] scoped to `user_id`.
     ///
     /// `collection` is the name of the Qdrant collection that holds chunk
     /// payloads (the same collection used by `search_knowledge` and
     /// `fetch_section_chunks`).
-    pub fn new(neo4j: Arc<Neo4jStore>, qdrant: Arc<QdrantStore>, collection: String) -> Self {
+    pub fn new_for_user(
+        neo4j: Arc<Neo4jStore>,
+        qdrant: Arc<QdrantStore>,
+        collection: String,
+        user_id: UserId,
+    ) -> Self {
         Self {
             neo4j: Some(neo4j),
             qdrant: Some(qdrant),
             collection: Some(collection),
             coverage_collector: None,
+            user_id,
         }
     }
 
@@ -145,9 +160,16 @@ impl Tool for SearchSectionsTool {
     /// partial results.
     #[tracing::instrument(
         skip(self),
-        fields(tool = Self::NAME, n_sections = args.section_ids.len())
+        fields(tool = Self::NAME, n_sections = args.section_ids.len(), user_id = %self.user_id)
     )]
     async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
+        // Sentinel guard: fails fast if the tool was constructed via the
+        // serde-skip default path (contract tests) rather than new_for_user().
+        assert!(
+            self.user_id.as_str() != "_unset_test_only",
+            "search_sections: call() reached with sentinel user_id — use new_for_user()"
+        );
+
         let neo4j = self
             .neo4j
             .as_ref()
@@ -175,12 +197,13 @@ impl Tool for SearchSectionsTool {
             let qdrant = Arc::clone(qdrant);
             let collection = collection.clone();
             let sid = sid.clone();
+            let user_id = self.user_id.clone();
             async move {
                 let _permit = sem
                     .acquire_owned()
                     .await
                     .map_err(|e| format!("semaphore closed: {e}"))?;
-                fetch_one(&neo4j, &qdrant, &collection, &sid, max_chars).await
+                fetch_one(&neo4j, &qdrant, &collection, &user_id, &sid, max_chars).await
             }
         });
 
@@ -227,11 +250,12 @@ async fn fetch_one(
     neo4j: &Neo4jStore,
     qdrant: &QdrantStore,
     collection: &str,
+    user_id: &UserId,
     section_id: &str,
     max_chars: usize,
 ) -> Result<(String, Vec<PointPayload>), String> {
     let chunk_ids = neo4j
-        .chunks_in_sections(&[section_id.to_string()])
+        .chunks_in_sections(user_id, &[section_id.to_string()])
         .await
         .map_err(|e| format!("neo4j chunks_in_sections({section_id}): {e}"))?;
 
@@ -240,7 +264,7 @@ async fn fetch_one(
     }
 
     let payloads = qdrant
-        .retrieve_chunks_by_ids(collection, &chunk_ids)
+        .retrieve_chunks_by_ids(collection, user_id, &chunk_ids)
         .await
         .map_err(|e| format!("qdrant retrieve_chunks_by_ids({section_id}): {e}"))?;
 

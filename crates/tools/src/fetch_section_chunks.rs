@@ -16,7 +16,7 @@
 
 use std::sync::Arc;
 
-use agent_rs_core::ToolError;
+use agent_rs_core::{ToolError, UserId};
 use agent_rs_core::types::Score;
 use agent_rs_stores::neo4j::Neo4jStore;
 use agent_rs_stores::qdrant::QdrantStore;
@@ -65,19 +65,34 @@ pub struct FetchSectionChunksTool {
     /// in [`SearchKnowledgeTool`].
     #[serde(skip)]
     coverage_collector: Option<Arc<Mutex<Vec<SearchResult>>>>,
+    /// Tenant scope baked in at construction time. The LLM never sees or
+    /// controls this field — it is excluded from the JSON schema.
+    #[serde(skip, default = "default_unset_user_id")]
+    user_id: UserId,
+}
+
+/// Sentinel `UserId` for contract-test deserialization path.
+fn default_unset_user_id() -> UserId {
+    UserId::try_new("_unset_test_only").expect("sentinel must pass validator")
 }
 
 impl FetchSectionChunksTool {
-    /// Construct a wired-up [`FetchSectionChunksTool`].
+    /// Construct a wired-up [`FetchSectionChunksTool`] scoped to `user_id`.
     ///
     /// `collection` is the name of the Qdrant collection that holds chunk
     /// payloads (typically the same collection used by `search_knowledge`).
-    pub fn new(neo4j: Arc<Neo4jStore>, qdrant: Arc<QdrantStore>, collection: String) -> Self {
+    pub fn new_for_user(
+        neo4j: Arc<Neo4jStore>,
+        qdrant: Arc<QdrantStore>,
+        collection: String,
+        user_id: UserId,
+    ) -> Self {
         Self {
             neo4j: Some(neo4j),
             qdrant: Some(qdrant),
             collection: Some(collection),
             coverage_collector: None,
+            user_id,
         }
     }
 
@@ -146,10 +161,18 @@ impl Tool for FetchSectionChunksTool {
         fields(
             tool = Self::NAME,
             section_id = %args.section_id,
-            include_descendants = args.include_descendants
+            include_descendants = args.include_descendants,
+            user_id = %self.user_id
         )
     )]
     async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
+        // Sentinel guard: fails fast if the tool was constructed via the
+        // serde-skip default path (contract tests) rather than new_for_user().
+        assert!(
+            self.user_id.as_str() != "_unset_test_only",
+            "fetch_section_chunks: call() reached with sentinel user_id — use new_for_user()"
+        );
+
         let neo4j = self.neo4j.as_ref().ok_or_else(|| {
             ToolError::McpClient("fetch_section_chunks: Neo4jStore missing".into())
         })?;
@@ -163,7 +186,7 @@ impl Tool for FetchSectionChunksTool {
         // Expand to descendant sections when requested.
         let section_ids: Vec<String> = if args.include_descendants {
             let mut ids = neo4j
-                .list_descendant_sections(&args.section_id)
+                .list_descendant_sections(&self.user_id, &args.section_id)
                 .await
                 .map_err(|e| {
                     ToolError::McpClient(format!("fetch_section_chunks: descendants: {e}"))
@@ -180,7 +203,7 @@ impl Tool for FetchSectionChunksTool {
 
         // Fetch chunk ids, ordered by chunk_index (Neo4j query sorts them).
         let chunk_ids = neo4j
-            .chunks_in_sections(&section_ids)
+            .chunks_in_sections(&self.user_id, &section_ids)
             .await
             .map_err(|e| ToolError::McpClient(format!("fetch_section_chunks: chunks: {e}")))?;
 
@@ -193,7 +216,7 @@ impl Tool for FetchSectionChunksTool {
 
         // Retrieve full payloads from Qdrant (no vectors).
         let payloads = qdrant
-            .retrieve_chunks_by_ids(collection, &chunk_ids)
+            .retrieve_chunks_by_ids(collection, &self.user_id, &chunk_ids)
             .await
             .map_err(|e| ToolError::McpClient(format!("fetch_section_chunks: retrieve: {e}")))?;
 

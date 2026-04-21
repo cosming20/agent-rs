@@ -124,10 +124,10 @@ impl ResultPersister {
             }
         }
 
-        // Store assistant response in memory
+        // Store assistant response in memory (user_id scopes the row to the tenant).
         if let Err(err) = self
             .memory
-            .store_message(&ctx.session_id, MessageRole::Assistant, &response.answer)
+            .store_message(&ctx.user_id, &ctx.session_id, MessageRole::Assistant, &response.answer)
             .await
         {
             error!(error = %err, "failed to store assistant message");

@@ -9,7 +9,7 @@
 
 use std::sync::Arc;
 
-use agent_rs_core::ToolError;
+use agent_rs_core::{ToolError, UserId};
 use agent_rs_stores::postgres::{IngestedDocumentRow, PgStore};
 use rig::completion::ToolDefinition;
 use rig::tool::Tool;
@@ -33,12 +33,23 @@ pub struct DocumentInfoArgs {
 pub struct DocumentInfoTool {
     #[serde(skip)]
     pg_store: Option<Arc<PgStore>>,
+    /// Tenant scope baked in at construction time. The LLM never sees or
+    /// controls this field — it is excluded from the JSON schema.
+    #[serde(skip, default = "default_unset_user_id")]
+    user_id: UserId,
+}
+
+/// Sentinel `UserId` for contract-test deserialization path.
+fn default_unset_user_id() -> UserId {
+    UserId::try_new("_unset_test_only").expect("sentinel must pass validator")
 }
 
 impl DocumentInfoTool {
-    pub fn new(pg_store: Arc<PgStore>) -> Self {
+    /// Construct a wired-up [`DocumentInfoTool`] scoped to `user_id`.
+    pub fn new_for_user(pg_store: Arc<PgStore>, user_id: UserId) -> Self {
         Self {
             pg_store: Some(pg_store),
+            user_id,
         }
     }
 }
@@ -74,8 +85,15 @@ impl Tool for DocumentInfoTool {
         }
     }
 
-    #[tracing::instrument(skip(self), fields(tool = Self::NAME))]
+    #[tracing::instrument(skip(self), fields(tool = Self::NAME, user_id = %self.user_id))]
     async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
+        // Sentinel guard: fails fast if the tool was constructed via the
+        // serde-skip default path (contract tests) rather than new_for_user().
+        assert!(
+            self.user_id.as_str() != "_unset_test_only",
+            "document_info: call() reached with sentinel user_id — use new_for_user()"
+        );
+
         let pg = self
             .pg_store
             .as_ref()
@@ -83,7 +101,7 @@ impl Tool for DocumentInfoTool {
 
         // Query ingested_documents table.
         let rows = pg
-            .list_ingested_documents()
+            .list_ingested_documents(&self.user_id)
             .await
             .map_err(|e| ToolError::McpClient(format!("query ingested_documents: {e}")))?;
 

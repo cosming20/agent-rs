@@ -105,11 +105,10 @@ impl CoveragePlanner {
             return;
         }
 
-        // Resolve target docs. If the query names specific ingested
-        // documents (by `source` filename or `title` substring, case-
-        // insensitive), target only those. Otherwise fall back to every
-        // ingested doc — preserves the previous single-corpus behaviour.
-        let all_docs = match self.pg.list_ingested_documents().await {
+        // Resolve target docs. If `ctx.active_document_ids` is set, restrict
+        // to that pinned set. Otherwise fall back to the user's full document
+        // library — preserves the previous single-corpus exhaustive behaviour.
+        let all_docs = match self.pg.list_ingested_documents(&ctx.user_id).await {
             Ok(d) => d,
             Err(e) => {
                 warn!(error = %e, "coverage_planner: failed to list docs; skipping plan");
@@ -117,11 +116,22 @@ impl CoveragePlanner {
             }
         };
 
-        let docs = filter_docs_by_query(&ctx.query, &all_docs);
-        if docs.len() < all_docs.len() {
+        // When the session has active documents, restrict to that subset;
+        // otherwise use the full library (None = no filter applied).
+        let library_docs: Vec<agent_rs_stores::postgres::IngestedDocumentRow> =
+            match ctx.active_document_ids.as_ref() {
+                Some(ids) => all_docs
+                    .into_iter()
+                    .filter(|d| ids.contains(&d.document_id))
+                    .collect(),
+                None => all_docs,
+            };
+
+        let docs = filter_docs_by_query(&ctx.query, &library_docs);
+        if docs.len() < library_docs.len() {
             tracing::info!(
                 matched = docs.len(),
-                total = all_docs.len(),
+                total = library_docs.len(),
                 "coverage_planner: query references specific documents"
             );
         }
@@ -129,7 +139,7 @@ impl CoveragePlanner {
         let mut targets: Vec<SectionRef> = Vec::new();
         for doc in docs {
             let rows =
-                match self.neo4j.list_sections_for_doc(&doc.document_id.to_string()).await {
+                match self.neo4j.list_sections_for_doc(&ctx.user_id, &doc.document_id.to_string()).await {
                     Ok(r) => r,
                     Err(e) => {
                         warn!(
@@ -380,6 +390,8 @@ mod tests {
             started_at: chrono::NaiveDateTime::default(),
             completed_at: None,
             updated_at: chrono::NaiveDateTime::default(),
+            user_id: "test-user".to_string(),
+            minio_object_key: None,
         }
     }
 

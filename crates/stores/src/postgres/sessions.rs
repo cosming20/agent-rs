@@ -8,6 +8,9 @@
 //! which uses `INSERT … ON CONFLICT DO NOTHING` followed by a `SELECT` and an
 //! ownership check inside the same Postgres transaction so that concurrent
 //! callers see serialised results.
+//!
+//! [`PgStore::read_context_snapshot`] loads history, memories, and active
+//! documents in a single `REPEATABLE READ` transaction for a consistent view.
 
 use agent_rs_core::{
     StoreError,
@@ -18,8 +21,8 @@ use diesel_async::{AsyncConnection, RunQueryDsl, scoped_futures::ScopedFutureExt
 use tracing::instrument;
 
 use super::PgStore;
-use super::models::{NewSession, SessionRow};
-use super::schema::sessions;
+use super::models::{ChatMessageRow, IngestedDocumentRow, MemoryRow, NewSession, SessionRow};
+use super::schema::{chat_messages, ingested_documents, memories, session_active_documents, sessions};
 
 impl PgStore {
     /// Upsert-with-ownership semantics for a session row.
@@ -94,6 +97,79 @@ impl PgStore {
                 }
 
                 Ok(row)
+            }
+            .scope_boxed()
+        })
+        .await
+    }
+
+    /// Load conversation history, long-term memories, and active documents
+    /// for `(user_id, session_id)` in a single `REPEATABLE READ` transaction.
+    ///
+    /// All three reads observe the same consistent database snapshot, preventing
+    /// torn reads when documents are activated or messages are appended concurrently.
+    ///
+    /// # Returns
+    ///
+    /// A tuple `(history, memories, active_docs)` where:
+    /// - `history` — chat messages ordered oldest-first.
+    /// - `memories` — long-term memory rows for the user.
+    /// - `active_docs` — documents activated for this session (only `complete` rows).
+    ///
+    /// # Errors
+    ///
+    /// - [`StoreError::ConnectionPool`] — could not acquire a connection.
+    /// - [`StoreError::Postgres`] — any database-level error.
+    #[instrument(skip(self), fields(user_id = %user_id, session_id = %session_id))]
+    pub async fn read_context_snapshot(
+        &self,
+        user_id: &UserId,
+        session_id: &SessionId,
+    ) -> Result<(Vec<ChatMessageRow>, Vec<MemoryRow>, Vec<IngestedDocumentRow>), StoreError> {
+        let mut conn = self.conn().await?;
+        let uid = user_id.as_str().to_owned();
+        let sid = *session_id.inner();
+
+        conn.transaction::<_, StoreError, _>(|conn| {
+            async move {
+                diesel::sql_query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")
+                    .execute(conn)
+                    .await
+                    .map_err(StoreError::from)?;
+
+                let history: Vec<ChatMessageRow> = chat_messages::table
+                    .filter(chat_messages::user_id.eq(&uid))
+                    .filter(chat_messages::session_id.eq(sid))
+                    .order(chat_messages::created_at.asc())
+                    .select(ChatMessageRow::as_select())
+                    .load(conn)
+                    .await
+                    .map_err(StoreError::from)?;
+
+                let memory_rows: Vec<MemoryRow> = memories::table
+                    .filter(memories::user_id.eq(&uid))
+                    .order(memories::created_at.asc())
+                    .select(MemoryRow::as_select())
+                    .load(conn)
+                    .await
+                    .map_err(StoreError::from)?;
+
+                let active: Vec<IngestedDocumentRow> = ingested_documents::table
+                    .inner_join(
+                        session_active_documents::table.on(
+                            session_active_documents::document_id
+                                .eq(ingested_documents::document_id),
+                        ),
+                    )
+                    .filter(session_active_documents::session_id.eq(sid))
+                    .filter(ingested_documents::user_id.eq(&uid))
+                    .filter(ingested_documents::ingest_status.eq("complete"))
+                    .select(IngestedDocumentRow::as_select())
+                    .load(conn)
+                    .await
+                    .map_err(StoreError::from)?;
+
+                Ok((history, memory_rows, active))
             }
             .scope_boxed()
         })
