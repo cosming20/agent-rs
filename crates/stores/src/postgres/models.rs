@@ -381,6 +381,10 @@ impl IngestedDocumentRow {
 ///
 /// `user_id` is mandatory — dedup is scoped per-user so two tenants can
 /// upload the same file and each gets a distinct `document_id`.
+///
+/// `minio_object_key` is set by callers that pre-upload the source file to
+/// object storage before running the pipeline.  It is `None` when the upload
+/// step is omitted (e.g. in tests or text-only paths).
 #[derive(Debug, Insertable)]
 #[diesel(table_name = ingested_documents)]
 pub struct NewIngestedDocument {
@@ -393,6 +397,9 @@ pub struct NewIngestedDocument {
     pub updated_at: NaiveDateTime,
     /// The tenant that initiated this ingestion.
     pub user_id: String,
+    /// MinIO/S3 object key set when the source file was pre-uploaded before
+    /// the pipeline runs.  `None` when the upload step is skipped.
+    pub minio_object_key: Option<String>,
 }
 
 /// Outcome of a [`PgStore::begin_ingestion`] call.

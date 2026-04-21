@@ -16,10 +16,14 @@
 //! Usage:
 //!
 //! ```bash
-//! just ask "what is the return type of split() in Romanian"
+//! # 3 positional args: user_id, session_id (empty string = new random session), question
+//! just ask "alice" "" "what is X?"
+//!
+//! # with optional flags
+//! just ask "alice" "" "what is X?" --strategy hybrid --limit 5
 //!
 //! # or directly:
-//! cargo run --release --example ask -- --strategy hybrid --limit 8 "my question"
+//! cargo run --release --example ask -- "alice" "" "my question"
 //! ```
 //!
 //! Prerequisites: `.env` loaded, docker services up, `AGENT_RS__LLM__API_KEY`
@@ -37,57 +41,70 @@ use agent_rs_core::types::{CollectionName, RetrievalStrategy, SessionId, UserId}
 use agent_rs_observability::metrics::RetrievalMetrics;
 use agent_rs_observability::tracing::init_tracing;
 use anyhow::{Context, Result, bail};
+use uuid::Uuid;
 
 struct Args {
+    user_id: UserId,
+    session_id: SessionId,
     question: String,
     strategy: RetrievalStrategy,
     limit: usize,
-    user_id: String,
 }
 
 fn parse_args() -> Result<Args> {
-    let mut args = std::env::args().skip(1);
+    let mut positional: Vec<String> = Vec::new();
     let mut strategy_str: Option<String> = None;
     let mut limit: Option<usize> = None;
-    let mut user: Option<String> = None;
-    let mut parts: Vec<String> = Vec::new();
-    while let Some(a) = args.next() {
+    let mut iter = std::env::args().skip(1);
+    while let Some(a) = iter.next() {
         match a.as_str() {
             "--strategy" | "-s" => {
-                strategy_str = Some(args.next().context("--strategy needs a value")?);
+                strategy_str = Some(iter.next().context("--strategy needs a value")?);
             }
             "--limit" | "-n" => {
-                let v = args.next().context("--limit needs a value")?;
+                let v = iter.next().context("--limit needs a value")?;
                 limit = Some(v.parse().with_context(|| format!("invalid --limit: {v}"))?);
-            }
-            "--user" => {
-                user = Some(args.next().context("--user needs a value")?);
             }
             "-h" | "--help" => {
                 println!(
-                    "Usage: ask [--strategy <name>] [--limit N] [--user <id>] <question...>\n\
+                    "Usage: ask <user_id> <session_id_or_empty> <question> [--strategy <name>] [--limit N]\n\
                      Strategies: semantic keyword hybrid graph graph_hybrid graph_cot\n\
-                                graph_constrained rag_completion summaries temporal"
+                                graph_constrained rag_completion summaries temporal\n\
+                     Pass empty string for session_id to generate a new random session."
                 );
                 std::process::exit(0);
             }
             flag if flag.starts_with("--") => bail!("unknown flag: {flag}"),
-            positional => parts.push(positional.to_owned()),
+            arg => positional.push(arg.to_owned()),
         }
     }
-    if parts.is_empty() {
-        bail!("missing question; see --help");
+    if positional.len() != 3 {
+        bail!(
+            "usage: just ask \"<user_id>\" \"<session_id_or_empty>\" \"<question>\" — got {} positional arg(s)",
+            positional.len()
+        );
     }
+    let user_id = UserId::try_new(&positional[0]).context("invalid user_id")?;
+    let raw_session = positional[1].as_str();
+    let session_id = if raw_session.is_empty() {
+        SessionId::from_uuid(Uuid::new_v4())
+    } else {
+        SessionId::from_uuid(
+            Uuid::parse_str(raw_session).context("invalid session UUID")?,
+        )
+    };
+    let question = positional[2].clone();
     let strategy = match strategy_str.as_deref() {
         Some(s) => RetrievalStrategy::from_db_str(s)
             .map_err(|e| anyhow::anyhow!("unknown strategy '{s}': {e}"))?,
         None => RetrievalStrategy::GraphHybrid,
     };
     Ok(Args {
-        question: parts.join(" "),
+        user_id,
+        session_id,
+        question,
         strategy,
         limit: limit.unwrap_or(8),
-        user_id: user.unwrap_or_else(|| "cli".to_owned()),
     })
 }
 
@@ -179,21 +196,19 @@ async fn main() -> Result<()> {
     println!("  strategy    : {:?}", args.strategy);
     println!("  limit       : {}", args.limit);
     println!("  user        : {}", args.user_id);
+    println!("  session     : {}", args.session_id);
     println!("  collection  : {}", collection);
     println!("  embedder    : {}", embedder_label);
     println!("  boot_ms     : {}", boot_ms);
     println!("================================================");
     println!();
 
-    let session_id = SessionId::new();
-    let user_id = UserId::from_string(args.user_id.clone());
-
     let t = Instant::now();
     let response = orchestrator
         .process_query(
             args.question,
-            session_id,
-            user_id,
+            args.session_id,
+            args.user_id,
             args.strategy,
             args.limit,
         )

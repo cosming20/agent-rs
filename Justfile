@@ -167,9 +167,11 @@ docling-native:
 
 # ─── Dev loop ─────────────────────────────────────────────────────────────
 
-# Ingest one document (PDF / txt / md). Usage: `just ingest test.pdf`
-ingest path *args:
-    cargo run --release --example ingest -- {{args}} {{path}}
+# Ingest one document (PDF / txt / md).
+# Usage: `just ingest "<user_id>" "<path/to/doc.pdf>"`
+# Optional: add --source <label> after the path to override the source label.
+ingest user_id path:
+    cargo run --release --example ingest -- "{{user_id}}" "{{path}}"
 
 # Run one retrieval query. Usage: `just query "ce este histograma?"`
 # Extra flags go through:  `just query --strategy hybrid --limit 5 "my query"`
@@ -178,10 +180,17 @@ query *args:
     cargo run --release --example query -- {{args}}
 
 # Ask a question through the full agent pipeline (tools + grounding +
-# LLM answer synthesis with citations). Usage: `just ask "what is X?"`.
-# Extra flags: --strategy <name> --limit N --user <id>.
-ask *args:
-    cargo run --release --example ask -- {{args}}
+# LLM answer synthesis with citations).
+# Usage: `just ask "<user_id>" "<session_id_or_empty>" "<question>"`
+# Pass an empty string for session_id to generate a new random session.
+# Optional flags: --strategy <name> --limit N
+ask user_id session_id question:
+    cargo run --release --example ask -- "{{user_id}}" "{{session_id}}" "{{question}}"
+
+# ask with optional strategy/limit flags.
+# Usage: `just ask-opts alice "" "my question" --strategy hybrid --limit 5`
+ask-opts user_id session_id question *flags:
+    cargo run --release --example ask -- "{{user_id}}" "{{session_id}}" "{{question}}" {{flags}}
 
 # A/B compare: weighted-keyword feature OFF then ON for the same query.
 query-ab query:
