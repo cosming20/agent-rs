@@ -30,17 +30,12 @@ pub struct SectionRef {
 /// `None` = the standard non-exhaustive flow runs (definition / how-to / etc.).
 /// `Exhaustive` = the agent is expected to hit every section in `target_sections`.
 /// `Partial` = a relaxed exhaustive (e.g., user asked "main methods" not "ALL").
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub enum CoverageMode {
+    #[default]
     None,
     Partial,
     Exhaustive,
-}
-
-impl Default for CoverageMode {
-    fn default() -> Self {
-        CoverageMode::None
-    }
 }
 
 /// Plan emitted by the planner; consumed by the agent and the verifier.

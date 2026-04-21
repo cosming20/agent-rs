@@ -72,6 +72,26 @@ pub enum StoreError {
     /// receiving this error.
     #[error("incomplete batch write: expected {expected} rows, Neo4j reported {created}")]
     IncompleteBatch { expected: usize, created: i64 },
+
+    /// Session does not exist, OR belongs to a different user.
+    ///
+    /// Deliberately collapses both cases into one error to prevent
+    /// enumeration attacks: a caller cannot distinguish "this session_id
+    /// was never issued" from "this session_id belongs to someone else".
+    #[error("session {session_id} not found for user {user_id}")]
+    SessionNotFound { session_id: String, user_id: String },
+
+    /// Caller attempted to activate / read / delete a document that does
+    /// not belong to the provided user.
+    #[error("document {document_id} not owned by user {user_id}")]
+    DocumentNotOwnedByUser {
+        document_id: String,
+        user_id: String,
+    },
+
+    /// Error from the MinIO / S3 client. Message is the wrapped cause.
+    #[error("MinIO error: {0}")]
+    Minio(String),
 }
 
 // ---- Retrieval ----
@@ -116,6 +136,13 @@ pub enum AgentError {
     Synthesis(String),
     #[error("memory store: {0}")]
     MemoryStore(String),
+    /// Invalid user id — rejected by [`crate::types::UserId::try_new`].
+    ///
+    /// Message is verbose for logs but callers must NOT propagate it back to
+    /// user-facing output; return a generic "invalid user id" at API
+    /// boundaries instead.
+    #[error("invalid user id: {0}")]
+    InvalidUserId(String),
     #[error("max retries ({max}) exceeded")]
     MaxRetriesExceeded { max: usize },
     #[error("retrieval error: {0}")]
@@ -167,5 +194,43 @@ impl From<qdrant_client::QdrantError> for StoreError {
 impl From<neo4rs::Error> for StoreError {
     fn from(err: neo4rs::Error) -> Self {
         Self::Neo4j(Box::new(err))
+    }
+}
+
+#[cfg(test)]
+mod multi_tenant_error_tests {
+    use super::*;
+
+    #[test]
+    fn store_error_session_not_found_does_not_leak_existence() {
+        // The Display impl must NOT reveal whether a session exists for a
+        // different user — both "no such session" and "session belongs to
+        // different user" collapse to the same message text.
+        let err = StoreError::SessionNotFound {
+            session_id: "sess-123".into(),
+            user_id: "alice".into(),
+        };
+        let s = format!("{err}");
+        assert!(s.contains("not found"));
+        assert!(!s.to_lowercase().contains("different user"));
+        assert!(!s.to_lowercase().contains("belongs to"));
+    }
+
+    #[test]
+    fn store_error_document_not_owned_has_required_fields() {
+        let err = StoreError::DocumentNotOwnedByUser {
+            document_id: "doc-1".into(),
+            user_id: "alice".into(),
+        };
+        let s = format!("{err}");
+        assert!(s.contains("doc-1"));
+    }
+
+    #[test]
+    fn store_error_minio_wraps_message() {
+        let err = StoreError::Minio("bucket not found".into());
+        let s = format!("{err}");
+        assert!(s.contains("MinIO"));
+        assert!(s.contains("bucket not found"));
     }
 }

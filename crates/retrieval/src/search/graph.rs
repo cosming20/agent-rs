@@ -22,7 +22,7 @@
 use std::cmp::Ordering;
 use std::collections::HashMap;
 
-use agent_rs_core::{CollectionName, Score};
+use agent_rs_core::{CollectionName, Score, UserId};
 use agent_rs_stores::{
     traits::{GraphStore, VectorStore},
     types::{NodeLabel, PointPayload, SearchResult},
@@ -80,6 +80,7 @@ const BASE_DEPTH_SCORE: f64 = 1.0;
 /// `query` is retained for trace-span provenance only and is not attached to
 /// the per-result payload (payload comes from Qdrant and already contains the
 /// full chunk metadata).
+#[allow(clippy::too_many_arguments)]
 #[instrument(skip(graph, vectors), fields(
     collection = %collection,
     num_seeds = seed_node_ids.len(),
@@ -90,6 +91,7 @@ pub async fn graph_search(
     graph: &(dyn GraphStore + Send + Sync),
     vectors: &(dyn VectorStore + Send + Sync),
     collection: &CollectionName,
+    user_id: &UserId,
     query: &str,
     seed_node_ids: &[String],
     max_depth: usize,
@@ -136,11 +138,12 @@ pub async fn graph_search(
         return Ok(Vec::new());
     }
 
-    // Rehydrate payloads from the vector store. Qdrant returns only IDs that
-    // still exist; we drop the rest so empty-content results never leak.
+    // Rehydrate payloads from the vector store, scoped to user_id.
+    // Qdrant returns only IDs that still exist; the user scope filter provides
+    // defence-in-depth against cross-tenant leakage.
     let ids: Vec<String> = scored.iter().map(|(id, _)| id.clone()).collect();
     let payloads = vectors
-        .get_by_ids(collection, &ids)
+        .retrieve_chunks_for_user(collection, user_id, &ids)
         .await
         .map_err(RetrievalError::Store)?;
 
@@ -193,6 +196,7 @@ pub async fn graph_search(
 /// # Errors
 ///
 /// Returns [`RetrievalError::Store`] if the underlying traversal fails.
+#[allow(clippy::too_many_arguments)]
 #[instrument(skip(graph, vectors), fields(
     collection = %collection,
     num_seeds = seed_node_ids.len(),
@@ -203,6 +207,7 @@ pub async fn graph_cot_search(
     graph: &(dyn GraphStore + Send + Sync),
     vectors: &(dyn VectorStore + Send + Sync),
     collection: &CollectionName,
+    user_id: &UserId,
     query: &str,
     seed_node_ids: &[String],
     max_depth: usize,
@@ -214,6 +219,7 @@ pub async fn graph_cot_search(
         graph,
         vectors,
         collection,
+        user_id,
         query,
         seed_node_ids,
         max_depth,
@@ -233,6 +239,7 @@ pub async fn graph_cot_search(
 /// # Errors
 ///
 /// Returns [`RetrievalError::Store`] if the underlying traversal fails.
+#[allow(clippy::too_many_arguments)]
 #[instrument(skip(graph, vectors), fields(
     collection = %collection,
     num_seeds = seed_node_ids.len(),
@@ -243,6 +250,7 @@ pub async fn graph_constrained_search(
     graph: &(dyn GraphStore + Send + Sync),
     vectors: &(dyn VectorStore + Send + Sync),
     collection: &CollectionName,
+    user_id: &UserId,
     query: &str,
     seed_node_ids: &[String],
     max_depth: usize,
@@ -255,6 +263,7 @@ pub async fn graph_constrained_search(
         graph,
         vectors,
         collection,
+        user_id,
         query,
         seed_node_ids,
         max_depth,
@@ -274,6 +283,7 @@ pub async fn graph_constrained_search(
 /// # Errors
 ///
 /// Returns [`RetrievalError::Store`] if the underlying traversal fails.
+#[allow(clippy::too_many_arguments)]
 #[instrument(skip(graph, vectors), fields(
     collection = %collection,
     num_seeds = seed_node_ids.len(),
@@ -284,6 +294,7 @@ pub async fn graph_rag_context_search(
     graph: &(dyn GraphStore + Send + Sync),
     vectors: &(dyn VectorStore + Send + Sync),
     collection: &CollectionName,
+    user_id: &UserId,
     query: &str,
     seed_node_ids: &[String],
     max_depth: usize,
@@ -296,6 +307,7 @@ pub async fn graph_rag_context_search(
         graph,
         vectors,
         collection,
+        user_id,
         query,
         seed_node_ids,
         max_depth,

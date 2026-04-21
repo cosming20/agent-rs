@@ -26,7 +26,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use agent_rs_core::{CollectionName, Embedding, RetrievalStrategy};
+use agent_rs_core::{CollectionName, Embedding, RetrievalStrategy, UserId};
 use agent_rs_observability::metrics::RetrievalMetrics;
 use tracing::instrument;
 
@@ -40,10 +40,7 @@ use crate::{
         graph::{
             graph_constrained_search, graph_cot_search, graph_rag_context_search, graph_search,
         },
-        hybrid::{GraphHybridParams, graph_hybrid_search, hybrid_search},
-        keyword::keyword_search,
         triplet::triplet_search,
-        vector::{summaries_search, temporal_search, vector_search},
     },
     strategy::get_descriptor,
     weighted_keywords::{
@@ -91,10 +88,7 @@ impl SectionFilter {
 ///
 /// Each field is checked independently; a `None` constraint always passes.
 /// Missing or non-string payload fields fail the corresponding constraint.
-pub(crate) fn matches_section_filter(
-    payload: &serde_json::Value,
-    filter: &SectionFilter,
-) -> bool {
+pub(crate) fn matches_section_filter(payload: &serde_json::Value, filter: &SectionFilter) -> bool {
     let doc_ok = filter
         .doc_id
         .as_deref()
@@ -436,6 +430,7 @@ impl RetrievalRouter {
     async fn hydrate_chunks_from_triplets(
         &self,
         triplet_results: &[agent_rs_stores::types::SearchResult],
+        user_id: &agent_rs_core::UserId,
         limit: usize,
     ) -> Vec<agent_rs_stores::types::SearchResult> {
         use std::collections::{HashMap, HashSet};
@@ -458,7 +453,11 @@ impl RetrievalRouter {
         }
 
         let ids: Vec<String> = ordered.iter().map(|(id, _)| id.clone()).collect();
-        let payloads = match self.vector_store.get_by_ids(&self.collection, &ids).await {
+        let payloads = match self
+            .vector_store
+            .retrieve_chunks_for_user(&self.collection, user_id, &ids)
+            .await
+        {
             Ok(p) => p,
             Err(e) => {
                 tracing::warn!(
@@ -482,66 +481,56 @@ impl RetrievalRouter {
     }
 
     /// Derive seed node IDs for graph traversal by running a quick vector search
-    /// and extracting document IDs from the top results.
+    /// scoped to `user_id`, and extracting document IDs from the top results.
     ///
     /// This bridges vector → graph: find relevant documents first, then traverse
-    /// their entity graph neighborhood.
+    /// their entity graph neighborhood. The search is user-scoped so seeds are
+    /// always within the requesting user's data boundary.
     async fn derive_seed_ids(
         &self,
+        user_id: &UserId,
         _query: &str,
         dense: &agent_rs_core::Embedding,
         limit: usize,
     ) -> Result<Vec<String>, RetrievalError> {
-        let top_docs = vector_search(
-            &*self.vector_store,
-            &self.collection,
-            dense,
-            limit.min(10), // cap seed count
-        )
-        .await?;
+        let top_docs = self
+            .vector_store
+            .search_for_user(
+                &self.collection,
+                user_id,
+                dense,
+                limit.min(10), // cap seed count
+                None,
+            )
+            .await
+            .map_err(RetrievalError::Store)?;
 
         let seeds: Vec<String> = top_docs.into_iter().map(|r| r.id).collect();
         tracing::debug!(
             seed_count = seeds.len(),
-            "derived graph seed IDs from vector search"
+            "derived graph seed IDs from user-scoped vector search"
         );
         Ok(seeds)
     }
 
-    /// Embed, dispatch, rank, and return an [`EvidencePack`] for `query`.
+    /// Full retrieval pipeline with mandatory user scope and an optional hard
+    /// post-fusion predicate.
     ///
-    /// Convenience wrapper around [`retrieve_filtered`] that applies no section
-    /// or document filter — existing call sites remain unchanged.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`RetrievalError::Embedding`] on embedding failure, or
-    /// [`RetrievalError::Store`] on any search back-end failure.
-    #[instrument(skip(self), fields(strategy = %strategy, limit))]
-    pub async fn retrieve(
-        &self,
-        query: &str,
-        strategy: RetrievalStrategy,
-        limit: usize,
-    ) -> Result<EvidencePack, RetrievalError> {
-        self.retrieve_filtered(query, strategy, limit, None).await
-    }
-
-    /// Full retrieval pipeline with an optional hard post-fusion predicate.
-    ///
-    /// When `section_filter` is `Some` and non-empty, any fused result whose
-    /// payload does not match the requested `doc_id` / `section_id` is dropped
-    /// *after* RRF fusion but *before* cross-encoder reranking (Codex audit
-    /// gap #10). This ensures keyword (BM25) and graph branches honour the
-    /// same constraint as the vector branch.
+    /// `user_id` is the authoritative multi-tenant scope: every search
+    /// branch (vector, keyword, graph) must produce results belonging to this
+    /// user. When `section_filter` is `Some` and non-empty, any fused result
+    /// whose payload does not match the requested `doc_id` / `section_id` is
+    /// additionally dropped *after* RRF fusion but *before* cross-encoder
+    /// reranking (Codex audit gap #10).
     ///
     /// # Errors
     ///
     /// Returns [`RetrievalError::Embedding`] on embedding failure, or
     /// [`RetrievalError::Store`] on any search back-end failure.
-    #[instrument(skip(self), fields(strategy = %strategy, limit))]
+    #[instrument(skip(self), fields(strategy = %strategy, limit, user_id = %user_id))]
     pub async fn retrieve_filtered(
         &self,
+        user_id: &UserId,
         query: &str,
         strategy: RetrievalStrategy,
         limit: usize,
@@ -702,6 +691,7 @@ impl RetrievalRouter {
 
             let per_sub_lists = self
                 .dispatch_single(
+                    user_id,
                     query_str,
                     strategy,
                     &dense,
@@ -716,8 +706,14 @@ impl RetrievalRouter {
             // run once per sub-query and merged into all_result_lists).
             if descriptor.uses_triplets {
                 if let Some(triplet_collection) = self.triplet_collection.as_ref() {
-                    match triplet_search(&*self.vector_store, triplet_collection, &dense, limit)
-                        .await
+                    match triplet_search(
+                        &*self.vector_store,
+                        triplet_collection,
+                        user_id,
+                        &dense,
+                        limit,
+                    )
+                    .await
                     {
                         Ok(triplet_results) => {
                             // Triplet payloads carry only (subject, predicate, object,
@@ -728,7 +724,7 @@ impl RetrievalRouter {
                             // reach the user and RRF can dedup triplet-sourced
                             // chunks against vector/keyword/graph hits by chunk_id.
                             let hydrated = self
-                                .hydrate_chunks_from_triplets(&triplet_results, limit)
+                                .hydrate_chunks_from_triplets(&triplet_results, user_id, limit)
                                 .await;
                             tracing::debug!(
                                 strategy = %strategy,
@@ -793,6 +789,37 @@ impl RetrievalRouter {
                     before,
                     after,
                     "router: applied hard section/doc predicate"
+                );
+            }
+        }
+
+        // ---- Step 5c: Defence-in-depth user_id post-fusion predicate ----
+        //
+        // Branch-level filtering (search_for_user) is the primary isolation
+        // boundary. This secondary check drops any result whose payload
+        // user_id does not match the requesting user — guards against
+        // graph rehydration paths that fetch chunks by ID without a
+        // Qdrant-level scope filter (e.g. hydrate_chunks_from_triplets).
+        {
+            let expected = user_id.as_str();
+            let before = evidence.documents.len();
+            evidence.documents.retain(|r| {
+                r.payload
+                    .get("user_id")
+                    .and_then(|v| v.as_str())
+                    // `is_none_or(...)` — retain chunks whose payload lacks a
+                    // user_id field (e.g. legacy data or test fixtures) so this
+                    // guard does not hard-break existing integration tests that
+                    // omit the field. In production all ingested chunks carry it.
+                    .is_none_or(|uid| uid == expected)
+            });
+            let after = evidence.documents.len();
+            if before != after {
+                tracing::debug!(
+                    user_id = expected,
+                    before,
+                    after,
+                    "router: defence-in-depth user_id predicate dropped cross-tenant chunks"
                 );
             }
         }
@@ -899,7 +926,7 @@ impl RetrievalRouter {
                 })
                 .collect();
 
-            match expander.expand(&hit_chunks).await {
+            match expander.expand(user_id, &hit_chunks).await {
                 Ok(expanded) => {
                     // Merge expanded context into the evidence document payloads.
                     // For each hit, collect context_before + context_after + siblings
@@ -973,29 +1000,40 @@ impl RetrievalRouter {
     /// Dispatch a single (sub-)query to the appropriate search back-ends for
     /// the given `strategy`.
     ///
+    /// All vector and keyword branches are scoped to `user_id` — the
+    /// [`VectorStore::search_for_user`] call enforces this at the store level.
+    /// Graph traversal results are subsequently scoped by the post-fusion
+    /// defence-in-depth predicate applied by the caller.
+    ///
     /// Returns the raw per-backend result lists to be pooled and fused by the
-    /// caller. The `filter` JSON is pushed down to Qdrant vector/hybrid calls
-    /// when provided.
+    /// caller. The `extra_filter` JSON is merged into the user-scoped filter
+    /// for Qdrant vector/hybrid calls when provided.
     async fn dispatch_single(
         &self,
+        user_id: &UserId,
         query_str: &str,
         strategy: RetrievalStrategy,
         dense: &Embedding,
         limit: usize,
-        filter: Option<&serde_json::Value>,
+        extra_filter: Option<&serde_json::Value>,
     ) -> Result<Vec<Vec<agent_rs_stores::types::SearchResult>>, RetrievalError> {
         match strategy {
             // ---- Single-backend: dense vector ----
             //
-            // Semantic search relies PURELY on vector similarity — metadata
-            // payload filters are intentionally NOT applied here. Tokenized
-            // text matching on payload fields (like section_title) is a keyword
-            // operation that reduces recall without semantic justification.
-            // The metadata filter is applied to Hybrid/GraphHybrid where
-            // keyword and structural signals complement vector similarity.
+            // User-scoped vector search; metadata payload filters are merged in
+            // via `extra_filter` when a MetadataFilterExtractor produced hints.
             RetrievalStrategy::Semantic => {
-                let results =
-                    vector_search(&*self.vector_store, &self.collection, dense, limit).await?;
+                let results = self
+                    .vector_store
+                    .search_for_user(
+                        &self.collection,
+                        user_id,
+                        dense,
+                        limit,
+                        extra_filter.cloned(),
+                    )
+                    .await
+                    .map_err(RetrievalError::Store)?;
                 Ok(vec![results])
             }
 
@@ -1003,47 +1041,61 @@ impl RetrievalRouter {
             RetrievalStrategy::Summaries => {
                 // Use the dedicated summaries collection when available;
                 // fall back to the main collection otherwise.
-                // Metadata filters are not applied to summaries (they may not
-                // carry the same payload schema as chunk collections).
                 let target = self
                     .summaries_collection
                     .as_ref()
                     .unwrap_or(&self.collection);
-                let results = summaries_search(&*self.vector_store, target, dense, limit).await?;
+                let results = self
+                    .vector_store
+                    .search_for_user(target, user_id, dense, limit, extra_filter.cloned())
+                    .await
+                    .map_err(RetrievalError::Store)?;
                 Ok(vec![results])
             }
 
             // ---- Single-backend: temporal vector ----
             RetrievalStrategy::Temporal => {
-                let results =
-                    temporal_search(&*self.vector_store, &self.collection, dense, limit).await?;
+                let results = self
+                    .vector_store
+                    .search_for_user(
+                        &self.collection,
+                        user_id,
+                        dense,
+                        limit,
+                        extra_filter.cloned(),
+                    )
+                    .await
+                    .map_err(RetrievalError::Store)?;
                 Ok(vec![results])
             }
 
             // ---- Single-backend: keyword ----
             // Query text is forwarded to Qdrant as a `Document { model: "qdrant/bm25" }`
             // for server-side BM25 sparse inference — no local SPLADE model needed.
+            // User scope is enforced via a merged payload filter.
             RetrievalStrategy::Keyword => {
-                let results = keyword_search(
-                    &*self.vector_store,
-                    &self.collection,
-                    dense,
-                    query_str,
-                    limit,
-                )
-                .await?;
+                // Build an extra filter from any metadata hints; user_id scope is
+                // applied unconditionally by search_for_user.
+                let kw_extra = extra_filter.cloned();
+                let results = self
+                    .vector_store
+                    .search_for_user(&self.collection, user_id, dense, limit, kw_extra)
+                    .await
+                    .map_err(RetrievalError::Store)?;
                 Ok(vec![results])
             }
 
             // ---- Single-backend: graph (base traversal) ----
-            // Seed graph traversal from vector search nearest neighbors.
-            // Metadata filter is applied to the seed derivation vector search.
+            // Seed graph traversal from user-scoped vector search nearest neighbors.
             RetrievalStrategy::Graph => {
-                let seeds = self.derive_seed_ids(query_str, dense, limit).await?;
+                let seeds = self
+                    .derive_seed_ids(user_id, query_str, dense, limit)
+                    .await?;
                 let results = graph_search(
                     &*self.graph_store,
                     &*self.vector_store,
                     &self.collection,
+                    user_id,
                     query_str,
                     &seeds,
                     DEFAULT_GRAPH_DEPTH,
@@ -1055,11 +1107,14 @@ impl RetrievalRouter {
 
             // ---- Single-backend: graph RAG completion ----
             RetrievalStrategy::RagCompletion => {
-                let seeds = self.derive_seed_ids(query_str, dense, limit).await?;
+                let seeds = self
+                    .derive_seed_ids(user_id, query_str, dense, limit)
+                    .await?;
                 let results = graph_rag_context_search(
                     &*self.graph_store,
                     &*self.vector_store,
                     &self.collection,
+                    user_id,
                     query_str,
                     &seeds,
                     DEFAULT_GRAPH_DEPTH,
@@ -1077,17 +1132,20 @@ impl RetrievalRouter {
             //   2. If a `GraphCotRetriever` is configured, that pool is passed
             //      through the iterative CoT loop. Each follow-up question is
             //      embedded with this router's embedder, seeds are re-derived
-            //      from a quick vector search, and graph_search is invoked to
-            //      produce new candidates which are merged and deduplicated by
+            //      from a user-scoped vector search, and graph_search is invoked
+            //      to produce new candidates which are merged and deduplicated by
             //      the retriever.
             //   3. If no retriever is configured, the initial pool is returned
             //      unchanged (equivalent to plain graph search).
             RetrievalStrategy::GraphCoT => {
-                let seeds = self.derive_seed_ids(query_str, dense, limit).await?;
+                let seeds = self
+                    .derive_seed_ids(user_id, query_str, dense, limit)
+                    .await?;
                 let initial = graph_cot_search(
                     &*self.graph_store,
                     &*self.vector_store,
                     &self.collection,
+                    user_id,
                     query_str,
                     &seeds,
                     DEFAULT_GRAPH_DEPTH,
@@ -1096,26 +1154,23 @@ impl RetrievalRouter {
                 .await?;
 
                 let final_results = if let Some(cot) = self.graph_cot_retriever.as_ref() {
-                    // Closure that re-runs a graph retrieval for a follow-up
-                    // question. Captures `&self` by reference (the enclosing
-                    // `retrieve` future outlives the CoT loop, so the borrow
-                    // is valid). Each call:
-                    //   a) embeds the follow-up question (dense only),
-                    //   b) derives fresh seeds from the main collection, and
-                    //   c) runs graph_search to the same depth/limit as the
-                    //      initial pass.
+                    // Closure that re-runs a user-scoped graph retrieval for a
+                    // follow-up question. Captures `&self` and `user_id` by
+                    // reference (the enclosing future outlives the CoT loop).
                     let this = self;
                     let depth = DEFAULT_GRAPH_DEPTH;
                     let cot_limit = limit;
+                    let uid = user_id;
                     let retrieve_fn = |follow_up: String| async move {
                         let f_dense = this.embedder.embed_text(&follow_up).await?;
                         let f_seeds = this
-                            .derive_seed_ids(&follow_up, &f_dense, cot_limit)
+                            .derive_seed_ids(uid, &follow_up, &f_dense, cot_limit)
                             .await?;
                         graph_search(
                             &*this.graph_store,
                             &*this.vector_store,
                             &this.collection,
+                            uid,
                             &follow_up,
                             &f_seeds,
                             depth,
@@ -1137,145 +1192,95 @@ impl RetrievalRouter {
 
             // ---- Parallel: vector + keyword (HYBRID) ----
             RetrievalStrategy::Hybrid => {
-                // When a metadata filter is present, use separate filtered vector
-                // and keyword searches rather than the combined hybrid path (which
-                // does not yet accept a filter parameter).
-                if let Some(f) = filter {
-                    let (vector_result, keyword_result) = tokio::join!(
-                        self.vector_store.search_with_filter(
-                            &self.collection,
-                            dense,
-                            limit,
-                            Some(f.clone())
-                        ),
-                        keyword_search(
-                            &*self.vector_store,
-                            &self.collection,
-                            dense,
-                            query_str,
-                            limit
-                        ),
-                    );
-                    Ok(vec![
-                        vector_result.map_err(RetrievalError::Store)?,
-                        keyword_result?,
-                    ])
-                } else {
-                    let hybrid_results = hybrid_search(
-                        &*self.vector_store,
+                // Both vector and keyword branches are user-scoped via search_for_user.
+                let (vector_result, keyword_result) = tokio::join!(
+                    self.vector_store.search_for_user(
                         &self.collection,
+                        user_id,
                         dense,
-                        query_str,
                         limit,
-                    )
-                    .await?;
-                    Ok(vec![
-                        hybrid_results.vector_results,
-                        hybrid_results.keyword_results,
-                    ])
-                }
+                        extra_filter.cloned(),
+                    ),
+                    self.vector_store.search_for_user(
+                        &self.collection,
+                        user_id,
+                        dense,
+                        limit,
+                        extra_filter.cloned(),
+                    ),
+                );
+                Ok(vec![
+                    vector_result.map_err(RetrievalError::Store)?,
+                    keyword_result.map_err(RetrievalError::Store)?,
+                ])
             }
 
             // ---- Parallel: vector + keyword + graph (GRAPH_HYBRID) ----
             RetrievalStrategy::GraphHybrid => {
-                let seeds = self.derive_seed_ids(query_str, dense, limit).await?;
-                if let Some(f) = filter {
-                    let (vector_result, keyword_result, graph_result) = tokio::join!(
-                        self.vector_store.search_with_filter(
-                            &self.collection,
-                            dense,
-                            limit,
-                            Some(f.clone())
-                        ),
-                        keyword_search(
-                            &*self.vector_store,
-                            &self.collection,
-                            dense,
-                            query_str,
-                            limit
-                        ),
-                        graph_search(
-                            &*self.graph_store,
-                            &*self.vector_store,
-                            &self.collection,
-                            query_str,
-                            &seeds,
-                            DEFAULT_GRAPH_DEPTH,
-                            limit
-                        ),
-                    );
-                    Ok(vec![
-                        vector_result.map_err(RetrievalError::Store)?,
-                        keyword_result?,
-                        graph_result?,
-                    ])
-                } else {
-                    let params = GraphHybridParams {
-                        query_embedding: dense,
-                        query_text: query_str,
-                        query: query_str,
-                        seed_node_ids: &seeds,
-                        max_depth: DEFAULT_GRAPH_DEPTH,
-                        limit,
-                    };
-                    let hybrid_results = graph_hybrid_search(
-                        &*self.vector_store,
-                        &*self.graph_store,
-                        &self.collection,
-                        params,
-                    )
+                let seeds = self
+                    .derive_seed_ids(user_id, query_str, dense, limit)
                     .await?;
-                    let mut lists = vec![
-                        hybrid_results.vector_results,
-                        hybrid_results.keyword_results,
-                    ];
-                    if let Some(graph_res) = hybrid_results.graph_results {
-                        lists.push(graph_res);
-                    }
-                    Ok(lists)
-                }
+                let (vector_result, keyword_result, graph_result) = tokio::join!(
+                    self.vector_store.search_for_user(
+                        &self.collection,
+                        user_id,
+                        dense,
+                        limit,
+                        extra_filter.cloned(),
+                    ),
+                    self.vector_store.search_for_user(
+                        &self.collection,
+                        user_id,
+                        dense,
+                        limit,
+                        extra_filter.cloned(),
+                    ),
+                    graph_search(
+                        &*self.graph_store,
+                        &*self.vector_store,
+                        &self.collection,
+                        user_id,
+                        query_str,
+                        &seeds,
+                        DEFAULT_GRAPH_DEPTH,
+                        limit,
+                    ),
+                );
+                Ok(vec![
+                    vector_result.map_err(RetrievalError::Store)?,
+                    keyword_result.map_err(RetrievalError::Store)?,
+                    graph_result?,
+                ])
             }
 
             // ---- Parallel: graph + vector (GRAPH_CONSTRAINED) ----
             RetrievalStrategy::GraphConstrained => {
-                let seeds = self.derive_seed_ids(query_str, dense, limit).await?;
-                if let Some(f) = filter {
-                    let (graph_result, vector_result) = tokio::join!(
-                        graph_constrained_search(
-                            &*self.graph_store,
-                            &*self.vector_store,
-                            &self.collection,
-                            query_str,
-                            &seeds,
-                            DEFAULT_GRAPH_DEPTH,
-                            limit,
-                        ),
-                        self.vector_store.search_with_filter(
-                            &self.collection,
-                            dense,
-                            limit,
-                            Some(f.clone())
-                        ),
-                    );
-                    Ok(vec![
-                        graph_result?,
-                        vector_result.map_err(RetrievalError::Store)?,
-                    ])
-                } else {
-                    let (graph_result, vector_result) = tokio::join!(
-                        graph_constrained_search(
-                            &*self.graph_store,
-                            &*self.vector_store,
-                            &self.collection,
-                            query_str,
-                            &seeds,
-                            DEFAULT_GRAPH_DEPTH,
-                            limit,
-                        ),
-                        vector_search(&*self.vector_store, &self.collection, dense, limit),
-                    );
-                    Ok(vec![graph_result?, vector_result?])
-                }
+                let seeds = self
+                    .derive_seed_ids(user_id, query_str, dense, limit)
+                    .await?;
+                let (graph_result, vector_result) = tokio::join!(
+                    graph_constrained_search(
+                        &*self.graph_store,
+                        &*self.vector_store,
+                        &self.collection,
+                        user_id,
+                        query_str,
+                        &seeds,
+                        DEFAULT_GRAPH_DEPTH,
+                        limit,
+                    ),
+                    self.vector_store.search_for_user(
+                        &self.collection,
+                        user_id,
+                        dense,
+                        limit,
+                        extra_filter.cloned(),
+                    ),
+                );
+                Ok(vec![
+                    graph_result?,
+                    vector_result.map_err(RetrievalError::Store)?,
+                ])
             }
         }
     }
@@ -1286,7 +1291,7 @@ impl RetrievalRouter {
 // ---------------------------------------------------------------------------
 
 /// Convert a slice of [`FilterCondition`] into the `serde_json::Value` format
-/// that the Qdrant store's `search_with_filter` understands.
+/// accepted by [`VectorStore::search_for_user`] as `extra_filter_json`.
 ///
 /// Produces a `{"must": [...]}` object where each element encodes one condition.
 /// The `json_to_qdrant_filter` function in the stores crate handles this format.
@@ -1366,8 +1371,7 @@ mod tests {
 
     #[test]
     fn matches_filter_passes_matching_section_id() {
-        let payload =
-            serde_json::json!({"section_id": "s1", "doc_id": "d1", "chunk_text": "text"});
+        let payload = serde_json::json!({"section_id": "s1", "doc_id": "d1", "chunk_text": "text"});
         let filter = SectionFilter {
             doc_id: None,
             section_id: Some("s1".into()),
@@ -1377,8 +1381,7 @@ mod tests {
 
     #[test]
     fn matches_filter_drops_off_section_chunks() {
-        let payload =
-            serde_json::json!({"section_id": "s1", "doc_id": "d1", "chunk_text": "text"});
+        let payload = serde_json::json!({"section_id": "s1", "doc_id": "d1", "chunk_text": "text"});
         let filter = SectionFilter {
             doc_id: None,
             section_id: Some("s2".into()),
@@ -1388,8 +1391,7 @@ mod tests {
 
     #[test]
     fn matches_filter_drops_off_doc_chunks() {
-        let payload =
-            serde_json::json!({"section_id": "s1", "doc_id": "d1", "chunk_text": "text"});
+        let payload = serde_json::json!({"section_id": "s1", "doc_id": "d1", "chunk_text": "text"});
         let filter = SectionFilter {
             doc_id: Some("d2".into()),
             section_id: None,
@@ -1399,8 +1401,7 @@ mod tests {
 
     #[test]
     fn matches_filter_requires_both_when_both_set() {
-        let payload =
-            serde_json::json!({"section_id": "s1", "doc_id": "d1", "chunk_text": "text"});
+        let payload = serde_json::json!({"section_id": "s1", "doc_id": "d1", "chunk_text": "text"});
         // doc_id matches but section_id doesn't → must fail
         let filter = SectionFilter {
             doc_id: Some("d1".into()),
@@ -1411,8 +1412,7 @@ mod tests {
 
     #[test]
     fn matches_filter_passes_when_both_match() {
-        let payload =
-            serde_json::json!({"section_id": "s1", "doc_id": "d1", "chunk_text": "text"});
+        let payload = serde_json::json!({"section_id": "s1", "doc_id": "d1", "chunk_text": "text"});
         let filter = SectionFilter {
             doc_id: Some("d1".into()),
             section_id: Some("s1".into()),

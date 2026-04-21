@@ -3,29 +3,32 @@
 //! Provides [`QdrantStore`], a gRPC-backed implementation of [`VectorStore`]
 //! that supports:
 //! - Named-vector collections (dense + optional sparse).
-//! - Dense-only similarity search via the `query` API.
-//! - Hybrid (dense + sparse) search via prefetch + RRF fusion.
+//! - User-scoped dense vector search (mandatory `user_id` filter).
 //! - Point upsert with both dense and optional sparse vectors.
-//! - Point deletion by string ID.
+//! - Point deletion by ID and by filter.
 //! - Collection existence checks.
+//!
+//! Unscoped search methods (`search`, `search_hybrid`, `search_with_filter`,
+//! `get_by_ids`) are intentionally absent — multi-tenancy requires every
+//! read path to carry a `user_id` scope.
 
 mod collections;
 pub mod section_filter;
 
 use std::collections::HashMap;
 
-use agent_rs_core::{CollectionName, Embedding, StoreError};
+use agent_rs_core::{CollectionName, Embedding, StoreError, UserId};
 use async_trait::async_trait;
 use qdrant_client::Qdrant;
 use qdrant_client::qdrant::{
     DeletePointsBuilder, DenseVector, Document, GetPointsBuilder, NamedVectors, PointId,
-    PointStruct, PointsIdsList, PrefetchQueryBuilder, QueryPointsBuilder, ScrollPointsBuilder,
-    UpsertPointsBuilder, Vector, Vectors,
+    PointStruct, PointsIdsList, QueryPointsBuilder, ScrollPointsBuilder, UpsertPointsBuilder,
+    Vector, Vectors,
 };
 use tracing::instrument;
 
 use crate::traits::VectorStore;
-use crate::types::{CollectionConfig, FilterSpec, PointPayload, SearchResult, VectorPoint};
+use crate::types::{CollectionConfig, FilterSpec, SearchResult, VectorPoint};
 use agent_rs_core::Score;
 
 // ---- QdrantStore ----
@@ -148,131 +151,6 @@ impl VectorStore for QdrantStore {
         Ok(())
     }
 
-    /// Dense vector similarity search using the "dense" named vector.
-    ///
-    /// Uses the modern `query` API (not the deprecated `search_points`).
-    #[instrument(skip(self, query), fields(collection = %collection, limit = limit))]
-    async fn search(
-        &self,
-        collection: &CollectionName,
-        query: &Embedding,
-        limit: usize,
-    ) -> Result<Vec<SearchResult>, StoreError> {
-        let response = self
-            .client
-            .query(
-                QueryPointsBuilder::new(collection.as_str())
-                    .query(qdrant_client::qdrant::Query::from(
-                        query.as_slice().to_vec(),
-                    ))
-                    .using("dense")
-                    .limit(limit as u64)
-                    .with_payload(true),
-            )
-            .await
-            .map_err(StoreError::from)?;
-
-        response
-            .result
-            .into_iter()
-            .map(scored_point_to_result)
-            .collect()
-    }
-
-    /// Hybrid search: dense vector + server-side BM25, fused via prefetch + RRF.
-    ///
-    /// Two prefetch sub-queries are issued (one per vector type), then the
-    /// top-level query merges them with Reciprocal Rank Fusion.
-    ///
-    /// `query_text` is sent to Qdrant as a `Document { model: "qdrant/bm25" }`
-    /// so Qdrant performs tokenisation and BM25 scoring server-side. The
-    /// collection must have been created with `Modifier::Idf` on the sparse
-    /// named vector for this to produce valid scores.
-    #[instrument(skip(self, dense), fields(collection = %collection, limit = limit))]
-    async fn search_hybrid(
-        &self,
-        collection: &CollectionName,
-        dense: &Embedding,
-        query_text: &str,
-        limit: usize,
-    ) -> Result<Vec<SearchResult>, StoreError> {
-        let prefetch_dense = PrefetchQueryBuilder::default()
-            .query(qdrant_client::qdrant::Query::from(
-                dense.as_slice().to_vec(),
-            ))
-            .using("dense")
-            .limit(limit as u64)
-            .build();
-
-        // Server-side BM25 sparse query using the `qdrant/bm25` model.
-        // `Document` implements `Into<VectorInput>` which the Query API accepts.
-        let prefetch_sparse = PrefetchQueryBuilder::default()
-            .query(qdrant_client::qdrant::Query::new_nearest(Document::new(
-                query_text,
-                "qdrant/bm25",
-            )))
-            .using("sparse")
-            .limit(limit as u64)
-            .build();
-
-        let response = self
-            .client
-            .query(
-                QueryPointsBuilder::new(collection.as_str())
-                    .prefetch(vec![prefetch_dense, prefetch_sparse])
-                    .query(qdrant_client::qdrant::Query::new_fusion(
-                        qdrant_client::qdrant::Fusion::Rrf,
-                    ))
-                    .limit(limit as u64)
-                    .with_payload(true),
-            )
-            .await
-            .map_err(StoreError::from)?;
-
-        response
-            .result
-            .into_iter()
-            .map(scored_point_to_result)
-            .collect()
-    }
-
-    /// Dense vector similarity search with optional payload filter.
-    ///
-    /// The `filter` JSON is converted to a Qdrant `Filter` with `must` conditions.
-    /// Supported condition shapes:
-    /// - `{"key": "field_name", "match": {"value": "exact_value"}}` (exact match)
-    ///
-    /// When `filter` is `None`, behaves identically to [`search`].
-    #[instrument(skip(self, query, filter), fields(collection = %collection, limit = limit))]
-    async fn search_with_filter(
-        &self,
-        collection: &CollectionName,
-        query: &Embedding,
-        limit: usize,
-        filter: Option<serde_json::Value>,
-    ) -> Result<Vec<SearchResult>, StoreError> {
-        let mut builder = QueryPointsBuilder::new(collection.as_str())
-            .query(qdrant_client::qdrant::Query::from(
-                query.as_slice().to_vec(),
-            ))
-            .using("dense")
-            .limit(limit as u64)
-            .with_payload(true);
-
-        if let Some(filter_json) = filter {
-            let qdrant_filter = json_to_qdrant_filter(filter_json)?;
-            builder = builder.filter(qdrant_filter);
-        }
-
-        let response = self.client.query(builder).await.map_err(StoreError::from)?;
-
-        response
-            .result
-            .into_iter()
-            .map(scored_point_to_result)
-            .collect()
-    }
-
     /// Delete points by string IDs.
     #[instrument(skip(self, ids), fields(collection = %collection, count = ids.len()))]
     async fn delete(
@@ -369,26 +247,205 @@ impl VectorStore for QdrantStore {
             .map_err(StoreError::from)
     }
 
-    /// Batch payload lookup by point ID.
+    /// Dense vector similarity search scoped to a specific user.
     ///
-    /// IDs that don't resolve to a point in the collection are silently
-    /// dropped; the caller sees only hits. Qdrant accepts the same
-    /// string-ID-to-UUID coercion as [`VectorStore::upsert`]: valid UUID
-    /// strings round-trip, and anything else is mapped to the deterministic
-    /// UUIDv5 projection used at upsert time so the lookup key stays stable.
+    /// Overrides the trait default to use native Qdrant filter construction
+    /// via [`crate::qdrant::section_filter::build_user_filter`] and
+    /// [`crate::qdrant::section_filter::merge_user_filter`], which produces
+    /// an optimised `Filter` proto instead of the JSON-shim path.
     ///
-    /// Vectors are not requested (`with_vectors(false)`) — this is a
-    /// payload-only projection used for graph-search rehydration.
-    #[instrument(skip(self, ids), fields(collection = %collection, n_ids = ids.len()))]
-    async fn get_by_ids(
+    /// `extra_filter_json` conditions are converted to Qdrant `must` conditions
+    /// and merged with the mandatory user scope filter.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError`] on Qdrant gRPC failure.
+    #[instrument(skip(self, query, extra_filter_json), fields(collection = %collection, user_id = %user_id, limit = limit))]
+    async fn search_for_user(
         &self,
         collection: &CollectionName,
+        user_id: &UserId,
+        query: &Embedding,
+        limit: usize,
+        extra_filter_json: Option<serde_json::Value>,
+    ) -> Result<Vec<SearchResult>, StoreError> {
+        use crate::qdrant::section_filter::{build_user_filter, merge_user_filter};
+
+        let user_scope = build_user_filter(user_id.as_str(), None, None);
+        let extra_qdrant = extra_filter_json.map(json_to_qdrant_filter).transpose()?;
+        let merged = merge_user_filter(user_scope, extra_qdrant);
+
+        let response = self
+            .client
+            .query(
+                QueryPointsBuilder::new(collection.as_str())
+                    .query(qdrant_client::qdrant::Query::from(
+                        query.as_slice().to_vec(),
+                    ))
+                    .using("dense")
+                    .limit(limit as u64)
+                    .filter(merged)
+                    .with_payload(true),
+            )
+            .await
+            .map_err(StoreError::from)?;
+
+        response
+            .result
+            .into_iter()
+            .map(scored_point_to_result)
+            .collect()
+    }
+
+    /// Fetch payload-only projections scoped to a user.
+    ///
+    /// Delegates to [`QdrantStore::get_payloads_by_ids`] and then drops any
+    /// point whose payload `user_id` does not match — defence-in-depth against
+    /// cross-tenant leakage even when chunk IDs are globally unique.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError`] on Qdrant gRPC failure.
+    ///
+    /// # Panics
+    ///
+    /// Panics when `user_id` is empty.
+    #[instrument(skip(self, ids), fields(collection = %collection, user_id = %user_id, n_ids = ids.len()))]
+    async fn retrieve_chunks_for_user(
+        &self,
+        collection: &CollectionName,
+        user_id: &UserId,
         ids: &[String],
-    ) -> Result<Vec<PointPayload>, StoreError> {
+    ) -> Result<Vec<crate::types::PointPayload>, StoreError> {
+        assert!(
+            !user_id.as_str().is_empty(),
+            "retrieve_chunks_for_user: empty user_id is forbidden"
+        );
+
         if ids.is_empty() {
             return Ok(Vec::new());
         }
 
+        let points = self.get_payloads_by_ids(collection, ids).await?;
+
+        let expected = user_id.as_str();
+        Ok(points
+            .into_iter()
+            .filter(|p| p.payload.get("user_id").and_then(|v| v.as_str()) == Some(expected))
+            .collect())
+    }
+}
+
+// ---- QdrantStore inherent methods ----
+
+impl QdrantStore {
+    /// Dense vector similarity search scoped to a specific user.
+    ///
+    /// Builds a mandatory `user_id` filter via [`build_user_filter`] and
+    /// merges it with any caller-supplied `extra_filter`. This is the
+    /// preferred search entry point for multi-tenant contexts.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError`] on Qdrant gRPC failure.
+    #[instrument(skip(self, query, extra_filter), fields(collection = %collection, user_id = %user_id, limit = limit))]
+    pub async fn search_for_user(
+        &self,
+        collection: &CollectionName,
+        user_id: &UserId,
+        query: &Embedding,
+        limit: usize,
+        extra_filter: Option<qdrant_client::qdrant::Filter>,
+    ) -> Result<Vec<crate::types::SearchResult>, StoreError> {
+        use crate::qdrant::section_filter::{build_user_filter, merge_user_filter};
+
+        let user_scope = build_user_filter(user_id.as_str(), None, None);
+        let merged = merge_user_filter(user_scope, extra_filter);
+
+        let response = self
+            .client
+            .query(
+                QueryPointsBuilder::new(collection.as_str())
+                    .query(qdrant_client::qdrant::Query::from(
+                        query.as_slice().to_vec(),
+                    ))
+                    .using("dense")
+                    .limit(limit as u64)
+                    .filter(merged)
+                    .with_payload(true),
+            )
+            .await
+            .map_err(StoreError::from)?;
+
+        response
+            .result
+            .into_iter()
+            .map(scored_point_to_result)
+            .collect()
+    }
+
+    /// Fetch payload-only projections for a list of chunk ids, enforcing
+    /// user-scope as defence-in-depth.
+    ///
+    /// Fetches points by ID from Qdrant and then drops any point whose
+    /// payload `user_id` does not match the requested `user_id`. IDs are
+    /// globally unique so a fetch-by-id normally returns only the right
+    /// point, but this secondary check prevents cross-tenant reads if a
+    /// caller ever supplies a chunk ID belonging to a different tenant.
+    ///
+    /// Ids that do not resolve to a stored point are silently dropped; the
+    /// caller sees only hits.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError`] on Qdrant gRPC failure.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `user_id` is empty — empty user scope is forbidden.
+    #[instrument(skip(self, ids), fields(collection, user_id = %user_id, n_ids = ids.len()))]
+    pub async fn retrieve_chunks_by_ids(
+        &self,
+        collection: &str,
+        user_id: &UserId,
+        ids: &[String],
+    ) -> Result<Vec<crate::types::PointPayload>, StoreError> {
+        assert!(
+            !user_id.as_str().is_empty(),
+            "retrieve_chunks_by_ids: empty user_id is forbidden"
+        );
+
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let coll = agent_rs_core::CollectionName::from_string(collection.to_owned());
+        let points = self.get_payloads_by_ids(&coll, ids).await?;
+
+        // Defence-in-depth: drop any point whose payload user_id does not match.
+        let expected = user_id.as_str();
+        let filtered: Vec<crate::types::PointPayload> = points
+            .into_iter()
+            .filter(|p| p.payload.get("user_id").and_then(|v| v.as_str()) == Some(expected))
+            .collect();
+
+        Ok(filtered)
+    }
+
+    /// Fetch payload-only projections for a list of point IDs.
+    ///
+    /// Internal helper used by [`retrieve_chunks_by_ids`]. Ids that don't
+    /// resolve to a stored point are silently dropped.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError`] on Qdrant gRPC failure.
+    #[instrument(skip(self, ids), fields(collection = %collection, n_ids = ids.len()))]
+    async fn get_payloads_by_ids(
+        &self,
+        collection: &CollectionName,
+        ids: &[String],
+    ) -> Result<Vec<crate::types::PointPayload>, StoreError> {
         let point_ids: Vec<PointId> = ids
             .iter()
             .map(|id| match uuid::Uuid::parse_str(id) {
@@ -411,7 +468,7 @@ impl VectorStore for QdrantStore {
             .await
             .map_err(StoreError::from)?;
 
-        let mut out: Vec<PointPayload> = Vec::with_capacity(response.result.len());
+        let mut out: Vec<crate::types::PointPayload> = Vec::with_capacity(response.result.len());
         for point in response.result {
             let id_str = match point.id {
                 Some(qdrant_client::qdrant::PointId {
@@ -421,8 +478,6 @@ impl VectorStore for QdrantStore {
                     point_id_options: Some(qdrant_client::qdrant::point_id::PointIdOptions::Num(n)),
                 }) => n.to_string(),
                 _ => {
-                    // Missing ID on a returned point indicates a corrupt
-                    // response; skip defensively rather than invent a value.
                     tracing::warn!(collection = %collection, "qdrant returned a point with no id");
                     continue;
                 }
@@ -434,64 +489,34 @@ impl VectorStore for QdrantStore {
                     .map(|(k, v)| (k, qdrant_value_to_json(v)))
                     .collect(),
             );
-            out.push(PointPayload {
+            out.push(crate::types::PointPayload {
                 id: id_str,
                 payload: payload_json,
             });
         }
         Ok(out)
     }
-}
-
-// ---- QdrantStore inherent methods ----
-
-impl QdrantStore {
-    /// Fetch payload-only projections for a list of chunk ids.
-    ///
-    /// Thin wrapper around [`VectorStore::get_by_ids`] that accepts a plain
-    /// `&str` collection name, sparing callers from constructing a
-    /// [`CollectionName`] themselves. Used by `fetch_section_chunks` and
-    /// similar tools that already know the ids they want and do not need
-    /// vector data.
-    ///
-    /// Ids that do not resolve to a stored point are silently dropped; the
-    /// caller sees only hits.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`StoreError`] on Qdrant gRPC failure.
-    #[instrument(skip(self, ids), fields(collection, n_ids = ids.len()))]
-    pub async fn retrieve_chunks_by_ids(
-        &self,
-        collection: &str,
-        ids: &[String],
-    ) -> Result<Vec<crate::types::PointPayload>, StoreError> {
-        use crate::traits::VectorStore as _;
-
-        let coll = agent_rs_core::CollectionName::from_string(collection.to_owned());
-        self.get_by_ids(&coll, ids).await
-    }
 
     /// Return the `summary_text` of the first stored summary whose payload
-    /// matches `section_id`. Returns `Ok(None)` when no matching point exists.
+    /// matches both `user_id` and `section_id`. Returns `Ok(None)` when no
+    /// matching point exists.
     ///
-    /// Uses the scroll API (no vector required) with a payload filter on
-    /// `section_id` and a limit of 1 so only the first summary chunk is read.
+    /// Uses the scroll API (no vector required) with a mandatory user-scope
+    /// filter ANDed with the `section_id` condition, limiting to 1 result.
     ///
     /// # Errors
     ///
     /// Returns [`StoreError`] on Qdrant gRPC failure.
-    #[instrument(skip(self), fields(collection = %collection, section_id = %section_id))]
+    #[instrument(skip(self), fields(collection = %collection, user_id = %user_id, section_id = %section_id))]
     pub async fn first_summary_by_section(
         &self,
         collection: &str,
+        user_id: &UserId,
         section_id: &str,
     ) -> Result<Option<String>, StoreError> {
-        use crate::qdrant::section_filter::build_section_filter;
+        use crate::qdrant::section_filter::build_user_filter;
 
-        let Some(filter) = build_section_filter(None, Some(section_id)) else {
-            return Ok(None);
-        };
+        let filter = build_user_filter(user_id.as_str(), None, Some(section_id));
 
         let response = self
             .client
@@ -505,22 +530,15 @@ impl QdrantStore {
             .await
             .map_err(StoreError::from)?;
 
-        let summary = response
-            .result
-            .into_iter()
-            .next()
-            .and_then(|point| {
-                point
-                    .payload
-                    .get("summary_text")
-                    .and_then(|v| {
-                        use qdrant_client::qdrant::value::Kind;
-                        match v.kind.as_ref() {
-                            Some(Kind::StringValue(s)) => Some(s.clone()),
-                            _ => None,
-                        }
-                    })
-            });
+        let summary = response.result.into_iter().next().and_then(|point| {
+            point.payload.get("summary_text").and_then(|v| {
+                use qdrant_client::qdrant::value::Kind;
+                match v.kind.as_ref() {
+                    Some(Kind::StringValue(s)) => Some(s.clone()),
+                    _ => None,
+                }
+            })
+        });
 
         Ok(summary)
     }

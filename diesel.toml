@@ -1,0 +1,9 @@
+# Diesel CLI config. `diesel migration run` / `diesel migration revert` /
+# `diesel migration redo` will auto-regenerate `schema.rs` after each
+# schema-changing action, keeping the Rust side in lock-step with Postgres.
+
+[print_schema]
+file = "crates/stores/src/postgres/schema.rs"
+
+[migrations_directory]
+dir = "crates/stores/migrations"

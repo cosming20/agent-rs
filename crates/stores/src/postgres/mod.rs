@@ -32,9 +32,28 @@ use crate::types::{ChatMessage, EvidenceItem, Memory, QueryRun};
 pub mod documents;
 pub mod models;
 pub mod schema;
+pub mod session_docs;
+pub mod sessions;
+
+// ---------------------------------------------------------------------------
+// Shared raw-query helpers
+// ---------------------------------------------------------------------------
+
+/// Projection type for `SELECT COUNT(*)::bigint AS count` raw queries.
+///
+/// Diesel's `sql_query` requires a `QueryableByName` target; this newtype
+/// satisfies that requirement without pulling in an extra dependency.
+#[derive(Debug, diesel::QueryableByName)]
+pub struct CountRow {
+    /// The count value returned by the query.
+    #[diesel(sql_type = diesel::sql_types::BigInt)]
+    pub count: i64,
+}
 
 pub use documents::HeaderMetadata;
-pub use models::{BeginIngestionOutcome, IngestedDocumentRow, NewIngestedDocument};
+pub use models::{
+    BeginIngestionOutcome, IngestedDocumentRow, NewIngestedDocument, NewSession, SessionRow,
+};
 
 use models::{
     ChatMessageRow, EvidenceItemRow, MemoryRow, NewChatMessage, NewEvidenceItem, NewMemory,
@@ -230,6 +249,139 @@ impl StateStore for PgStore {
             .filter(evidence_items::run_id.eq(run_id))
             .order(evidence_items::created_at.asc())
             .select(EvidenceItemRow::as_select())
+            .load(&mut conn)
+            .await
+            .map_err(StoreError::from)?;
+
+        rows.into_iter()
+            .map(|r| r.into_domain())
+            .collect::<Result<Vec<_>, _>>()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// User-scoped helpers (direct PgStore methods, defence-in-depth layer)
+// ---------------------------------------------------------------------------
+//
+// These methods enforce `user_id` at the SQL level — an independent guard
+// beneath any application-layer authorisation check.
+
+impl PgStore {
+    /// Persist a memory entry for `user_id`.
+    ///
+    /// The `user_id` is written into the `memories.user_id` column at INSERT
+    /// time so that [`list_memories`] can filter by it at the database level.
+    ///
+    /// # Errors
+    ///
+    /// - [`StoreError::ConnectionPool`] — pool exhausted.
+    /// - [`StoreError::Postgres`] — database-level error.
+    #[instrument(skip(self), fields(user_id = %user_id))]
+    pub async fn save_memory(&self, user_id: &UserId, content: &str) -> Result<(), StoreError> {
+        let mut conn = self.conn().await?;
+        let now = chrono::Utc::now().naive_utc();
+        let new_row = models::NewMemory {
+            id: Uuid::new_v4(),
+            user_id: user_id.as_str(),
+            content,
+            created_at: now,
+        };
+        diesel::insert_into(memories::table)
+            .values(&new_row)
+            .execute(&mut conn)
+            .await
+            .map_err(StoreError::from)?;
+        Ok(())
+    }
+
+    /// Fetch all memories belonging to `user_id`, ordered oldest first.
+    ///
+    /// Cross-user reads always return an empty vec — the `WHERE user_id = ?`
+    /// predicate is enforced at the database level.
+    ///
+    /// # Errors
+    ///
+    /// - [`StoreError::ConnectionPool`] — pool exhausted.
+    /// - [`StoreError::Postgres`] — database-level error.
+    #[instrument(skip(self), fields(user_id = %user_id))]
+    pub async fn list_memories(
+        &self,
+        user_id: &UserId,
+    ) -> Result<Vec<crate::types::Memory>, StoreError> {
+        let mut conn = self.conn().await?;
+        let rows: Vec<MemoryRow> = memories::table
+            .filter(memories::user_id.eq(user_id.as_str()))
+            .order(memories::created_at.asc())
+            .select(MemoryRow::as_select())
+            .load(&mut conn)
+            .await
+            .map_err(StoreError::from)?;
+
+        rows.into_iter()
+            .map(|r| r.into_domain())
+            .collect::<Result<Vec<_>, _>>()
+    }
+
+    /// Append a chat message for `(user_id, session_id)`.
+    ///
+    /// The caller must have already verified that the session belongs to
+    /// `user_id` via [`create_or_fetch_session`].  This method additionally
+    /// persists `user_id` in the `chat_messages` row so that
+    /// [`list_chat_messages`] can re-check ownership at query time.
+    ///
+    /// # Errors
+    ///
+    /// - [`StoreError::ConnectionPool`] — pool exhausted.
+    /// - [`StoreError::Postgres`] — database-level error.
+    #[instrument(skip(self), fields(user_id = %user_id, session_id = %session_id, role = role))]
+    pub async fn append_chat_message(
+        &self,
+        user_id: &UserId,
+        session_id: &SessionId,
+        role: &str,
+        content: &str,
+    ) -> Result<(), StoreError> {
+        let mut conn = self.conn().await?;
+        let now = chrono::Utc::now().naive_utc();
+        let new_row = models::NewChatMessage {
+            id: Uuid::new_v4(),
+            session_id: *session_id.inner(),
+            role,
+            content,
+            created_at: now,
+            user_id: user_id.as_str(),
+        };
+        diesel::insert_into(chat_messages::table)
+            .values(&new_row)
+            .execute(&mut conn)
+            .await
+            .map_err(StoreError::from)?;
+        Ok(())
+    }
+
+    /// Fetch chat messages for `(user_id, session_id)`, ordered oldest first.
+    ///
+    /// Both predicates (`user_id` AND `session_id`) are enforced at the SQL
+    /// level.  If a caller bypasses application-layer authz and passes
+    /// `(bob, alice_session_id)`, the query returns zero rows — defence in
+    /// depth.
+    ///
+    /// # Errors
+    ///
+    /// - [`StoreError::ConnectionPool`] — pool exhausted.
+    /// - [`StoreError::Postgres`] — database-level error.
+    #[instrument(skip(self), fields(user_id = %user_id, session_id = %session_id))]
+    pub async fn list_chat_messages(
+        &self,
+        user_id: &UserId,
+        session_id: &SessionId,
+    ) -> Result<Vec<crate::types::ChatMessage>, StoreError> {
+        let mut conn = self.conn().await?;
+        let rows: Vec<ChatMessageRow> = chat_messages::table
+            .filter(chat_messages::user_id.eq(user_id.as_str()))
+            .filter(chat_messages::session_id.eq(*session_id.inner()))
+            .order(chat_messages::created_at.asc())
+            .select(ChatMessageRow::as_select())
             .load(&mut conn)
             .await
             .map_err(StoreError::from)?;

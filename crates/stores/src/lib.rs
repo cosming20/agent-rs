@@ -9,6 +9,7 @@
 pub mod traits;
 pub mod types;
 
+pub mod minio;
 pub mod neo4j;
 pub mod postgres;
 pub mod qdrant;

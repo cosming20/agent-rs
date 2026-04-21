@@ -91,8 +91,13 @@ impl AgentOrchestrator {
         // Shared memory manager over the state store.
         let memory = Arc::new(MemoryManager::new(Arc::clone(&store)));
 
-        // Step 1: Context builder
-        let context_builder = ContextBuilder::new(Arc::clone(&memory), &settings.context);
+        // Step 1: Context builder — receives pg_store for the session gate and
+        // context snapshot (REPEATABLE READ history + memories + active docs).
+        let context_builder = ContextBuilder::new(
+            Arc::clone(&memory),
+            Arc::clone(&pg_store),
+            &settings.context,
+        );
 
         // Step 1.5: Coverage planner — no-op for non-exhaustive queries.
         // Clone before passing so neo4j remains available for the tool factory.

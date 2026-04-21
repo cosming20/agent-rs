@@ -19,7 +19,9 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
 
-use agent_rs_core::{CollectionName, IngestBackend, NAMESPACE_OID};
+use agent_rs_core::{CollectionName, IngestBackend, NAMESPACE_OID, UserId};
+
+use super::document_id::derive_document_id;
 use agent_rs_stores::postgres::PgStore;
 use agent_rs_stores::postgres::documents::HeaderMetadata;
 use agent_rs_stores::postgres::models::{BeginIngestionOutcome, NewIngestedDocument};
@@ -406,6 +408,7 @@ impl IngestionPipeline {
         text: &str,
         doc_id: &str,
         source: &str,
+        user_id: &str,
     ) -> Result<IngestionResult, RetrievalError> {
         let start = Instant::now();
 
@@ -463,7 +466,7 @@ impl IngestionPipeline {
             .iter()
             .zip(embeddings.into_iter())
             .map(|(chunk, embedding)| {
-                let payload = build_chunk_payload(chunk);
+                let payload = build_chunk_payload(chunk, user_id);
                 VectorPoint {
                     id: chunk.chunk_id.clone(),
                     embedding,
@@ -585,7 +588,7 @@ impl IngestionPipeline {
         // This powers the `RetrievalStrategy::Summaries` search path.
         // The plain-text path has no ingest_run_id so we pass None.
         let summaries_created = self
-            .upsert_summaries_if_enabled(doc_id, &chunks, None)
+            .upsert_summaries_if_enabled(doc_id, user_id, &chunks, None)
             .await?;
 
         let duration_ms = start.elapsed().as_millis() as u64;
@@ -717,6 +720,7 @@ impl IngestionPipeline {
     async fn upsert_summaries_if_enabled(
         &self,
         doc_id: &str,
+        user_id: &str,
         chunks: &[DocumentChunk],
         ingest_run_id: Option<&str>,
     ) -> Result<usize, RetrievalError> {
@@ -859,7 +863,7 @@ impl IngestionPipeline {
                 embedding,
                 // Summaries collections use dense-only search; no BM25 needed.
                 text: String::new(),
-                payload: build_summary_payload(summary),
+                payload: build_summary_payload(summary, user_id),
             })
             .chain(
                 non_ok_summaries
@@ -869,7 +873,7 @@ impl IngestionPipeline {
                         id: summary.summary_id.clone(),
                         embedding,
                         text: String::new(),
-                        payload: build_summary_payload(summary),
+                        payload: build_summary_payload(summary, user_id),
                     }),
             )
             .collect();
@@ -910,11 +914,18 @@ impl IngestionPipeline {
         pdf_bytes: &[u8],
         doc_id: &str,
         source: &str,
+        user_id: &str,
     ) -> Result<IngestionResult, RetrievalError> {
         match self.ingest_backend {
-            IngestBackend::Docling => self.ingest_with_docling(pdf_bytes, doc_id, source).await,
+            IngestBackend::Docling => {
+                self.ingest_with_docling(pdf_bytes, doc_id, source, user_id)
+                    .await
+            }
             IngestBackend::DoclingWithLegacyFallback => {
-                match self.ingest_with_docling(pdf_bytes, doc_id, source).await {
+                match self
+                    .ingest_with_docling(pdf_bytes, doc_id, source, user_id)
+                    .await
+                {
                     Ok(result) => Ok(result),
                     Err(RetrievalError::DoclingIngestFailed {
                         triggers_legacy_fallback: true,
@@ -926,12 +937,16 @@ impl IngestionPipeline {
                             reason = %message,
                             "Docling ingest failed with legacy-fallback flag; switching to pdf-extract"
                         );
-                        self.ingest_pdf_legacy(pdf_bytes, doc_id, source).await
+                        self.ingest_pdf_legacy(pdf_bytes, doc_id, source, user_id)
+                            .await
                     }
                     Err(other) => Err(other),
                 }
             }
-            IngestBackend::Legacy => self.ingest_pdf_legacy(pdf_bytes, doc_id, source).await,
+            IngestBackend::Legacy => {
+                self.ingest_pdf_legacy(pdf_bytes, doc_id, source, user_id)
+                    .await
+            }
         }
     }
 
@@ -966,6 +981,7 @@ impl IngestionPipeline {
         pdf_bytes: &[u8],
         doc_id: &str,
         source: &str,
+        user_id: &str,
     ) -> Result<IngestionResult, RetrievalError> {
         use backon::{ExponentialBuilder, Retryable};
         use sha2::{Digest, Sha256};
@@ -996,18 +1012,23 @@ impl IngestionPipeline {
         // ---- Step 2: Dedup via Postgres ----
         let maybe_run_id: Option<Uuid> = if let Some(pg) = &self.pg_store {
             let now = Utc::now().naive_utc();
+            let pg_user_id_for_doc = agent_rs_core::UserId::from_string(user_id.to_owned());
             let new_doc = NewIngestedDocument {
-                document_id: Uuid::new_v5(&NAMESPACE_OID, sha256.as_bytes()),
+                document_id: derive_document_id(&pg_user_id_for_doc, &sha256),
                 sha256: sha256.clone(),
                 source: source.to_owned(),
                 ingest_status: agent_rs_core::IngestStatus::InProgress.as_str().to_owned(),
                 ingest_run_id: Uuid::new_v4(),
                 started_at: now,
                 updated_at: now,
+                user_id: user_id.to_owned(),
+                // MinIO key is not known at pipeline entry; the CLI ingest example
+                // updates it via PgStore::set_minio_object_key after upload.
+                minio_object_key: None,
             };
 
             match pg
-                .begin_ingestion(new_doc)
+                .begin_ingestion(&pg_user_id_for_doc, new_doc)
                 .await
                 .map_err(RetrievalError::Store)?
             {
@@ -1163,6 +1184,10 @@ impl IngestionPipeline {
                     header,
                     doc_id,
                     source,
+                    // user_id threaded from ingest_with_docling caller (Phase 5.1).
+                    // Until Phase 6/7 wires upstream callers, this may be "".
+                    // The QdrantStore filter will enforce the real user_id on reads.
+                    user_id,
                     ingest_run_id,
                     doc_n_tables,
                     doc_n_pictures,
@@ -1344,8 +1369,13 @@ impl IngestionPipeline {
         // All new nodes are tagged with `ingest_run_id` so rollback by run_id
         // can target exactly this ingestion without touching pre-existing data.
         let structural_result: Result<(), RetrievalError> = async {
-            let snapshot =
-                proto_header_to_snapshot(header, &docling_response.footer, ingest_run_id, source);
+            let snapshot = proto_header_to_snapshot(
+                header,
+                &docling_response.footer,
+                ingest_run_id,
+                source,
+                user_id,
+            );
             let doc_uuid = snapshot.document_id;
 
             // Build ordered StructuralChunk list with FOLLOWS back-pointers.
@@ -1403,7 +1433,12 @@ impl IngestionPipeline {
 
         // ---- Step 7: Chunk summarization (optional) ----
         let summaries_created = match self
-            .upsert_summaries_if_enabled(doc_id, &pseudo_chunks, Some(ingest_run_id_str.as_str()))
+            .upsert_summaries_if_enabled(
+                doc_id,
+                user_id,
+                &pseudo_chunks,
+                Some(ingest_run_id_str.as_str()),
+            )
             .await
         {
             Ok(n) => n,
@@ -1512,6 +1547,7 @@ impl IngestionPipeline {
         pdf_bytes: &[u8],
         doc_id: &str,
         source: &str,
+        user_id: &str,
     ) -> Result<IngestionResult, RetrievalError> {
         // pdf-extract is synchronous and CPU-bound; offload to blocking pool.
         let bytes = pdf_bytes.to_vec();
@@ -1531,7 +1567,7 @@ impl IngestionPipeline {
             "PDF text extraction complete (legacy path)"
         );
 
-        self.ingest_text(&text, doc_id, source).await
+        self.ingest_text(&text, doc_id, source, user_id).await
     }
 
     /// Stub for the legacy path when the `legacy_pdf_extract` feature is disabled.
@@ -1623,10 +1659,12 @@ impl IngestionPipeline {
 // ---- Private helpers ----
 
 /// Build the JSON payload for a chunk to be stored in Qdrant.
-fn build_chunk_payload(chunk: &DocumentChunk) -> serde_json::Value {
+fn build_chunk_payload(chunk: &DocumentChunk, user_id: &str) -> serde_json::Value {
     json!({
         "chunk_id": chunk.chunk_id,
         "doc_id": chunk.doc_id,
+        // ---- multi-tenancy ----
+        "user_id": user_id,
         "chunk_text": chunk.content,
         "chunk_index": chunk.chunk_index,
         "total_chunks": chunk.total_chunks,
@@ -1641,11 +1679,12 @@ fn build_chunk_payload(chunk: &DocumentChunk) -> serde_json::Value {
     })
 }
 
-/// Build the 27-field JSON payload for a Docling-sourced chunk stored in Qdrant.
+/// Build the 28-field JSON payload for a Docling-sourced chunk stored in Qdrant.
 ///
 /// The payload carries all filterable/retrievable metadata so downstream
 /// evidence assembly can render citations without a second round-trip.
-/// Every point is also tagged with `ingest_run_id` for rollback.
+/// Every point is also tagged with `ingest_run_id` for rollback and
+/// `user_id` for mandatory multi-tenant read filtering (Phase 5.1).
 ///
 /// `doc_n_tables` / `doc_n_pictures` come from the stream footer, which the
 /// caller has already received in full before this function is called.
@@ -1655,6 +1694,7 @@ fn build_docling_chunk_payload(
     header: &ProtoDocumentHeader,
     doc_id: &str,
     source: &str,
+    user_id: &str,
     ingest_run_id: Uuid,
     doc_n_tables: u32,
     doc_n_pictures: u32,
@@ -1664,6 +1704,8 @@ fn build_docling_chunk_payload(
         "chunk_id":       chunk.chunk_id,
         "doc_id":         doc_id,
         "ingest_run_id":  ingest_run_id.to_string(),
+        // ---- multi-tenancy ----
+        "user_id":        user_id,
         // ---- content ----
         "chunk_text":     chunk.embed_text,
         "raw_text":       chunk.raw_text,
@@ -1761,7 +1803,13 @@ fn proto_chunk_to_document_chunk(
 }
 
 /// Build the JSON payload for a summary point stored in the summaries collection.
-fn build_summary_payload(summary: &super::summarizer::ChunkSummary) -> serde_json::Value {
+///
+/// `user_id` is stored as a top-level field so that [`QdrantStore::first_summary_by_section`]
+/// can filter by both `user_id` and `section_id` without a cross-tenant scan.
+fn build_summary_payload(
+    summary: &super::summarizer::ChunkSummary,
+    user_id: &str,
+) -> serde_json::Value {
     json!({
         "summary_id": summary.summary_id,
         "chunk_id": summary.chunk_id,
@@ -1771,6 +1819,7 @@ fn build_summary_payload(summary: &super::summarizer::ChunkSummary) -> serde_jso
         "section_id": summary.section_id,
         "ingest_run_id": summary.ingest_run_id,
         "summary_status": summary.summary_status,
+        "user_id": user_id,
     })
 }
 
@@ -1778,15 +1827,18 @@ fn build_summary_payload(summary: &super::summarizer::ChunkSummary) -> serde_jso
 
 /// Build a `DocumentHeaderSnapshot` from a proto `DocumentHeader` + `DocumentFooter`.
 ///
-/// The document UUID is derived deterministically from the sha256 via UUIDv5
-/// so the same source bytes always produce the same document node.
+/// The document UUID is derived deterministically from `(user_id, sha256)` via
+/// UUIDv5, salted with the tenant so two users uploading the same bytes receive
+/// distinct `document_id` values.
 fn proto_header_to_snapshot(
     header: &ProtoDocumentHeader,
     footer: &ProtoDocumentFooter,
     ingest_run_id: Uuid,
     source: &str,
+    user_id: &str,
 ) -> DocumentHeaderSnapshot {
-    let document_id = Uuid::new_v5(&NAMESPACE_OID, header.sha256.as_bytes());
+    let uid = UserId::from_string(user_id.to_owned());
+    let document_id = derive_document_id(&uid, &header.sha256);
 
     let pages: Vec<StructuralPageInfo> = header
         .pages
@@ -1809,6 +1861,7 @@ fn proto_header_to_snapshot(
     DocumentHeaderSnapshot {
         document_id,
         ingest_run_id,
+        user_id: UserId::from_string(user_id.to_owned()),
         sha256: header.sha256.clone(),
         source: source.to_owned(),
         docling_version: none_if_empty(&header.docling_version),
