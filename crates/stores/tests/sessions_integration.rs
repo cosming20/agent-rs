@@ -234,7 +234,10 @@ async fn activate_document_for_session_with_valid_owner() {
     let session = SessionId::from_uuid(Uuid::new_v4());
 
     pg.create_or_fetch_session(&alice, &session).await.unwrap();
-    let doc = pg.test_insert_document_complete(&alice, "alice-3-4.pdf").await.unwrap();
+    let doc = pg
+        .test_insert_document_complete(&alice, "alice-3-4.pdf")
+        .await
+        .unwrap();
 
     pg.activate_document_for_session(&alice, &session, &doc.document_id)
         .await
@@ -253,7 +256,9 @@ async fn activate_document_rejects_cross_user() {
     let bob = UserId::try_new(&format!("bob-3-4b-{}", &run[..8])).expect("valid");
     let bob_session = SessionId::from_uuid(Uuid::new_v4());
 
-    pg.create_or_fetch_session(&bob, &bob_session).await.unwrap();
+    pg.create_or_fetch_session(&bob, &bob_session)
+        .await
+        .unwrap();
     let alice_doc = pg
         .test_insert_document_complete(&alice, "alice-3-4b.pdf")
         .await
@@ -278,15 +283,64 @@ async fn activate_document_idempotent() {
     let session = SessionId::from_uuid(Uuid::new_v4());
 
     pg.create_or_fetch_session(&alice, &session).await.unwrap();
-    let doc = pg.test_insert_document_complete(&alice, "alice-3-4c.pdf").await.unwrap();
+    let doc = pg
+        .test_insert_document_complete(&alice, "alice-3-4c.pdf")
+        .await
+        .unwrap();
 
     // First activation succeeds.
-    pg.activate_document_for_session(&alice, &session, &doc.document_id).await.unwrap();
+    pg.activate_document_for_session(&alice, &session, &doc.document_id)
+        .await
+        .unwrap();
     // Second activation (same session + doc) must NOT error — idempotent.
-    pg.activate_document_for_session(&alice, &session, &doc.document_id).await.unwrap();
+    pg.activate_document_for_session(&alice, &session, &doc.document_id)
+        .await
+        .unwrap();
 
     let active = pg.list_active_documents(&alice, &session).await.unwrap();
-    assert_eq!(active.len(), 1, "duplicate activations must collapse to one row");
+    assert_eq!(
+        active.len(),
+        1,
+        "duplicate activations must collapse to one row"
+    );
+}
+
+/// Regression test for Codex Phase 3 Bug 1: idempotency fallback must
+/// re-verify ownership rather than matching any existing (session, doc) row.
+///
+/// Before the fix, bob calling `activate(bob, alice_session, alice_doc)` after
+/// alice had already activated her doc would pass the fallback COUNT check and
+/// return `Ok(())`, silently succeeding without owning anything.
+#[tokio::test]
+async fn activate_document_idempotency_does_not_leak_cross_user() {
+    let pg = test_pg().await;
+    let run = uuid::Uuid::new_v4().simple().to_string();
+    let alice = UserId::try_new(&format!("alice-3-4e-{}", &run[..8])).expect("valid");
+    let bob = UserId::try_new(&format!("bob-3-4e-{}", &run[..8])).expect("valid");
+    let alice_session = SessionId::from_uuid(Uuid::new_v4());
+
+    pg.create_or_fetch_session(&alice, &alice_session)
+        .await
+        .unwrap();
+    let alice_doc = pg
+        .test_insert_document_complete(&alice, "alice.pdf")
+        .await
+        .unwrap();
+
+    // Alice activates her doc — creates the row.
+    pg.activate_document_for_session(&alice, &alice_session, &alice_doc.document_id)
+        .await
+        .unwrap();
+
+    // Bob MUST NOT succeed on the existing row.
+    let err = pg
+        .activate_document_for_session(&bob, &alice_session, &alice_doc.document_id)
+        .await
+        .expect_err("bob must not succeed on an existing alice activation");
+    match err {
+        StoreError::DocumentNotOwnedByUser { .. } => {}
+        other => panic!("expected DocumentNotOwnedByUser, got {other:?}"),
+    }
 }
 
 #[tokio::test]
@@ -311,4 +365,43 @@ async fn activate_document_rejects_non_complete_status() {
         StoreError::DocumentNotOwnedByUser { .. } => {}
         other => panic!("expected DocumentNotOwnedByUser (doc not 'complete'), got {other:?}"),
     }
+}
+
+/// Regression test for Codex Phase 3 Bug 2: sha256 lookups must be scoped to
+/// the requesting user, not global across all tenants.
+///
+/// Before the fix, bob could call `is_already_ingested_complete(sha256)` or
+/// `get_ingested_document_by_sha256(sha256)` and receive positive results for
+/// alice's ingestion, leaking the fact that alice had processed the file.
+#[tokio::test]
+async fn sha256_lookup_is_user_scoped() {
+    let pg = test_pg().await;
+    let run = uuid::Uuid::new_v4().simple().to_string();
+    let alice = UserId::try_new(&format!("alice-3-sha-{}", &run[..8])).expect("valid");
+    let bob = UserId::try_new(&format!("bob-3-sha-{}", &run[..8])).expect("valid");
+    let shared_sha: String = format!("{}{}", &run, &run).chars().take(64).collect();
+
+    pg.test_insert_document_with_sha(&alice, "alice.pdf", &shared_sha)
+        .await
+        .unwrap();
+
+    // Bob probes with the same sha256 — MUST not see alice's doc.
+    let bob_has = pg
+        .is_already_ingested_complete(&bob, &shared_sha)
+        .await
+        .unwrap();
+    assert!(!bob_has, "bob must not see alice's ingest via sha probe");
+
+    let bob_fetch = pg
+        .get_ingested_document_by_sha256(&bob, &shared_sha)
+        .await
+        .unwrap();
+    assert!(bob_fetch.is_none(), "bob must not retrieve alice's row by sha");
+
+    // Alice herself must still see her own doc.
+    let alice_has = pg
+        .is_already_ingested_complete(&alice, &shared_sha)
+        .await
+        .unwrap();
+    assert!(alice_has, "alice must still find her own doc");
 }
