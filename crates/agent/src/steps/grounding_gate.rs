@@ -250,7 +250,7 @@ impl GroundingGate {
     ///
     /// Populates `ctx.verification` and `ctx.retries`.
     #[instrument(skip(self, ctx, agent_runner, evidence_fuser), fields(
-        session_id = %ctx.session_id,
+        trace_id = ?ctx.trace_id,
         max_retries = self.max_retries,
     ))]
     pub async fn verify_and_retry(

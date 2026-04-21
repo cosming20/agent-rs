@@ -1,12 +1,14 @@
-//! Result persister -- synthesize response, persist run, store messages.
+//! Result persister -- synthesize response, persist telemetry.
 //!
 //! Final step in the orchestrator pipeline. Produces the
-//! [`SynthesizedResponse`] and persists all state.
+//! [`SynthesizedResponse`] and persists analytics (query_run + evidence_items).
+//!
+//! After the 2026-04-21 stateless pivot this no longer stores assistant
+//! chat messages — that's the web app's job now.
 
 use std::sync::Arc;
 
 use agent_rs_core::errors::AgentError;
-use agent_rs_core::types::MessageRole;
 use agent_rs_observability::metrics::RetrievalMetrics;
 use agent_rs_stores::traits::StateStore;
 use agent_rs_stores::types::QueryRun;
@@ -15,13 +17,11 @@ use tracing::{error, info, instrument};
 use uuid::Uuid;
 
 use crate::context::QueryContext;
-use crate::memory::MemoryManager;
 use crate::synthesis::{ResponseSynthesizer, SynthesizedResponse};
 
-/// Synthesizes response, persists run data, stores messages.
+/// Synthesizes response, persists telemetry rows.
 pub struct ResultPersister {
     synthesizer: ResponseSynthesizer,
-    memory: Arc<MemoryManager>,
     store: Arc<dyn StateStore>,
     metrics: Arc<RetrievalMetrics>,
 }
@@ -30,13 +30,11 @@ impl ResultPersister {
     /// Create a new ResultPersister.
     pub fn new(
         synthesizer: ResponseSynthesizer,
-        memory: Arc<MemoryManager>,
         store: Arc<dyn StateStore>,
         metrics: Arc<RetrievalMetrics>,
     ) -> Self {
         Self {
             synthesizer,
-            memory,
             store,
             metrics,
         }
@@ -44,7 +42,7 @@ impl ResultPersister {
 
     /// Synthesize, persist, and return the final response.
     #[instrument(skip(self, ctx), fields(
-        session_id = %ctx.session_id,
+        trace_id = ?ctx.trace_id,
         strategy = %ctx.strategy,
     ))]
     pub async fn persist(&self, ctx: &QueryContext) -> Result<SynthesizedResponse, AgentError> {
@@ -52,14 +50,11 @@ impl ResultPersister {
             AgentError::Orchestrator("verification result missing before persist".into())
         })?;
 
-        // Emit verifier method and query duration metrics before synthesis.
         self.metrics
             .record_verifier_method(&verification.method, verification.is_grounded);
         self.metrics
             .record_query_duration_ms(ctx.elapsed_ms() as f64, ctx.strategy);
 
-        // Synthesize citations, passing the coverage report so the synthesizer
-        // can suppress the hedging wrapper when coverage data is available.
         let response = self.synthesizer.synthesize(
             &ctx.answer,
             &ctx.evidence,
@@ -76,10 +71,11 @@ impl ResultPersister {
             "response synthesized"
         );
 
-        // Persist pipeline run
+        // Persist pipeline run — `trace_id` replaces the old session_id;
+        // it's an optional correlation UUID with no ownership semantics.
         let run = QueryRun {
             id: Uuid::new_v4(),
-            session_id: ctx.session_id.clone(),
+            trace_id: ctx.trace_id,
             user_id: ctx.user_id.clone(),
             query: ctx.query.clone(),
             answer: response.answer.clone(),
@@ -94,7 +90,7 @@ impl ResultPersister {
             AgentError::Orchestrator(format!("failed to persist query run: {err}"))
         })?;
 
-        // Persist evidence items
+        // Persist evidence items.
         let evidence_items: Vec<agent_rs_stores::types::EvidenceItem> = ctx
             .evidence
             .iter()
@@ -113,7 +109,7 @@ impl ResultPersister {
                     .and_then(|v| v.as_str())
                     .unwrap_or("unknown")
                     .to_owned(),
-                score: doc.score.value(),
+                score: doc.score.value() as f64,
                 created_at: Utc::now().naive_utc(),
             })
             .collect();
@@ -122,15 +118,6 @@ impl ResultPersister {
             if let Err(err) = self.store.store_evidence_batch(&evidence_items).await {
                 error!(error = %err, "failed to persist evidence items");
             }
-        }
-
-        // Store assistant response in memory (user_id scopes the row to the tenant).
-        if let Err(err) = self
-            .memory
-            .store_message(&ctx.user_id, &ctx.session_id, MessageRole::Assistant, &response.answer)
-            .await
-        {
-            error!(error = %err, "failed to store assistant message");
         }
 
         Ok(response)

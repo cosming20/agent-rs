@@ -4,11 +4,17 @@
 //! every query is non-blocking. Connection management is encapsulated
 //! inside [`PgStore`]; callers never interact with the pool directly.
 //!
-//! # Construction
+//! # Tables owned by this module
 //!
-//! ```rust,ignore
-//! let store = PgStore::new("postgres://user:pass@localhost/mydb").await?;
-//! ```
+//! - `memories` — user-level long-term facts
+//! - `query_runs` — per-Ask telemetry rows (correlated by `trace_id`)
+//! - `evidence_items` — evidence surfaced per run (FK cascade from runs)
+//! - `strategy_performance` — adaptive strategy learning
+//! - `document_index_state` — MinIO key → indexing state machine (see
+//!   [`document_index_state`] submodule)
+//!
+//! Sessions / chat_messages / ingested_documents USED to live here but
+//! were relocated to agent-rs-web during the 2026-04-21 stateless pivot.
 //!
 //! # Error handling
 //!
@@ -16,7 +22,7 @@
 //! `#[from]` impl in `agent-rs-core`. Pool checkout errors are mapped
 //! to [`StoreError::ConnectionPool`].
 
-use agent_rs_core::{SessionId, StoreError, UserId};
+use agent_rs_core::{StoreError, UserId};
 use async_trait::async_trait;
 use diesel::prelude::*;
 use diesel_async::{
@@ -27,48 +33,32 @@ use tracing::instrument;
 use uuid::Uuid;
 
 use crate::traits::StateStore;
-use crate::types::{ChatMessage, EvidenceItem, Memory, QueryRun};
+use crate::types::{EvidenceItem, Memory, QueryRun};
 
-pub mod documents;
+pub mod document_index_state;
 pub mod models;
 pub mod schema;
-pub mod session_docs;
-pub mod sessions;
 
 // ---------------------------------------------------------------------------
 // Shared raw-query helpers
 // ---------------------------------------------------------------------------
 
 /// Projection type for `SELECT COUNT(*)::bigint AS count` raw queries.
-///
-/// Diesel's `sql_query` requires a `QueryableByName` target; this newtype
-/// satisfies that requirement without pulling in an extra dependency.
 #[derive(Debug, diesel::QueryableByName)]
 pub struct CountRow {
-    /// The count value returned by the query.
     #[diesel(sql_type = diesel::sql_types::BigInt)]
     pub count: i64,
 }
 
-pub use documents::HeaderMetadata;
-pub use models::{
-    BeginIngestionOutcome, IngestedDocumentRow, NewIngestedDocument, NewSession, SessionRow,
-};
-
 use models::{
-    ChatMessageRow, EvidenceItemRow, MemoryRow, NewChatMessage, NewEvidenceItem, NewMemory,
-    NewQueryRun, QueryRunRow,
+    EvidenceItemRow, MemoryRow, NewEvidenceItem, NewMemory, NewQueryRun, QueryRunRow,
 };
-use schema::{chat_messages, evidence_items, memories, query_runs};
+use schema::{evidence_items, memories, query_runs};
 
 // ---------------------------------------------------------------------------
 // PgStore
 // ---------------------------------------------------------------------------
 
-/// A [`StateStore`] backed by PostgreSQL via Diesel + diesel-async + bb8.
-///
-/// All public methods are instrumented with `tracing::instrument` so that
-/// spans appear in distributed traces.
 #[derive(Clone)]
 pub struct PgStore {
     pool: Pool<AsyncPgConnection>,
@@ -92,7 +82,7 @@ impl PgStore {
     }
 
     /// Obtain a pooled connection, mapping pool errors to [`StoreError`].
-    async fn conn(
+    pub(crate) async fn conn(
         &self,
     ) -> Result<
         diesel_async::pooled_connection::bb8::PooledConnection<'_, AsyncPgConnection>,
@@ -111,28 +101,19 @@ impl PgStore {
 
 #[async_trait]
 impl StateStore for PgStore {
-    /// Fetch the last `limit` messages for `session_id`, ordered oldest first.
-    #[instrument(skip(self), fields(session_id = %session_id, limit = limit))]
-    async fn get_messages(
-        &self,
-        session_id: &SessionId,
-        limit: usize,
-    ) -> Result<Vec<ChatMessage>, StoreError> {
+    #[instrument(skip(self), fields(user_id = %user_id))]
+    async fn get_memories(&self, user_id: &UserId) -> Result<Vec<Memory>, StoreError> {
         let mut conn = self.conn().await?;
-        let raw_limit = i64::try_from(limit).unwrap_or(i64::MAX);
-
-        // Subquery trick: select the N most-recent rows, then reverse for ASC order.
-        let rows: Vec<ChatMessageRow> = chat_messages::table
-            .filter(chat_messages::session_id.eq(*session_id.inner()))
-            .order(chat_messages::created_at.desc())
-            .limit(raw_limit)
-            .select(ChatMessageRow::as_select())
+        // Uses idx_memories_user_created (user_id, created_at DESC).
+        // We reverse client-side to return oldest-first (callers expect
+        // chronological order for prompt assembly).
+        let mut rows: Vec<MemoryRow> = memories::table
+            .filter(memories::user_id.eq(user_id.as_str()))
+            .order(memories::created_at.desc())
+            .select(MemoryRow::as_select())
             .load(&mut conn)
             .await
             .map_err(StoreError::from)?;
-
-        // Reverse so callers receive messages in chronological order.
-        let mut rows = rows;
         rows.reverse();
 
         rows.into_iter()
@@ -140,37 +121,6 @@ impl StateStore for PgStore {
             .collect::<Result<Vec<_>, _>>()
     }
 
-    /// Persist a single [`ChatMessage`].
-    #[instrument(skip(self), fields(message_id = %message.id))]
-    async fn store_message(&self, message: &ChatMessage) -> Result<(), StoreError> {
-        let mut conn = self.conn().await?;
-        let new_row = NewChatMessage::from_domain(message);
-        diesel::insert_into(chat_messages::table)
-            .values(&new_row)
-            .execute(&mut conn)
-            .await
-            .map_err(StoreError::from)?;
-        Ok(())
-    }
-
-    /// Fetch all memories for `user_id`, ordered oldest first.
-    #[instrument(skip(self), fields(user_id = %user_id))]
-    async fn get_memories(&self, user_id: &UserId) -> Result<Vec<Memory>, StoreError> {
-        let mut conn = self.conn().await?;
-        let rows: Vec<MemoryRow> = memories::table
-            .filter(memories::user_id.eq(user_id.as_str()))
-            .order(memories::created_at.asc())
-            .select(MemoryRow::as_select())
-            .load(&mut conn)
-            .await
-            .map_err(StoreError::from)?;
-
-        rows.into_iter()
-            .map(|r| r.into_domain())
-            .collect::<Result<Vec<_>, _>>()
-    }
-
-    /// Persist a single [`Memory`].
     #[instrument(skip(self), fields(memory_id = %memory.id))]
     async fn store_memory(&self, memory: &Memory) -> Result<(), StoreError> {
         let mut conn = self.conn().await?;
@@ -183,7 +133,6 @@ impl StateStore for PgStore {
         Ok(())
     }
 
-    /// Persist a [`QueryRun`].
     #[instrument(skip(self), fields(run_id = %run.id))]
     async fn persist_run(&self, run: &QueryRun) -> Result<(), StoreError> {
         let mut conn = self.conn().await?;
@@ -196,7 +145,6 @@ impl StateStore for PgStore {
         Ok(())
     }
 
-    /// Fetch a [`QueryRun`] by ID, returning `None` if it does not exist.
     #[instrument(skip(self), fields(run_id = %id))]
     async fn get_run(&self, id: &Uuid) -> Result<Option<QueryRun>, StoreError> {
         let mut conn = self.conn().await?;
@@ -211,7 +159,6 @@ impl StateStore for PgStore {
         maybe_row.map(|r| r.into_domain()).transpose()
     }
 
-    /// Persist a single [`EvidenceItem`] linked to a query run.
     #[instrument(skip(self), fields(evidence_id = %item.id, run_id = %item.run_id))]
     async fn store_evidence(&self, item: &EvidenceItem) -> Result<(), StoreError> {
         let mut conn = self.conn().await?;
@@ -224,7 +171,6 @@ impl StateStore for PgStore {
         Ok(())
     }
 
-    /// Persist a batch of [`EvidenceItem`]s for a query run in a single INSERT.
     #[instrument(skip(self, items), fields(run_id = ?items.first().map(|i| i.run_id), count = items.len()))]
     async fn store_evidence_batch(&self, items: &[EvidenceItem]) -> Result<(), StoreError> {
         if items.is_empty() {
@@ -241,7 +187,6 @@ impl StateStore for PgStore {
         Ok(())
     }
 
-    /// Fetch all evidence items for a query run, ordered oldest first.
     #[instrument(skip(self), fields(run_id = %run_id))]
     async fn get_evidence(&self, run_id: &Uuid) -> Result<Vec<EvidenceItem>, StoreError> {
         let mut conn = self.conn().await?;
@@ -260,17 +205,14 @@ impl StateStore for PgStore {
 }
 
 // ---------------------------------------------------------------------------
-// User-scoped helpers (direct PgStore methods, defence-in-depth layer)
+// User-scoped memory helpers (direct PgStore methods)
 // ---------------------------------------------------------------------------
 //
-// These methods enforce `user_id` at the SQL level — an independent guard
-// beneath any application-layer authorisation check.
+// These enforce `user_id` at the SQL level — an independent guard beneath
+// any application-layer authorisation check.
 
 impl PgStore {
     /// Persist a memory entry for `user_id`.
-    ///
-    /// The `user_id` is written into the `memories.user_id` column at INSERT
-    /// time so that [`list_memories`] can filter by it at the database level.
     ///
     /// # Errors
     ///
@@ -279,12 +221,10 @@ impl PgStore {
     #[instrument(skip(self), fields(user_id = %user_id))]
     pub async fn save_memory(&self, user_id: &UserId, content: &str) -> Result<(), StoreError> {
         let mut conn = self.conn().await?;
-        let now = chrono::Utc::now().naive_utc();
-        let new_row = models::NewMemory {
+        let new_row = NewMemory {
             id: Uuid::new_v4(),
             user_id: user_id.as_str(),
             content,
-            created_at: now,
         };
         diesel::insert_into(memories::table)
             .values(&new_row)
@@ -304,90 +244,8 @@ impl PgStore {
     /// - [`StoreError::ConnectionPool`] — pool exhausted.
     /// - [`StoreError::Postgres`] — database-level error.
     #[instrument(skip(self), fields(user_id = %user_id))]
-    pub async fn list_memories(
-        &self,
-        user_id: &UserId,
-    ) -> Result<Vec<crate::types::Memory>, StoreError> {
-        let mut conn = self.conn().await?;
-        let rows: Vec<MemoryRow> = memories::table
-            .filter(memories::user_id.eq(user_id.as_str()))
-            .order(memories::created_at.asc())
-            .select(MemoryRow::as_select())
-            .load(&mut conn)
-            .await
-            .map_err(StoreError::from)?;
-
-        rows.into_iter()
-            .map(|r| r.into_domain())
-            .collect::<Result<Vec<_>, _>>()
-    }
-
-    /// Append a chat message for `(user_id, session_id)`.
-    ///
-    /// The caller must have already verified that the session belongs to
-    /// `user_id` via [`create_or_fetch_session`].  This method additionally
-    /// persists `user_id` in the `chat_messages` row so that
-    /// [`list_chat_messages`] can re-check ownership at query time.
-    ///
-    /// # Errors
-    ///
-    /// - [`StoreError::ConnectionPool`] — pool exhausted.
-    /// - [`StoreError::Postgres`] — database-level error.
-    #[instrument(skip(self), fields(user_id = %user_id, session_id = %session_id, role = role))]
-    pub async fn append_chat_message(
-        &self,
-        user_id: &UserId,
-        session_id: &SessionId,
-        role: &str,
-        content: &str,
-    ) -> Result<(), StoreError> {
-        let mut conn = self.conn().await?;
-        let now = chrono::Utc::now().naive_utc();
-        let new_row = models::NewChatMessage {
-            id: Uuid::new_v4(),
-            session_id: *session_id.inner(),
-            role,
-            content,
-            created_at: now,
-            user_id: user_id.as_str(),
-        };
-        diesel::insert_into(chat_messages::table)
-            .values(&new_row)
-            .execute(&mut conn)
-            .await
-            .map_err(StoreError::from)?;
-        Ok(())
-    }
-
-    /// Fetch chat messages for `(user_id, session_id)`, ordered oldest first.
-    ///
-    /// Both predicates (`user_id` AND `session_id`) are enforced at the SQL
-    /// level.  If a caller bypasses application-layer authz and passes
-    /// `(bob, alice_session_id)`, the query returns zero rows — defence in
-    /// depth.
-    ///
-    /// # Errors
-    ///
-    /// - [`StoreError::ConnectionPool`] — pool exhausted.
-    /// - [`StoreError::Postgres`] — database-level error.
-    #[instrument(skip(self), fields(user_id = %user_id, session_id = %session_id))]
-    pub async fn list_chat_messages(
-        &self,
-        user_id: &UserId,
-        session_id: &SessionId,
-    ) -> Result<Vec<crate::types::ChatMessage>, StoreError> {
-        let mut conn = self.conn().await?;
-        let rows: Vec<ChatMessageRow> = chat_messages::table
-            .filter(chat_messages::user_id.eq(user_id.as_str()))
-            .filter(chat_messages::session_id.eq(*session_id.inner()))
-            .order(chat_messages::created_at.asc())
-            .select(ChatMessageRow::as_select())
-            .load(&mut conn)
-            .await
-            .map_err(StoreError::from)?;
-
-        rows.into_iter()
-            .map(|r| r.into_domain())
-            .collect::<Result<Vec<_>, _>>()
+    pub async fn list_memories(&self, user_id: &UserId) -> Result<Vec<Memory>, StoreError> {
+        // Reuses the StateStore impl so indexing + ordering stay consistent.
+        <Self as StateStore>::get_memories(self, user_id).await
     }
 }

@@ -5,7 +5,7 @@
 //! the storage-layer representations.
 
 use agent_rs_core::{
-    Confidence, Embedding, MessageRole, RetrievalStrategy, Score, SessionId, UserId,
+    Confidence, Embedding, MessageRole, RetrievalStrategy, Score, UserId,
 };
 use chrono::NaiveDateTime;
 use serde::{Deserialize, Serialize};
@@ -317,20 +317,27 @@ pub struct GraphPath {
 }
 
 // ---- State Store Types ----
+//
+// `ChatMessage` used to live here but was removed in the 2026-04-21
+// stateless pivot — chat history is now owned entirely by agent-rs-web
+// and replayed inline via the `history: repeated ChatTurn` field on
+// `AskRequest`. Agent-rs never persists conversation turns.
 
-/// A single chat message in a conversation session.
+/// A single turn replayed inline with an Ask request.
+///
+/// Carries only `role` and `content` — no authorship timestamps, no IDs,
+/// no session binding. Existed only for the lifetime of the request that
+/// delivered it.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ChatMessage {
-    pub id: Uuid,
-    pub session_id: SessionId,
-    /// Tenant that authored and owns this message.
-    pub user_id: UserId,
+pub struct ChatTurn {
     pub role: MessageRole,
     pub content: String,
-    pub created_at: NaiveDateTime,
 }
 
 /// A persistent memory entry associated with a user.
+///
+/// User-level long-term facts stored on agent-rs — invisible to the
+/// protocol (clients never see or manipulate memories directly).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Memory {
     pub id: Uuid,
@@ -340,10 +347,14 @@ pub struct Memory {
 }
 
 /// A record of a single query execution including its result.
+///
+/// `trace_id` replaces the old `session_id` — an optional client-supplied
+/// correlation UUID with no authorization meaning, kept only for linking
+/// telemetry across logs/traces.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct QueryRun {
     pub id: Uuid,
-    pub session_id: SessionId,
+    pub trace_id: Option<Uuid>,
     pub user_id: UserId,
     pub query: String,
     pub answer: String,

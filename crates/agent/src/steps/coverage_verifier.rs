@@ -44,7 +44,7 @@ impl CoverageVerifier {
     /// `ctx.coverage_report`.
     ///
     /// This is a no-op when `ctx.coverage_plan` is `None`.
-    #[instrument(skip(self, ctx), fields(session_id = %ctx.session_id))]
+    #[instrument(skip(self, ctx), fields(trace_id = ?ctx.trace_id))]
     pub fn verify(&self, ctx: &mut QueryContext) {
         let Some(plan) = ctx.coverage_plan.as_ref() else {
             return;

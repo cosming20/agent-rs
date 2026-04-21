@@ -4,12 +4,12 @@
 //! (Qdrant, Neo4j, Postgres) implement these traits in their
 //! respective submodules.
 
-use agent_rs_core::{CollectionName, Embedding, SessionId, StoreError, UserId};
+use agent_rs_core::{CollectionName, Embedding, StoreError, UserId};
 use async_trait::async_trait;
 use uuid::Uuid;
 
 use crate::types::{
-    ChatMessage, CollectionConfig, EvidenceItem, FilterSpec, GraphEdge, GraphNode, GraphPath,
+    CollectionConfig, EvidenceItem, FilterSpec, GraphEdge, GraphNode, GraphPath,
     Memory, NodeLabel, PointPayload, QueryRun, RelationType, SearchResult, VectorPoint,
 };
 
@@ -256,21 +256,16 @@ pub trait GraphStore: Send + Sync {
 
 // ---- State Store ----
 
-/// Abstraction over persistent state storage (chat history, memory, runs, evidence).
+/// Abstraction over persistent state storage (memories, runs, evidence).
+///
+/// Chat history is NOT here — in the stateless architecture, history is
+/// replayed inline from the client via `AskRequest.history` and never
+/// persisted on the agent side. Only user-level state (long-term memories)
+/// and analytics/telemetry (query runs + evidence) live in this store.
 ///
 /// Backed by a relational database (Postgres via Diesel).
 #[async_trait]
 pub trait StateStore: Send + Sync {
-    /// Get the last N messages for a session.
-    async fn get_messages(
-        &self,
-        session_id: &SessionId,
-        limit: usize,
-    ) -> Result<Vec<ChatMessage>, StoreError>;
-
-    /// Store a chat message.
-    async fn store_message(&self, message: &ChatMessage) -> Result<(), StoreError>;
-
     /// Get all memories for a user.
     async fn get_memories(&self, user_id: &UserId) -> Result<Vec<Memory>, StoreError>;
 

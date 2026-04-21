@@ -2,12 +2,19 @@
 //!
 //! Created once per `process_query()` call. Each pipeline step reads
 //! what it needs and writes its outputs to this context.
+//!
+//! After the 2026-04-21 stateless pivot: `session_id` was removed. The
+//! agent no longer owns any session state — conversation history is
+//! supplied by the client inline via the `history` + `active_document_keys`
+//! + `history_document_keys` fields on `AskRequest` and stored directly on
+//! `QueryContext` at construction time. `trace_id` is an optional
+//! client-supplied correlation UUID with no authorization meaning.
 
 use std::time::Instant;
 
-use agent_rs_core::types::{MessageRole, RetrievalStrategy, SessionId, UserId};
+use agent_rs_core::types::{MessageRole, RetrievalStrategy, UserId};
 use agent_rs_retrieval::EvidencePack;
-use agent_rs_stores::types::SearchResult;
+use agent_rs_stores::types::{ChatTurn, SearchResult};
 use uuid::Uuid;
 
 use crate::verifier::VerificationResult;
@@ -20,8 +27,9 @@ pub struct QueryContext {
     // ---- Immutable request parameters ----
     /// The user's query text.
     pub query: String,
-    /// Session identifier for conversation continuity.
-    pub session_id: SessionId,
+    /// Optional client-supplied correlation UUID. Used only for linking
+    /// telemetry across logs and traces; has no authorization meaning.
+    pub trace_id: Option<Uuid>,
     /// User identifier for memory and authorization.
     pub user_id: UserId,
     /// Retrieval strategy to use (may be overridden by strategy prediction).
@@ -34,16 +42,21 @@ pub struct QueryContext {
     pub start_time: Instant,
 
     // ---- Accumulated by ContextBuilder ----
-    /// Chat history messages for the Rig agent.
+    /// Chat history messages for the Rig agent. Populated directly from
+    /// the `history: Vec<ChatTurn>` argument passed at construction —
+    /// NEVER read from the DB (there is no such DB anymore).
     pub(crate) chat_messages: Vec<String>,
-    /// Conversation context string for search augmentation.
+    /// Conversation context string for search augmentation, derived from
+    /// the same client-supplied history.
     pub(crate) conversation_context: String,
-    /// Document IDs active in this session.
+    /// MinIO keys of documents active in this turn (plus history). The
+    /// union `active ∪ history` determines the retrieval filter; coverage
+    /// planning operates over the full union.
     ///
-    /// `None` when the session has no active-document filter, which causes
-    /// [`CoveragePlanner`] to fall back to the user's full document library.
-    /// `Some(ids)` restricts coverage planning and retrieval to those documents.
-    pub active_document_ids: Option<Vec<Uuid>>,
+    /// Empty `Vec` triggers the full-library fallback on CoveragePlanner.
+    /// (`Option<Vec<Uuid>>` used to carry the same signal pre-pivot; now
+    /// the keys are `String`s and we treat empty-vec = no filter.)
+    pub active_document_keys: Vec<String>,
 
     // ---- Accumulated by AgentRunner ----
     /// Knowledge-base evidence accumulated by tool calls.
@@ -67,49 +80,56 @@ pub struct QueryContext {
     /// Number of retry attempts performed.
     pub(crate) retries: usize,
 
-    // ---- Coverage-aware RAG fields (Phase 4) ----
-    /// Plan emitted by `CoveragePlanner` (Task 4.1).
-    /// `None` for non-exhaustive flows (current default).
+    // ---- Coverage-aware RAG fields ----
     pub coverage_plan: Option<crate::coverage::CoveragePlan>,
-
-    /// Untruncated evidence merged in by exhaustive-mode tool calls.
-    /// `EvidenceFuser` (Task 4.3) will preserve this set verbatim alongside
-    /// the reranked tier in `evidence`.
     pub coverage_evidence: Vec<agent_rs_stores::types::SearchResult>,
-
-    /// Verifier output. Populated by `CoverageVerifier` (Task 4.2). `None` when
-    /// the query was non-exhaustive or no plan existed.
     pub coverage_report: Option<crate::coverage::CoverageReport>,
-
-    /// Captured tool invocations (args + tool name). Used by the grounding
-    /// gate (Task 5.1) to extract subject tokens from the rewritten query
-    /// rather than from the raw user prompt.
     pub tool_calls: Vec<crate::coverage::ToolCallRecord>,
 }
 
 impl QueryContext {
-    /// Create a new QueryContext with immutable request parameters.
+    /// Create a new stateless QueryContext.
     ///
-    /// All mutable fields are initialized to empty/default values.
+    /// `history` is replayed inline by the caller (the web app). The
+    /// orchestrator never reads or writes chat history to any persistent
+    /// store — it exists only for the lifetime of this request.
     pub fn new(
         query: String,
-        session_id: SessionId,
         user_id: UserId,
+        history: Vec<ChatTurn>,
+        active_document_keys: Vec<String>,
         strategy: RetrievalStrategy,
         limit: usize,
-        role: MessageRole,
+        trace_id: Option<Uuid>,
     ) -> Self {
+        // Materialize chat_messages + conversation_context directly from
+        // the request-supplied history so the rest of the pipeline sees
+        // the same shape it used to when ContextBuilder read from PG.
+        let mut chat_messages: Vec<String> = Vec::with_capacity(history.len());
+        let mut conversation_context = String::new();
+        for turn in &history {
+            let role_str = match turn.role {
+                MessageRole::User => "user",
+                MessageRole::Assistant => "assistant",
+                MessageRole::System => "system",
+            };
+            let line = format!("{role_str}: {}", turn.content);
+            conversation_context.push_str(&line);
+            conversation_context.push('\n');
+            chat_messages.push(line);
+        }
+
         Self {
             query,
-            session_id,
+            trace_id,
             user_id,
             strategy,
             limit,
-            role,
+            role: MessageRole::User,
             start_time: Instant::now(),
-            chat_messages: Vec::new(),
-            conversation_context: String::new(),
-            active_document_ids: None,
+            chat_messages,
+            conversation_context,
+            active_document_keys,
             kb_evidence: Vec::new(),
             web_evidence: Vec::new(),
             answer: String::new(),

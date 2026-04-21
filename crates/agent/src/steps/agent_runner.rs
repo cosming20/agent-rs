@@ -153,7 +153,7 @@ impl AgentRunner {
     /// The `search_knowledge` tool accumulates evidence into a shared
     /// collector, which is drained into `ctx.kb_evidence` after execution.
     #[instrument(skip(self, ctx), fields(
-        session_id = %ctx.session_id,
+        trace_id = ?ctx.trace_id,
         strategy = %ctx.strategy,
     ))]
     pub async fn run(&self, ctx: &mut QueryContext) -> Result<(), AgentError> {
@@ -223,7 +223,7 @@ impl AgentRunner {
     ///
     /// Builds a fresh agent with tools so the retry can make new tool calls.
     #[instrument(skip(self, ctx, retry_prompt), fields(
-        session_id = %ctx.session_id,
+        trace_id = ?ctx.trace_id,
         retry = ctx.retries,
     ))]
     pub async fn rerun(

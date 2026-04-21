@@ -8,17 +8,18 @@ use std::sync::Arc;
 
 use agent_rs_core::config::Settings;
 use agent_rs_core::errors::AgentError;
-use agent_rs_core::types::{MessageRole, RetrievalStrategy, SessionId, UserId};
+use agent_rs_core::types::{RetrievalStrategy, UserId};
 use agent_rs_observability::metrics::RetrievalMetrics;
 use agent_rs_retrieval::{ResultRanker, RetrievalRouter};
 use agent_rs_stores::neo4j::Neo4jStore;
 use agent_rs_stores::postgres::PgStore;
 use agent_rs_stores::qdrant::QdrantStore;
 use agent_rs_stores::traits::StateStore;
+use agent_rs_stores::types::ChatTurn;
 use tracing::{info, instrument};
+use uuid::Uuid;
 
 use crate::context::QueryContext;
-use crate::memory::MemoryManager;
 use crate::steps::agent_runner::AgentRunner;
 use crate::steps::context_builder::ContextBuilder;
 use crate::steps::coverage_planner::CoveragePlanner;
@@ -84,20 +85,14 @@ impl AgentOrchestrator {
         router: Arc<RetrievalRouter>,
         metrics: Arc<RetrievalMetrics>,
     ) -> Result<Self, AgentError> {
-        // Erase the concrete PgStore to the StateStore trait for memory /
-        // history / persister paths that only need trait-level methods.
+        // Erase the concrete PgStore to the StateStore trait for the
+        // persister path that only needs trait-level methods.
         let store: Arc<dyn StateStore> = Arc::clone(&pg_store) as _;
 
-        // Shared memory manager over the state store.
-        let memory = Arc::new(MemoryManager::new(Arc::clone(&store)));
-
-        // Step 1: Context builder — receives pg_store for the session gate and
-        // context snapshot (REPEATABLE READ history + memories + active docs).
-        let context_builder = ContextBuilder::new(
-            Arc::clone(&memory),
-            Arc::clone(&pg_store),
-            &settings.context,
-        );
+        // Step 1: Context builder — now only reads user-level memories; no
+        // session / history DB reads (history is replayed inline by the
+        // client via `AskRequest.history`).
+        let context_builder = ContextBuilder::new(Arc::clone(&pg_store), &settings.context);
 
         // Step 1.5: Coverage planner — no-op for non-exhaustive queries.
         // Clone before passing so neo4j remains available for the tool factory.
@@ -150,9 +145,10 @@ impl AgentOrchestrator {
         let grounding_gate =
             GroundingGate::new(verifier, settings.agent.max_retries, Arc::clone(&metrics));
 
-        // Step 5: Result persister
+        // Step 5: Result persister — writes query_run + evidence_items for
+        // telemetry. No longer writes chat_messages (that table is gone).
         let synthesizer = ResponseSynthesizer::new(settings.synthesis.max_snippet_length);
-        let result_persister = ResultPersister::new(synthesizer, memory, store, metrics);
+        let result_persister = ResultPersister::new(synthesizer, store, metrics);
 
         Ok(Self {
             context_builder,
@@ -170,36 +166,44 @@ impl AgentOrchestrator {
     /// # Arguments
     ///
     /// - `query` -- the raw user question or instruction.
-    /// - `session_id` -- conversation session for history loading.
     /// - `user_id` -- identifier of the requesting user.
+    /// - `history` -- prior conversation turns (empty for a fresh thread).
+    ///   Replayed inline; never persisted on the agent side.
+    /// - `active_document_keys` -- MinIO keys of documents scoped to this
+    ///   request (union `active ∪ history` determines retrieval filter).
     /// - `strategy` -- retrieval strategy to use.
     /// - `limit` -- maximum number of evidence documents to retrieve.
+    /// - `trace_id` -- optional client correlation UUID for log linking.
     ///
     /// # Errors
     ///
-    /// Returns [`AgentError`] variants on pipeline failures (orchestration,
-    /// verification, synthesis, retrieval, or store errors).
-    #[instrument(skip(self, query), fields(
-        %session_id,
+    /// Returns [`AgentError`] variants on pipeline failures.
+    #[allow(clippy::too_many_arguments)]
+    #[instrument(skip(self, query, history, active_document_keys), fields(
         %user_id,
         strategy = %strategy,
         limit,
+        history_len = history.len(),
+        active_keys = active_document_keys.len(),
     ))]
     pub async fn process_query(
         &self,
         query: String,
-        session_id: SessionId,
         user_id: UserId,
+        history: Vec<ChatTurn>,
+        active_document_keys: Vec<String>,
         strategy: RetrievalStrategy,
         limit: usize,
+        trace_id: Option<Uuid>,
     ) -> Result<SynthesizedResponse, AgentError> {
         let mut ctx = QueryContext::new(
             query,
-            session_id,
             user_id,
+            history,
+            active_document_keys,
             strategy,
             limit,
-            MessageRole::User,
+            trace_id,
         );
 
         info!(
