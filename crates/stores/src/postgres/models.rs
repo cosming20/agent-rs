@@ -19,7 +19,9 @@ use uuid::Uuid;
 
 use crate::types::{ChatMessage, EvidenceItem, Memory, QueryRun};
 
-use super::schema::{chat_messages, evidence_items, ingested_documents, memories, query_runs, sessions};
+use super::schema::{
+    chat_messages, evidence_items, ingested_documents, memories, query_runs, sessions,
+};
 
 // ---------------------------------------------------------------------------
 // Role helpers

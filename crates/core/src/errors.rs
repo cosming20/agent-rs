@@ -79,10 +79,7 @@ pub enum StoreError {
     /// enumeration attacks: a caller cannot distinguish "this session_id
     /// was never issued" from "this session_id belongs to someone else".
     #[error("session {session_id} not found for user {user_id}")]
-    SessionNotFound {
-        session_id: String,
-        user_id: String,
-    },
+    SessionNotFound { session_id: String, user_id: String },
 
     /// Caller attempted to activate / read / delete a document that does
     /// not belong to the provided user.

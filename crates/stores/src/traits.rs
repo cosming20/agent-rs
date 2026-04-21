@@ -246,6 +246,14 @@ pub trait GraphStore: Send + Sync {
     ///
     /// Returns [`StoreError`] on any backend failure; caller should call
     /// `rollback_by_run_id(ingest_run_id)` to clean up partial state.
+    /// # Errors
+    ///
+    /// Returns [`StoreError`] on any backend failure; caller should call
+    /// `rollback_by_run_id(ingest_run_id)` to clean up partial state.
+    ///
+    /// `user_id` is authoritative for the `Document` node and is written via
+    /// `ON CREATE SET` — re-ingesting the same `document_id` does not alter
+    /// the original owner.
     async fn upsert_document_structure(
         &self,
         header: &crate::neo4j::structural::DocumentHeaderSnapshot,
