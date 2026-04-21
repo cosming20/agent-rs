@@ -406,6 +406,7 @@ impl IngestionPipeline {
         text: &str,
         doc_id: &str,
         source: &str,
+        user_id: &str,
     ) -> Result<IngestionResult, RetrievalError> {
         let start = Instant::now();
 
@@ -463,7 +464,7 @@ impl IngestionPipeline {
             .iter()
             .zip(embeddings.into_iter())
             .map(|(chunk, embedding)| {
-                let payload = build_chunk_payload(chunk);
+                let payload = build_chunk_payload(chunk, user_id);
                 VectorPoint {
                     id: chunk.chunk_id.clone(),
                     embedding,
@@ -910,11 +911,18 @@ impl IngestionPipeline {
         pdf_bytes: &[u8],
         doc_id: &str,
         source: &str,
+        user_id: &str,
     ) -> Result<IngestionResult, RetrievalError> {
         match self.ingest_backend {
-            IngestBackend::Docling => self.ingest_with_docling(pdf_bytes, doc_id, source).await,
+            IngestBackend::Docling => {
+                self.ingest_with_docling(pdf_bytes, doc_id, source, user_id)
+                    .await
+            }
             IngestBackend::DoclingWithLegacyFallback => {
-                match self.ingest_with_docling(pdf_bytes, doc_id, source).await {
+                match self
+                    .ingest_with_docling(pdf_bytes, doc_id, source, user_id)
+                    .await
+                {
                     Ok(result) => Ok(result),
                     Err(RetrievalError::DoclingIngestFailed {
                         triggers_legacy_fallback: true,
@@ -926,12 +934,16 @@ impl IngestionPipeline {
                             reason = %message,
                             "Docling ingest failed with legacy-fallback flag; switching to pdf-extract"
                         );
-                        self.ingest_pdf_legacy(pdf_bytes, doc_id, source).await
+                        self.ingest_pdf_legacy(pdf_bytes, doc_id, source, user_id)
+                            .await
                     }
                     Err(other) => Err(other),
                 }
             }
-            IngestBackend::Legacy => self.ingest_pdf_legacy(pdf_bytes, doc_id, source).await,
+            IngestBackend::Legacy => {
+                self.ingest_pdf_legacy(pdf_bytes, doc_id, source, user_id)
+                    .await
+            }
         }
     }
 
@@ -966,6 +978,7 @@ impl IngestionPipeline {
         pdf_bytes: &[u8],
         doc_id: &str,
         source: &str,
+        user_id: &str,
     ) -> Result<IngestionResult, RetrievalError> {
         use backon::{ExponentialBuilder, Retryable};
         use sha2::{Digest, Sha256};
@@ -1163,6 +1176,10 @@ impl IngestionPipeline {
                     header,
                     doc_id,
                     source,
+                    // user_id threaded from ingest_with_docling caller (Phase 5.1).
+                    // Until Phase 6/7 wires upstream callers, this may be "".
+                    // The QdrantStore filter will enforce the real user_id on reads.
+                    user_id,
                     ingest_run_id,
                     doc_n_tables,
                     doc_n_pictures,
@@ -1512,6 +1529,7 @@ impl IngestionPipeline {
         pdf_bytes: &[u8],
         doc_id: &str,
         source: &str,
+        user_id: &str,
     ) -> Result<IngestionResult, RetrievalError> {
         // pdf-extract is synchronous and CPU-bound; offload to blocking pool.
         let bytes = pdf_bytes.to_vec();
@@ -1531,7 +1549,7 @@ impl IngestionPipeline {
             "PDF text extraction complete (legacy path)"
         );
 
-        self.ingest_text(&text, doc_id, source).await
+        self.ingest_text(&text, doc_id, source, user_id).await
     }
 
     /// Stub for the legacy path when the `legacy_pdf_extract` feature is disabled.
@@ -1623,10 +1641,12 @@ impl IngestionPipeline {
 // ---- Private helpers ----
 
 /// Build the JSON payload for a chunk to be stored in Qdrant.
-fn build_chunk_payload(chunk: &DocumentChunk) -> serde_json::Value {
+fn build_chunk_payload(chunk: &DocumentChunk, user_id: &str) -> serde_json::Value {
     json!({
         "chunk_id": chunk.chunk_id,
         "doc_id": chunk.doc_id,
+        // ---- multi-tenancy ----
+        "user_id": user_id,
         "chunk_text": chunk.content,
         "chunk_index": chunk.chunk_index,
         "total_chunks": chunk.total_chunks,
@@ -1641,11 +1661,12 @@ fn build_chunk_payload(chunk: &DocumentChunk) -> serde_json::Value {
     })
 }
 
-/// Build the 27-field JSON payload for a Docling-sourced chunk stored in Qdrant.
+/// Build the 28-field JSON payload for a Docling-sourced chunk stored in Qdrant.
 ///
 /// The payload carries all filterable/retrievable metadata so downstream
 /// evidence assembly can render citations without a second round-trip.
-/// Every point is also tagged with `ingest_run_id` for rollback.
+/// Every point is also tagged with `ingest_run_id` for rollback and
+/// `user_id` for mandatory multi-tenant read filtering (Phase 5.1).
 ///
 /// `doc_n_tables` / `doc_n_pictures` come from the stream footer, which the
 /// caller has already received in full before this function is called.
@@ -1655,6 +1676,7 @@ fn build_docling_chunk_payload(
     header: &ProtoDocumentHeader,
     doc_id: &str,
     source: &str,
+    user_id: &str,
     ingest_run_id: Uuid,
     doc_n_tables: u32,
     doc_n_pictures: u32,
@@ -1664,6 +1686,8 @@ fn build_docling_chunk_payload(
         "chunk_id":       chunk.chunk_id,
         "doc_id":         doc_id,
         "ingest_run_id":  ingest_run_id.to_string(),
+        // ---- multi-tenancy ----
+        "user_id":        user_id,
         // ---- content ----
         "chunk_text":     chunk.embed_text,
         "raw_text":       chunk.raw_text,

@@ -14,7 +14,7 @@ pub mod section_filter;
 
 use std::collections::HashMap;
 
-use agent_rs_core::{CollectionName, Embedding, StoreError};
+use agent_rs_core::{CollectionName, Embedding, StoreError, UserId};
 use async_trait::async_trait;
 use qdrant_client::Qdrant;
 use qdrant_client::qdrant::{
@@ -446,13 +446,59 @@ impl VectorStore for QdrantStore {
 // ---- QdrantStore inherent methods ----
 
 impl QdrantStore {
-    /// Fetch payload-only projections for a list of chunk ids.
+    /// Dense vector similarity search scoped to a specific user.
     ///
-    /// Thin wrapper around [`VectorStore::get_by_ids`] that accepts a plain
-    /// `&str` collection name, sparing callers from constructing a
-    /// [`CollectionName`] themselves. Used by `fetch_section_chunks` and
-    /// similar tools that already know the ids they want and do not need
-    /// vector data.
+    /// Builds a mandatory `user_id` filter via [`build_user_filter`] and
+    /// merges it with any caller-supplied `extra_filter`. This is the
+    /// preferred search entry point for multi-tenant contexts.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError`] on Qdrant gRPC failure.
+    #[instrument(skip(self, query, extra_filter), fields(collection = %collection, user_id = %user_id, limit = limit))]
+    pub async fn search_for_user(
+        &self,
+        collection: &CollectionName,
+        user_id: &UserId,
+        query: &Embedding,
+        limit: usize,
+        extra_filter: Option<qdrant_client::qdrant::Filter>,
+    ) -> Result<Vec<crate::types::SearchResult>, StoreError> {
+        use crate::qdrant::section_filter::{build_user_filter, merge_user_filter};
+
+        let user_scope = build_user_filter(user_id.as_str(), None, None);
+        let merged = merge_user_filter(user_scope, extra_filter);
+
+        let response = self
+            .client
+            .query(
+                QueryPointsBuilder::new(collection.as_str())
+                    .query(qdrant_client::qdrant::Query::from(
+                        query.as_slice().to_vec(),
+                    ))
+                    .using("dense")
+                    .limit(limit as u64)
+                    .filter(merged)
+                    .with_payload(true),
+            )
+            .await
+            .map_err(StoreError::from)?;
+
+        response
+            .result
+            .into_iter()
+            .map(scored_point_to_result)
+            .collect()
+    }
+
+    /// Fetch payload-only projections for a list of chunk ids, enforcing
+    /// user-scope as defence-in-depth.
+    ///
+    /// Fetches points by ID from Qdrant and then drops any point whose
+    /// payload `user_id` does not match the requested `user_id`. IDs are
+    /// globally unique so a fetch-by-id normally returns only the right
+    /// point, but this secondary check prevents cross-tenant reads if a
+    /// caller ever supplies a chunk ID belonging to a different tenant.
     ///
     /// Ids that do not resolve to a stored point are silently dropped; the
     /// caller sees only hits.
@@ -460,38 +506,53 @@ impl QdrantStore {
     /// # Errors
     ///
     /// Returns [`StoreError`] on Qdrant gRPC failure.
-    #[instrument(skip(self, ids), fields(collection, n_ids = ids.len()))]
+    #[instrument(skip(self, ids), fields(collection, user_id = %user_id, n_ids = ids.len()))]
     pub async fn retrieve_chunks_by_ids(
         &self,
         collection: &str,
+        user_id: &UserId,
         ids: &[String],
     ) -> Result<Vec<crate::types::PointPayload>, StoreError> {
         use crate::traits::VectorStore as _;
 
         let coll = agent_rs_core::CollectionName::from_string(collection.to_owned());
-        self.get_by_ids(&coll, ids).await
+        let points = self.get_by_ids(&coll, ids).await?;
+
+        // Defence-in-depth: drop any point whose payload user_id does not match.
+        let expected = user_id.as_str();
+        let filtered: Vec<crate::types::PointPayload> = points
+            .into_iter()
+            .filter(|p| {
+                p.payload
+                    .get("user_id")
+                    .and_then(|v| v.as_str())
+                    == Some(expected)
+            })
+            .collect();
+
+        Ok(filtered)
     }
 
     /// Return the `summary_text` of the first stored summary whose payload
-    /// matches `section_id`. Returns `Ok(None)` when no matching point exists.
+    /// matches both `user_id` and `section_id`. Returns `Ok(None)` when no
+    /// matching point exists.
     ///
-    /// Uses the scroll API (no vector required) with a payload filter on
-    /// `section_id` and a limit of 1 so only the first summary chunk is read.
+    /// Uses the scroll API (no vector required) with a mandatory user-scope
+    /// filter ANDed with the `section_id` condition, limiting to 1 result.
     ///
     /// # Errors
     ///
     /// Returns [`StoreError`] on Qdrant gRPC failure.
-    #[instrument(skip(self), fields(collection = %collection, section_id = %section_id))]
+    #[instrument(skip(self), fields(collection = %collection, user_id = %user_id, section_id = %section_id))]
     pub async fn first_summary_by_section(
         &self,
         collection: &str,
+        user_id: &UserId,
         section_id: &str,
     ) -> Result<Option<String>, StoreError> {
-        use crate::qdrant::section_filter::build_section_filter;
+        use crate::qdrant::section_filter::build_user_filter;
 
-        let Some(filter) = build_section_filter(None, Some(section_id)) else {
-            return Ok(None);
-        };
+        let filter = build_user_filter(user_id.as_str(), None, Some(section_id));
 
         let response = self
             .client
@@ -505,22 +566,15 @@ impl QdrantStore {
             .await
             .map_err(StoreError::from)?;
 
-        let summary = response
-            .result
-            .into_iter()
-            .next()
-            .and_then(|point| {
-                point
-                    .payload
-                    .get("summary_text")
-                    .and_then(|v| {
-                        use qdrant_client::qdrant::value::Kind;
-                        match v.kind.as_ref() {
-                            Some(Kind::StringValue(s)) => Some(s.clone()),
-                            _ => None,
-                        }
-                    })
-            });
+        let summary = response.result.into_iter().next().and_then(|point| {
+            point.payload.get("summary_text").and_then(|v| {
+                use qdrant_client::qdrant::value::Kind;
+                match v.kind.as_ref() {
+                    Some(Kind::StringValue(s)) => Some(s.clone()),
+                    _ => None,
+                }
+            })
+        });
 
         Ok(summary)
     }
