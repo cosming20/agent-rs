@@ -275,7 +275,10 @@ impl PgStore {
         Ok(())
     }
 
-    /// Return `true` if a document with `sha256` has `ingest_status = 'complete'`.
+    /// Return `true` if a document with `sha256` has `ingest_status = 'complete'`
+    /// **and** is owned by `user_id`.
+    ///
+    /// Scoped to a single tenant: bob cannot probe alice's sha256 fingerprint.
     ///
     /// This is the fast-path dedup check: callers can skip ingestion entirely
     /// when this returns `true`.
@@ -283,8 +286,12 @@ impl PgStore {
     /// # Errors
     ///
     /// Returns [`StoreError::Postgres`] on any database error.
-    #[instrument(skip(self), fields(sha256 = %sha256))]
-    pub async fn is_already_ingested_complete(&self, sha256: &str) -> Result<bool, StoreError> {
+    #[instrument(skip(self), fields(sha256 = %sha256, user_id = %user_id.as_str()))]
+    pub async fn is_already_ingested_complete(
+        &self,
+        user_id: &UserId,
+        sha256: &str,
+    ) -> Result<bool, StoreError> {
         use diesel::dsl::exists;
         use diesel::select;
 
@@ -292,6 +299,7 @@ impl PgStore {
 
         let found: bool = select(exists(
             ingested_documents::table
+                .filter(ingested_documents::user_id.eq(user_id.as_str()))
                 .filter(ingested_documents::sha256.eq(sha256))
                 .filter(ingested_documents::ingest_status.eq(IngestStatus::Complete.as_str())),
         ))
@@ -302,10 +310,12 @@ impl PgStore {
         Ok(found)
     }
 
-    /// Fetch the `ingested_documents` row identified by `sha256`.
+    /// Fetch the `ingested_documents` row identified by `(user_id, sha256)`.
     ///
-    /// Returns `None` if no row exists for the given sha256 (i.e., the document
-    /// was never ingested or was already deleted).
+    /// Returns `None` if no row exists for the given user + sha256 (i.e., the
+    /// document was never ingested by this user, or was already deleted).
+    ///
+    /// Scoped to a single tenant: bob cannot retrieve alice's row by sha256.
     ///
     /// Used by `IngestCoordinator::cleanup_partial` (W3) to fetch the
     /// `ingest_run_id` needed to roll back Qdrant and Neo4j before deleting
@@ -314,14 +324,16 @@ impl PgStore {
     /// # Errors
     ///
     /// Returns [`StoreError::Postgres`] on any database error.
-    #[instrument(skip(self), fields(sha256 = %sha256))]
+    #[instrument(skip(self), fields(sha256 = %sha256, user_id = %user_id.as_str()))]
     pub async fn get_ingested_document_by_sha256(
         &self,
+        user_id: &UserId,
         sha256: &str,
     ) -> Result<Option<IngestedDocumentRow>, StoreError> {
         let mut conn = self.conn().await?;
 
         ingested_documents::table
+            .filter(ingested_documents::user_id.eq(user_id.as_str()))
             .filter(ingested_documents::sha256.eq(sha256))
             .select(IngestedDocumentRow::as_select())
             .first(&mut conn)

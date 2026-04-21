@@ -35,8 +35,25 @@ pub mod schema;
 pub mod session_docs;
 pub mod sessions;
 
+// ---------------------------------------------------------------------------
+// Shared raw-query helpers
+// ---------------------------------------------------------------------------
+
+/// Projection type for `SELECT COUNT(*)::bigint AS count` raw queries.
+///
+/// Diesel's `sql_query` requires a `QueryableByName` target; this newtype
+/// satisfies that requirement without pulling in an extra dependency.
+#[derive(Debug, diesel::QueryableByName)]
+pub struct CountRow {
+    /// The count value returned by the query.
+    #[diesel(sql_type = diesel::sql_types::BigInt)]
+    pub count: i64,
+}
+
 pub use documents::HeaderMetadata;
-pub use models::{BeginIngestionOutcome, IngestedDocumentRow, NewIngestedDocument, NewSession, SessionRow};
+pub use models::{
+    BeginIngestionOutcome, IngestedDocumentRow, NewIngestedDocument, NewSession, SessionRow,
+};
 
 use models::{
     ChatMessageRow, EvidenceItemRow, MemoryRow, NewChatMessage, NewEvidenceItem, NewMemory,
@@ -260,11 +277,7 @@ impl PgStore {
     /// - [`StoreError::ConnectionPool`] — pool exhausted.
     /// - [`StoreError::Postgres`] — database-level error.
     #[instrument(skip(self), fields(user_id = %user_id))]
-    pub async fn save_memory(
-        &self,
-        user_id: &UserId,
-        content: &str,
-    ) -> Result<(), StoreError> {
+    pub async fn save_memory(&self, user_id: &UserId, content: &str) -> Result<(), StoreError> {
         let mut conn = self.conn().await?;
         let now = chrono::Utc::now().naive_utc();
         let new_row = models::NewMemory {
