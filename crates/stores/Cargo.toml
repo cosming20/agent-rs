@@ -3,6 +3,11 @@ name = "agent-rs-stores"
 version = "0.1.0"
 edition.workspace = true
 
+[features]
+## Gates integration tests that require a live Postgres instance.
+## Run via: `cargo test -p agent-rs-stores --features integration-tests --test sessions_integration`
+integration-tests = []
+
 [dependencies]
 agent-rs-core = { workspace = true }
 async-trait = { workspace = true }

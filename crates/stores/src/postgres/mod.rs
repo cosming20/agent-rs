@@ -32,9 +32,10 @@ use crate::types::{ChatMessage, EvidenceItem, Memory, QueryRun};
 pub mod documents;
 pub mod models;
 pub mod schema;
+pub mod sessions;
 
 pub use documents::HeaderMetadata;
-pub use models::{BeginIngestionOutcome, IngestedDocumentRow, NewIngestedDocument};
+pub use models::{BeginIngestionOutcome, IngestedDocumentRow, NewIngestedDocument, NewSession, SessionRow};
 
 use models::{
     ChatMessageRow, EvidenceItemRow, MemoryRow, NewChatMessage, NewEvidenceItem, NewMemory,
