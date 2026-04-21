@@ -87,3 +87,73 @@ async fn session_create_or_fetch_rejects_cross_user_hijack() {
         other => panic!("expected StoreError::SessionNotFound, got {other:?}"),
     }
 }
+
+#[tokio::test]
+async fn list_ingested_documents_scoped_to_user() {
+    let pg = test_pg().await;
+    let alice = UserId::try_new("alice-test-3-2a").expect("valid");
+    let bob = UserId::try_new("bob-test-3-2a").expect("valid");
+
+    pg.test_insert_document_complete(&alice, "alice-3-2.pdf")
+        .await
+        .unwrap();
+    pg.test_insert_document_complete(&bob, "bob-3-2.pdf")
+        .await
+        .unwrap();
+
+    let alice_docs = pg.list_ingested_documents(&alice).await.unwrap();
+    assert!(alice_docs.iter().all(|d| d.user_id == alice.as_str()));
+    assert!(alice_docs.iter().any(|d| d.source == "alice-3-2.pdf"));
+    assert!(
+        alice_docs.iter().all(|d| d.source != "bob-3-2.pdf"),
+        "alice must not see bob's doc"
+    );
+
+    let bob_docs = pg.list_ingested_documents(&bob).await.unwrap();
+    assert!(bob_docs.iter().any(|d| d.source == "bob-3-2.pdf"));
+    assert!(bob_docs.iter().all(|d| d.source != "alice-3-2.pdf"));
+}
+
+#[tokio::test]
+async fn list_ingested_documents_filters_out_non_complete() {
+    let pg = test_pg().await;
+    let alice = UserId::try_new("alice-test-3-2b").expect("valid");
+
+    pg.test_insert_document_complete(&alice, "complete.pdf")
+        .await
+        .unwrap();
+    pg.test_insert_document_with_status(&alice, "pending.pdf", "pending")
+        .await
+        .unwrap();
+    pg.test_insert_document_with_status(&alice, "failed.pdf", "failed")
+        .await
+        .unwrap();
+
+    let docs = pg.list_ingested_documents(&alice).await.unwrap();
+    assert!(docs.iter().any(|d| d.source == "complete.pdf"));
+    assert!(docs.iter().all(|d| d.source != "pending.pdf"));
+    assert!(docs.iter().all(|d| d.source != "failed.pdf"));
+}
+
+#[tokio::test]
+async fn two_users_same_sha_get_separate_document_ids() {
+    let pg = test_pg().await;
+    let alice = UserId::try_new("alice-test-3-2c").expect("valid");
+    let bob = UserId::try_new("bob-test-3-2c").expect("valid");
+
+    // Both users upload a doc with the SAME sha256 content. Per-user
+    // dedup means each gets a distinct document_id.
+    let shared_sha = "abc123def456abc123def456abc123def456abc123def456abc123def456abcd";
+    let a = pg
+        .test_insert_document_with_sha(&alice, "same.pdf", shared_sha)
+        .await
+        .unwrap();
+    let b = pg
+        .test_insert_document_with_sha(&bob, "same.pdf", shared_sha)
+        .await
+        .unwrap();
+
+    assert_ne!(a.document_id, b.document_id);
+    assert_eq!(a.user_id, alice.as_str());
+    assert_eq!(b.user_id, bob.as_str());
+}
