@@ -19,7 +19,7 @@ use uuid::Uuid;
 
 use crate::types::{ChatMessage, EvidenceItem, Memory, QueryRun};
 
-use super::schema::{chat_messages, evidence_items, ingested_documents, memories, query_runs};
+use super::schema::{chat_messages, evidence_items, ingested_documents, memories, query_runs, sessions};
 
 // ---------------------------------------------------------------------------
 // Role helpers
@@ -386,4 +386,34 @@ pub enum BeginIngestionOutcome {
     AlreadyBeingIngested,
     /// Row exists with `complete`.  No work needed; return idempotent result.
     AlreadyComplete,
+}
+
+// ---------------------------------------------------------------------------
+// sessions
+// ---------------------------------------------------------------------------
+
+/// A row read from the `sessions` table.
+///
+/// Every `SessionRow` returned to application code has already passed the
+/// cross-user ownership check in [`PgStore::create_or_fetch_session`], so
+/// the `user_id` field is authorisation-verified.
+#[derive(Debug, Clone, Queryable, Selectable)]
+#[diesel(table_name = sessions)]
+#[diesel(check_for_backend(diesel::pg::Pg))]
+pub struct SessionRow {
+    pub session_id: Uuid,
+    pub user_id: String,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+    pub updated_at: chrono::DateTime<chrono::Utc>,
+}
+
+/// Fields required to insert a new row into `sessions`.
+///
+/// `created_at` and `updated_at` default to `NOW()` via the DB default, so
+/// they are omitted here.
+#[derive(Debug, Insertable)]
+#[diesel(table_name = sessions)]
+pub struct NewSession<'a> {
+    pub session_id: Uuid,
+    pub user_id: &'a str,
 }
