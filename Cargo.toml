@@ -140,3 +140,7 @@ backon = "1"
 # Hashing — deterministic IDs and document integrity checks
 blake3 = "1"
 sha2 = "0.10"
+
+# S3-compatible object storage (MinIO)
+aws-sdk-s3 = { version = "1.60", default-features = false, features = ["rt-tokio", "behavior-version-latest"] }
+aws-config = { version = "1.5", default-features = false, features = ["rt-tokio", "behavior-version-latest"] }

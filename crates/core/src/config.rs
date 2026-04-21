@@ -388,6 +388,42 @@ pub struct DoclingConfig {
     pub max_pages: u32,
 }
 
+/// MinIO / S3-compatible object storage config.
+///
+/// Loaded from `AGENT_RS__MINIO__*` env vars. Defaults are suitable
+/// for the docker-compose dev stack (minioadmin/minioadmin on
+/// localhost:1069); production deployments override via env.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct MinioConfig {
+    /// S3 API endpoint URL, e.g. `http://localhost:1069`.
+    ///
+    /// Override via `AGENT_RS__MINIO__ENDPOINT`.
+    pub endpoint: String,
+    /// S3 access key (MinIO root user).
+    ///
+    /// Override via `AGENT_RS__MINIO__ACCESS_KEY`.
+    pub access_key: String,
+    /// S3 secret key (MinIO root password).
+    ///
+    /// Override via `AGENT_RS__MINIO__SECRET_KEY`.
+    pub secret_key: String,
+    /// Bucket where user documents are stored.
+    ///
+    /// Override via `AGENT_RS__MINIO__BUCKET`.
+    pub bucket: String,
+}
+
+impl Default for MinioConfig {
+    fn default() -> Self {
+        Self {
+            endpoint: "http://localhost:1069".into(),
+            access_key: "minioadmin".into(),
+            secret_key: "minioadmin".into(),
+            bucket: "agent-rs-docs".into(),
+        }
+    }
+}
+
 /// gRPC server configuration.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ServerConfig {
@@ -461,6 +497,9 @@ pub struct Settings {
     pub ingest_backend: IngestBackend,
     /// Docling sidecar gRPC connection settings.
     pub docling: DoclingConfig,
+    /// MinIO / S3-compatible object storage settings.
+    #[serde(default)]
+    pub minio: MinioConfig,
 }
 
 impl Default for Settings {
@@ -571,6 +610,7 @@ impl Default for Settings {
                 max_pdf_bytes: 100 * 1024 * 1024, // 100 MiB
                 max_pages: 500,
             },
+            minio: MinioConfig::default(),
         }
     }
 }
