@@ -396,7 +396,10 @@ async fn sha256_lookup_is_user_scoped() {
         .get_ingested_document_by_sha256(&bob, &shared_sha)
         .await
         .unwrap();
-    assert!(bob_fetch.is_none(), "bob must not retrieve alice's row by sha");
+    assert!(
+        bob_fetch.is_none(),
+        "bob must not retrieve alice's row by sha"
+    );
 
     // Alice herself must still see her own doc.
     let alice_has = pg

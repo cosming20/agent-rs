@@ -412,8 +412,7 @@ impl ChunkSummarizer {
                         tracing::warn!(error = %e, "semaphore closed during summarization");
                         let key = format!("{chunk_id_owned}|summary");
                         let summary_id =
-                            uuid::Uuid::new_v5(&SUMMARY_UUID_NAMESPACE, key.as_bytes())
-                                .to_string();
+                            uuid::Uuid::new_v5(&SUMMARY_UUID_NAMESPACE, key.as_bytes()).to_string();
                         let preview: String =
                             chunk_text_owned.chars().take(PREVIEW_CHARS).collect();
                         return (

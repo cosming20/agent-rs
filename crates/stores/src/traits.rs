@@ -40,38 +40,6 @@ pub trait VectorStore: Send + Sync {
         points: Vec<VectorPoint>,
     ) -> Result<(), StoreError>;
 
-    /// Dense vector similarity search.
-    async fn search(
-        &self,
-        collection: &CollectionName,
-        query: &Embedding,
-        limit: usize,
-    ) -> Result<Vec<SearchResult>, StoreError>;
-
-    /// Dense vector similarity search with optional payload filter.
-    ///
-    /// The `filter` is a JSON object describing Qdrant payload conditions.
-    /// When `None`, behaves identically to [`search`].
-    async fn search_with_filter(
-        &self,
-        collection: &CollectionName,
-        query: &Embedding,
-        limit: usize,
-        filter: Option<serde_json::Value>,
-    ) -> Result<Vec<SearchResult>, StoreError>;
-
-    /// Hybrid search: dense vector + server-side BM25, fused via prefetch + RRF.
-    ///
-    /// `query_text` is sent to Qdrant as a `Document { model: "qdrant/bm25" }`
-    /// for the sparse prefetch leg so Qdrant handles tokenisation server-side.
-    async fn search_hybrid(
-        &self,
-        collection: &CollectionName,
-        dense: &Embedding,
-        query_text: &str,
-        limit: usize,
-    ) -> Result<Vec<SearchResult>, StoreError>;
-
     /// Delete points by their string IDs.
     async fn delete(&self, collection: &CollectionName, ids: Vec<String>)
     -> Result<(), StoreError>;
@@ -96,24 +64,47 @@ pub trait VectorStore: Send + Sync {
     /// Check if a collection exists.
     async fn collection_exists(&self, name: &CollectionName) -> Result<bool, StoreError>;
 
-    /// Fetch payloads for a batch of point IDs.
+    /// Dense vector similarity search scoped to a specific user.
     ///
-    /// Used by graph-driven retrieval paths to rehydrate chunk content for
-    /// nodes discovered via Neo4j traversal. Missing IDs are silently dropped
-    /// from the returned vector (they surface as a count delta to the caller,
-    /// which is expected to treat them as orphan/skew evidence rather than an
-    /// error).
+    /// Implementations MUST apply a mandatory `user_id` payload filter so that
+    /// no cross-tenant data can be returned. This is the only permitted
+    /// read path for chunk data — unscoped `search` / `search_hybrid` /
+    /// `search_with_filter` / `get_by_ids` are deliberately absent from this
+    /// trait, making accidental bypass a compile error.
     ///
-    /// Dense / sparse vectors are *not* returned — this is a payload-only
-    /// projection. Vector rehydration would require a separate method with a
-    /// different return shape.
+    /// `extra_filter_json` conditions are merged with the user scope filter
+    /// when provided (same `{"must": [...]}` schema).
     ///
     /// # Errors
     ///
-    /// Returns [`StoreError`] on backend failure. Missing IDs are not an error.
-    async fn get_by_ids(
+    /// Returns [`StoreError`] on backend failure.
+    async fn search_for_user(
         &self,
         collection: &CollectionName,
+        user_id: &UserId,
+        query: &Embedding,
+        limit: usize,
+        extra_filter_json: Option<serde_json::Value>,
+    ) -> Result<Vec<SearchResult>, StoreError>;
+
+    /// Fetch payload-only projections for a list of chunk IDs, scoped to a user.
+    ///
+    /// Implementations MUST drop any returned point whose payload `user_id`
+    /// does not match the requested `user_id`. IDs that do not exist are
+    /// silently dropped. This is the only permitted payload-fetch path —
+    /// the unscoped `get_by_ids` is absent from this trait.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError`] on backend failure.
+    ///
+    /// # Panics
+    ///
+    /// Implementations MUST panic when `user_id` is empty.
+    async fn retrieve_chunks_for_user(
+        &self,
+        collection: &CollectionName,
+        user_id: &UserId,
         ids: &[String],
     ) -> Result<Vec<PointPayload>, StoreError>;
 }

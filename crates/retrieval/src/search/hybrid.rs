@@ -5,17 +5,16 @@
 //! deferred to the caller (the ranker/router layer) so that weighting and
 //! truncation decisions live in one place.
 //!
+//! Every search arm is user-scoped: all functions require a `user_id` and
+//! delegate to user-scoped store methods so cross-tenant reads are impossible.
+//!
 //! # Functions
 //!
 //! - [`hybrid_search`] — vector + BM25 keyword in parallel (HYBRID strategy).
 //! - [`graph_hybrid_search`] — vector + BM25 keyword + graph in parallel
 //!   (GRAPH_HYBRID strategy).
-//!
-//! Server-side BM25 inference is used for the keyword leg: the raw query text
-//! is forwarded to Qdrant as `Document { model: "qdrant/bm25" }` so no local
-//! SPLADE model is required.
 
-use agent_rs_core::{CollectionName, Embedding};
+use agent_rs_core::{CollectionName, Embedding, UserId};
 use agent_rs_stores::{
     traits::{GraphStore, VectorStore},
     types::SearchResult,
@@ -46,7 +45,7 @@ pub struct HybridResults {
 
 // ---- hybrid_search ----
 
-/// Dispatch vector and BM25 keyword searches in parallel.
+/// Dispatch user-scoped vector and BM25 keyword searches in parallel.
 ///
 /// Both searches target the same `collection`. Results are returned as
 /// an unfused [`HybridResults`] (graph_results is `None`).
@@ -56,6 +55,7 @@ pub struct HybridResults {
 /// - `vector_store` — the vector backend.
 /// - `collection` — the target collection (must have both dense and sparse
 ///   named vectors; sparse must be configured with `Modifier::Idf`).
+/// - `user_id` — tenant scope; mandatory — empty value is a programming error.
 /// - `query_embedding` — the dense query vector.
 /// - `query_text` — the raw query string for server-side BM25 inference.
 /// - `limit` — maximum results per back-end.
@@ -70,13 +70,21 @@ pub struct HybridResults {
 pub async fn hybrid_search(
     vector_store: &(dyn VectorStore + Send + Sync),
     collection: &CollectionName,
+    user_id: &UserId,
     query_embedding: &Embedding,
     query_text: &str,
     limit: usize,
 ) -> Result<HybridResults, RetrievalError> {
     let (vector_result, keyword_result) = tokio::join!(
-        vector_search(vector_store, collection, query_embedding, limit),
-        keyword_search(vector_store, collection, query_embedding, query_text, limit),
+        vector_search(vector_store, collection, user_id, query_embedding, limit),
+        keyword_search(
+            vector_store,
+            collection,
+            user_id,
+            query_embedding,
+            query_text,
+            limit
+        ),
     );
 
     Ok(HybridResults {
@@ -109,7 +117,7 @@ pub struct GraphHybridParams<'a> {
 
 // ---- graph_hybrid_search ----
 
-/// Dispatch vector, BM25 keyword, and graph searches in parallel.
+/// Dispatch user-scoped vector, BM25 keyword, and graph searches in parallel.
 ///
 /// All three searches run concurrently. Vector and keyword searches target
 /// `collection`; graph search expands from `params.seed_node_ids`. Results are
@@ -121,6 +129,7 @@ pub struct GraphHybridParams<'a> {
 /// - `vector_store` — the vector backend (used for both vector and keyword).
 /// - `graph_store` — the graph backend.
 /// - `collection` — the target vector/keyword collection.
+/// - `user_id` — tenant scope; mandatory — empty value is a programming error.
 /// - `params` — all remaining search parameters; see [`GraphHybridParams`].
 ///
 /// # Errors
@@ -136,18 +145,21 @@ pub async fn graph_hybrid_search(
     vector_store: &(dyn VectorStore + Send + Sync),
     graph_store: &(dyn GraphStore + Send + Sync),
     collection: &CollectionName,
+    user_id: &UserId,
     params: GraphHybridParams<'_>,
 ) -> Result<HybridResults, RetrievalError> {
     let (vector_result, keyword_result, graph_result) = tokio::join!(
         vector_search(
             vector_store,
             collection,
+            user_id,
             params.query_embedding,
             params.limit
         ),
         keyword_search(
             vector_store,
             collection,
+            user_id,
             params.query_embedding,
             params.query_text,
             params.limit
@@ -156,6 +168,7 @@ pub async fn graph_hybrid_search(
             graph_store,
             vector_store,
             collection,
+            user_id,
             params.query,
             params.seed_node_ids,
             params.max_depth,
