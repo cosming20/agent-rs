@@ -75,5 +75,11 @@ pub(crate) fn agent_error_to_status(err: AgentError) -> Status {
                 "An internal error occurred. Correlation ID: {correlation_id}"
             ))
         }
+        InvalidUserId(ref raw) => {
+            tracing::warn!(correlation_id = %correlation_id, raw = %raw, "invalid user_id in request");
+            Status::invalid_argument(format!(
+                "Invalid user_id. Correlation ID: {correlation_id}"
+            ))
+        }
     }
 }

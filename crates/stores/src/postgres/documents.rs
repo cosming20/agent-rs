@@ -275,6 +275,41 @@ impl PgStore {
         Ok(())
     }
 
+    /// Persist the MinIO object key for an `ingested_documents` row identified
+    /// by `(user_id, document_id)`.
+    ///
+    /// Called by the ingest CLI after a successful `MinioStore::put_object` so
+    /// the object key is recorded in Postgres alongside the pipeline metadata.
+    /// The update is idempotent: re-running the CLI for a document that was
+    /// already uploaded just overwrites the key with the same value.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::Postgres`] on any database error.
+    #[instrument(skip(self), fields(document_id = %document_id, user_id = %user_id.as_str()))]
+    pub async fn set_minio_object_key(
+        &self,
+        user_id: &UserId,
+        document_id: Uuid,
+        object_key: &str,
+    ) -> Result<(), StoreError> {
+        let mut conn = self.conn().await?;
+        let now = Utc::now().naive_utc();
+
+        diesel::update(ingested_documents::table)
+            .filter(ingested_documents::user_id.eq(user_id.as_str()))
+            .filter(ingested_documents::document_id.eq(document_id))
+            .set((
+                ingested_documents::minio_object_key.eq(Some(object_key)),
+                ingested_documents::updated_at.eq(now),
+            ))
+            .execute(&mut conn)
+            .await
+            .map_err(StoreError::from)?;
+
+        Ok(())
+    }
+
     /// Return `true` if a document with `sha256` has `ingest_status = 'complete'`
     /// **and** is owned by `user_id`.
     ///

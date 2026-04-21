@@ -1019,6 +1019,9 @@ impl IngestionPipeline {
                 started_at: now,
                 updated_at: now,
                 user_id: user_id.to_owned(),
+                // MinIO key is not known at pipeline entry; the CLI ingest example
+                // updates it via PgStore::set_minio_object_key after upload.
+                minio_object_key: None,
             };
 
             let pg_user_id = agent_rs_core::UserId::from_string(user_id.to_owned());

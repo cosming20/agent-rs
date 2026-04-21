@@ -58,6 +58,7 @@ regex      = "1"
 qdrant-client = "1"
 dotenvy    = "0.15"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+sha2       = "0.10"
 
 [workspace.package]
 edition = "2024"
