@@ -16,9 +16,10 @@ use std::time::{Duration, Instant};
 use agent_rs::stores::Stores;
 use agent_rs_agent::orchestrator::AgentOrchestrator;
 use agent_rs_core::errors::AgentError;
-use agent_rs_core::types::{MessageRole, RetrievalStrategy, UserId};
+use agent_rs_core::types::{CollectionName, MessageRole, RetrievalStrategy, UserId};
 use agent_rs_queue::{IndexJob, IndexPublisher};
-use agent_rs_stores::types::ChatTurn;
+use agent_rs_stores::traits::VectorStore;
+use agent_rs_stores::types::{ChatTurn, FilterSpec};
 use futures::Stream;
 use tokio::time::sleep;
 use tonic::{Request, Response, Status};
@@ -46,6 +47,12 @@ pub struct AgentServerDeps {
     /// RabbitMQ publisher used by `EnqueueIndex` to hand jobs off to the
     /// `IndexerWorker`.
     pub index_publisher: Arc<IndexPublisher>,
+    /// Primary chunks collection (e.g. `agent-rs`).
+    pub chunk_collection: CollectionName,
+    /// Per-section summaries collection (e.g. `agent-rs_summaries`).
+    pub summaries_collection: CollectionName,
+    /// Knowledge-graph triplets collection (e.g. `agent-rs_triplets`).
+    pub triplet_collection: CollectionName,
 }
 
 // ---- server struct ----------------------------------------------------------
@@ -55,16 +62,27 @@ pub struct AgentServer {
     stores: Stores,
     orchestrator: Arc<AgentOrchestrator>,
     index_publisher: Arc<IndexPublisher>,
+    chunk_collection: CollectionName,
+    summaries_collection: CollectionName,
+    triplet_collection: CollectionName,
 }
 
 impl AgentServer {
     /// Construct from a pre-wired dependency bundle.
     pub fn new(deps: AgentServerDeps) -> Self {
-        info!("AgentServer initialised");
+        info!(
+            chunk_collection = %deps.chunk_collection,
+            summaries_collection = %deps.summaries_collection,
+            triplet_collection = %deps.triplet_collection,
+            "AgentServer initialised"
+        );
         Self {
             stores: deps.stores,
             orchestrator: deps.orchestrator,
             index_publisher: deps.index_publisher,
+            chunk_collection: deps.chunk_collection,
+            summaries_collection: deps.summaries_collection,
+            triplet_collection: deps.triplet_collection,
         }
     }
 }
@@ -271,9 +289,12 @@ impl Agent for AgentServer {
             let citations: Vec<pb::Citation> = response
                 .citations
                 .iter()
-                .enumerate()
-                .map(|(i, c)| pb::Citation {
-                    index: (i + 1) as u32,
+                .map(|c| pb::Citation {
+                    // Synthesizer already assigns 1-based indices — preserve
+                    // them so that textual `[n]` markers in `answer` continue
+                    // to line up with `citations[n-1]` even if synthesis
+                    // adds a filter/dedupe pass later.
+                    index: c.index as u32,
                     chunk_id: c.chunk_id.clone(),
                     content_snippet: c.content_snippet.clone(),
                     minio_object_key: c.minio_object_key.clone(),
@@ -309,9 +330,20 @@ impl Agent for AgentServer {
     /// Unary `EnqueueIndex` RPC.
     ///
     /// Idempotently inserts a `document_index_state` row with `state=pending`
-    /// (CAS via `ON CONFLICT DO NOTHING`). The RabbitMQ publish step is a
-    /// TODO pending the `crates/queue` crate; until then the row alone is
-    /// enough for `GetDocumentStatus` and the future IndexerWorker to pick up.
+    /// (CAS via `ON CONFLICT DO NOTHING`), then publishes an [`IndexJob`] to
+    /// the RabbitMQ queue. If the publish fails, the state row is rolled
+    /// back so the next `EnqueueIndex` attempt can re-publish.
+    ///
+    /// ## Rollback race (documented trade-off)
+    ///
+    /// A pathological timeline exists where client A inserts the row and
+    /// starts publishing, client B observes `state=pending` and returns
+    /// `already_queued`, then A's publish fails and wipes the row. B's
+    /// caller still sees `already_queued` but `GetDocumentStatus` now
+    /// answers `not_found`. Web treats `not_found` as the authoritative
+    /// signal and simply re-enqueues — the inconsistency converges within
+    /// one poll cycle. We accept this over adding per-job-id optimistic
+    /// concurrency on the state row.
     #[instrument(skip(self, request), fields(user_id))]
     async fn enqueue_index(
         &self,
@@ -424,6 +456,18 @@ impl Agent for AgentServer {
 
     // ---- DeleteDocument -----------------------------------------------------
 
+    /// Purge every trace of a document owned by `user_id`:
+    ///
+    /// 1. Qdrant: `delete_by_filter` on the chunks + summaries + triplets
+    ///    collections, scoped to `(user_id, minio_object_key)`.
+    /// 2. Neo4j: detach-delete the `Document` node (matched on `id` +
+    ///    `user_id`) and every descendant (`Section`, `Chunk`, `Page`,
+    ///    `Table`, `Picture`) reachable through the structural relations.
+    /// 3. Postgres: drop the `document_index_state` row so a future
+    ///    `EnqueueIndex` for the same key starts fresh.
+    ///
+    /// The web app separately removes the MinIO object — it wrote the
+    /// bytes; it owns the blob lifecycle.
     #[instrument(skip(self, request), fields(user_id))]
     async fn delete_document(
         &self,
@@ -438,18 +482,61 @@ impl Agent for AgentServer {
             return Err(Status::invalid_argument("minio_object_key is empty"));
         }
 
-        // TODO(delete): drop Qdrant points + Neo4j subgraph filtered by
-        // payload.minio_object_key once the store APIs land (task #47/#48).
-        // For now we only remove the state row so the web app can re-enqueue.
+        // ---- Qdrant: purge all three collections -----------------------
+        let build_filter = || {
+            FilterSpec::And(vec![
+                FilterSpec::eq("user_id", user_id.as_str().to_owned()),
+                FilterSpec::eq("minio_object_key", key.clone()),
+            ])
+        };
+
+        let removed_chunks = self
+            .stores
+            .qdrant
+            .delete_by_filter(&self.chunk_collection, build_filter())
+            .await
+            .map_err(map_store_err)?;
+        let _ = self
+            .stores
+            .qdrant
+            .delete_by_filter(&self.summaries_collection, build_filter())
+            .await
+            .map_err(map_store_err)?;
+        let _ = self
+            .stores
+            .qdrant
+            .delete_by_filter(&self.triplet_collection, build_filter())
+            .await
+            .map_err(map_store_err)?;
+
+        // ---- Neo4j: detach-delete the Document + descendants -----------
+        //
+        // The Cypher interpolates only the label constants; the caller
+        // input flows through `$minio_key` and `$user_id` parameters.
+        let removed_sections = self
+            .stores
+            .neo4j
+            .delete_document_by_minio_key(&user_id, &key)
+            .await
+            .map_err(map_store_err)?;
+
+        // ---- Postgres: drop the state row ------------------------------
         self.stores
             .postgres
             .delete_index_state(&user_id, &key)
             .await
             .map_err(map_store_err)?;
 
+        info!(
+            removed_chunks,
+            removed_sections,
+            minio_object_key = %key,
+            "document deleted"
+        );
+
         Ok(Response::new(pb::DeleteDocumentResponse {
-            removed_chunks: 0,
-            removed_sections: 0,
+            removed_chunks: removed_chunks as u32,
+            removed_sections: removed_sections as u32,
         }))
     }
 }

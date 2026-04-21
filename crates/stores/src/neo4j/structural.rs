@@ -603,6 +603,82 @@ impl Neo4jStore {
         tracing::info!(run_id = %run_id_str, deleted_nodes = deleted, "rollback complete");
         Ok(deleted)
     }
+
+    /// Delete a document subgraph by its MinIO object key.
+    ///
+    /// Detach-deletes the `Document` node matching `(id = $minio_key,
+    /// user_id = $user_id)` and every descendant reachable through the
+    /// `HAS_PAGE` / `HAS_SECTION` / `HAS_TABLE` / `HAS_PICTURE` edges
+    /// (i.e. `Page`, `Section`, `Chunk`, `Table`, `Picture`). Cross-user
+    /// deletes are a no-op because the `user_id` predicate is on the root
+    /// node.
+    ///
+    /// Returns the total number of nodes detached and deleted (for logs
+    /// and the `DeleteDocumentResponse.removed_sections` field — we use
+    /// total descendants as an approximation since the proto does not
+    /// separate chunks / sections / pages).
+    ///
+    /// # Errors
+    ///
+    /// - [`StoreError`] on Neo4j query failure.
+    #[instrument(skip(self), fields(user_id = %user_id, minio_object_key = %minio_object_key))]
+    pub async fn delete_document_by_minio_key(
+        &self,
+        user_id: &UserId,
+        minio_object_key: &str,
+    ) -> Result<u64, StoreError> {
+        // Count first so we can return an accurate number — Neo4j's DETACH
+        // DELETE does not report a node count at the driver layer.
+        let count_cypher = format!(
+            "MATCH (d:{LABEL_DOCUMENT} {{id: $minio_key, user_id: $user_id}}) \
+             OPTIONAL MATCH (d)-[:{REL_HAS_PAGE}|{REL_HAS_SECTION}|{REL_HAS_TABLE}|{REL_HAS_PICTURE}*0..]->(n) \
+             RETURN count(DISTINCT n) AS total"
+        );
+        let mut rs = self
+            .graph
+            .execute(
+                query(&count_cypher)
+                    .param("minio_key", minio_object_key)
+                    .param("user_id", user_id.as_str()),
+            )
+            .await
+            .map_err(StoreError::from)?;
+        let deleted: u64 = match rs.next().await.map_err(StoreError::from)? {
+            Some(row) => {
+                let n: i64 = row.get("total").map_err(|e| {
+                    StoreError::QueryFailed(format!("delete count deserialize: {e}"))
+                })?;
+                n.max(0) as u64
+            }
+            None => 0,
+        };
+
+        if deleted == 0 {
+            return Ok(0);
+        }
+
+        let delete_cypher = format!(
+            "MATCH (d:{LABEL_DOCUMENT} {{id: $minio_key, user_id: $user_id}}) \
+             OPTIONAL MATCH (d)-[:{REL_HAS_PAGE}|{REL_HAS_SECTION}|{REL_HAS_TABLE}|{REL_HAS_PICTURE}*0..]->(n) \
+             DETACH DELETE d, n"
+        );
+        self.graph
+            .run(
+                query(&delete_cypher)
+                    .param("minio_key", minio_object_key)
+                    .param("user_id", user_id.as_str()),
+            )
+            .await
+            .map_err(StoreError::from)?;
+
+        tracing::info!(
+            user_id = %user_id,
+            minio_object_key = %minio_object_key,
+            deleted_nodes = deleted,
+            "document subgraph deleted"
+        );
+        Ok(deleted)
+    }
 }
 
 // ---------------------------------------------------------------------------

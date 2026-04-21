@@ -75,10 +75,8 @@ async fn main() -> Result<()> {
     )
     .context("build AgentOrchestrator")?;
 
-    let amqp_endpoint = std::env::var("AGENT_RS__RABBITMQ__ENDPOINT")
-        .unwrap_or_else(|_| "amqp://agentrs:agentrs-local@localhost:1075".to_owned());
     let index_publisher = Arc::new(
-        IndexPublisher::connect(&amqp_endpoint)
+        IndexPublisher::connect(&settings.rabbitmq.endpoint)
             .await
             .context("connect to RabbitMQ indexing queue")?,
     );
@@ -87,6 +85,9 @@ async fn main() -> Result<()> {
         stores,
         orchestrator: Arc::new(orchestrator),
         index_publisher,
+        chunk_collection: collection,
+        summaries_collection,
+        triplet_collection,
     });
 
     let port: u16 = std::env::var("AGENT_RS__AGENT_SERVICE__PORT")

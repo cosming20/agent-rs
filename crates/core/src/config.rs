@@ -424,6 +424,27 @@ impl Default for MinioConfig {
     }
 }
 
+/// RabbitMQ connection configuration for the indexing queue.
+///
+/// All values are layered: compiled-in defaults → `config.toml` →
+/// `AGENT_RS__RABBITMQ__*` env vars. The default endpoint points at the
+/// docker-compose-provided broker on ports 1075 (AMQP) / 1076 (management).
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct RabbitmqConfig {
+    /// AMQP URI, e.g. `amqp://user:pass@host:port`.
+    ///
+    /// Override via `AGENT_RS__RABBITMQ__ENDPOINT`.
+    pub endpoint: String,
+}
+
+impl Default for RabbitmqConfig {
+    fn default() -> Self {
+        Self {
+            endpoint: "amqp://agentrs:agentrs-local@localhost:1075".into(),
+        }
+    }
+}
+
 /// gRPC server configuration.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ServerConfig {
@@ -500,6 +521,9 @@ pub struct Settings {
     /// MinIO / S3-compatible object storage settings.
     #[serde(default)]
     pub minio: MinioConfig,
+    /// RabbitMQ connection settings for the indexing queue.
+    #[serde(default)]
+    pub rabbitmq: RabbitmqConfig,
 }
 
 impl Default for Settings {
@@ -611,6 +635,7 @@ impl Default for Settings {
                 max_pages: 500,
             },
             minio: MinioConfig::default(),
+            rabbitmq: RabbitmqConfig::default(),
         }
     }
 }
