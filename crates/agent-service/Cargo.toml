@@ -54,6 +54,15 @@ agent-rs-tools = { path = "../tools" }
 # Observability registry (metrics / tracing init)
 agent-rs-observability = { path = "../observability" }
 
+# Workspace root: provides connect_stores, build_ingestion_pipeline,
+# build_router, build_embedder, IngestFeatures, RouterFeatures, and the
+# canonical Stores struct. No circular dependency — the root does not
+# depend on agent-rs-agent-service.
+agent-rs = { path = "../.." }
+
+# Hashing — SHA-256 for document_id derivation (same as examples/ingest.rs)
+sha2 = { workspace = true }
+
 uuid = { workspace = true }
 chrono = { workspace = true }
 
