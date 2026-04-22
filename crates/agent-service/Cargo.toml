@@ -12,6 +12,13 @@ license.workspace = true
 name = "agent-service"
 path = "src/main.rs"
 
+# Indexer worker — a separate long-running process that consumes the
+# RabbitMQ index queue and runs the document-indexing pipeline
+# (AgentIndexHandler). docker-compose runs one or more replicas.
+[[bin]]
+name = "indexer-worker"
+path = "src/bin/indexer-worker.rs"
+
 [dependencies]
 # gRPC + codegen runtime
 tonic     = "0.12"
@@ -25,6 +32,7 @@ tokio = { workspace = true, features = ["macros", "rt-multi-thread", "signal"] }
 tokio-stream = "0.1"
 futures = "0.3"
 async-stream = "0.3"
+tower = { version = "0.5", features = ["limit", "timeout", "load-shed"] }
 
 # Observability — reuse the workspace tracing stack
 tracing = { workspace = true }
@@ -57,6 +65,15 @@ agent-rs-observability = { path = "../observability" }
 
 # RabbitMQ publisher / consumer for the indexing pipeline
 agent-rs-queue = { path = "../queue" }
+
+# PDF text extraction for the IndexerWorker's MVP indexing pipeline.
+# Lightweight alternative to the Docling sidecar — used while Docling is
+# unavailable or for simple text-only PDFs.
+pdf-extract = { workspace = true }
+
+# Serde helpers for chunk payloads.
+serde_json = { workspace = true }
+async-trait = { workspace = true }
 
 # Workspace root: provides connect_stores, build_ingestion_pipeline,
 # build_router, build_embedder, IngestFeatures, RouterFeatures, and the

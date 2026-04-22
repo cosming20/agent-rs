@@ -31,12 +31,21 @@ use pb::agent_server::Agent;
 
 /// Polling period while an active document is still indexing.
 ///
-/// The client sees an `AskIndexingWait` every tick so its spinner stays live.
-const INDEXING_POLL_INTERVAL: Duration = Duration::from_millis(500);
+/// Kept at 1 second so a single connected client generates at most 1 poll/s
+/// on Postgres per document — a 1000-client burst produces ≤1000 SELECTs/s
+/// rather than the 2000/s the 500 ms cadence would. The client's UI spinner
+/// still animates; the server just emits coarser `AskIndexingWait` ticks.
+const INDEXING_POLL_INTERVAL: Duration = Duration::from_secs(1);
 
 /// Safety cap on how long `Ask` will wait for all active documents to finish
 /// indexing before returning an error.
-const INDEXING_MAX_WAIT: Duration = Duration::from_secs(120);
+///
+/// A short cap is deliberate: a long deadline encourages web clients to hold
+/// the gRPC stream open while the IndexerWorker chews through a PDF, which
+/// would keep a tower concurrency slot occupied. Web polls
+/// `GetDocumentStatus` separately — once the poll goes `complete`, it
+/// retries `Ask` and we burn zero wait time.
+const INDEXING_MAX_WAIT: Duration = Duration::from_secs(30);
 
 // ---- dependency bundle -----------------------------------------------------
 

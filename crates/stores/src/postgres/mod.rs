@@ -59,22 +59,64 @@ use schema::{evidence_items, memories, query_runs};
 // PgStore
 // ---------------------------------------------------------------------------
 
+/// Sizing parameters for the bb8 connection pool.
+///
+/// Defaults chosen for a single-node Postgres sized against
+/// docker-compose's `max_connections = 200`: 50 conns per agent-rs
+/// process leaves headroom for the web app, the indexer-worker fleet,
+/// and the Postgres admin session. Bump via
+/// [`PgStoreConfig::max_connections`] / `..::connection_timeout_ms` on a
+/// sharded/replicated setup.
+#[derive(Debug, Clone, Copy)]
+pub struct PgStoreConfig {
+    /// Hard cap on simultaneous pooled connections. A caller that misses
+    /// the cap gets a [`StoreError::ConnectionPool`] after
+    /// `connection_timeout_ms` elapses.
+    pub max_connections: u32,
+    /// How long [`PgStore::conn`] waits for a free slot before erroring.
+    pub connection_timeout_ms: u64,
+}
+
+impl Default for PgStoreConfig {
+    fn default() -> Self {
+        Self {
+            max_connections: 50,
+            connection_timeout_ms: 5_000,
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct PgStore {
     pool: Pool<AsyncPgConnection>,
 }
 
 impl PgStore {
-    /// Create a new [`PgStore`], connecting to `database_url` and building
-    /// a `bb8` connection pool with the default configuration.
+    /// Create a new [`PgStore`] with the default [`PgStoreConfig`].
     ///
     /// # Errors
     ///
     /// Returns [`StoreError::ConnectionPool`] if the pool fails to build or
-    /// if no initial connection can be established.
+    /// if no initial connection can be established within
+    /// `connection_timeout_ms`.
     pub async fn new(database_url: &str) -> Result<Self, StoreError> {
+        Self::with_config(database_url, PgStoreConfig::default()).await
+    }
+
+    /// Create a new [`PgStore`] with a caller-supplied [`PgStoreConfig`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::ConnectionPool`] if the pool fails to build
+    /// or if no initial connection can be established.
+    pub async fn with_config(
+        database_url: &str,
+        config: PgStoreConfig,
+    ) -> Result<Self, StoreError> {
         let manager = AsyncDieselConnectionManager::<AsyncPgConnection>::new(database_url);
         let pool = Pool::builder()
+            .max_size(config.max_connections)
+            .connection_timeout(std::time::Duration::from_millis(config.connection_timeout_ms))
             .build(manager)
             .await
             .map_err(|e| StoreError::ConnectionPool(e.to_string()))?;

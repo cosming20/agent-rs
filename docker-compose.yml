@@ -361,6 +361,60 @@ services:
       start_period: 20s
 
   # ----------------------------------------------------------
+  # IndexerWorker — horizontal pool of RabbitMQ consumers that run
+  # the document-indexing pipeline (MinIO read → chunk → embed →
+  # Qdrant upsert → mark complete). One instance per replica; the
+  # broker fans out queue messages round-robin.
+  #
+  # Sized for MVP at 3 replicas × prefetch 5 = 15 in-flight jobs.
+  # Bump `deploy.replicas` (or `docker compose up --scale
+  # indexer-worker=N`) + `AGENT_RS__INDEXER__PREFETCH` to match
+  # corpus size without redeploying.
+  # ----------------------------------------------------------
+  indexer-worker:
+    build:
+      context: .
+      dockerfile: infra/indexer-worker/Dockerfile
+    restart: "on-failure:5"
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+      qdrant:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+    environment:
+      # Connect strings — mirror agent-service's configuration so
+      # the two processes talk to the same infra. Override via the
+      # root .env file when using non-default ports / credentials.
+      - AGENT_RS__RABBITMQ__ENDPOINT=amqp://${RABBITMQ_USER:-agentrs}:${RABBITMQ_PASSWORD:-agentrs-local}@rabbitmq:5672
+      - AGENT_RS__POSTGRES__HOST=postgres
+      - AGENT_RS__POSTGRES__PORT=5432
+      - AGENT_RS__POSTGRES__USER=${POSTGRES_USER}
+      - AGENT_RS__POSTGRES__PASSWORD=${POSTGRES_PASSWORD}
+      - AGENT_RS__POSTGRES__DB=${POSTGRES_DB}
+      - AGENT_RS__QDRANT__HOST=qdrant
+      - AGENT_RS__QDRANT__GRPC_PORT=6334
+      - AGENT_RS__QDRANT__HTTP_PORT=6333
+      - AGENT_RS__QDRANT__API_KEY=${QDRANT_API_KEY}
+      - AGENT_RS__MINIO__ENDPOINT=http://minio:9000
+      - AGENT_RS__MINIO__ACCESS_KEY=${MINIO_ROOT_USER:-minioadmin}
+      - AGENT_RS__MINIO__SECRET_KEY=${MINIO_ROOT_PASSWORD:-minioadmin}
+      - AGENT_RS__INDEXER__PREFETCH=${INDEXER_PREFETCH:-5}
+      - RUST_LOG=${RUST_LOG:-info}
+    networks:
+      - agentic-ra-net
+    mem_limit: 1g
+    mem_reservation: 512m
+    cpus: 1.0
+    deploy:
+      replicas: 3
+    profiles:
+      - worker
+
+  # ----------------------------------------------------------
   # Docling Sidecar — PDF parsing + structural chunking (gRPC)
   # Port 1068 (1064/1065 reserved for ruvector profile).
   # Build context: repo root (current directory).

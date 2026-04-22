@@ -28,7 +28,7 @@ pub mod summarizer;
 pub mod text_normalize;
 pub mod types;
 
-pub use chunker::{ChunkStrategy, ChunkerConfig, DocumentChunk};
+pub use chunker::{ChunkStrategy, ChunkerConfig, DocumentChunk, chunk_document};
 pub use docling_client::{DoclingResponse, DoclingSidecarClient};
 pub use graph_extractor::{
     DEFAULT_BATCH_CONCURRENCY, ExtractedEdge, ExtractedNode, KnowledgeGraph, LlmGraphExtractor,

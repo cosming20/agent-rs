@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use agent_rs_core::config::Settings;
 use agent_rs_stores::neo4j::Neo4jStore;
-use agent_rs_stores::postgres::PgStore;
+use agent_rs_stores::postgres::{PgStore, PgStoreConfig};
 use agent_rs_stores::qdrant::QdrantStore;
 use anyhow::{Context, Result};
 use tracing::info;
@@ -29,11 +29,21 @@ pub async fn connect_stores(settings: &Settings) -> Result<Stores> {
             .context("failed to connect to Neo4j")?,
     );
 
-    info!("connecting to Postgres...");
+    info!(
+        max_connections = settings.postgres.max_connections,
+        connection_timeout_ms = settings.postgres.connection_timeout_ms,
+        "connecting to Postgres..."
+    );
     let postgres = Arc::new(
-        PgStore::new(&settings.postgres.dsn())
-            .await
-            .context("failed to connect to Postgres")?,
+        PgStore::with_config(
+            &settings.postgres.dsn(),
+            PgStoreConfig {
+                max_connections: settings.postgres.max_connections,
+                connection_timeout_ms: settings.postgres.connection_timeout_ms,
+            },
+        )
+        .await
+        .context("failed to connect to Postgres")?,
     );
 
     info!("all storage backends connected");

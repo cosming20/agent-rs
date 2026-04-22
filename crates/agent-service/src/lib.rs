@@ -5,5 +5,6 @@
 //! wires configuration loading + tracing + a graceful shutdown signal
 //! around [`server::AgentServer`].
 
+pub mod indexer;
 pub mod pb;
 pub mod server;

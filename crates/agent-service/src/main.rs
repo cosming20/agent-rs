@@ -11,6 +11,7 @@
 
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 
 use agent_rs::embedder::build_embedder;
 use agent_rs::router::{RouterFeatures, build_router};
@@ -23,6 +24,10 @@ use agent_rs_observability::tracing::init_tracing;
 use agent_rs_queue::IndexPublisher;
 use anyhow::{Context, Result};
 use tonic::transport::Server;
+use tower::ServiceBuilder;
+use tower::limit::ConcurrencyLimitLayer;
+use tower::load_shed::LoadShedLayer;
+use tower::timeout::TimeoutLayer;
 use tracing::info;
 
 use agent_rs_agent_service::pb::agent_server::AgentServer as AgentGrpcServer;
@@ -98,9 +103,39 @@ async fn main() -> Result<()> {
         .parse()
         .context("parse bind address")?;
 
-    info!(%addr, "agent-rs-agent-service listening");
+    let srv = &settings.server;
+    let request_timeout = Duration::from_secs(srv.request_timeout_s);
+
+    // Layer stack (outer → inner):
+    //   LoadShed  — convert backpressure from ConcurrencyLimit into
+    //               immediate `ResourceExhausted` instead of queueing
+    //   Concurrency — global cap on in-flight RPCs across every conn
+    //   Timeout   — per-request wall-clock deadline; excess is
+    //               cancelled with `DeadlineExceeded`
+    //
+    // The tonic `.timeout()` setting at the transport level is kept as a
+    // belt-and-braces fallback; the tower layer is the authoritative cap.
+    let layer = ServiceBuilder::new()
+        .layer(LoadShedLayer::new())
+        .layer(ConcurrencyLimitLayer::new(srv.max_in_flight))
+        .layer(TimeoutLayer::new(request_timeout))
+        .into_inner();
+
+    info!(
+        %addr,
+        max_in_flight = srv.max_in_flight,
+        request_timeout_s = srv.request_timeout_s,
+        max_concurrent_streams = srv.max_concurrent_streams,
+        concurrency_per_connection = srv.concurrency_per_connection,
+        "agent-rs-agent-service listening"
+    );
 
     Server::builder()
+        .timeout(request_timeout)
+        .tcp_keepalive(Some(Duration::from_secs(30)))
+        .concurrency_limit_per_connection(srv.concurrency_per_connection as usize)
+        .max_concurrent_streams(Some(srv.max_concurrent_streams))
+        .layer(layer)
         .add_service(AgentGrpcServer::new(server))
         .serve_with_shutdown(addr, shutdown_signal())
         .await

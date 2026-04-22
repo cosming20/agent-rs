@@ -75,6 +75,26 @@ pub struct PostgresConfig {
     pub user: String,
     pub password: String,
     pub db: String,
+    /// Hard cap on simultaneous pooled connections per process. Must be
+    /// sized against Postgres's `max_connections` so all agent-rs /
+    /// indexer-worker / web replicas fit. Override via
+    /// `AGENT_RS__POSTGRES__MAX_CONNECTIONS`.
+    #[serde(default = "default_pg_max_connections")]
+    pub max_connections: u32,
+    /// How long a caller waits for a free pool slot before the request
+    /// errors. Keep strictly below any outer request deadline so failures
+    /// surface at the pool layer, not as a client timeout. Override via
+    /// `AGENT_RS__POSTGRES__CONNECTION_TIMEOUT_MS`.
+    #[serde(default = "default_pg_connection_timeout_ms")]
+    pub connection_timeout_ms: u64,
+}
+
+fn default_pg_max_connections() -> u32 {
+    50
+}
+
+fn default_pg_connection_timeout_ms() -> u64 {
+    5_000
 }
 
 impl fmt::Debug for PostgresConfig {
@@ -478,6 +498,18 @@ pub struct ServerConfig {
     ///
     /// Override via `AGENT_RS__SERVER__CONCURRENCY_PER_CONNECTION`.
     pub concurrency_per_connection: u32,
+    /// Global cap on in-flight gRPC calls across every connection. The
+    /// tower `ConcurrencyLimitLayer` shed-sheds above this: callers
+    /// receive `Status::resource_exhausted` rather than queueing
+    /// indefinitely behind a saturated Postgres / Qdrant / LLM tier.
+    ///
+    /// Override via `AGENT_RS__SERVER__MAX_IN_FLIGHT`.
+    #[serde(default = "default_max_in_flight")]
+    pub max_in_flight: usize,
+}
+
+fn default_max_in_flight() -> usize {
+    512
 }
 
 impl ServerConfig {
@@ -545,6 +577,8 @@ impl Default for Settings {
                 user: "agentic".into(),
                 password: "agentic".into(),
                 db: "agentic_rag".into(),
+                max_connections: default_pg_max_connections(),
+                connection_timeout_ms: default_pg_connection_timeout_ms(),
             },
             neo4j: Neo4jConfig {
                 host: "localhost".into(),
@@ -625,6 +659,7 @@ impl Default for Settings {
                 request_timeout_s: 120,
                 max_concurrent_streams: 256,
                 concurrency_per_connection: 32,
+                max_in_flight: default_max_in_flight(),
             },
             ingest_backend: IngestBackend::default(),
             docling: DoclingConfig {
