@@ -153,7 +153,7 @@ impl DoclingSidecarClient {
     /// - Out-of-order or missing stream messages.
     /// - Sidecar-reported `IngestError` payload.
     pub async fn chunk_document(
-        &mut self,
+        &self,
         file_bytes: Vec<u8>,
         doc_id: &str,
         source: &str,
@@ -184,8 +184,12 @@ impl DoclingSidecarClient {
             source, "sending ChunkDocumentRequest to Docling sidecar"
         );
 
-        let response = self
-            .inner
+        // Tonic's generated client method takes `&mut self`, but the
+        // underlying `Channel` is already `Arc`-backed and HTTP/2
+        // multiplexes concurrent streams. Clone per call so the outer
+        // `DoclingSidecarClient` is `Sync` and shareable via `Arc`.
+        let mut client = self.inner.clone();
+        let response = client
             .chunk_document(request)
             .await
             .map_err(|status| map_tonic_status(status, doc_id))?;

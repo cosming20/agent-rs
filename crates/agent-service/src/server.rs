@@ -168,6 +168,25 @@ impl Agent for AgentServer {
     ///    [`AgentOrchestrator::process_query`] with inline history and
     ///    active/history key union.
     /// 3. Emits a single terminal `AskFinal` (or `AskError`).
+    ///
+    /// # Cancellation
+    ///
+    /// Two safety nets cap the lifetime of this RPC:
+    ///
+    /// - The tower `TimeoutLayer` wired in `main.rs` enforces
+    ///   `settings.server.request_timeout_s` on the whole call.
+    /// - The body is built with `async_stream::try_stream!`; when the
+    ///   client drops the tonic stream, the returned `Stream` is
+    ///   dropped and every `.await` inside is cancelled at its next
+    ///   yield point. The `AgentOrchestrator::process_query` pipeline
+    ///   uses no `tokio::spawn`, so dropping the future drops every
+    ///   sub-future transitively — no orphan tool calls survive the
+    ///   disconnect.
+    ///
+    /// If a long-running tool (LLM request, Brave fetch) is between yield
+    /// points, the in-flight HTTP call completes before cancellation
+    /// surfaces. That's an accepted latency on the disconnection path;
+    /// `TimeoutLayer` bounds the damage.
     #[instrument(skip(self, request), fields(user_id, strategy, trace_id))]
     async fn ask(
         &self,

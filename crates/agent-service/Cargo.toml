@@ -71,6 +71,10 @@ agent-rs-queue = { path = "../queue" }
 # unavailable or for simple text-only PDFs.
 pdf-extract = { workspace = true }
 
+# Shared HTTP client for the optional LLM stages (summarizer, KG
+# extractor). Pinned to rustls-TLS to match the workspace default.
+reqwest = { workspace = true }
+
 # Serde helpers for chunk payloads.
 serde_json = { workspace = true }
 async-trait = { workspace = true }

@@ -12,23 +12,35 @@
 //! gRPC and never runs agent tools) to keep process memory low.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use agent_rs::embedder::build_embedder;
 use agent_rs::stores::connect_stores;
-use agent_rs_agent_service::indexer::AgentIndexHandler;
-use agent_rs_core::config::Settings;
+use agent_rs_agent_service::indexer::{AgentIndexHandler, AgentIndexHandlerDeps};
+use agent_rs_core::config::{IngestBackend, Settings};
 use agent_rs_core::types::CollectionName;
 use agent_rs_observability::metrics::RetrievalMetrics;
 use agent_rs_observability::tracing::init_tracing;
 use agent_rs_queue::run_indexer;
-use agent_rs_retrieval::ingestion::ChunkerConfig;
+use agent_rs_retrieval::ingestion::docling_client::DoclingSidecarClient;
+use agent_rs_retrieval::ingestion::summarizer::ChunkSummarizer;
+use agent_rs_retrieval::ingestion::{ChunkerConfig, LlmGraphExtractor};
 use anyhow::{Context, Result};
-use tracing::info;
+use tracing::{info, warn};
 
 /// Default number of in-flight jobs per worker process. Tuned for the
 /// MVP pipeline (~200 MiB peak per job). Override via
 /// `AGENT_RS__INDEXER__PREFETCH` without rebuilding.
 const DEFAULT_PREFETCH: u16 = 5;
+
+/// Parse a boolean-shaped env var. Accepts `1`, `true` (case-insensitive);
+/// everything else, including unset, is `false`.
+fn env_flag(name: &str) -> bool {
+    match std::env::var(name) {
+        Ok(v) => v == "1" || v.eq_ignore_ascii_case("true"),
+        Err(_) => false,
+    }
+}
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -42,23 +54,129 @@ async fn main() -> Result<()> {
     info!(embedder = %embedder_label, "embedder ready");
 
     let collection = CollectionName::from_string(settings.retrieval.dataset.clone());
+    let summaries_collection =
+        CollectionName::from_string(format!("{}_summaries", collection.as_str()));
+    let triplet_collection =
+        CollectionName::from_string(format!("{}_triplets", collection.as_str()));
     // Metrics handle kept for parity with the gRPC service and to keep
     // the retrieval-metrics registration path hot for future Qdrant /
     // Neo4j instrumentation of the indexing hot loop.
     let _metrics = Arc::new(RetrievalMetrics::new("agent-rs-indexer-worker"));
 
-    let handler = Arc::new(AgentIndexHandler::new(
-        Arc::new(
+    // Docling sidecar — wire only when the configured ingest backend
+    // wants it. With `DoclingWithLegacyFallback` a connect failure is
+    // non-fatal: we log it and let the pdf-extract path carry the load
+    // until the sidecar comes back.
+    let docling: Option<Arc<DoclingSidecarClient>> = match settings.ingest_backend {
+        IngestBackend::Docling | IngestBackend::DoclingWithLegacyFallback => {
+            match DoclingSidecarClient::connect(
+                settings.docling.endpoint.clone(),
+                Duration::from_secs(settings.docling.connect_timeout_s),
+                Duration::from_secs(settings.docling.stream_idle_timeout_s),
+            )
+            .await
+            {
+                Ok(client) => {
+                    info!(
+                        endpoint = %settings.docling.endpoint,
+                        "Docling sidecar client ready"
+                    );
+                    Some(Arc::new(client))
+                }
+                Err(e) if matches!(
+                    settings.ingest_backend,
+                    IngestBackend::DoclingWithLegacyFallback
+                ) =>
+                {
+                    warn!(error = %e, "Docling sidecar unreachable; falling back to pdf-extract");
+                    None
+                }
+                Err(e) => {
+                    return Err(anyhow::anyhow!(
+                        "Docling backend required but sidecar unavailable: {e}"
+                    ));
+                }
+            }
+        }
+        IngestBackend::Legacy => None,
+    };
+
+    // Optional LLM stages (per-chunk summaries + KG triplets).
+    //
+    // Controlled by:
+    //   - OPENAI_API_KEY / LLM_API_KEY env — turned into a shared key.
+    //   - AGENT_RS__INDEXER__ENABLE_SUMMARIES (default false)
+    //   - AGENT_RS__INDEXER__ENABLE_KG        (default false)
+    //
+    // Both default off so a fresh deployment does not accidentally spend
+    // LLM budget on every ingested document. Flip the flags on when the
+    // deployment has observability + rate-limit protection in place.
+    let llm_api_key = std::env::var("OPENAI_API_KEY")
+        .or_else(|_| std::env::var("LLM_API_KEY"))
+        .ok();
+    let llm_model = std::env::var("LLM_MODEL").unwrap_or_else(|_| "gpt-4o-mini".into());
+    let http_client = Arc::new(reqwest::Client::builder()
+        .timeout(Duration::from_secs(120))
+        .build()
+        .context("build shared HTTP client")?);
+
+    let summarizer = if env_flag("AGENT_RS__INDEXER__ENABLE_SUMMARIES") {
+        match llm_api_key.as_deref() {
+            Some(key) => {
+                info!(model = %llm_model, "summarizer enabled");
+                Some(Arc::new(ChunkSummarizer::new(
+                    key.to_owned(),
+                    llm_model.clone(),
+                    Arc::clone(&http_client),
+                )))
+            }
+            None => {
+                warn!("AGENT_RS__INDEXER__ENABLE_SUMMARIES=true but no OPENAI_API_KEY set; disabling");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    let extractor = if env_flag("AGENT_RS__INDEXER__ENABLE_KG") {
+        match llm_api_key.as_deref() {
+            Some(key) => {
+                info!(model = %llm_model, "KG extractor enabled");
+                Some(Arc::new(LlmGraphExtractor::new(
+                    key.to_owned(),
+                    llm_model.clone(),
+                    Arc::clone(&http_client),
+                )))
+            }
+            None => {
+                warn!("AGENT_RS__INDEXER__ENABLE_KG=true but no OPENAI_API_KEY set; disabling");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    let handler = Arc::new(AgentIndexHandler::new(AgentIndexHandlerDeps {
+        minio: Arc::new(
             agent_rs_stores::minio::MinioStore::new(settings.minio.clone())
                 .await
                 .context("connect MinIO")?,
         ),
         embedder,
-        stores.qdrant.clone(),
-        stores.postgres.clone(),
-        collection,
-        ChunkerConfig::default(),
-    ));
+        qdrant: stores.qdrant.clone(),
+        neo4j: stores.neo4j.clone(),
+        pg: stores.postgres.clone(),
+        chunk_collection: collection,
+        summaries_collection,
+        triplet_collection,
+        chunker_config: ChunkerConfig::default(),
+        docling,
+        ingest_backend: settings.ingest_backend,
+        summarizer,
+        extractor,
+    }));
 
     let prefetch: u16 = std::env::var("AGENT_RS__INDEXER__PREFETCH")
         .ok()

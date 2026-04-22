@@ -679,6 +679,138 @@ impl Neo4jStore {
         );
         Ok(deleted)
     }
+
+    /// Minimal structural upsert used by the RabbitMQ `IndexerWorker`
+    /// MVP path (pre-Docling integration).
+    ///
+    /// Writes:
+    ///   - One `Document { id: minio_object_key, user_id, sha256, source,
+    ///     n_chunks }` node.
+    ///   - One `Section { id: <uuidv5(minio_key, "section-{i}")>,
+    ///     doc_id: minio_object_key, heading: <first ~80 chars of chunk
+    ///     text>, section_order: i, first_chunk_index: i,
+    ///     is_preamble: false }` per chunk.
+    ///   - `(Document)-[:HAS_SECTION]->(Section)` edges so
+    ///     `list_sections_for_doc(user_id, minio_key)` returns one row
+    ///     per chunk — enough for `coverage_planner` and
+    ///     `outline_corpus` to emit a flat TOC.
+    ///
+    /// Rich Docling-derived structure (real sections, pages, tables,
+    /// pictures) continues to flow through [`Self::upsert_document_structure`];
+    /// this method is the fallback wired when the Docling sidecar is
+    /// unavailable or when indexing plain text.
+    ///
+    /// Idempotent via `MERGE`. Re-runs overwrite the node/section props
+    /// in place but preserve any prior `ingest_run_id`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError`] on Neo4j query failure or props serialisation.
+    #[instrument(
+        skip(self, chunk_headings),
+        fields(
+            user_id = %user_id,
+            minio_object_key = %minio_object_key,
+            n_sections = chunk_headings.len(),
+        )
+    )]
+    pub async fn upsert_minimal_document(
+        &self,
+        user_id: &UserId,
+        minio_object_key: &str,
+        sha256: &str,
+        source: &str,
+        chunk_headings: &[String],
+    ) -> Result<(), StoreError> {
+        let run_id = Uuid::new_v4().to_string();
+
+        // ---- Document node ---------------------------------------------
+        upsert_document_node(
+            &self.graph,
+            minio_object_key,
+            &run_id,
+            user_id.as_str(),
+            json!({
+                "sha256": sha256,
+                "source": source,
+                "n_chunks": chunk_headings.len() as i64,
+            }),
+        )
+        .await?;
+
+        if chunk_headings.is_empty() {
+            return Ok(());
+        }
+
+        // ---- Section nodes ---------------------------------------------
+        //
+        // Derive stable section ids from (minio_key, index) so re-indexing
+        // the same document hits the same Section nodes under MERGE
+        // instead of creating duplicates.
+        let doc_namespace = synthetic_doc_namespace(minio_object_key);
+        let section_rows: Vec<NodeRow> = chunk_headings
+            .iter()
+            .enumerate()
+            .map(|(i, heading)| {
+                let short = heading_preview(heading);
+                NodeRow {
+                    id: Uuid::new_v5(&doc_namespace, format!("section-{i}").as_bytes())
+                        .to_string(),
+                    run_id: run_id.clone(),
+                    props: json!({
+                        "doc_id": minio_object_key,
+                        "heading": short,
+                        "title": short,
+                        "section_order": i as i64,
+                        "first_chunk_index": i as i64,
+                        "page_start": 1,
+                        "is_preamble": false,
+                    }),
+                }
+            })
+            .collect();
+        upsert_nodes_batch(&self.graph, LABEL_SECTION, &section_rows).await?;
+
+        // ---- HAS_SECTION edges -----------------------------------------
+        let has_section_rows: Vec<EdgeRow> = section_rows
+            .iter()
+            .map(|s| EdgeRow {
+                src: minio_object_key.to_owned(),
+                dst: s.id.clone(),
+                run_id: run_id.clone(),
+            })
+            .collect();
+        upsert_edges_batch(&self.graph, REL_HAS_SECTION, &has_section_rows).await?;
+
+        tracing::info!(
+            user_id = %user_id,
+            minio_object_key = %minio_object_key,
+            n_sections = section_rows.len(),
+            "minimal structure upserted"
+        );
+        Ok(())
+    }
+}
+
+/// Build the UUIDv5 namespace for synthetic Section ids derived from a
+/// MinIO object key. Uses the `URL` namespace as the anchor — the key
+/// is already a URL-safe path.
+fn synthetic_doc_namespace(minio_object_key: &str) -> Uuid {
+    Uuid::new_v5(&Uuid::NAMESPACE_URL, minio_object_key.as_bytes())
+}
+
+/// First line (or up to 80 characters) of chunk text, trimmed, used as a
+/// human-readable Section heading.
+fn heading_preview(text: &str) -> String {
+    const MAX: usize = 80;
+    let first_line = text.lines().next().unwrap_or(text).trim();
+    if first_line.chars().count() <= MAX {
+        return first_line.to_owned();
+    }
+    // Truncate on a char boundary near MAX. String::chars().take() is
+    // safe because `String::from_iter(chars)` preserves UTF-8.
+    let trimmed: String = first_line.chars().take(MAX).collect();
+    format!("{trimmed}…")
 }
 
 // ---------------------------------------------------------------------------
