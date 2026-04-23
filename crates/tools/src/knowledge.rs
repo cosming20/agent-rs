@@ -216,13 +216,15 @@ impl Tool for SearchKnowledgeTool {
         let limit = args.limit.unwrap_or(DEFAULT_LIMIT);
 
         // Build the hard post-fusion predicate from the caller-supplied
-        // doc_id / section_id fields (Task 3.6 — Codex audit gap #10).
-        // An empty filter is passed as `None` so the router skips the retain
-        // loop entirely in the common case.
+        // doc_id / section_id fields. LLMs routinely emit `""` for these
+        // when they have no preference — pre-normalise to `None` so the
+        // router doesn't try to match on an empty-string payload value
+        // (which reliably matches zero documents).
         let section_filter = {
+            let normalise = |s: Option<String>| s.filter(|v| !v.trim().is_empty());
             let f = SectionFilter {
-                doc_id: args.doc_id.clone(),
-                section_id: args.section_id.clone(),
+                doc_id: normalise(args.doc_id.clone()),
+                section_id: normalise(args.section_id.clone()),
             };
             if f.is_empty() { None } else { Some(f) }
         };

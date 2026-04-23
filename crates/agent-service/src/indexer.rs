@@ -196,6 +196,13 @@ impl AgentIndexHandler {
                 payload: json!({
                     "user_id": user_id.as_str(),
                     "minio_object_key": job.minio_object_key,
+                    // `source` is what the ranker uses to build the
+                    // "evidence came from X" header. We don't carry the
+                    // original filename on the agent side (web owns it),
+                    // so the MinIO key is the closest stable identifier
+                    // — better than the "unknown" fallback and keeps
+                    // source-count histograms useful.
+                    "source": job.minio_object_key,
                     "chunk_id": c.chunk_id,
                     "chunk_text": c.raw_text,
                     "chunk_index": c.chunk_index,

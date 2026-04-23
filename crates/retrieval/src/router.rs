@@ -88,11 +88,19 @@ impl SectionFilter {
 ///
 /// Each field is checked independently; a `None` constraint always passes.
 /// Missing or non-string payload fields fail the corresponding constraint.
+///
+/// The `doc_id` constraint resolves against `minio_object_key` on the
+/// payload (the canonical document handle after the 2026-04-21 stateless
+/// pivot) with a fallback to the legacy `doc_id` key so chunks indexed
+/// before the rename remain retrievable.
 pub(crate) fn matches_section_filter(payload: &serde_json::Value, filter: &SectionFilter) -> bool {
-    let doc_ok = filter
-        .doc_id
-        .as_deref()
-        .is_none_or(|want| payload.get("doc_id").and_then(|v| v.as_str()) == Some(want));
+    let doc_ok = filter.doc_id.as_deref().is_none_or(|want| {
+        let key = payload
+            .get("minio_object_key")
+            .and_then(|v| v.as_str())
+            .or_else(|| payload.get("doc_id").and_then(|v| v.as_str()));
+        key == Some(want)
+    });
     let sec_ok = filter
         .section_id
         .as_deref()
