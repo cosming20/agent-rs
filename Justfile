@@ -20,31 +20,34 @@ default:
 env:
     @if [ ! -f .env ]; then cp .env.example .env && echo "Created .env — edit OPENAI_API_KEY and AGENT_RS__LLM__API_KEY"; else echo ".env already exists"; fi
 
-# Full first-time setup: copy .env, start infra, wait for health, run migrations, create MinIO bucket.
+# Full first-time setup: copy .env, start infra, wait for health, run
+# migrations, create MinIO bucket. Leaves every service running so the
+# caller can follow up with `just serve` / `just worker` / `just web`.
 bootstrap: env infra-up
     @echo "Waiting ~20s for services to be healthy..."
     @sleep 20
     just migrations
     just minio-bootstrap
     @echo
-    @echo "Bootstrap complete. Verify:"
-    @echo "  docker compose ps"
-    @echo "  just ingest test.pdf"
+    @echo "Bootstrap complete. Next steps (in separate terminals):"
+    @echo "  just serve     # agent-service gRPC on :1072"
+    @echo "  just worker    # indexer-worker consumer"
+    @echo "  just web       # agent-rs-web SSR on :3000 (sibling repo)"
 
 # ─── Infrastructure ───────────────────────────────────────────────────────
 
 # Create (or re-verify) the MinIO bucket used for document storage.
-# Idempotent: mc alias set runs on every call; mc mb --ignore-existing is a no-op
-# when the bucket already exists. Safe to run against a live MinIO instance.
+# Idempotent: mc alias set runs on every call; mc mb --ignore-existing is a
+# no-op when the bucket already exists.
 minio-bootstrap:
     docker compose exec -T minio mc alias set local http://localhost:9000 ${MINIO_ROOT_USER:-minioadmin} ${MINIO_ROOT_PASSWORD:-minioadmin} >/dev/null
     docker compose exec -T minio mc mb --ignore-existing local/${MINIO_BUCKET:-agent-rs-docs}
     @echo "MinIO bucket ${MINIO_BUCKET:-agent-rs-docs} ready"
 
 # Start all core services (qdrant, postgres, neo4j, minio, rabbitmq,
-# docling-sidecar). The stateless pivot adds MinIO (object storage for
-# per-user document bytes) and RabbitMQ (indexing job queue between the
-# gRPC service and the indexer-worker fleet) to the baseline stack.
+# docling-sidecar). The stateless pivot adds MinIO (user document bytes)
+# and RabbitMQ (indexing job queue between agent-service and
+# indexer-worker) to the baseline stack.
 infra-up:
     docker compose up -d qdrant postgres neo4j minio rabbitmq docling-sidecar
 
@@ -63,6 +66,16 @@ logs service:
 # Show the health + ports of every service.
 status:
     docker compose ps
+
+# Open the RabbitMQ management UI (AMQP on :1075, mgmt on :1076).
+rabbitmq-ui:
+    @echo "Opening RabbitMQ management UI: http://localhost:1076"
+    @open http://localhost:1076 2>/dev/null || xdg-open http://localhost:1076 2>/dev/null || echo "Open manually: http://localhost:1076"
+
+# Open the MinIO web console (API on :1069, console on :1070).
+minio-ui:
+    @echo "Opening MinIO console: http://localhost:1070"
+    @open http://localhost:1070 2>/dev/null || xdg-open http://localhost:1070 2>/dev/null || echo "Open manually: http://localhost:1070"
 
 # ─── Observability stack (opt-in, not part of infra-up) ──────────────────
 
@@ -95,13 +108,13 @@ grafana:
 
 # Sanity-check: curl the collector's Prometheus scrape endpoint and the
 # collector health-check. Useful after `just obs-up` to confirm the
-# pipeline is live before running a query.
+# pipeline is live before exercising the binaries.
 obs-smoke:
     @echo "=== collector health ==="
     @curl -s http://localhost:13133/ 2>&1 | head -3 || echo "collector NOT responding on :13133"
     @echo
     @echo "=== prometheus exporter (first 3 agentic_ra_* metrics) ==="
-    @curl -s http://localhost:8889/metrics 2>&1 | grep -E '^agentic_ra_' | head -3 || echo "no agentic_ra_* metrics yet — run `just query '...'` first"
+    @curl -s http://localhost:8889/metrics 2>&1 | grep -E '^agentic_ra_' | head -3 || echo "no agentic_ra_* metrics yet"
     @echo
     @echo "=== prometheus UI reachable? ==="
     @curl -sf http://localhost:1066/-/ready && echo "prometheus READY" || echo "prometheus NOT ready"
@@ -168,40 +181,33 @@ docling-native:
     DOCLING_MAX_CHUNKS_PER_DOC=10000 \
     .venv/docling-sidecar/bin/python -m docling_sidecar
 
-# ─── Dev loop ─────────────────────────────────────────────────────────────
+# ─── Runtime binaries ─────────────────────────────────────────────────────
 
-# Ingest one document (PDF / txt / md).
-# Usage: `just ingest "<user_id>" "<path/to/doc.pdf>"`
-# Optional: add --source <label> after the path to override the source label.
-ingest user_id path:
-    cargo run --release --example ingest -- "{{user_id}}" "{{path}}"
+# Run the agent gRPC service (port 1072 by default).
+#
+# Usage: `just serve`            # release build
+#        `RELEASE=0 just serve`  # debug build
+serve:
+    cargo run {{ if env_var_or_default("RELEASE", "1") == "1" { "--release" } else { "" } }} -p agent-rs-agent-service --bin agent-service
 
-# Run one retrieval query. Usage: `just query "ce este histograma?"`
-# Extra flags go through:  `just query --strategy hybrid --limit 5 "my query"`
-# Returns ranked chunks only — no LLM answer synthesis, no tools.
-query *args:
-    cargo run --release --example query -- {{args}}
+# Run one indexer-worker replica. Scale horizontally by starting the
+# recipe in multiple terminals — the broker fans out jobs round-robin.
+#
+# Usage: `just worker`
+#        `AGENT_RS__INDEXER__PREFETCH=10 just worker`   # bump concurrency
+#        `AGENT_RS__INDEXER__ENABLE_SUMMARIES=true just worker`   # LLM stages
+worker:
+    cargo run {{ if env_var_or_default("RELEASE", "1") == "1" { "--release" } else { "" } }} -p agent-rs-agent-service --bin indexer-worker
 
-# Ask a question through the full agent pipeline (tools + grounding +
-# LLM answer synthesis with citations).
-# Usage: `just ask "<user_id>" "<session_id_or_empty>" "<question>"`
-# Pass an empty string for session_id to generate a new random session.
-# Optional flags: --strategy <name> --limit N
-ask user_id session_id question:
-    cargo run --release --example ask -- "{{user_id}}" "{{session_id}}" "{{question}}"
-
-# ask with optional strategy/limit flags.
-# Usage: `just ask-opts alice "" "my question" --strategy hybrid --limit 5`
-ask-opts user_id session_id question *flags:
-    cargo run --release --example ask -- "{{user_id}}" "{{session_id}}" "{{question}}" {{flags}}
-
-# A/B compare: weighted-keyword feature OFF then ON for the same query.
-query-ab query:
-    @echo "=== feature OFF =========================="
-    EVAL_SKIP_WEIGHTED_KEYWORDS=1 cargo run --release --example query -- '{{query}}'
-    @echo
-    @echo "=== feature ON ==========================="
-    cargo run --release --example query -- '{{query}}'
+# Run the SSR web frontend from the sibling repo (expects
+# ../agent-rs-web on the same branch). `cargo leptos watch` hot-reloads
+# on source edits.
+#
+# Usage: `just web`
+# Requires: `cargo install cargo-leptos` + a sibling checkout of
+# github.com/cosming20/agent-rs-web.
+web:
+    cd ../agent-rs-web && cargo leptos watch
 
 # ─── Quality gates ────────────────────────────────────────────────────────
 
@@ -229,9 +235,9 @@ fmt-check:
 ci: fmt-check clippy test
     @echo "Gate passed."
 
-# Build release binaries + examples.
+# Build release binaries.
 build:
-    cargo build --release --workspace --examples
+    cargo build --release --workspace
 
 # ─── Cleanup ──────────────────────────────────────────────────────────────
 
@@ -258,6 +264,8 @@ data-wipe:
     docker exec agentic-ra-postgres psql \
         -U "$AGENT_RS__POSTGRES__USER" -d "$AGENT_RS__POSTGRES__DB" \
         -c 'TRUNCATE document_index_state, evidence_items, query_runs, memories, strategy_performance RESTART IDENTITY CASCADE;'
+    @echo "→ RabbitMQ: purging the indexing queue..."
+    @docker exec agentic-ra-rabbitmq rabbitmqctl purge_queue agent-rs.index 2>/dev/null || echo "   (queue not yet declared; skip)"
     @echo "Data wipe complete. target/ untouched; containers still running."
 
 # Remove cargo target directory.
