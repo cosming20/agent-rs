@@ -266,6 +266,9 @@ data-wipe:
         -c 'TRUNCATE document_index_state, evidence_items, query_runs, memories, strategy_performance RESTART IDENTITY CASCADE;'
     @echo "→ RabbitMQ: purging the indexing queue..."
     @docker exec agentic-ra-rabbitmq rabbitmqctl purge_queue agent-rs.index 2>/dev/null || echo "   (queue not yet declared; skip)"
+    @echo "→ MinIO: clearing the documents bucket (bucket itself kept)..."
+    @docker compose exec -T minio mc alias set local http://localhost:9000 ${MINIO_ROOT_USER:-minioadmin} ${MINIO_ROOT_PASSWORD:-minioadmin} >/dev/null 2>&1 || true
+    @docker compose exec -T minio mc rm --recursive --force --quiet local/${MINIO_BUCKET:-agent-rs-docs} 2>/dev/null || echo "   (bucket empty or missing; skip)"
     @echo "Data wipe complete. target/ untouched; containers still running."
 
 # Remove cargo target directory.
