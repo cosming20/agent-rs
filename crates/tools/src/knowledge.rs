@@ -300,17 +300,38 @@ impl Tool for SearchKnowledgeTool {
             };
             let table_info = if has_table { ", contains_table" } else { "" };
 
+            // Surface the stable `chunk_id` BOTH as the bracket index
+            // (so the LLM can use the short form `[1]`) AND as the
+            // citation marker the synthesizer expects (`[cite:<uuid>]`).
+            // Without the explicit cite marker the LLM tends to invent
+            // shorthand ids like `c-1`/`c-2` which the synthesizer
+            // can't resolve, dropping every citation and forcing the
+            // answer ungrounded — observed during the FCM evaluation
+            // run on 2026-04-23.
+            let chunk_id = doc
+                .payload
+                .get("chunk_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or(doc.id.as_str());
             output.push_str(&format!(
-                "[{}] (score: {:.4}, source: {}{}{}{})\n{}\n\n",
-                i + 1,
-                doc.score.value(),
-                source,
-                page_info,
-                section_info,
-                table_info,
-                content,
+                "[{idx}] cite:{chunk_id} (score: {score:.4}, source: {source}{page}{section}{table})\n{content}\n\n",
+                idx = i + 1,
+                chunk_id = chunk_id,
+                score = doc.score.value(),
+                source = source,
+                page = page_info,
+                section = section_info,
+                table = table_info,
+                content = content,
             ));
         }
+
+        // Final reminder so the LLM emits `[cite:<chunk_id>]` rather
+        // than guessing — the synthesizer requires the exact id.
+        output.push_str(
+            "When citing, use the exact `[cite:<chunk_id>]` marker shown next to each \
+             document above. Do NOT shorten the id.\n",
+        );
 
         Ok(output)
     }
