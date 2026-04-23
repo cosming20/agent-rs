@@ -48,12 +48,27 @@ minio-bootstrap:
 # docling-sidecar). The stateless pivot adds MinIO (user document bytes)
 # and RabbitMQ (indexing job queue between agent-service and
 # indexer-worker) to the baseline stack.
+#
+# Also cascades into the sibling `../agent-rs-web` repo to bring up its
+# own isolated Postgres (port 1055, deliberately adjacent to agent's
+# 1054 for easy mental mapping) + Redis (port 1074). If the sibling
+# repo isn't checked out, that step is a no-op with a hint.
 infra-up:
     docker compose up -d qdrant postgres neo4j minio rabbitmq docling-sidecar
+    @if [ -d ../agent-rs-web ]; then \
+        echo "→ bringing up agent-rs-web infra (postgres on 1055, redis on 1074)..."; \
+        (cd ../agent-rs-web && just infra-up); \
+     else \
+        echo "→ ../agent-rs-web not found; skip web infra. Clone it alongside this repo to enable."; \
+     fi
 
-# Stop + remove containers (volumes kept).
+# Stop + remove containers (volumes kept). Also cascades into
+# ../agent-rs-web if present so a single command tears everything down.
 infra-down:
     docker compose down
+    @if [ -d ../agent-rs-web ]; then \
+        (cd ../agent-rs-web && just infra-down); \
+     fi
 
 # Stop + remove containers AND volumes (wipes all data).
 infra-reset:
@@ -269,6 +284,12 @@ data-wipe:
     @echo "→ MinIO: clearing the documents bucket (bucket itself kept)..."
     @docker compose exec -T minio mc alias set local http://localhost:9000 ${MINIO_ROOT_USER:-minioadmin} ${MINIO_ROOT_PASSWORD:-minioadmin} >/dev/null 2>&1 || true
     @docker compose exec -T minio mc rm --recursive --force --quiet local/${MINIO_BUCKET:-agent-rs-docs} 2>/dev/null || echo "   (bucket empty or missing; skip)"
+    @if [ -d ../agent-rs-web ]; then \
+        echo "→ web Postgres: cascading data-wipe into ../agent-rs-web..."; \
+        (cd ../agent-rs-web && FORCE=1 just data-wipe); \
+     else \
+        echo "→ ../agent-rs-web not found; skip web data-wipe."; \
+     fi
     @echo "Data wipe complete. target/ untouched; containers still running."
 
 # Remove cargo target directory.
