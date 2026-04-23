@@ -41,9 +41,12 @@ minio-bootstrap:
     docker compose exec -T minio mc mb --ignore-existing local/${MINIO_BUCKET:-agent-rs-docs}
     @echo "MinIO bucket ${MINIO_BUCKET:-agent-rs-docs} ready"
 
-# Start all core services (qdrant, postgres, neo4j, docling-sidecar).
+# Start all core services (qdrant, postgres, neo4j, minio, rabbitmq,
+# docling-sidecar). The stateless pivot adds MinIO (object storage for
+# per-user document bytes) and RabbitMQ (indexing job queue between the
+# gRPC service and the indexer-worker fleet) to the baseline stack.
 infra-up:
-    docker compose up -d qdrant postgres neo4j docling-sidecar
+    docker compose up -d qdrant postgres neo4j minio rabbitmq docling-sidecar
 
 # Stop + remove containers (volumes kept).
 infra-down:
