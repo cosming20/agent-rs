@@ -11,6 +11,7 @@
 //! - [`embedder`] — build OpenAI or local fastembed embedder
 //! - [`router`] — assemble the retrieval router with all cognitive features
 
+pub mod bootstrap;
 pub mod embedder;
 pub mod router;
 pub mod stores;

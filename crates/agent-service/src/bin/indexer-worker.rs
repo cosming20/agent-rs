@@ -14,6 +14,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use agent_rs::bootstrap::ensure_collections;
 use agent_rs::embedder::build_embedder;
 use agent_rs::stores::connect_stores;
 use agent_rs_agent_service::indexer::{AgentIndexHandler, AgentIndexHandlerDeps};
@@ -58,6 +59,19 @@ async fn main() -> Result<()> {
         CollectionName::from_string(format!("{}_summaries", collection.as_str()));
     let triplet_collection =
         CollectionName::from_string(format!("{}_triplets", collection.as_str()));
+
+    // Idempotent bootstrap — create collections on cold clusters, no-op
+    // on warm ones. Without this the first upsert after a fresh
+    // `docker compose up` would fail with "collection not found".
+    ensure_collections(
+        &stores.qdrant,
+        embedder.dimensions(),
+        &collection,
+        &summaries_collection,
+        &triplet_collection,
+    )
+    .await
+    .context("ensure Qdrant collections")?;
     // Metrics handle kept for parity with the gRPC service and to keep
     // the retrieval-metrics registration path hot for future Qdrant /
     // Neo4j instrumentation of the indexing hot loop.

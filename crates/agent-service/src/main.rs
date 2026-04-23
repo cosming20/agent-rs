@@ -13,6 +13,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
+use agent_rs::bootstrap::ensure_collections;
 use agent_rs::embedder::build_embedder;
 use agent_rs::router::{RouterFeatures, build_router};
 use agent_rs::stores::connect_stores;
@@ -54,6 +55,19 @@ async fn main() -> Result<()> {
         CollectionName::from_string(format!("{}_summaries", collection.as_str()));
 
     let metrics = Arc::new(RetrievalMetrics::new("agent-rs-agent-service"));
+
+    // Idempotent Qdrant bootstrap — same as indexer-worker, because
+    // agent-service may start first on a fresh deployment and its first
+    // search query would otherwise hit a missing collection.
+    ensure_collections(
+        &stores.qdrant,
+        embedder.dimensions(),
+        &collection,
+        &summaries_collection,
+        &triplet_collection,
+    )
+    .await
+    .context("ensure Qdrant collections")?;
 
     let router = build_router(
         &settings,
