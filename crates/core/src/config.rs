@@ -563,7 +563,7 @@ impl Default for Settings {
         Self {
             llm: LlmConfig {
                 api_key: String::new(),
-                model: "gpt-4o".into(),
+                model: "gpt-5.4-mini".into(),
             },
             qdrant: QdrantConfig {
                 host: "localhost".into(),

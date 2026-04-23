@@ -42,8 +42,15 @@ use crate::error::RetrievalError;
 // Constants
 // ---------------------------------------------------------------------------
 
-/// Default OpenAI model for summarization. Chosen for cost/latency.
-const DEFAULT_MODEL: &str = "gpt-4o-mini";
+/// Default OpenAI model for summarization. Chosen for cost/latency:
+/// gpt-5.4-mini runs with `reasoning_effort=minimal` so per-chunk
+/// latency stays in the sub-second range.
+const DEFAULT_MODEL: &str = "gpt-5.4-mini";
+
+/// Default reasoning effort for gpt-5.x / o-series models. `"minimal"`
+/// skips most hidden thinking tokens, which dominates latency for a
+/// summary-granularity call.
+const DEFAULT_REASONING_EFFORT: &str = "minimal";
 
 /// OpenAI chat completions endpoint.
 const CHAT_COMPLETIONS_URL: &str = "https://api.openai.com/v1/chat/completions";
@@ -162,6 +169,11 @@ struct ChatRequest<'a> {
     model: &'a str,
     messages: Vec<ChatMessage<'a>>,
     temperature: f32,
+    /// `reasoning_effort` — gpt-5.x / o-series hint. Serialised only when
+    /// present; older non-reasoning models (gpt-4o, 3.5) ignore unknown
+    /// fields but we keep the wire clean.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reasoning_effort: Option<&'a str>,
 }
 
 #[derive(Debug, Serialize)]
@@ -323,6 +335,7 @@ impl ChunkSummarizer {
                 },
             ],
             temperature: 0.0,
+            reasoning_effort: reasoning_effort_for(self.model.as_str()),
         };
 
         let body_bytes = serde_json::to_vec(&body).map_err(|e| RetrievalError::Ingestion {
@@ -562,6 +575,19 @@ impl ChunkSummarizer {
 // ---------------------------------------------------------------------------
 
 /// Decide whether an ingestion error should be retried.
+/// Return the `reasoning_effort` value to forward for the given model.
+///
+/// Only gpt-5.x / o-series reasoning models honour the field — returning
+/// `None` for older models keeps the request body clean and avoids
+/// confusing dashboards that might misread an inert field as a signal.
+fn reasoning_effort_for(model: &str) -> Option<&'static str> {
+    if model.starts_with("gpt-5") || model.starts_with("o1") || model.starts_with("o3") {
+        Some(DEFAULT_REASONING_EFFORT)
+    } else {
+        None
+    }
+}
+
 fn is_retryable_error(e: &RetrievalError) -> bool {
     match e {
         RetrievalError::Ingestion { reason } => {

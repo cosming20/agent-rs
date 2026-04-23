@@ -53,7 +53,7 @@ use crate::error::RetrievalError;
 /// structured extraction and coreference than `gpt-4o-mini` while staying
 /// within ~3x the per-token cost. Override per-call via [`LlmGraphExtractor::with_default_model`]
 /// or pass an explicit model to [`LlmGraphExtractor::new`].
-const DEFAULT_MODEL: &str = "gpt-5.4-mini-2026-03-17";
+const DEFAULT_MODEL: &str = "gpt-5.4-mini";
 
 /// OpenAI chat completions endpoint.
 const CHAT_COMPLETIONS_URL: &str = "https://api.openai.com/v1/chat/completions";
@@ -433,6 +433,10 @@ struct ChatRequest<'a> {
     /// dramatically improves cache hit rate when many requests share the same
     /// system prompt + schema prefix.
     prompt_cache_key: &'static str,
+    /// `reasoning_effort` — gpt-5.x / o-series hint. Serialised only when
+    /// present; older non-reasoning models ignore it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reasoning_effort: Option<&'a str>,
 }
 
 #[derive(Debug, Serialize)]
@@ -947,6 +951,23 @@ fn build_request_body<'a>(model: &'a str, chunk_text: &'a str) -> ChatRequest<'a
         // cache after the first call. Different from the chunk text which goes
         // in the user message and is the only varying part.
         prompt_cache_key: "agent-rs-graph-extractor-v2",
+        reasoning_effort: reasoning_effort_for(model),
+    }
+}
+
+/// Default reasoning effort forwarded to gpt-5.x / o-series models on each
+/// extraction call. `"minimal"` keeps per-chunk latency sub-second while
+/// still letting the model constrain its output to the JSON schema.
+const DEFAULT_REASONING_EFFORT: &str = "minimal";
+
+/// Return the `reasoning_effort` to forward for the given model. Only
+/// reasoning-capable families receive a value; older models ignore the
+/// field but we omit it anyway for a cleaner request body and dashboards.
+fn reasoning_effort_for(model: &str) -> Option<&'static str> {
+    if model.starts_with("gpt-5") || model.starts_with("o1") || model.starts_with("o3") {
+        Some(DEFAULT_REASONING_EFFORT)
+    } else {
+        None
     }
 }
 

@@ -50,9 +50,10 @@ use crate::error::RetrievalError;
 
 /// Default OpenAI model for metadata hint extraction.
 ///
-/// `gpt-4o-mini` is fast and cheap — appropriate for a best-effort pre-filter
-/// step that must not add measurable latency to the retrieval path.
-const DEFAULT_MODEL: &str = "gpt-4o-mini";
+/// `gpt-5.4-mini` with `reasoning_effort=minimal` is fast and cheap —
+/// appropriate for a best-effort pre-filter step that must not add
+/// measurable latency to the retrieval path.
+const DEFAULT_MODEL: &str = "gpt-5.4-mini";
 
 /// OpenAI chat completions endpoint.
 const CHAT_COMPLETIONS_URL: &str = "https://api.openai.com/v1/chat/completions";

@@ -204,7 +204,7 @@ impl WeightedKeywordExtractorConfig {
     }
 }
 
-const DEFAULT_MODEL: &str = "gpt-5.4-mini-2026-03-17";
+const DEFAULT_MODEL: &str = "gpt-5.4-mini";
 const OPENAI_CHAT_URL: &str = "https://api.openai.com/v1/chat/completions";
 
 // ---------------------------------------------------------------------------
