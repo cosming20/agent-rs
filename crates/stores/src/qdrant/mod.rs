@@ -260,7 +260,17 @@ impl VectorStore for QdrantStore {
     /// # Errors
     ///
     /// Returns [`StoreError`] on Qdrant gRPC failure.
-    #[instrument(skip(self, query, extra_filter_json), fields(collection = %collection, user_id = %user_id, limit = limit))]
+    #[instrument(
+        skip(self, query, extra_filter_json),
+        fields(
+            collection = %collection,
+            user_id = %user_id,
+            limit = limit,
+            query_dims = query.as_slice().len(),
+            n_points = tracing::field::Empty,
+            with_extra_filter = extra_filter_json.is_some(),
+        )
+    )]
     async fn search_for_user(
         &self,
         collection: &CollectionName,
@@ -289,6 +299,9 @@ impl VectorStore for QdrantStore {
             )
             .await
             .map_err(StoreError::from)?;
+
+        let n_points = response.result.len();
+        tracing::Span::current().record("n_points", n_points);
 
         response
             .result

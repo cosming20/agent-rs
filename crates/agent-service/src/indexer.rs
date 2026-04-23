@@ -133,6 +133,13 @@ impl AgentIndexHandler {
             user_id = %job.user_id,
             minio_object_key = %job.minio_object_key,
             job_id = %job.job_id,
+            bytes = tracing::field::Empty,
+            sha256 = tracing::field::Empty,
+            n_pages = tracing::field::Empty,
+            n_chunks = tracing::field::Empty,
+            n_embeddings = tracing::field::Empty,
+            n_qdrant_points = tracing::field::Empty,
+            n_neo4j_sections = tracing::field::Empty,
         )
     )]
     async fn index(&self, job: &IndexJob) -> Result<IndexSummary, IndexError> {
@@ -159,6 +166,8 @@ impl AgentIndexHandler {
             .map_err(|e| IndexError::Fetch(e.to_string()))?;
 
         let sha256 = format!("{:x}", Sha256::digest(&bytes));
+        tracing::Span::current().record("bytes", bytes.len());
+        tracing::Span::current().record("sha256", &sha256);
         info!(bytes = bytes.len(), sha256 = %sha256, "document fetched from MinIO");
 
         // ---- 2. produce structured chunks -------------------------------
@@ -169,6 +178,8 @@ impl AgentIndexHandler {
             ));
         }
         let n_chunks = chunks.len() as i32;
+        tracing::Span::current().record("n_pages", n_pages);
+        tracing::Span::current().record("n_chunks", n_chunks);
 
         // ---- 3. embed ----------------------------------------------------
         let texts: Vec<&str> = chunks.iter().map(|c| c.embed_text.as_str()).collect();
@@ -177,6 +188,7 @@ impl AgentIndexHandler {
             .embed_documents(&texts)
             .await
             .map_err(|e| IndexError::Embed(e.to_string()))?;
+        tracing::Span::current().record("n_embeddings", embeddings.len());
         if embeddings.len() != chunks.len() {
             return Err(IndexError::Embed(format!(
                 "embedder returned {} vectors for {} chunks",
@@ -216,10 +228,13 @@ impl AgentIndexHandler {
             .collect();
 
         // ---- 5. Qdrant upsert -------------------------------------------
+        let n_points = points.len();
         self.qdrant
             .upsert(&self.chunk_collection, points)
             .await
             .map_err(|e| IndexError::Upsert(e.to_string()))?;
+        tracing::Span::current().record("n_qdrant_points", n_points);
+        info!(n_points, collection = %self.chunk_collection, "qdrant chunks upserted");
 
         // ---- 6a. Optional LLM stages (best-effort) ----------------------
         //
@@ -246,6 +261,7 @@ impl AgentIndexHandler {
                     .unwrap_or_else(|| c.raw_text.clone())
             })
             .collect();
+        let n_sections = section_headings.len();
         self.neo4j
             .upsert_minimal_document(
                 &user_id,
@@ -256,6 +272,8 @@ impl AgentIndexHandler {
             )
             .await
             .map_err(|e| IndexError::Upsert(e.to_string()))?;
+        tracing::Span::current().record("n_neo4j_sections", n_sections);
+        info!(n_sections, "neo4j minimal structure upserted");
 
         // ---- 7. mark complete -------------------------------------------
         self.pg
@@ -283,6 +301,17 @@ impl AgentIndexHandler {
     /// MIME / extension + the configured [`IngestBackend`].
     ///
     /// Returns the chunk list plus an estimated page count.
+    #[instrument(
+        skip(self, bytes),
+        fields(
+            minio_object_key = %minio_key,
+            bytes = bytes.len(),
+            ext = tracing::field::Empty,
+            backend = tracing::field::Empty,
+            n_chunks = tracing::field::Empty,
+            n_pages = tracing::field::Empty,
+        )
+    )]
     async fn chunk_pipeline(
         &self,
         minio_key: &str,
@@ -293,6 +322,7 @@ impl AgentIndexHandler {
             .next()
             .unwrap_or("")
             .to_ascii_lowercase();
+        tracing::Span::current().record("ext", &ext);
 
         let is_pdf = ext == "pdf";
         let docling_preferred = matches!(
@@ -303,7 +333,12 @@ impl AgentIndexHandler {
         if is_pdf && docling_preferred {
             if let Some(docling) = self.docling.as_ref() {
                 match self.chunk_via_docling(docling, minio_key, bytes).await {
-                    Ok(result) => return Ok(result),
+                    Ok(result) => {
+                        tracing::Span::current().record("backend", "docling");
+                        tracing::Span::current().record("n_chunks", result.0.len());
+                        tracing::Span::current().record("n_pages", result.1);
+                        return Ok(result);
+                    }
                     Err(e) => {
                         if matches!(
                             self.ingest_backend,
@@ -311,6 +346,7 @@ impl AgentIndexHandler {
                         ) {
                             warn!(
                                 error = %e,
+                                fallback = "pdf-extract",
                                 "docling failed; falling back to pdf-extract"
                             );
                         } else {
@@ -325,7 +361,12 @@ impl AgentIndexHandler {
             }
         }
 
-        self.chunk_via_text_fallback(minio_key, bytes, &ext)
+        let (chunks, pages) = self.chunk_via_text_fallback(minio_key, bytes, &ext)?;
+        tracing::Span::current().record("backend", "pdf_extract");
+        tracing::Span::current().record("n_chunks", chunks.len());
+        tracing::Span::current().record("n_pages", pages);
+        tracing::Span::current().record("n_chunks", chunks.len());
+        Ok((chunks, pages))
     }
 
     async fn chunk_via_docling(
@@ -395,6 +436,17 @@ impl AgentIndexHandler {
     /// When the summarizer is absent (no API key / disabled), this is a
     /// no-op. Any downstream failure logs at WARN and does not fail
     /// indexing.
+    #[instrument(
+        skip(self, chunks),
+        fields(
+            user_id = %user_id,
+            minio_object_key = %minio_key,
+            enabled = self.summarizer.is_some(),
+            n_input = chunks.len(),
+            n_usable = tracing::field::Empty,
+            n_upserted = tracing::field::Empty,
+        )
+    )]
     async fn run_summaries(
         &self,
         user_id: &UserId,
@@ -427,6 +479,7 @@ impl AgentIndexHandler {
                 matches!(s.summary_status, SummaryStatus::Ok) && !s.summary_text.trim().is_empty()
             })
             .collect();
+        tracing::Span::current().record("n_usable", usable.len());
         if usable.is_empty() {
             info!("summariser produced no usable summaries; skipping upsert");
             return;
@@ -468,11 +521,13 @@ impl AgentIndexHandler {
             })
             .collect();
 
+        let n_points = points.len();
         if let Err(e) = self.qdrant.upsert(&self.summaries_collection, points).await {
-            warn!(error = %e, "summary Qdrant upsert failed; continuing");
+            warn!(error = %e, n_dropped = n_points, "summary Qdrant upsert failed; continuing");
         } else {
+            tracing::Span::current().record("n_upserted", n_points);
             info!(
-                count = usable.len(),
+                count = n_points,
                 collection = %self.summaries_collection,
                 "summaries upserted"
             );
@@ -488,6 +543,17 @@ impl AgentIndexHandler {
     ///
     /// Failures log + skip. The structural graph already on Neo4j is
     /// untouched.
+    #[instrument(
+        skip(self, chunks),
+        fields(
+            user_id = %user_id,
+            minio_object_key = %minio_key,
+            enabled = self.extractor.is_some(),
+            n_input = chunks.len(),
+            n_triplets = tracing::field::Empty,
+            n_upserted = tracing::field::Empty,
+        )
+    )]
     async fn run_kg_extraction(
         &self,
         user_id: &UserId,
@@ -549,6 +615,7 @@ impl AgentIndexHandler {
             }
         }
 
+        tracing::Span::current().record("n_triplets", triplets.len());
         if triplets.is_empty() {
             info!("KG extractor produced zero triplets; skipping upsert");
             return;
@@ -591,11 +658,13 @@ impl AgentIndexHandler {
             })
             .collect();
 
+        let n_points = points.len();
         if let Err(e) = self.qdrant.upsert(&self.triplet_collection, points).await {
-            warn!(error = %e, "triplets Qdrant upsert failed; continuing");
+            warn!(error = %e, n_dropped = n_points, "triplets Qdrant upsert failed; continuing");
         } else {
+            tracing::Span::current().record("n_upserted", n_points);
             info!(
-                count = triplets.len(),
+                count = n_points,
                 collection = %self.triplet_collection,
                 "triplets upserted"
             );

@@ -535,7 +535,25 @@ impl RetrievalRouter {
     ///
     /// Returns [`RetrievalError::Embedding`] on embedding failure, or
     /// [`RetrievalError::Store`] on any search back-end failure.
-    #[instrument(skip(self), fields(strategy = %strategy, limit, user_id = %user_id))]
+    #[instrument(
+        skip(self),
+        fields(
+            strategy = %strategy,
+            limit,
+            user_id = %user_id,
+            query_len = query.len(),
+            n_sub_queries = tracing::field::Empty,
+            n_hyde = tracing::field::Empty,
+            n_branches = tracing::field::Empty,
+            n_ranker_input = tracing::field::Empty,
+            n_ranker_output = tracing::field::Empty,
+            n_after_section_filter = tracing::field::Empty,
+            n_after_user_filter = tracing::field::Empty,
+            n_after_rerank = tracing::field::Empty,
+            n_after_context_expand = tracing::field::Empty,
+            n_final = tracing::field::Empty,
+        )
+    )]
     pub async fn retrieve_filtered(
         &self,
         user_id: &UserId,
@@ -545,6 +563,12 @@ impl RetrievalRouter {
         section_filter: Option<SectionFilter>,
     ) -> Result<EvidencePack, RetrievalError> {
         let descriptor = get_descriptor(strategy);
+        // Branch-by-branch contribution accumulator. Populated as each
+        // back-end returns; emitted as a single `retrieve_filtered.summary`
+        // event on the way out so operators can see the whole pipeline at
+        // a glance: "dense→3, sparse→0, graph→0, triplet→0, hyde→3".
+        let mut branch_hits: std::collections::BTreeMap<&'static str, usize> =
+            std::collections::BTreeMap::new();
 
         // ---- Steps 1 + 1b + 2: PARALLEL pre-dispatch LLM calls ----
         //
@@ -688,7 +712,11 @@ impl RetrievalRouter {
             }
         }
 
-        for query_str in sub_queries.iter().chain(hyde_texts.iter()) {
+        tracing::Span::current().record("n_sub_queries", sub_queries.len());
+        tracing::Span::current().record("n_hyde", hyde_texts.len());
+
+        for (idx, query_str) in sub_queries.iter().chain(hyde_texts.iter()).enumerate() {
+            let is_hyde = idx >= sub_queries.len();
             let embed_text = query_str.to_string();
 
             // Always embed dense — every strategy needs at minimum a dense vector.
@@ -707,6 +735,23 @@ impl RetrievalRouter {
                     qdrant_filter_json.as_ref(),
                 )
                 .await?;
+
+            // Record per-branch contribution. `dispatch_single` returns
+            // lists ordered by descriptor's branch table; we log the sum
+            // per sub-query under a label so the summary event can show
+            // "where evidence actually came from".
+            let branch_label = if is_hyde { "hyde" } else { "primary" };
+            let branch_total: usize = per_sub_lists.iter().map(|l| l.len()).sum();
+            *branch_hits.entry(branch_label).or_insert(0) += branch_total;
+            tracing::debug!(
+                sub_query_index = idx,
+                is_hyde,
+                query_str = %query_str,
+                n_lists = per_sub_lists.len(),
+                list_sizes = ?per_sub_lists.iter().map(|l| l.len()).collect::<Vec<_>>(),
+                total = branch_total,
+                "sub-query dispatch complete"
+            );
 
             all_result_lists.extend(per_sub_lists);
 
@@ -775,9 +820,16 @@ impl RetrievalRouter {
             limit
         };
 
+        let ranker_input_total: usize = all_result_lists.iter().map(|l| l.len()).sum();
+        let ranker_input_lists = all_result_lists.len();
+        tracing::Span::current().record("n_branches", ranker_input_lists);
+        tracing::Span::current().record("n_ranker_input", ranker_input_total);
+
         let mut evidence = self
             .ranker
             .rank(all_result_lists, primary_query, strategy, rrf_limit);
+
+        tracing::Span::current().record("n_ranker_output", evidence.documents.len());
 
         // ---- Step 5b: Hard post-fusion section/doc predicate (Codex gap #10) ----
         //
@@ -791,14 +843,22 @@ impl RetrievalRouter {
                     .documents
                     .retain(|r| matches_section_filter(&r.payload, filter));
                 let after = evidence.documents.len();
-                tracing::debug!(
-                    doc_id = ?filter.doc_id,
-                    section_id = ?filter.section_id,
-                    before,
-                    after,
-                    "router: applied hard section/doc predicate"
-                );
+                tracing::Span::current().record("n_after_section_filter", after);
+                if before != after {
+                    tracing::info!(
+                        doc_id = ?filter.doc_id,
+                        section_id = ?filter.section_id,
+                        before,
+                        after,
+                        dropped = before - after,
+                        "router.section_filter dropped chunks"
+                    );
+                }
+            } else {
+                tracing::Span::current().record("n_after_section_filter", evidence.documents.len());
             }
+        } else {
+            tracing::Span::current().record("n_after_section_filter", evidence.documents.len());
         }
 
         // ---- Step 5c: Defence-in-depth user_id post-fusion predicate ----
@@ -822,12 +882,14 @@ impl RetrievalRouter {
                     .is_none_or(|uid| uid == expected)
             });
             let after = evidence.documents.len();
+            tracing::Span::current().record("n_after_user_filter", after);
             if before != after {
-                tracing::debug!(
+                tracing::warn!(
                     user_id = expected,
                     before,
                     after,
-                    "router: defence-in-depth user_id predicate dropped cross-tenant chunks"
+                    dropped = before - after,
+                    "router.user_filter dropped cross-tenant chunks — upstream scope leaked"
                 );
             }
         }
@@ -882,6 +944,7 @@ impl RetrievalRouter {
                             );
                         }
                     }
+                    tracing::Span::current().record("n_after_rerank", reranked.len());
                     evidence.documents = reranked;
                 }
                 Err(e) => {
@@ -898,6 +961,7 @@ impl RetrievalRouter {
                         m.record_reranker_fallback(strategy);
                     }
                     evidence.documents.truncate(limit);
+                    tracing::Span::current().record("n_after_rerank", evidence.documents.len());
                 }
             }
 
@@ -1001,6 +1065,29 @@ impl RetrievalRouter {
                 }
             }
         }
+
+        tracing::Span::current().record("n_after_context_expand", evidence.documents.len());
+        tracing::Span::current().record("n_final", evidence.documents.len());
+
+        // Single summary event so operators can eyeball the whole pipeline
+        // in one grep line without walking the Jaeger tree. Format chosen
+        // to read left-to-right like a pipeline diagram:
+        //   "retrieve.summary primary=3 hyde=3 branches=6 ranker=20→10 final=10"
+        let branch_summary = branch_hits
+            .iter()
+            .map(|(k, v)| format!("{k}={v}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        tracing::info!(
+            strategy = %strategy,
+            user_id = %user_id,
+            query_len = query.len(),
+            branches = %branch_summary,
+            ranker_input = ranker_input_total,
+            ranker_output = tracing::field::Empty,
+            final_count = evidence.documents.len(),
+            "retrieve.summary"
+        );
 
         Ok(evidence)
     }

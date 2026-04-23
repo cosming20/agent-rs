@@ -137,6 +137,18 @@ impl ResultRanker {
         strategy = %strategy,
         limit
     ))]
+    #[tracing::instrument(
+        skip(self, result_lists, query),
+        fields(
+            strategy = %strategy,
+            query_len = query.len(),
+            limit,
+            n_lists = result_lists.len(),
+            n_total_input = tracing::field::Empty,
+            n_unique_ids = tracing::field::Empty,
+            n_output = tracing::field::Empty,
+        )
+    )]
     pub fn rank(
         &self,
         result_lists: Vec<Vec<SearchResult>>,
@@ -145,6 +157,14 @@ impl ResultRanker {
         limit: usize,
     ) -> EvidencePack {
         let total_docs: usize = result_lists.iter().map(|l| l.len()).sum();
+        tracing::Span::current().record("n_total_input", total_docs);
+
+        // List sizes visible as a DEBUG event so operators can see which
+        // branch contributed what when ranker output is surprising.
+        tracing::debug!(
+            list_sizes = ?result_lists.iter().map(|l| l.len()).collect::<Vec<_>>(),
+            "ranker input per-list sizes"
+        );
 
         // Build a map from document ID to the best (lowest-score-already-set)
         // SearchResult payload so we can reconstruct results after scoring.
@@ -168,6 +188,9 @@ impl ResultRanker {
                     .or_insert_with(|| doc.clone());
             }
         }
+
+        let unique_ids_count = rrf_scores.len();
+        tracing::Span::current().record("n_unique_ids", unique_ids_count);
 
         let mut fused: Vec<(String, f64)> = if rrf_scores.len() > PARALLEL_THRESHOLD {
             rrf_scores.into_par_iter().collect()
@@ -200,6 +223,8 @@ impl ResultRanker {
 
         // Compute source_counts AFTER truncation so they reflect the final result set
         let source_counts = build_source_counts_from_docs(&documents);
+
+        tracing::Span::current().record("n_output", documents.len());
 
         EvidencePack {
             documents,
