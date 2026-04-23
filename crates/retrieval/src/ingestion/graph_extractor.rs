@@ -53,7 +53,7 @@ use crate::error::RetrievalError;
 /// structured extraction and coreference than `gpt-4o-mini` while staying
 /// within ~3x the per-token cost. Override per-call via [`LlmGraphExtractor::with_default_model`]
 /// or pass an explicit model to [`LlmGraphExtractor::new`].
-const DEFAULT_MODEL: &str = "gpt-5.4-mini";
+const DEFAULT_MODEL: &str = "gpt-5.4-mini-2026-03-17";
 
 /// OpenAI chat completions endpoint.
 const CHAT_COMPLETIONS_URL: &str = "https://api.openai.com/v1/chat/completions";

@@ -45,7 +45,7 @@ use crate::error::RetrievalError;
 /// Default OpenAI model for summarization. Chosen for cost/latency:
 /// gpt-5.4-mini runs with `reasoning_effort=minimal` so per-chunk
 /// latency stays in the sub-second range.
-const DEFAULT_MODEL: &str = "gpt-5.4-mini";
+const DEFAULT_MODEL: &str = "gpt-5.4-mini-2026-03-17";
 
 /// Default reasoning effort for gpt-5.x / o-series models. `"minimal"`
 /// skips most hidden thinking tokens, which dominates latency for a

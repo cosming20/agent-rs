@@ -57,7 +57,7 @@ use crate::error::RetrievalError;
 ///
 /// Matches the model used by [`crate::ingestion::graph_extractor`] for cost
 /// and caching consistency.
-const DEFAULT_MODEL: &str = "gpt-5.4-mini";
+const DEFAULT_MODEL: &str = "gpt-5.4-mini-2026-03-17";
 
 /// OpenAI chat completions endpoint.
 const CHAT_COMPLETIONS_URL: &str = "https://api.openai.com/v1/chat/completions";

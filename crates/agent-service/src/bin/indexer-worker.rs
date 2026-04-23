@@ -114,7 +114,8 @@ async fn main() -> Result<()> {
     let llm_api_key = std::env::var("OPENAI_API_KEY")
         .or_else(|_| std::env::var("LLM_API_KEY"))
         .ok();
-    let llm_model = std::env::var("LLM_MODEL").unwrap_or_else(|_| "gpt-5.4-mini".into());
+    let llm_model =
+        std::env::var("LLM_MODEL").unwrap_or_else(|_| "gpt-5.4-mini-2026-03-17".into());
     let http_client = Arc::new(reqwest::Client::builder()
         .timeout(Duration::from_secs(120))
         .build()
