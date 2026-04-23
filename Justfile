@@ -254,7 +254,7 @@ data-wipe:
     @echo "→ Postgres: truncating application tables (schema + migrations kept)..."
     docker exec agentic-ra-postgres psql \
         -U "$AGENT_RS__POSTGRES__USER" -d "$AGENT_RS__POSTGRES__DB" \
-        -c 'TRUNCATE ingested_documents, evidence_items, query_runs, chat_messages, memories, strategy_performance RESTART IDENTITY CASCADE;'
+        -c 'TRUNCATE document_index_state, evidence_items, query_runs, memories, strategy_performance RESTART IDENTITY CASCADE;'
     @echo "Data wipe complete. target/ untouched; containers still running."
 
 # Remove cargo target directory.
