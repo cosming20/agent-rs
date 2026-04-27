@@ -37,6 +37,9 @@ const WEB_BUDGET_EXHAUSTED_TOTAL: &str = "tools.web_budget_exhausted_total";
 const GROUNDING_RETRY_TOTAL: &str = "grounding.retry_total";
 const GROUNDING_RETRIES_EXHAUSTED_TOTAL: &str = "grounding.retries_exhausted_total";
 const GROUNDING_SUBJECT_ABSENT_TOTAL: &str = "grounding.subject_absent_short_circuit_total";
+const GROUNDING_CLAIM_DIRECTED_RETRY_TOTAL: &str = "grounding.claim_directed_retry_total";
+const GROUNDING_CLAIM_DIRECTED_NEW_EVIDENCE_COUNT: &str =
+    "grounding.claim_directed_new_evidence_count";
 const QUERY_DURATION_MS: &str = "pipeline.query_duration_ms";
 const VERIFIER_METHOD_TOTAL: &str = "verification.method_total";
 const RERANKER_FALLBACK_TOTAL: &str = "retrieval.reranker_fallback_total";
@@ -111,6 +114,12 @@ const CHUNK_CHARS_BUCKETS: &[f64] = &[
 /// surrounding heading context (typically a preamble or page header).
 const CHUNK_HEADING_DEPTH_BUCKETS: &[f64] = &[0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 8.0, 10.0];
 
+/// Histogram buckets for the count of new evidence items surfaced by a
+/// single claim-directed search. The grounding gate caps per-claim
+/// retrieval at the configured `claim_search_top_k` (default 3);
+/// buckets up to 16 leave headroom for operators that tune higher.
+const CLAIM_DIRECTED_NEW_EVIDENCE_BUCKETS: &[f64] = &[0.0, 1.0, 2.0, 3.0, 5.0, 8.0, 12.0, 16.0];
+
 /// All custom metric instruments for the retrieval pipeline.
 ///
 /// Cheaply cloneable — the underlying OTel instruments are `Arc`-backed.
@@ -140,6 +149,14 @@ pub struct RetrievalMetrics {
     /// retries because the query's subject tokens were absent from the
     /// first-pass evidence — strong signal the topic is out-of-corpus.
     grounding_subject_absent: metrics::Counter<u64>,
+    /// Count of claim-directed retry iterations performed by the
+    /// grounding gate. Each iteration may dispatch one search per
+    /// flagged claim before re-verifying.
+    grounding_claim_directed_retry: metrics::Counter<u64>,
+    /// Distribution of "new evidence items surfaced" per claim-directed
+    /// search. A value of `0` means the search produced no novel
+    /// evidence and the gate fell back to a full agent rerun.
+    grounding_claim_directed_new_evidence: metrics::Histogram<u64>,
     /// End-to-end query pipeline duration in milliseconds.
     query_duration_ms: metrics::Histogram<f64>,
     /// Count of verifier invocations by method (llm/heuristic/heuristic_fallback/none).
@@ -288,6 +305,27 @@ impl RetrievalMetrics {
                  the subject of the query was absent from the first-pass evidence.",
             )
             .with_unit("queries")
+            .build();
+
+        let grounding_claim_directed_retry = meter
+            .u64_counter(GROUNDING_CLAIM_DIRECTED_RETRY_TOTAL)
+            .with_description(
+                "Number of claim-directed retry iterations performed by the grounding gate. \
+                 Each iteration runs one focused retrieval per ungrounded claim before \
+                 re-verifying the answer.",
+            )
+            .with_unit("iterations")
+            .build();
+
+        let grounding_claim_directed_new_evidence = meter
+            .u64_histogram(GROUNDING_CLAIM_DIRECTED_NEW_EVIDENCE_COUNT)
+            .with_description(
+                "Number of new evidence items surfaced by a single claim-directed search. \
+                 A value of zero means no novel evidence was found and the gate fell back \
+                 to a full agent rerun.",
+            )
+            .with_unit("documents")
+            .with_boundaries(CLAIM_DIRECTED_NEW_EVIDENCE_BUCKETS.to_vec())
             .build();
 
         let query_duration_ms = meter
@@ -465,6 +503,8 @@ impl RetrievalMetrics {
             grounding_retry,
             grounding_retries_exhausted,
             grounding_subject_absent,
+            grounding_claim_directed_retry,
+            grounding_claim_directed_new_evidence,
             query_duration_ms,
             verifier_method,
             reranker_fallback,
@@ -571,6 +611,31 @@ impl RetrievalMetrics {
     pub fn record_grounding_subject_absent(&self, strategy: RetrievalStrategy) {
         self.grounding_subject_absent
             .add(1, &[strategy_attr(strategy)]);
+    }
+
+    /// Increment the claim-directed retry iteration counter, labelled
+    /// by strategy.
+    ///
+    /// Call once per claim-directed retry iteration — typically before
+    /// the gate dispatches per-claim searches and re-verifies. Distinct
+    /// from [`Self::record_grounding_retry`] (which counts every retry
+    /// iteration regardless of mode); claim-directed iterations are a
+    /// strict subset.
+    pub fn record_grounding_claim_directed_retry(&self, strategy: RetrievalStrategy) {
+        self.grounding_claim_directed_retry
+            .add(1, &[strategy_attr(strategy)]);
+    }
+
+    /// Record the count of new evidence items surfaced by one
+    /// claim-directed search batch.
+    ///
+    /// `count` is the number of documents that were not already present
+    /// in the evidence pack. A value of `0` indicates the
+    /// claim-directed search produced no novel support and the gate
+    /// fell through to a full agent rerun.
+    pub fn record_grounding_claim_directed_new_evidence(&self, count: u64) {
+        self.grounding_claim_directed_new_evidence
+            .record(count, &[]);
     }
 
     /// Record the end-to-end query pipeline duration in milliseconds.

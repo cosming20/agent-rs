@@ -19,6 +19,7 @@ use agent_rs_stores::types::ChatTurn;
 use tracing::{info, instrument};
 use uuid::Uuid;
 
+use crate::claim_searcher::{ClaimSearcher, RouterClaimSearcher};
 use crate::context::QueryContext;
 use crate::lang::detect_lang;
 use crate::steps::agent_runner::AgentRunner;
@@ -149,10 +150,19 @@ impl AgentOrchestrator {
             &settings.llm.api_key,
             verifier_model,
         ));
+        // Claim-directed retry handle. Wraps the same shared retrieval
+        // router the agent's `search_knowledge` tool uses, so a
+        // claim-directed search shares cache, embedder, and
+        // cross-encoder rerank state with the in-turn retrieval.
+        let claim_searcher: Arc<dyn ClaimSearcher> =
+            Arc::new(RouterClaimSearcher::new(Arc::clone(&router)));
         let grounding_gate = GroundingGate::new(
             verifier,
             settings.agent.max_retries,
             settings.grounding.subject_min_token_len,
+            claim_searcher,
+            settings.grounding.retry_strategy,
+            settings.grounding.claim_search_top_k,
             Arc::clone(&metrics),
         );
 

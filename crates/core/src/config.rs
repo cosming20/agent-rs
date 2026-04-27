@@ -348,6 +348,34 @@ pub struct VerifierConfig {
     pub model: Option<String>,
 }
 
+/// Strategy used by the grounding gate when the verifier reports the
+/// answer as ungrounded.
+///
+/// `ClaimDirected` (default) extracts each claim flagged as
+/// `supported = false` and runs a focused retrieval per claim, hoping
+/// to surface evidence the agent missed. Only on zero-new-evidence does
+/// it fall through to a full agent rerun.
+///
+/// `AgentRerun` skips claim search entirely and re-runs the agent with
+/// a diagnostic prompt — the legacy behaviour, kept for A/B comparison
+/// and as an escape hatch.
+///
+/// Override via `AGENT_RS__GROUNDING__RETRY_STRATEGY` (`claim_directed`
+/// or `agent_rerun`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RetryStrategy {
+    /// Run a focused retrieval per ungrounded claim before re-running the
+    /// agent. Falls through to [`Self::AgentRerun`] only when no new
+    /// evidence is surfaced.
+    #[default]
+    ClaimDirected,
+    /// Re-run the full agent with a diagnostic prompt — the legacy retry
+    /// path. Kept for A/B comparison and as an escape hatch when the
+    /// claim-directed path regresses.
+    AgentRerun,
+}
+
 /// Grounding gate heuristic configuration.
 ///
 /// Controls the language-agnostic subject-presence check that runs before
@@ -368,16 +396,42 @@ pub struct GroundingConfig {
     /// Override via `AGENT_RS__GROUNDING__SUBJECT_MIN_TOKEN_LEN`.
     #[serde(default = "default_subject_min_token_len")]
     pub subject_min_token_len: usize,
+
+    /// Retry strategy used when the verifier flags the answer as
+    /// ungrounded. See [`RetryStrategy`] for semantics.
+    ///
+    /// Override via `AGENT_RS__GROUNDING__RETRY_STRATEGY`.
+    #[serde(default)]
+    pub retry_strategy: RetryStrategy,
+
+    /// Maximum number of evidence items returned per claim-directed
+    /// search.
+    ///
+    /// Tunable to balance retrieval breadth against token pressure on
+    /// the re-verifier. Tighter values keep the evidence pack focused;
+    /// broader values surface more candidate support at the cost of LLM
+    /// context. Only consulted when
+    /// [`Self::retry_strategy`] is [`RetryStrategy::ClaimDirected`].
+    ///
+    /// Override via `AGENT_RS__GROUNDING__CLAIM_SEARCH_TOP_K`.
+    #[serde(default = "default_claim_search_top_k")]
+    pub claim_search_top_k: usize,
 }
 
 fn default_subject_min_token_len() -> usize {
     4
 }
 
+fn default_claim_search_top_k() -> usize {
+    3
+}
+
 impl Default for GroundingConfig {
     fn default() -> Self {
         Self {
             subject_min_token_len: default_subject_min_token_len(),
+            retry_strategy: RetryStrategy::default(),
+            claim_search_top_k: default_claim_search_top_k(),
         }
     }
 }
