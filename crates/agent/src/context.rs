@@ -12,7 +12,7 @@
 
 use std::time::Instant;
 
-use agent_rs_core::types::{MessageRole, RetrievalStrategy, UserId};
+use agent_rs_core::types::{LangCode, MessageRole, RetrievalStrategy, UserId};
 use agent_rs_retrieval::EvidencePack;
 use agent_rs_stores::types::{ChatTurn, SearchResult};
 use uuid::Uuid;
@@ -38,6 +38,13 @@ pub struct QueryContext {
     pub limit: usize,
     /// Role of the message sender.
     pub role: MessageRole,
+    /// Language detected from the user's query.
+    ///
+    /// Set by [`crate::orchestrator::AgentOrchestrator::process_query`] before
+    /// any pipeline step runs, via [`crate::lang::detect_lang`]. Defaults to
+    /// [`LangCode::Other`] when [`QueryContext::new`] is invoked directly
+    /// (test paths) or when the detector cannot identify the language.
+    pub detected_lang: LangCode,
     /// Monotonic timestamp when the query started.
     pub start_time: Instant,
 
@@ -126,6 +133,7 @@ impl QueryContext {
             strategy,
             limit,
             role: MessageRole::User,
+            detected_lang: LangCode::Other,
             start_time: Instant::now(),
             chat_messages,
             conversation_context,

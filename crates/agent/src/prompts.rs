@@ -14,7 +14,9 @@ use crate::coverage::{CoverageMode, CoveragePlan};
 /// Strict on citations; strict on no-hallucination; strict on no chatty tails.
 pub const DEFAULT_SYSTEM_PROMPT: &str = "\
 You are a precise RAG agent. Answer the user's question using ONLY evidence \
-retrieved through your tools. Be fast, grounded, and terminally useful.
+retrieved through your tools. Be fast, grounded, and terminally useful. \
+Mirror the user's language exactly (script, diacritics, register) — never \
+translate or transliterate.
 
 WORKFLOW
 

@@ -11,8 +11,18 @@ use agent_rs_core::types::Confidence;
 use agent_rs_stores::types::SearchResult;
 use serde::{Deserialize, Serialize};
 use tracing::{info, instrument};
+use unicode_segmentation::UnicodeSegmentation;
 
 use crate::prompts::VERIFICATION_PROMPT;
+
+/// Minimum length (in Unicode scalar values) for a token to enter the
+/// heuristic verifier's overlap calculation.
+///
+/// Anything shorter is dropped regardless of language. This filters out
+/// mono-/bi-character function words across scripts (Romance articles,
+/// English particles, CJK fillers) without a per-language stopword list,
+/// keeping the heuristic universal by construction.
+const HEURISTIC_MIN_TOKEN_CHARS: usize = 3;
 
 /// Result of a faithfulness/grounding check.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -132,23 +142,6 @@ struct VerifierLlmResponse {
     #[serde(default)]
     claims: Vec<VerifierClaim>,
 }
-
-/// Stop words excluded from heuristic token overlap scoring.
-///
-/// Common English function words that carry no semantic weight for
-/// grounding assessment.
-const STOP_WORDS: &[&str] = &[
-    "the", "a", "an", "is", "are", "was", "were", "be", "been", "being", "have", "has", "had",
-    "do", "does", "did", "will", "would", "could", "should", "may", "might", "shall", "can", "to",
-    "of", "in", "for", "on", "with", "at", "by", "from", "as", "into", "through", "during",
-    "before", "after", "above", "below", "between", "out", "off", "over", "under", "again",
-    "further", "then", "once", "here", "there", "when", "where", "why", "how", "all", "each",
-    "every", "both", "few", "more", "most", "other", "some", "such", "no", "nor", "not", "only",
-    "own", "same", "so", "than", "too", "very", "just", "because", "but", "and", "or", "if",
-    "while", "about", "up", "its", "it", "this", "that", "these", "those", "i", "me", "my", "we",
-    "our", "you", "your", "he", "him", "his", "she", "her", "they", "them", "their", "what",
-    "which", "who", "whom",
-];
 
 /// Verifies that an answer is faithfully grounded in retrieved evidence.
 ///
@@ -353,19 +346,33 @@ impl GroundingVerifier {
         })
     }
 
-    /// Heuristic token overlap verification (fallback).
+    /// Heuristic token overlap verification (lang-agnostic fallback).
+    ///
+    /// This path runs only when the LLM verifier client is unavailable
+    /// (no API key, transport failure). The high-quality verifier path
+    /// is [`Self::verify_with_llm`] — it is lang-aware by construction
+    /// because the LLM does the semantic work.
+    ///
+    /// To stay corpus-language-neutral the heuristic tokenizes via
+    /// [`UnicodeSegmentation::unicode_words`] and filters by minimum
+    /// character count rather than against a per-language stopword
+    /// list. This loses precision (mono-character function words like
+    /// English `a` or Spanish `o` are not stripped, while shorter words
+    /// in CJK / abugida scripts are over-aggressively dropped) but
+    /// trades it for a single implementation that does not silently
+    /// degrade on non-English corpora. The heuristic only exists to
+    /// keep the pipeline well-formed when the LLM client is missing,
+    /// so the precision floor is acceptable.
     fn verify_heuristic(
         &self,
         answer: &str,
         evidence: &[SearchResult],
     ) -> Result<VerificationResult, AgentError> {
-        let stop_words: HashSet<&str> = STOP_WORDS.iter().copied().collect();
-
         let answer_tokens: HashSet<String> = answer
             .to_lowercase()
-            .split_whitespace()
+            .unicode_words()
+            .filter(|t| t.chars().count() >= HEURISTIC_MIN_TOKEN_CHARS)
             .map(|s| s.to_owned())
-            .filter(|t| !stop_words.contains(t.as_str()))
             .collect();
 
         if answer_tokens.is_empty() {
@@ -387,8 +394,9 @@ impl GroundingVerifier {
                 .get("chunk_text")
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
-            for token in text.to_lowercase().split_whitespace() {
-                if !stop_words.contains(token) {
+            let lowered = text.to_lowercase();
+            for token in lowered.unicode_words() {
+                if token.chars().count() >= HEURISTIC_MIN_TOKEN_CHARS {
                     evidence_tokens.insert(token.to_owned());
                 }
             }

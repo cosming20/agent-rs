@@ -39,3 +39,9 @@ regex = { workspace = true }
 
 # HTTP client (shared across web tools)
 reqwest = { workspace = true }
+
+# Language detection (drives prompt routing + lang-aware tokenization).
+whatlang = "0.18"
+
+# Unicode word segmentation for the lang-agnostic heuristic verifier.
+unicode-segmentation = "1.13"

@@ -19,6 +19,6 @@ pub use doc_handle::{DocHandle, DocHandleError};
 pub use errors::{AgentError, AgentRsError, RetrievalError, StoreError, ToolError};
 pub use types::{
     CollectionName, Confidence, DatasetName, Embedding, IngestStatus, InvalidIngestStatus,
-    MessageRole, NAMESPACE_OID, RetrievalStrategy, Score, SessionId, UserId,
+    LangCode, MessageRole, NAMESPACE_OID, RetrievalStrategy, Score, SessionId, UserId,
     truncate_to_char_boundary,
 };

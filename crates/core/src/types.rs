@@ -393,6 +393,100 @@ pub enum MessageRole {
     System,
 }
 
+/// Detected query language. Drives prompt routing and language-aware
+/// tokenization in the grounding pipeline.
+///
+/// `Other` is the safe default for languages not in the supported list,
+/// for empty/short queries where detection is unreliable, or when the
+/// detector returns `None`.
+///
+/// The string form is the lowercase 2-letter ISO-639-1 code (`en`, `ro`,
+/// `es`, `de`, `fr`, `it`, `pt`) or `other`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum LangCode {
+    /// English.
+    En,
+    /// Romanian.
+    Ro,
+    /// Spanish.
+    Es,
+    /// German.
+    De,
+    /// French.
+    Fr,
+    /// Italian.
+    It,
+    /// Portuguese.
+    Pt,
+    /// Any language not in the supported set, or unknown.
+    #[default]
+    Other,
+}
+
+impl LangCode {
+    /// Lowercase 2-letter ISO-639-1 code, or `"other"` for unknown/unsupported.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::En => "en",
+            Self::Ro => "ro",
+            Self::Es => "es",
+            Self::De => "de",
+            Self::Fr => "fr",
+            Self::It => "it",
+            Self::Pt => "pt",
+            Self::Other => "other",
+        }
+    }
+}
+
+impl fmt::Display for LangCode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+#[cfg(test)]
+mod lang_code_tests {
+    use super::*;
+
+    #[test]
+    fn display_roundtrips_iso_codes() {
+        assert_eq!(LangCode::En.to_string(), "en");
+        assert_eq!(LangCode::Ro.to_string(), "ro");
+        assert_eq!(LangCode::Es.to_string(), "es");
+        assert_eq!(LangCode::De.to_string(), "de");
+        assert_eq!(LangCode::Fr.to_string(), "fr");
+        assert_eq!(LangCode::It.to_string(), "it");
+        assert_eq!(LangCode::Pt.to_string(), "pt");
+        assert_eq!(LangCode::Other.to_string(), "other");
+    }
+
+    #[test]
+    fn default_is_other() {
+        assert_eq!(LangCode::default(), LangCode::Other);
+    }
+
+    #[test]
+    fn serde_roundtrip_lowercase_codes() {
+        for variant in [
+            LangCode::En,
+            LangCode::Ro,
+            LangCode::Es,
+            LangCode::De,
+            LangCode::Fr,
+            LangCode::It,
+            LangCode::Pt,
+            LangCode::Other,
+        ] {
+            let json = serde_json::to_string(&variant).expect("serialize");
+            assert_eq!(json, format!("\"{}\"", variant.as_str()));
+            let back: LangCode = serde_json::from_str(&json).expect("deserialize");
+            assert_eq!(back, variant);
+        }
+    }
+}
+
 // ---- Ingest state machine ----
 
 /// State of a document in the ingestion pipeline.

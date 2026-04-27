@@ -17,6 +17,7 @@
 
 pub mod context;
 pub mod coverage;
+pub mod lang;
 pub mod orchestrator;
 pub mod prompts;
 pub mod steps;

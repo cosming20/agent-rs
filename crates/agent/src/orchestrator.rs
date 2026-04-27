@@ -20,6 +20,7 @@ use tracing::{info, instrument};
 use uuid::Uuid;
 
 use crate::context::QueryContext;
+use crate::lang::detect_lang;
 use crate::steps::agent_runner::AgentRunner;
 use crate::steps::context_builder::ContextBuilder;
 use crate::steps::coverage_planner::CoveragePlanner;
@@ -219,9 +220,15 @@ impl AgentOrchestrator {
             trace_id,
         );
 
+        // Detect query language up-front so every downstream step (prompt
+        // routing, lang-aware tokenization, telemetry) can branch on a
+        // single typed value rather than re-running the detector.
+        ctx.detected_lang = detect_lang(&ctx.query);
+
         info!(
             query = %ctx.query,
             strategy = %ctx.strategy,
+            lang = %ctx.detected_lang,
             "pipeline started"
         );
 
