@@ -497,6 +497,52 @@ impl Default for GroundingConfig {
     }
 }
 
+/// Per-request LLM budget thresholds.
+///
+/// Soft caps only — exceeding triggers a structured `WARN` log; no
+/// requests are aborted in this phase. A future phase may add a hard-
+/// abort `BudgetGuard` for cost-critical deployments. Plugs into
+/// [`Settings`] under the `budget` key. Environment overrides use the
+/// `AGENT_RS__BUDGET__*` prefix:
+///
+/// - `AGENT_RS__BUDGET__SOFT_TOKEN_LIMIT` (u64, default `200_000`)
+/// - `AGENT_RS__BUDGET__SOFT_COST_USD` (f64, default `1.0`)
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct BudgetConfig {
+    /// Total tokens per request that triggers a `WARN` log when
+    /// exceeded. Override via `AGENT_RS__BUDGET__SOFT_TOKEN_LIMIT`.
+    #[serde(default = "default_soft_token_limit")]
+    pub soft_token_limit: u64,
+    /// Estimated USD cost per request that triggers a `WARN` log when
+    /// exceeded. Override via `AGENT_RS__BUDGET__SOFT_COST_USD`.
+    #[serde(default = "default_soft_cost_usd")]
+    pub soft_cost_usd: f64,
+}
+
+/// Default soft cap on total tokens per request before a warning log
+/// fires. Sized for typical multi-turn coverage flows on `gpt-5.4-mini`
+/// (a few dozen LLM calls, each <10K tokens). Operators tighten this
+/// for cost-sensitive deployments.
+fn default_soft_token_limit() -> u64 {
+    200_000
+}
+
+/// Default soft cap on USD cost per request before a warning log
+/// fires. Picked at $1 to surface only genuinely expensive runs while
+/// staying low enough that a runaway exhaustive query is not silent.
+fn default_soft_cost_usd() -> f64 {
+    1.0
+}
+
+impl Default for BudgetConfig {
+    fn default() -> Self {
+        Self {
+            soft_token_limit: default_soft_token_limit(),
+            soft_cost_usd: default_soft_cost_usd(),
+        }
+    }
+}
+
 /// Web search budget configuration.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct WebBudgetConfig {
@@ -855,6 +901,12 @@ pub struct Settings {
     /// per-field semantics and env-var overrides.
     #[serde(default)]
     pub circuit_breaker: CircuitBreakerConfig,
+    /// Per-request LLM token + cost soft caps. See [`BudgetConfig`]
+    /// for semantics and env-var overrides. This phase is
+    /// observability-first: exceeding the caps emits a `WARN` log and
+    /// histogram metrics; requests are not aborted.
+    #[serde(default)]
+    pub budget: BudgetConfig,
 }
 
 impl Default for Settings {
@@ -972,6 +1024,7 @@ impl Default for Settings {
             minio: MinioConfig::default(),
             rabbitmq: RabbitmqConfig::default(),
             circuit_breaker: CircuitBreakerConfig::default(),
+            budget: BudgetConfig::default(),
         }
     }
 }

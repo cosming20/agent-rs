@@ -10,9 +10,11 @@
 //! `QueryContext` at construction time. `trace_id` is an optional
 //! client-supplied correlation UUID with no authorization meaning.
 
+use std::sync::Arc;
 use std::time::Instant;
 
 use agent_rs_core::types::{LangCode, MessageRole, RetrievalStrategy, UserId};
+use agent_rs_observability::RequestBudget;
 use agent_rs_retrieval::EvidencePack;
 use agent_rs_stores::types::{ChatTurn, SearchResult};
 use uuid::Uuid;
@@ -92,6 +94,17 @@ pub struct QueryContext {
     pub coverage_evidence: Vec<agent_rs_stores::types::SearchResult>,
     pub coverage_report: Option<crate::coverage::CoverageReport>,
     pub tool_calls: Vec<crate::coverage::ToolCallRecord>,
+
+    // ---- Per-request LLM budget tracking ----
+    /// Aggregates token + USD cost for every LLM call dispatched during
+    /// this `process_query`. Constructed fresh per request and shared
+    /// via `Arc` to any pipeline step that has access to the
+    /// [`QueryContext`] and emits LLM calls (verifier, agent runner,
+    /// downstream pipeline-time callers). Ingestion-time callers do
+    /// not have a `QueryContext` and therefore do not update this
+    /// field; per-call histograms still flow through
+    /// [`agent_rs_observability::metrics::RetrievalMetrics`].
+    pub budget: Arc<RequestBudget>,
 }
 
 impl QueryContext {
@@ -150,6 +163,7 @@ impl QueryContext {
             coverage_evidence: Vec::new(),
             coverage_report: None,
             tool_calls: Vec::new(),
+            budget: RequestBudget::new(),
         }
     }
 

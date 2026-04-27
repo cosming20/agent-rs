@@ -57,6 +57,18 @@ const LLM_LATENCY_MS: &str = "llm.latency_ms";
 const LLM_FAILURES_TOTAL: &str = "llm.failures_total";
 const INGEST_STAGE_MS: &str = "ingestion.stage_ms";
 
+// ---- Per-call + per-request budget histograms ----
+//
+// `LLM_CALL_TOKENS` and `LLM_CALL_COST_USD` complement the existing
+// `LLM_TOKENS_*` counters with a histogram view of the per-call
+// distribution — useful for spotting fat-tail prompts that drive the
+// cost curve. `LLM_REQUEST_TOTAL_*` are emitted once per request from
+// the orchestrator, summarising the aggregated [`RequestBudget`].
+const LLM_CALL_TOKENS: &str = "llm.call_tokens";
+const LLM_CALL_COST_USD: &str = "llm.call_cost_usd";
+const LLM_REQUEST_TOTAL_TOKENS: &str = "llm.request_total_tokens";
+const LLM_REQUEST_TOTAL_COST_USD: &str = "llm.request_total_cost_usd";
+
 // ---- Tier 2 — chunk quality ----
 const CHUNKS_PER_DOC: &str = "ingestion.chunks_per_doc";
 const CHUNK_TOKENS: &str = "ingestion.chunk_tokens";
@@ -147,6 +159,38 @@ const BACKEND_LATENCY_MS_BUCKETS: &[f64] = &[
 /// thread-pool) tops out around 250 ms.
 const RRF_FUSION_MS_BUCKETS: &[f64] = &[0.1, 0.5, 1.0, 2.5, 5.0, 10.0, 25.0, 50.0, 100.0, 250.0];
 
+/// Histogram buckets for the per-call total-token count. Tuned to
+/// span small router-internal calls (a few hundred tokens) up through
+/// long-context summarisation (tens of thousands).
+const LLM_CALL_TOKENS_BUCKETS: &[f64] = &[
+    100.0, 500.0, 1000.0, 2500.0, 5000.0, 10_000.0, 25_000.0, 50_000.0, 100_000.0,
+];
+
+/// Histogram buckets for per-call USD cost. Coarser than
+/// [`COST_USD_BUCKETS`] — these are aimed at request-size triage,
+/// not fine-grained pricing analysis.
+const LLM_CALL_COST_USD_BUCKETS: &[f64] = &[0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1.0];
+
+/// Histogram buckets for the per-request aggregated total tokens.
+/// Wider than the per-call bucket set — a single request may chain
+/// dozens of LLM calls and accumulate high six-figure totals on
+/// exhaustive coverage flows.
+const LLM_REQUEST_TOTAL_TOKENS_BUCKETS: &[f64] = &[
+    1_000.0,
+    5_000.0,
+    10_000.0,
+    25_000.0,
+    50_000.0,
+    100_000.0,
+    200_000.0,
+    500_000.0,
+    1_000_000.0,
+];
+
+/// Histogram buckets for the per-request aggregated USD cost.
+const LLM_REQUEST_TOTAL_COST_USD_BUCKETS: &[f64] =
+    &[0.001, 0.01, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0];
+
 /// Latency buckets for the LLM grounding verifier.
 ///
 /// Reasoning models (gpt-5.x with `low` effort) take 1–10 s typical and
@@ -219,6 +263,21 @@ pub struct RetrievalMetrics {
     /// Per-stage ingestion wall-clock time in ms, labelled by stage name.
     /// Stages: docling_parse, embed, kg_extraction, summarize, total.
     ingest_stage_ms: metrics::Histogram<f64>,
+    /// Per-call total-token distribution, labelled by component +
+    /// model. Complements [`Self::llm_tokens_prompt`] /
+    /// [`Self::llm_tokens_completion`] (which are running totals) with
+    /// a distribution view useful for spotting fat-tail outliers.
+    llm_call_tokens: metrics::Histogram<u64>,
+    /// Per-call USD cost distribution, labelled by component + model.
+    /// Coarser buckets than [`Self::llm_cost_usd`]; aimed at
+    /// request-size triage rather than fine-grained pricing analysis.
+    llm_call_cost_usd: metrics::Histogram<f64>,
+    /// Aggregated per-request total tokens. Emitted once at end of
+    /// `process_query` from the [`RequestBudget`] snapshot.
+    llm_request_total_tokens: metrics::Histogram<u64>,
+    /// Aggregated per-request USD cost. Emitted once at end of
+    /// `process_query` from the [`RequestBudget`] snapshot.
+    llm_request_total_cost_usd: metrics::Histogram<f64>,
 
     // ---- Tier 2 — chunk quality ----
     /// Number of chunks produced per document.
@@ -493,6 +552,46 @@ impl RetrievalMetrics {
             .with_boundaries(INGEST_STAGE_MS_BUCKETS.to_vec())
             .build();
 
+        let llm_call_tokens = meter
+            .u64_histogram(LLM_CALL_TOKENS)
+            .with_description(
+                "Per-call total-token distribution (prompt + completion), labelled by \
+                 component + model.",
+            )
+            .with_unit("tokens")
+            .with_boundaries(LLM_CALL_TOKENS_BUCKETS.to_vec())
+            .build();
+
+        let llm_call_cost_usd = meter
+            .f64_histogram(LLM_CALL_COST_USD)
+            .with_description(
+                "Per-call USD cost distribution, labelled by component + model. \
+                 Coarser buckets than llm.cost_usd; aimed at request-size triage.",
+            )
+            .with_unit("USD")
+            .with_boundaries(LLM_CALL_COST_USD_BUCKETS.to_vec())
+            .build();
+
+        let llm_request_total_tokens = meter
+            .u64_histogram(LLM_REQUEST_TOTAL_TOKENS)
+            .with_description(
+                "Aggregated per-request total tokens across every LLM call in a single \
+                 process_query, emitted from the RequestBudget snapshot.",
+            )
+            .with_unit("tokens")
+            .with_boundaries(LLM_REQUEST_TOTAL_TOKENS_BUCKETS.to_vec())
+            .build();
+
+        let llm_request_total_cost_usd = meter
+            .f64_histogram(LLM_REQUEST_TOTAL_COST_USD)
+            .with_description(
+                "Aggregated per-request USD cost across every LLM call in a single \
+                 process_query, emitted from the RequestBudget snapshot.",
+            )
+            .with_unit("USD")
+            .with_boundaries(LLM_REQUEST_TOTAL_COST_USD_BUCKETS.to_vec())
+            .build();
+
         // ---- Tier 2 instruments ----
         let chunks_per_doc = meter
             .u64_histogram(CHUNKS_PER_DOC)
@@ -675,6 +774,10 @@ impl RetrievalMetrics {
             llm_latency_ms,
             llm_failures,
             ingest_stage_ms,
+            llm_call_tokens,
+            llm_call_cost_usd,
+            llm_request_total_tokens,
+            llm_request_total_cost_usd,
             chunks_per_doc,
             chunk_tokens,
             chunk_chars,
@@ -881,6 +984,33 @@ impl RetrievalMetrics {
 
         let cost = llm_cost_usd(model, prompt_tokens, completion_tokens);
         self.llm_cost_usd.record(cost, attrs_full);
+
+        // Tier-1.5 distribution metrics — see LLM_CALL_TOKENS /
+        // LLM_CALL_COST_USD docs for rationale.
+        self.llm_call_tokens
+            .record(prompt_tokens.saturating_add(completion_tokens), attrs_full);
+        self.llm_call_cost_usd.record(cost, attrs_full);
+    }
+
+    /// Record the per-request total token count, emitted once at the
+    /// end of `process_query` from the [`crate::budget::RequestBudget`]
+    /// snapshot.
+    pub fn record_request_total_tokens(&self, total: u64) {
+        self.llm_request_total_tokens.record(total, &[]);
+    }
+
+    /// Record the per-request total USD cost, emitted once at the end
+    /// of `process_query` from the [`crate::budget::RequestBudget`]
+    /// snapshot.
+    pub fn record_request_total_cost_usd(&self, cost_usd: f64) {
+        // Defensive clamp: budget never produces negatives, but a NaN
+        // would corrupt the histogram so coerce to zero.
+        let v = if cost_usd.is_finite() && cost_usd >= 0.0 {
+            cost_usd
+        } else {
+            0.0
+        };
+        self.llm_request_total_cost_usd.record(v, &[]);
     }
 
     /// Increment the LLM failure counter, labelled by component + kind.

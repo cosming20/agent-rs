@@ -20,8 +20,10 @@
 //! }
 //! ```
 
+pub mod budget;
 pub mod circuit_breaker;
 pub mod metrics;
 pub mod tracing;
 
+pub use budget::{BudgetSnapshot, RequestBudget, TokenUsage, estimate_cost_usd};
 pub use circuit_breaker::{BreakerState, CircuitBreaker};

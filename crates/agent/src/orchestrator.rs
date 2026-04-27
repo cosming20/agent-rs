@@ -6,7 +6,7 @@
 
 use std::sync::Arc;
 
-use agent_rs_core::config::Settings;
+use agent_rs_core::config::{BudgetConfig, Settings};
 use agent_rs_core::errors::AgentError;
 use agent_rs_core::types::{RetrievalStrategy, UserId};
 use agent_rs_observability::metrics::RetrievalMetrics;
@@ -16,7 +16,7 @@ use agent_rs_stores::postgres::PgStore;
 use agent_rs_stores::qdrant::QdrantStore;
 use agent_rs_stores::traits::StateStore;
 use agent_rs_stores::types::ChatTurn;
-use tracing::{info, instrument};
+use tracing::{info, instrument, warn};
 use uuid::Uuid;
 
 use crate::claim_searcher::{ClaimSearcher, RouterClaimSearcher};
@@ -54,6 +54,13 @@ pub struct AgentOrchestrator {
     coverage_verifier: CoverageVerifier,
     grounding_gate: GroundingGate,
     result_persister: ResultPersister,
+    /// Shared metric instruments. Reused at end-of-request to emit
+    /// the per-request budget histograms once the
+    /// [`crate::context::QueryContext::budget`] snapshot is available.
+    metrics: Arc<RetrievalMetrics>,
+    /// Per-request LLM budget thresholds. Read at end of
+    /// `process_query` to decide whether to emit a soft-cap warning.
+    budget_config: BudgetConfig,
 }
 
 impl AgentOrchestrator {
@@ -175,7 +182,7 @@ impl AgentOrchestrator {
             settings.synthesis.max_snippet_length,
             settings.synthesis.fallback_citation_count,
         );
-        let result_persister = ResultPersister::new(synthesizer, store, metrics);
+        let result_persister = ResultPersister::new(synthesizer, store, Arc::clone(&metrics));
 
         Ok(Self {
             context_builder,
@@ -185,6 +192,8 @@ impl AgentOrchestrator {
             coverage_verifier,
             grounding_gate,
             result_persister,
+            metrics,
+            budget_config: settings.budget.clone(),
         })
     }
 
@@ -278,6 +287,38 @@ impl AgentOrchestrator {
 
         // Step 5: Synthesize response with citations, persist run
         let response = self.result_persister.persist(&ctx).await?;
+
+        // Per-request LLM budget summary. Always logged so dashboards
+        // can graph cost per query; warns on top when a soft cap is
+        // exceeded. Histograms are emitted once per request so SLO
+        // calculators can pull P99 cost / tokens directly from OTel.
+        let snapshot = ctx.budget.snapshot();
+        self.metrics
+            .record_request_total_tokens(snapshot.total_tokens);
+        self.metrics
+            .record_request_total_cost_usd(snapshot.cost_usd);
+        info!(
+            call_count = snapshot.call_count,
+            prompt_tokens = snapshot.prompt_tokens,
+            completion_tokens = snapshot.completion_tokens,
+            total_tokens = snapshot.total_tokens,
+            cost_usd = snapshot.cost_usd,
+            "request budget snapshot"
+        );
+        let token_over = snapshot.total_tokens > self.budget_config.soft_token_limit;
+        let cost_over = snapshot.cost_usd > self.budget_config.soft_cost_usd;
+        if token_over || cost_over {
+            warn!(
+                call_count = snapshot.call_count,
+                total_tokens = snapshot.total_tokens,
+                soft_token_limit = self.budget_config.soft_token_limit,
+                cost_usd = snapshot.cost_usd,
+                soft_cost_usd = self.budget_config.soft_cost_usd,
+                token_over,
+                cost_over,
+                "request exceeded soft budget threshold"
+            );
+        }
 
         info!(
             confidence = response.confidence.value(),
