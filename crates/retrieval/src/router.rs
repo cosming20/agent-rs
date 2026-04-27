@@ -293,6 +293,21 @@ impl RetrievalRouter {
         self
     }
 
+    /// Attach an externally-constructed [`CircuitBreaker`] for Qdrant.
+    ///
+    /// Production wiring uses [`Self::with_qdrant_circuit_breaker`] to build
+    /// the breaker from [`CircuitBreakerConfig`]. This variant accepts an
+    /// already-constructed `Arc<CircuitBreaker>` so integration tests can
+    /// pre-trip the breaker (via [`CircuitBreaker::record_failure`]) before
+    /// dispatching a query, exercising the fallback paths without first
+    /// having to drive the router through `failure_threshold` real failures.
+    ///
+    /// Returns the router by value to support builder-style construction.
+    pub fn with_qdrant_circuit_breaker_arc(mut self, breaker: Arc<CircuitBreaker>) -> Self {
+        self.qdrant_breaker = Some(breaker);
+        self
+    }
+
     /// Attach an LLM-backed weighted-keyword extractor.
     ///
     /// The extractor runs in parallel with `query_rewriter`, `entity_linker`,
