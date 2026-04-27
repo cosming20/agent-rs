@@ -115,7 +115,7 @@ pub async fn build_router(
     let http_client = build_http_client(Duration::from_secs(60))
         .context("build shared HTTP client for router")?;
 
-    let ranker = ResultRanker::new(settings.ranker.rrf_k);
+    let ranker = ResultRanker::new(settings.ranker.rrf_k).with_metrics(Arc::clone(&metrics));
 
     let mut router = RetrievalRouter::new(
         embedder,
@@ -125,7 +125,8 @@ pub async fn build_router(
         collection.clone(),
     )
     .with_triplet_collection(triplet_collection.clone())
-    .with_summaries_collection(summaries_collection.clone());
+    .with_summaries_collection(summaries_collection.clone())
+    .with_qdrant_circuit_breaker(&settings.circuit_breaker);
 
     // GraphCoT iterative retriever.
     if !features.skip_graph_cot {

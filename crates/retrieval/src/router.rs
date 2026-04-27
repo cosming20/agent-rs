@@ -24,9 +24,10 @@
 //! Phase 4 will extract seed IDs from the query embedding nearest-neighbours.
 
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use agent_rs_core::{CollectionName, Embedding, RetrievalStrategy, UserId};
+use agent_rs_core::{CircuitBreakerConfig, CollectionName, Embedding, RetrievalStrategy, UserId};
+use agent_rs_observability::circuit_breaker::CircuitBreaker;
 use agent_rs_observability::metrics::RetrievalMetrics;
 use tracing::instrument;
 
@@ -221,6 +222,16 @@ pub struct RetrievalRouter {
     /// resolves to `WeightedKeywords::empty()` — preventing a slow
     /// extractor from extending the router's overall deadline.
     weighted_keyword_branch_budget: Duration,
+
+    /// Optional circuit breaker guarding Qdrant vector search.
+    ///
+    /// When set and Open, dense / hybrid retrieval strategies degrade
+    /// to a Postgres-FTS-equivalent path (BM25-only via the Qdrant
+    /// keyword endpoint, which uses a separate code path inside the
+    /// Qdrant gRPC client and so survives many failure modes that take
+    /// down the dense-search path). When `None`, the breaker is
+    /// disabled and every Qdrant call is attempted unconditionally.
+    qdrant_breaker: Option<Arc<CircuitBreaker>>,
 }
 
 impl RetrievalRouter {
@@ -259,7 +270,27 @@ impl RetrievalRouter {
             weighted_keyword_extractor: None,
             weighted_keyword_integration: WeightedKeywordIntegrationConfig::default(),
             weighted_keyword_branch_budget: Duration::from_secs(6),
+            qdrant_breaker: None,
         }
+    }
+
+    /// Attach a circuit breaker for Qdrant vector search.
+    ///
+    /// When the breaker is Open, dense and hybrid strategies degrade to
+    /// a BM25-only fallback path; the [`RetrievalMetrics`] handle (when
+    /// present) records each fallback as
+    /// `qdrant.circuit_breaker_fallback_total`.
+    ///
+    /// `cfg` is read from `Settings::circuit_breaker`. Returns the
+    /// router by value to support builder-style construction.
+    pub fn with_qdrant_circuit_breaker(mut self, cfg: &CircuitBreakerConfig) -> Self {
+        let breaker = CircuitBreaker::new(
+            cfg.failure_threshold,
+            Duration::from_secs(cfg.recovery_secs),
+            cfg.half_open_max_probes,
+        );
+        self.qdrant_breaker = Some(Arc::new(breaker));
+        self
     }
 
     /// Attach an LLM-backed weighted-keyword extractor.
@@ -488,6 +519,105 @@ impl RetrievalRouter {
             .collect()
     }
 
+    /// Wrap a Qdrant dense vector search with latency timing and
+    /// circuit-breaker accounting.
+    ///
+    /// Latency is recorded into `qdrant.search_duration_ms` whenever a
+    /// metrics handle is configured, regardless of breaker state — the
+    /// fast-path success case is the most useful sample. On error,
+    /// `record_failure` is invoked on the breaker so a sustained Qdrant
+    /// outage trips it.
+    ///
+    /// The caller is responsible for short-circuiting (skipping this
+    /// call entirely) when the breaker is Open; this helper only
+    /// records outcomes for the *attempted* calls.
+    async fn timed_dense_search(
+        &self,
+        collection: &CollectionName,
+        user_id: &UserId,
+        dense: &Embedding,
+        limit: usize,
+        extra_filter: Option<serde_json::Value>,
+    ) -> Result<Vec<agent_rs_stores::types::SearchResult>, RetrievalError> {
+        let started = Instant::now();
+        let outcome = self
+            .vector_store
+            .search_for_user(collection, user_id, dense, limit, extra_filter)
+            .await
+            .map_err(RetrievalError::Store);
+        if let Some(m) = &self.metrics {
+            let elapsed_ms = started.elapsed().as_secs_f64() * 1000.0;
+            m.record_qdrant_search_duration(elapsed_ms);
+        }
+        match (&outcome, &self.qdrant_breaker) {
+            (Ok(_), Some(b)) => b.record_success(),
+            (Err(e), Some(b)) if is_breaker_trippable(e) => b.record_failure(),
+            _ => {}
+        }
+        outcome
+    }
+
+    /// Time-instrumented wrapper around an embedding call.
+    ///
+    /// Records `embedder.duration_ms` for every attempt — both the
+    /// success path and the failure path are valuable signals for
+    /// alerting on degraded embedder availability.
+    async fn timed_embed(&self, text: &str) -> Result<Embedding, RetrievalError> {
+        let started = Instant::now();
+        let outcome = self.embedder.embed_text(text).await;
+        if let Some(m) = &self.metrics {
+            let elapsed_ms = started.elapsed().as_secs_f64() * 1000.0;
+            m.record_embedder_duration(elapsed_ms);
+        }
+        outcome
+    }
+
+    /// Time-instrumented wrapper around a Neo4j `graph_search`-style
+    /// dispatch. Records `neo4j.traversal_duration_ms` for every call.
+    ///
+    /// `task` returns the search future to invoke; the helper exists so
+    /// every call site picks up consistent timing without duplicating
+    /// the `Instant::now()` ritual at every dispatch point.
+    async fn timed_graph<F, Fut, T>(&self, task: F) -> Result<T, RetrievalError>
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = Result<T, RetrievalError>>,
+    {
+        let started = Instant::now();
+        let outcome = task().await;
+        if let Some(m) = &self.metrics {
+            let elapsed_ms = started.elapsed().as_secs_f64() * 1000.0;
+            m.record_neo4j_traversal_duration(elapsed_ms);
+        }
+        outcome
+    }
+
+    /// Decide whether to attempt a Qdrant dense call right now.
+    ///
+    /// Returns `true` when the breaker is absent (feature disabled) or
+    /// admits the request. Returns `false` when the breaker is Open and
+    /// the caller must fall back. On a `false` return the
+    /// `qdrant.circuit_breaker_fallback_total` counter is incremented
+    /// and a structured WARN event is emitted so the dashboards and
+    /// logs both surface the fallback decision.
+    fn breaker_allows_qdrant(&self, strategy: RetrievalStrategy) -> bool {
+        let Some(breaker) = self.qdrant_breaker.as_ref() else {
+            return true;
+        };
+        if breaker.allow() {
+            return true;
+        }
+        if let Some(m) = &self.metrics {
+            m.record_qdrant_circuit_breaker_fallback(strategy);
+        }
+        tracing::warn!(
+            strategy = %strategy,
+            breaker_state = %breaker.state(),
+            "qdrant_circuit_open_fallback"
+        );
+        false
+    }
+
     /// Derive seed node IDs for graph traversal by running a quick vector search
     /// scoped to `user_id`, and extracting document IDs from the top results.
     ///
@@ -502,16 +632,8 @@ impl RetrievalRouter {
         limit: usize,
     ) -> Result<Vec<String>, RetrievalError> {
         let top_docs = self
-            .vector_store
-            .search_for_user(
-                &self.collection,
-                user_id,
-                dense,
-                limit.min(10), // cap seed count
-                None,
-            )
-            .await
-            .map_err(RetrievalError::Store)?;
+            .timed_dense_search(&self.collection, user_id, dense, limit.min(10), None)
+            .await?;
 
         let seeds: Vec<String> = top_docs.into_iter().map(|r| r.id).collect();
         tracing::debug!(
@@ -723,7 +845,10 @@ impl RetrievalRouter {
             // Sparse embeddings are no longer computed client-side: the store layer
             // sends the raw query text as `Document { model: "qdrant/bm25" }` and
             // Qdrant performs BM25 inference server-side.
-            let dense = self.embedder.embed_text(&embed_text).await?;
+            //
+            // `timed_embed` records `embedder.duration_ms` when a metrics handle
+            // is configured, so embedder availability is alertable.
+            let dense = self.timed_embed(&embed_text).await?;
 
             let per_sub_lists = self
                 .dispatch_single(
@@ -907,7 +1032,13 @@ impl RetrievalRouter {
                 top_k = limit,
                 "cross-encoder reranking"
             );
-            match reranker.rerank(primary_query, candidates, limit).await {
+            let rerank_started = Instant::now();
+            let rerank_outcome = reranker.rerank(primary_query, candidates, limit).await;
+            if let Some(m) = &self.metrics {
+                let elapsed_ms = rerank_started.elapsed().as_secs_f64() * 1000.0;
+                m.record_reranker_duration(elapsed_ms);
+            }
+            match rerank_outcome {
                 Ok(mut reranked) => {
                     // Weighted-keyword rerank adjustment (consumer #2).
                     // Applied on the post-rerank list; empty keywords or
@@ -1112,28 +1243,59 @@ impl RetrievalRouter {
         limit: usize,
         extra_filter: Option<&serde_json::Value>,
     ) -> Result<Vec<Vec<agent_rs_stores::types::SearchResult>>, RetrievalError> {
+        let m = self.metrics.as_deref();
         match strategy {
             // ---- Single-backend: dense vector ----
             //
             // User-scoped vector search; metadata payload filters are merged in
             // via `extra_filter` when a MetadataFilterExtractor produced hints.
+            // When the Qdrant breaker is Open, degrade to a BM25-only path so
+            // a Qdrant outage results in a partial answer, not a 500.
             RetrievalStrategy::Semantic => {
+                if !self.breaker_allows_qdrant(strategy) {
+                    let fallback = keyword_search_or_warn(
+                        &*self.vector_store,
+                        &self.collection,
+                        user_id,
+                        query_str,
+                        limit,
+                        extra_filter.cloned(),
+                        "Semantic_fallback",
+                        m,
+                    )
+                    .await;
+                    return Ok(vec![fallback]);
+                }
                 let results = self
-                    .vector_store
-                    .search_for_user(
+                    .timed_dense_search(
                         &self.collection,
                         user_id,
                         dense,
                         limit,
                         extra_filter.cloned(),
                     )
-                    .await
-                    .map_err(RetrievalError::Store)?;
+                    .await?;
                 Ok(vec![results])
             }
 
             // ---- Single-backend: summaries vector ----
             RetrievalStrategy::Summaries => {
+                if !self.breaker_allows_qdrant(strategy) {
+                    let fallback = keyword_search_or_warn(
+                        &*self.vector_store,
+                        self.summaries_collection
+                            .as_ref()
+                            .unwrap_or(&self.collection),
+                        user_id,
+                        query_str,
+                        limit,
+                        extra_filter.cloned(),
+                        "Summaries_fallback",
+                        m,
+                    )
+                    .await;
+                    return Ok(vec![fallback]);
+                }
                 // Use the dedicated summaries collection when available;
                 // fall back to the main collection otherwise.
                 let target = self
@@ -1141,26 +1303,36 @@ impl RetrievalRouter {
                     .as_ref()
                     .unwrap_or(&self.collection);
                 let results = self
-                    .vector_store
-                    .search_for_user(target, user_id, dense, limit, extra_filter.cloned())
-                    .await
-                    .map_err(RetrievalError::Store)?;
+                    .timed_dense_search(target, user_id, dense, limit, extra_filter.cloned())
+                    .await?;
                 Ok(vec![results])
             }
 
             // ---- Single-backend: temporal vector ----
             RetrievalStrategy::Temporal => {
+                if !self.breaker_allows_qdrant(strategy) {
+                    let fallback = keyword_search_or_warn(
+                        &*self.vector_store,
+                        &self.collection,
+                        user_id,
+                        query_str,
+                        limit,
+                        extra_filter.cloned(),
+                        "Temporal_fallback",
+                        m,
+                    )
+                    .await;
+                    return Ok(vec![fallback]);
+                }
                 let results = self
-                    .vector_store
-                    .search_for_user(
+                    .timed_dense_search(
                         &self.collection,
                         user_id,
                         dense,
                         limit,
                         extra_filter.cloned(),
                     )
-                    .await
-                    .map_err(RetrievalError::Store)?;
+                    .await?;
                 Ok(vec![results])
             }
 
@@ -1182,6 +1354,7 @@ impl RetrievalRouter {
                     limit,
                     extra_filter.cloned(),
                     "Keyword",
+                    m,
                 )
                 .await;
                 Ok(vec![results])
@@ -1193,17 +1366,20 @@ impl RetrievalRouter {
                 let seeds = self
                     .derive_seed_ids(user_id, query_str, dense, limit)
                     .await?;
-                let results = graph_search(
-                    &*self.graph_store,
-                    &*self.vector_store,
-                    &self.collection,
-                    user_id,
-                    query_str,
-                    &seeds,
-                    DEFAULT_GRAPH_DEPTH,
-                    limit,
-                )
-                .await?;
+                let results = self
+                    .timed_graph(|| {
+                        graph_search(
+                            &*self.graph_store,
+                            &*self.vector_store,
+                            &self.collection,
+                            user_id,
+                            query_str,
+                            &seeds,
+                            DEFAULT_GRAPH_DEPTH,
+                            limit,
+                        )
+                    })
+                    .await?;
                 Ok(vec![results])
             }
 
@@ -1212,17 +1388,20 @@ impl RetrievalRouter {
                 let seeds = self
                     .derive_seed_ids(user_id, query_str, dense, limit)
                     .await?;
-                let results = graph_rag_context_search(
-                    &*self.graph_store,
-                    &*self.vector_store,
-                    &self.collection,
-                    user_id,
-                    query_str,
-                    &seeds,
-                    DEFAULT_GRAPH_DEPTH,
-                    limit,
-                )
-                .await?;
+                let results = self
+                    .timed_graph(|| {
+                        graph_rag_context_search(
+                            &*self.graph_store,
+                            &*self.vector_store,
+                            &self.collection,
+                            user_id,
+                            query_str,
+                            &seeds,
+                            DEFAULT_GRAPH_DEPTH,
+                            limit,
+                        )
+                    })
+                    .await?;
                 Ok(vec![results])
             }
 
@@ -1243,17 +1422,20 @@ impl RetrievalRouter {
                 let seeds = self
                     .derive_seed_ids(user_id, query_str, dense, limit)
                     .await?;
-                let initial = graph_cot_search(
-                    &*self.graph_store,
-                    &*self.vector_store,
-                    &self.collection,
-                    user_id,
-                    query_str,
-                    &seeds,
-                    DEFAULT_GRAPH_DEPTH,
-                    limit,
-                )
-                .await?;
+                let initial = self
+                    .timed_graph(|| {
+                        graph_cot_search(
+                            &*self.graph_store,
+                            &*self.vector_store,
+                            &self.collection,
+                            user_id,
+                            query_str,
+                            &seeds,
+                            DEFAULT_GRAPH_DEPTH,
+                            limit,
+                        )
+                    })
+                    .await?;
 
                 let final_results = if let Some(cot) = self.graph_cot_retriever.as_ref() {
                     // Closure that re-runs a user-scoped graph retrieval for a
@@ -1264,20 +1446,22 @@ impl RetrievalRouter {
                     let cot_limit = limit;
                     let uid = user_id;
                     let retrieve_fn = |follow_up: String| async move {
-                        let f_dense = this.embedder.embed_text(&follow_up).await?;
+                        let f_dense = this.timed_embed(&follow_up).await?;
                         let f_seeds = this
                             .derive_seed_ids(uid, &follow_up, &f_dense, cot_limit)
                             .await?;
-                        graph_search(
-                            &*this.graph_store,
-                            &*this.vector_store,
-                            &this.collection,
-                            uid,
-                            &follow_up,
-                            &f_seeds,
-                            depth,
-                            cot_limit,
-                        )
+                        this.timed_graph(|| {
+                            graph_search(
+                                &*this.graph_store,
+                                &*this.vector_store,
+                                &this.collection,
+                                uid,
+                                &follow_up,
+                                &f_seeds,
+                                depth,
+                                cot_limit,
+                            )
+                        })
                         .await
                     };
 
@@ -1299,9 +1483,27 @@ impl RetrievalRouter {
             // user-scoped at the store layer. If the collection has no
             // sparse vector, `keyword_search_for_user` gracefully returns
             // an empty list — RRF fusion downstream ignores it.
+            //
+            // When the breaker is Open, the dense branch is skipped — the
+            // keyword branch still runs (BM25 uses a separate Qdrant code
+            // path), and the result list is wrapped in a single-list `Vec`.
             RetrievalStrategy::Hybrid => {
+                if !self.breaker_allows_qdrant(strategy) {
+                    let fallback = keyword_search_or_warn(
+                        &*self.vector_store,
+                        &self.collection,
+                        user_id,
+                        query_str,
+                        limit,
+                        extra_filter.cloned(),
+                        "Hybrid_fallback",
+                        m,
+                    )
+                    .await;
+                    return Ok(vec![fallback]);
+                }
                 let (vector_result, keyword_result) = tokio::join!(
-                    self.vector_store.search_for_user(
+                    self.timed_dense_search(
                         &self.collection,
                         user_id,
                         dense,
@@ -1316,30 +1518,39 @@ impl RetrievalRouter {
                         limit,
                         extra_filter.cloned(),
                         "Hybrid",
+                        m,
                     ),
                 );
-                Ok(vec![
-                    vector_result.map_err(RetrievalError::Store)?,
-                    keyword_result,
-                ])
+                Ok(vec![vector_result?, keyword_result])
             }
 
             // ---- Parallel: vector + keyword + graph (GRAPH_HYBRID) ----
             //
             // Dense ANN + server-side BM25 + graph traversal, all fused by
             // RRF. Keyword branch gracefully no-ops when sparse is absent.
+            // When the breaker is Open, the dense branch is skipped; the
+            // keyword + graph branches still contribute.
             RetrievalStrategy::GraphHybrid => {
                 let seeds = self
                     .derive_seed_ids(user_id, query_str, dense, limit)
                     .await?;
+                let allow_dense = self.breaker_allows_qdrant(strategy);
+                let dense_fut = async {
+                    if allow_dense {
+                        self.timed_dense_search(
+                            &self.collection,
+                            user_id,
+                            dense,
+                            limit,
+                            extra_filter.cloned(),
+                        )
+                        .await
+                    } else {
+                        Ok(Vec::new())
+                    }
+                };
                 let (vector_result, keyword_result, graph_result) = tokio::join!(
-                    self.vector_store.search_for_user(
-                        &self.collection,
-                        user_id,
-                        dense,
-                        limit,
-                        extra_filter.cloned(),
-                    ),
+                    dense_fut,
                     keyword_search_or_warn(
                         &*self.vector_store,
                         &self.collection,
@@ -1348,8 +1559,9 @@ impl RetrievalRouter {
                         limit,
                         extra_filter.cloned(),
                         "GraphHybrid",
+                        m,
                     ),
-                    graph_search(
+                    self.timed_graph(|| graph_search(
                         &*self.graph_store,
                         &*self.vector_store,
                         &self.collection,
@@ -1358,13 +1570,9 @@ impl RetrievalRouter {
                         &seeds,
                         DEFAULT_GRAPH_DEPTH,
                         limit,
-                    ),
+                    )),
                 );
-                Ok(vec![
-                    vector_result.map_err(RetrievalError::Store)?,
-                    keyword_result,
-                    graph_result?,
-                ])
+                Ok(vec![vector_result?, keyword_result, graph_result?])
             }
 
             // ---- Parallel: graph + vector (GRAPH_CONSTRAINED) ----
@@ -1372,8 +1580,35 @@ impl RetrievalRouter {
                 let seeds = self
                     .derive_seed_ids(user_id, query_str, dense, limit)
                     .await?;
+                let allow_dense = self.breaker_allows_qdrant(strategy);
+                let dense_fut = async {
+                    if allow_dense {
+                        self.timed_dense_search(
+                            &self.collection,
+                            user_id,
+                            dense,
+                            limit,
+                            extra_filter.cloned(),
+                        )
+                        .await
+                    } else {
+                        // Fall back to keyword so the strategy keeps a
+                        // non-graph signal while the breaker is Open.
+                        Ok(keyword_search_or_warn(
+                            &*self.vector_store,
+                            &self.collection,
+                            user_id,
+                            query_str,
+                            limit,
+                            extra_filter.cloned(),
+                            "GraphConstrained_fallback",
+                            m,
+                        )
+                        .await)
+                    }
+                };
                 let (graph_result, vector_result) = tokio::join!(
-                    graph_constrained_search(
+                    self.timed_graph(|| graph_constrained_search(
                         &*self.graph_store,
                         &*self.vector_store,
                         &self.collection,
@@ -1382,19 +1617,10 @@ impl RetrievalRouter {
                         &seeds,
                         DEFAULT_GRAPH_DEPTH,
                         limit,
-                    ),
-                    self.vector_store.search_for_user(
-                        &self.collection,
-                        user_id,
-                        dense,
-                        limit,
-                        extra_filter.cloned(),
-                    ),
+                    )),
+                    dense_fut,
                 );
-                Ok(vec![
-                    graph_result?,
-                    vector_result.map_err(RetrievalError::Store)?,
-                ])
+                Ok(vec![graph_result?, vector_result?])
             }
         }
     }
@@ -1416,6 +1642,13 @@ impl RetrievalRouter {
 /// `strategy` is a caller-supplied tag (`"Keyword"` / `"Hybrid"` /
 /// `"GraphHybrid"`) so dashboards can attribute fail-open events to
 /// the retrieval path that triggered them.
+///
+/// When `metrics` is `Some`, the wall-clock latency of the call is
+/// recorded as `postgres.fts_duration_ms` — this metric is shared
+/// across the lexical/BM25 fallback path regardless of the underlying
+/// engine (Qdrant BM25 today, dedicated Postgres FTS in a future
+/// phase) so dashboards remain stable across infra migrations.
+#[allow(clippy::too_many_arguments)] // every argument is load-bearing wiring; bundling them into a config struct adds indirection without callsite clarity gains.
 async fn keyword_search_or_warn(
     vector_store: &dyn VectorStore,
     collection: &CollectionName,
@@ -1424,11 +1657,17 @@ async fn keyword_search_or_warn(
     limit: usize,
     extra_filter: Option<serde_json::Value>,
     strategy: &'static str,
+    metrics: Option<&RetrievalMetrics>,
 ) -> Vec<agent_rs_stores::types::SearchResult> {
-    match vector_store
+    let started = Instant::now();
+    let outcome = vector_store
         .keyword_search_for_user(collection, user_id, query_str, limit, extra_filter)
-        .await
-    {
+        .await;
+    if let Some(m) = metrics {
+        let elapsed_ms = started.elapsed().as_secs_f64() * 1000.0;
+        m.record_postgres_fts_duration(elapsed_ms);
+    }
+    match outcome {
         Ok(results) => results,
         Err(e) => {
             tracing::warn!(
@@ -1441,6 +1680,24 @@ async fn keyword_search_or_warn(
             Vec::new()
         }
     }
+}
+
+/// Classify a [`agent_rs_core::StoreError`]-bearing
+/// [`crate::RetrievalError`] as "real backend failure" or "soft
+/// negative result" for circuit-breaker accounting.
+///
+/// "No results" must not trip the breaker: the canonical failure modes
+/// the breaker should react to are network timeouts, Qdrant-side
+/// outages, and serialization errors. Empty result lists are returned
+/// as `Ok(Vec::new())` by the store layer, so the only thing this
+/// helper has to discriminate is *which kinds of errors count*. Today
+/// every concrete `RetrievalError::Store` variant is a real failure
+/// (the store layer surfaces empty result sets via `Ok`); the helper
+/// exists as a single inversion point so future variants for
+/// "predicate matched no rows" can be excluded without auditing every
+/// call site.
+fn is_breaker_trippable(err: &crate::RetrievalError) -> bool {
+    matches!(err, crate::RetrievalError::Store(_))
 }
 
 /// Convert a slice of [`FilterCondition`] into the `serde_json::Value` format

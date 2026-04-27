@@ -25,8 +25,11 @@
 //! list weight so that KB results rank higher for equal positions.
 
 use std::collections::HashMap;
+use std::sync::Arc;
+use std::time::Instant;
 
 use agent_rs_core::{RetrievalStrategy, Score};
+use agent_rs_observability::metrics::RetrievalMetrics;
 use agent_rs_stores::types::SearchResult;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -91,19 +94,35 @@ impl EvidencePack {
 /// // Pass multiple ranked lists; receive a fused EvidencePack.
 /// let _pack = ranker.rank(vec![vec![], vec![]], "my query", RetrievalStrategy::Hybrid, 10);
 /// ```
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct ResultRanker {
     /// The `k` smoothing constant used in the RRF formula.
     ///
     /// Lower values give a stronger preference to top-ranked documents.
     /// The canonical default is 60.
     pub rrf_k: usize,
+    /// Optional shared metrics handle.
+    ///
+    /// When `Some`, [`Self::rank`] records the wall-clock duration of
+    /// the fusion step into `rrf.fusion_duration_ms`. Bounds in-process
+    /// CPU work only — back-end I/O is timed separately by the router.
+    metrics: Option<Arc<RetrievalMetrics>>,
+}
+
+impl std::fmt::Debug for ResultRanker {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ResultRanker")
+            .field("rrf_k", &self.rrf_k)
+            .field("metrics", &self.metrics.is_some())
+            .finish()
+    }
 }
 
 impl Default for ResultRanker {
     fn default() -> Self {
         Self {
             rrf_k: DEFAULT_RRF_K,
+            metrics: None,
         }
     }
 }
@@ -111,7 +130,20 @@ impl Default for ResultRanker {
 impl ResultRanker {
     /// Create a new ranker with a custom `k` parameter.
     pub fn new(rrf_k: usize) -> Self {
-        Self { rrf_k }
+        Self {
+            rrf_k,
+            metrics: None,
+        }
+    }
+
+    /// Attach a shared metrics handle for RRF fusion latency emission.
+    ///
+    /// When set, [`Self::rank`] records the wall-clock duration of the
+    /// merge into `rrf.fusion_duration_ms`. Returns the ranker by value
+    /// to support builder-style construction.
+    pub fn with_metrics(mut self, metrics: Arc<RetrievalMetrics>) -> Self {
+        self.metrics = Some(metrics);
+        self
     }
 
     /// Fuse multiple ranked result lists into a single [`EvidencePack`].
@@ -156,6 +188,7 @@ impl ResultRanker {
         strategy: RetrievalStrategy,
         limit: usize,
     ) -> EvidencePack {
+        let started = Instant::now();
         let total_docs: usize = result_lists.iter().map(|l| l.len()).sum();
         tracing::Span::current().record("n_total_input", total_docs);
 
@@ -225,6 +258,11 @@ impl ResultRanker {
         let source_counts = build_source_counts_from_docs(&documents);
 
         tracing::Span::current().record("n_output", documents.len());
+
+        if let Some(m) = &self.metrics {
+            let elapsed_ms = started.elapsed().as_secs_f64() * 1000.0;
+            m.record_rrf_fusion_duration(elapsed_ms);
+        }
 
         EvidencePack {
             documents,

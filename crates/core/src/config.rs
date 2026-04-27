@@ -159,6 +159,31 @@ fn default_pg_connection_timeout_ms() -> u64 {
     5_000
 }
 
+/// Default consecutive-failure threshold that trips the Qdrant breaker
+/// from Closed to Open. Five consecutive errors over a short window is
+/// long enough to filter transient network blips and short enough that
+/// a sustained Qdrant outage degrades to fallback within a single
+/// request burst.
+fn default_breaker_failure_threshold() -> u32 {
+    5
+}
+
+/// Default wall-clock seconds the breaker stays Open before admitting a
+/// half-open probe. Sized to give Qdrant time to recover from a
+/// transient incident without waiting so long that fallback masks a
+/// permanent outage.
+fn default_breaker_recovery_secs() -> u64 {
+    30
+}
+
+/// Default number of probes admitted in HalfOpen before the breaker
+/// transitions back to Closed (on success) or Open (on any failure).
+/// One probe is enough — the fallback path keeps user traffic served
+/// while the breaker decides.
+fn default_breaker_half_open_max_probes() -> u32 {
+    1
+}
+
 impl fmt::Debug for PostgresConfig {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("PostgresConfig")
@@ -206,6 +231,42 @@ impl Neo4jConfig {
     /// takes host:port directly).
     pub fn endpoint(&self) -> String {
         format!("{}:{}", self.host, self.bolt_port)
+    }
+}
+
+/// Circuit-breaker configuration applied to Qdrant retrieval calls.
+///
+/// Controls when requests start short-circuiting after consecutive
+/// failures and when half-open probes are admitted to test recovery.
+/// Plugs into [`Settings`] under the `circuit_breaker` key. Environment
+/// overrides use the `AGENT_RS__CIRCUIT_BREAKER__*` prefix:
+///
+/// - `AGENT_RS__CIRCUIT_BREAKER__FAILURE_THRESHOLD` (u32, default `5`)
+/// - `AGENT_RS__CIRCUIT_BREAKER__RECOVERY_SECS` (u64 seconds, default `30`)
+/// - `AGENT_RS__CIRCUIT_BREAKER__HALF_OPEN_MAX_PROBES` (u32, default `1`)
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct CircuitBreakerConfig {
+    /// Number of consecutive failures before the breaker transitions
+    /// from Closed to Open.
+    #[serde(default = "default_breaker_failure_threshold")]
+    pub failure_threshold: u32,
+    /// Wall-clock seconds the breaker stays Open before allowing a
+    /// half-open probe.
+    #[serde(default = "default_breaker_recovery_secs")]
+    pub recovery_secs: u64,
+    /// Number of probes admitted in HalfOpen before transitioning back
+    /// to Closed (on success) or Open (on any failure).
+    #[serde(default = "default_breaker_half_open_max_probes")]
+    pub half_open_max_probes: u32,
+}
+
+impl Default for CircuitBreakerConfig {
+    fn default() -> Self {
+        Self {
+            failure_threshold: default_breaker_failure_threshold(),
+            recovery_secs: default_breaker_recovery_secs(),
+            half_open_max_probes: default_breaker_half_open_max_probes(),
+        }
     }
 }
 
@@ -788,6 +849,12 @@ pub struct Settings {
     /// RabbitMQ connection settings for the indexing queue.
     #[serde(default)]
     pub rabbitmq: RabbitmqConfig,
+    /// Circuit-breaker thresholds applied to Qdrant retrieval calls.
+    /// Defaults preserve the legacy "no breaker" behaviour up to the
+    /// fifth consecutive failure; see [`CircuitBreakerConfig`] for the
+    /// per-field semantics and env-var overrides.
+    #[serde(default)]
+    pub circuit_breaker: CircuitBreakerConfig,
 }
 
 impl Default for Settings {
@@ -904,6 +971,7 @@ impl Default for Settings {
             marker: default_marker_config(),
             minio: MinioConfig::default(),
             rabbitmq: RabbitmqConfig::default(),
+            circuit_breaker: CircuitBreakerConfig::default(),
         }
     }
 }

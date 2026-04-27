@@ -20,5 +20,8 @@
 //! }
 //! ```
 
+pub mod circuit_breaker;
 pub mod metrics;
 pub mod tracing;
+
+pub use circuit_breaker::{BreakerState, CircuitBreaker};

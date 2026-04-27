@@ -5,9 +5,12 @@
 //! (via rig-core) with a heuristic token-overlap fallback.
 
 use std::collections::HashSet;
+use std::sync::Arc;
+use std::time::Instant;
 
 use agent_rs_core::errors::AgentError;
 use agent_rs_core::types::Confidence;
+use agent_rs_observability::metrics::RetrievalMetrics;
 use agent_rs_stores::types::SearchResult;
 use serde::{Deserialize, Serialize};
 use tracing::{info, instrument};
@@ -155,6 +158,13 @@ pub struct GroundingVerifier {
     llm_client: Option<rig::providers::openai::Client>,
     /// Model to use for LLM verification.
     model: String,
+    /// Optional shared metrics handle.
+    ///
+    /// When `Some`, the LLM verifier records the wall-clock duration of
+    /// every `verify_with_llm` call into `llm.verifier_duration_ms`. The
+    /// heuristic path is intentionally not timed — it runs in
+    /// microseconds and would only add noise to the histogram.
+    metrics: Option<Arc<RetrievalMetrics>>,
 }
 
 impl GroundingVerifier {
@@ -185,7 +195,22 @@ impl GroundingVerifier {
             confidence_threshold,
             llm_client,
             model: model.to_owned(),
+            metrics: None,
         }
+    }
+
+    /// Attach a shared metrics handle for LLM verifier latency emission.
+    ///
+    /// When set, [`Self::verify_with_llm`] records the wall-clock
+    /// duration of every call into `llm.verifier_duration_ms`. The
+    /// heuristic path stays untimed — it runs in microseconds and
+    /// would only add noise to the histogram.
+    ///
+    /// Returns the verifier by value to support builder-style
+    /// construction.
+    pub fn with_metrics(mut self, metrics: Arc<RetrievalMetrics>) -> Self {
+        self.metrics = Some(metrics);
+        self
     }
 
     /// Check if the answer is grounded in the provided evidence.
@@ -288,9 +313,13 @@ impl GroundingVerifier {
             .preamble(VERIFICATION_PROMPT)
             .build();
 
-        let response_text = agent
-            .prompt(&user_message)
-            .await
+        let started = Instant::now();
+        let llm_outcome = agent.prompt(&user_message).await;
+        if let Some(m) = &self.metrics {
+            let elapsed_ms = started.elapsed().as_secs_f64() * 1000.0;
+            m.record_llm_verifier_duration(elapsed_ms);
+        }
+        let response_text = llm_outcome
             .map_err(|e| AgentError::Verification(format!("LLM verifier call failed: {e}")))?;
 
         let parsed: VerifierLlmResponse = serde_json::from_str(&response_text).map_err(|e| {

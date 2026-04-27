@@ -12,8 +12,8 @@ pub mod types;
 
 // Re-export commonly used items at crate root for ergonomic imports.
 pub use config::{
-    DEFAULT_LLM_MODEL, DEFAULT_REASONING_EFFORT, DoclingConfig, IngestBackend, LatencyMode,
-    RerankerConfig, RerankerProvider, Settings, temperature_for,
+    CircuitBreakerConfig, DEFAULT_LLM_MODEL, DEFAULT_REASONING_EFFORT, DoclingConfig,
+    IngestBackend, LatencyMode, RerankerConfig, RerankerProvider, Settings, temperature_for,
 };
 pub use doc_handle::{DocHandle, DocHandleError};
 pub use errors::{AgentError, AgentRsError, RetrievalError, StoreError, ToolError};

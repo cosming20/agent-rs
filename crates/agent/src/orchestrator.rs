@@ -145,11 +145,14 @@ impl AgentOrchestrator {
             .model
             .as_deref()
             .unwrap_or(settings.llm.model.as_str());
-        let verifier = Arc::new(GroundingVerifier::new(
-            settings.verifier.confidence_threshold,
-            &settings.llm.api_key,
-            verifier_model,
-        ));
+        let verifier = Arc::new(
+            GroundingVerifier::new(
+                settings.verifier.confidence_threshold,
+                &settings.llm.api_key,
+                verifier_model,
+            )
+            .with_metrics(Arc::clone(&metrics)),
+        );
         // Claim-directed retry handle. Wraps the same shared retrieval
         // router the agent's `search_knowledge` tool uses, so a
         // claim-directed search shares cache, embedder, and

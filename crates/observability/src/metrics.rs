@@ -65,6 +65,16 @@ const CHUNK_HEADING_DEPTH: &str = "ingestion.chunk_heading_depth";
 const CHUNK_FLAG_TOTAL: &str = "ingestion.chunk_flag_total";
 const CHUNK_EMPTY_EMBED_TOTAL: &str = "ingestion.chunk_empty_embed_total";
 
+// ---- Phase 4 — per-backend latency histograms ----
+const QDRANT_SEARCH_DURATION_MS: &str = "qdrant.search_duration_ms";
+const NEO4J_TRAVERSAL_DURATION_MS: &str = "neo4j.traversal_duration_ms";
+const POSTGRES_FTS_DURATION_MS: &str = "postgres.fts_duration_ms";
+const EMBEDDER_DURATION_MS: &str = "embedder.duration_ms";
+const RRF_FUSION_DURATION_MS: &str = "rrf.fusion_duration_ms";
+const RERANKER_DURATION_MS: &str = "reranker.duration_ms";
+const LLM_VERIFIER_DURATION_MS: &str = "llm.verifier_duration_ms";
+const QDRANT_CIRCUIT_BREAKER_FALLBACK_TOTAL: &str = "qdrant.circuit_breaker_fallback_total";
+
 /// Histogram bucket boundaries for retrieval latency (seconds).
 ///
 /// Chosen to give fine granularity for sub-100 ms fast paths and coarser
@@ -119,6 +129,32 @@ const CHUNK_HEADING_DEPTH_BUCKETS: &[f64] = &[0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0,
 /// retrieval at the configured `claim_search_top_k` (default 3);
 /// buckets up to 16 leave headroom for operators that tune higher.
 const CLAIM_DIRECTED_NEW_EVIDENCE_BUCKETS: &[f64] = &[0.0, 1.0, 2.0, 3.0, 5.0, 8.0, 12.0, 16.0];
+
+/// Per-backend latency buckets in milliseconds.
+///
+/// Shared across Qdrant search, Neo4j traversal, Postgres FTS, embedder,
+/// reranker. Tuned for backends whose fast-path is single-digit ms and
+/// whose slow-path can stretch to ~10 s (Postgres GIN scan, embedder
+/// cold start, reranker rate-limit retry).
+const BACKEND_LATENCY_MS_BUCKETS: &[f64] = &[
+    1.0, 5.0, 10.0, 25.0, 50.0, 100.0, 250.0, 500.0, 1000.0, 2500.0, 5000.0, 10000.0,
+];
+
+/// Latency buckets for the RRF fusion stage.
+///
+/// RRF is in-process CPU work and dominated by hashmap merges; fast path
+/// is sub-millisecond, slow path (very large pools or contended rayon
+/// thread-pool) tops out around 250 ms.
+const RRF_FUSION_MS_BUCKETS: &[f64] = &[0.1, 0.5, 1.0, 2.5, 5.0, 10.0, 25.0, 50.0, 100.0, 250.0];
+
+/// Latency buckets for the LLM grounding verifier.
+///
+/// Reasoning models (gpt-5.x with `low` effort) take 1–10 s typical and
+/// up to 25 s at high load; bucket up to 25 s so the P99 tail is
+/// resolvable without saturating the right-most bucket.
+const LLM_VERIFIER_MS_BUCKETS: &[f64] = &[
+    10.0, 50.0, 100.0, 250.0, 500.0, 1000.0, 2500.0, 5000.0, 10000.0, 25000.0,
+];
 
 /// All custom metric instruments for the retrieval pipeline.
 ///
@@ -210,6 +246,49 @@ pub struct RetrievalMetrics {
     /// Total section count expected (plan target) across all CoverageVerifier
     /// runs.
     coverage_verified_expected: metrics::Counter<u64>,
+
+    // ---- Phase 4 — per-backend latency histograms ----
+    /// Latency of a single Qdrant vector search call, in milliseconds.
+    /// Wired in [`crate::metrics::RetrievalMetrics::record_qdrant_search_duration`]
+    /// callers — the router wraps `VectorStore::search_for_user` with
+    /// an `Instant::now()` guard so this measures gRPC round-trip + the
+    /// store's local marshalling.
+    qdrant_search_duration_ms: metrics::Histogram<f64>,
+    /// Latency of a Neo4j graph traversal, in milliseconds. Measures
+    /// the wall-clock duration of `graph_search` from the router's
+    /// dispatch-time perspective (Cypher query + post-fetch payload
+    /// rehydration).
+    neo4j_traversal_duration_ms: metrics::Histogram<f64>,
+    /// Latency of a Postgres BM25 / FTS query, in milliseconds. Wired
+    /// at the keyword fallback path — when the Qdrant breaker is open
+    /// and the router degrades to BM25-only retrieval, this measures
+    /// the latency of the lexical search that filled in.
+    postgres_fts_duration_ms: metrics::Histogram<f64>,
+    /// Latency of dense embedding generation, in milliseconds.
+    /// Recorded around `Embedder::embed_text` calls; covers OpenAI HTTP
+    /// round-trip or local fastembed ONNX inference, depending on the
+    /// configured backend.
+    embedder_duration_ms: metrics::Histogram<f64>,
+    /// Latency of a single Reciprocal Rank Fusion merge, in
+    /// milliseconds. Recorded inside `ResultRanker::rank` so the
+    /// measurement bounds the in-process CPU work, excluding I/O.
+    rrf_fusion_duration_ms: metrics::Histogram<f64>,
+    /// Latency of a single reranker call, in milliseconds. Recorded at
+    /// the router-level wrap of `CrossEncoderReranker::rerank` so the
+    /// measurement covers HTTP round-trip and back-off-driven retries.
+    reranker_duration_ms: metrics::Histogram<f64>,
+    /// Latency of a single LLM grounding-verifier call, in
+    /// milliseconds. Recorded by passing this metric handle into
+    /// `GroundingVerifier`; covers the rig-core/OpenAI prompt
+    /// round-trip end-to-end.
+    llm_verifier_duration_ms: metrics::Histogram<f64>,
+
+    /// Count of Qdrant→Postgres-FTS fallback events triggered by the
+    /// circuit breaker, labelled by retrieval strategy. Increments when
+    /// the breaker is Open and the router degrades the request to a
+    /// BM25-only path. Used to detect prolonged Qdrant outages without
+    /// scraping logs.
+    qdrant_circuit_breaker_fallback: metrics::Counter<u64>,
 }
 
 impl RetrievalMetrics {
@@ -491,6 +570,86 @@ impl RetrievalMetrics {
             .with_unit("sections")
             .build();
 
+        // ---- Phase 4 — per-backend latency histograms ----
+        let qdrant_search_duration_ms = meter
+            .f64_histogram(QDRANT_SEARCH_DURATION_MS)
+            .with_description(
+                "Latency of a single Qdrant vector search call (gRPC round-trip plus \
+                 local marshalling).",
+            )
+            .with_unit("ms")
+            .with_boundaries(BACKEND_LATENCY_MS_BUCKETS.to_vec())
+            .build();
+
+        let neo4j_traversal_duration_ms = meter
+            .f64_histogram(NEO4J_TRAVERSAL_DURATION_MS)
+            .with_description(
+                "Latency of a Neo4j graph traversal — Cypher query plus payload \
+                 rehydration from the vector store.",
+            )
+            .with_unit("ms")
+            .with_boundaries(BACKEND_LATENCY_MS_BUCKETS.to_vec())
+            .build();
+
+        let postgres_fts_duration_ms = meter
+            .f64_histogram(POSTGRES_FTS_DURATION_MS)
+            .with_description(
+                "Latency of a Postgres BM25 / FTS query, recorded at the keyword \
+                 fallback path triggered by the Qdrant circuit breaker.",
+            )
+            .with_unit("ms")
+            .with_boundaries(BACKEND_LATENCY_MS_BUCKETS.to_vec())
+            .build();
+
+        let embedder_duration_ms = meter
+            .f64_histogram(EMBEDDER_DURATION_MS)
+            .with_description(
+                "Latency of dense embedding generation — OpenAI HTTP round-trip or \
+                 local fastembed ONNX inference, per call.",
+            )
+            .with_unit("ms")
+            .with_boundaries(BACKEND_LATENCY_MS_BUCKETS.to_vec())
+            .build();
+
+        let rrf_fusion_duration_ms = meter
+            .f64_histogram(RRF_FUSION_DURATION_MS)
+            .with_description(
+                "Latency of a single Reciprocal Rank Fusion merge, in milliseconds. \
+                 Bounds the in-process CPU work and excludes any back-end I/O.",
+            )
+            .with_unit("ms")
+            .with_boundaries(RRF_FUSION_MS_BUCKETS.to_vec())
+            .build();
+
+        let reranker_duration_ms = meter
+            .f64_histogram(RERANKER_DURATION_MS)
+            .with_description(
+                "Latency of a single reranker call (HTTP round-trip plus any \
+                 back-off-driven retries) in milliseconds.",
+            )
+            .with_unit("ms")
+            .with_boundaries(BACKEND_LATENCY_MS_BUCKETS.to_vec())
+            .build();
+
+        let llm_verifier_duration_ms = meter
+            .f64_histogram(LLM_VERIFIER_DURATION_MS)
+            .with_description(
+                "Latency of a single LLM grounding-verifier call end-to-end, in \
+                 milliseconds.",
+            )
+            .with_unit("ms")
+            .with_boundaries(LLM_VERIFIER_MS_BUCKETS.to_vec())
+            .build();
+
+        let qdrant_circuit_breaker_fallback = meter
+            .u64_counter(QDRANT_CIRCUIT_BREAKER_FALLBACK_TOTAL)
+            .with_description(
+                "Number of Qdrant→Postgres-FTS fallback events triggered by the \
+                 circuit breaker, labelled by retrieval strategy.",
+            )
+            .with_unit("events")
+            .build();
+
         Self {
             retrieval_latency,
             retrieval_results,
@@ -525,6 +684,14 @@ impl RetrievalMetrics {
             coverage_planner_unmatched,
             coverage_verified_fetched,
             coverage_verified_expected,
+            qdrant_search_duration_ms,
+            neo4j_traversal_duration_ms,
+            postgres_fts_duration_ms,
+            embedder_duration_ms,
+            rrf_fusion_duration_ms,
+            reranker_duration_ms,
+            llm_verifier_duration_ms,
+            qdrant_circuit_breaker_fallback,
         }
     }
 
@@ -798,6 +965,80 @@ impl RetrievalMetrics {
     pub fn coverage_verified(&self, fetched: usize, expected: usize) {
         self.coverage_verified_fetched.add(fetched as u64, &[]);
         self.coverage_verified_expected.add(expected as u64, &[]);
+    }
+
+    // ---- Phase 4 helpers — per-backend latency ----
+
+    /// Record the latency of a single Qdrant vector search call.
+    ///
+    /// `elapsed_ms` is the wall-clock milliseconds elapsed around the
+    /// `VectorStore::search_for_user` invocation, including the gRPC
+    /// round-trip and the store's local result marshalling.
+    pub fn record_qdrant_search_duration(&self, elapsed_ms: f64) {
+        self.qdrant_search_duration_ms.record(elapsed_ms, &[]);
+    }
+
+    /// Record the latency of a Neo4j graph traversal.
+    ///
+    /// Wraps the `graph_search` dispatch inside the router, so the
+    /// measurement covers the Cypher round-trip plus payload
+    /// rehydration from the vector store.
+    pub fn record_neo4j_traversal_duration(&self, elapsed_ms: f64) {
+        self.neo4j_traversal_duration_ms.record(elapsed_ms, &[]);
+    }
+
+    /// Record the latency of a Postgres BM25 / FTS query.
+    ///
+    /// Recorded at the keyword fallback path triggered when the Qdrant
+    /// circuit breaker is Open and the router degrades to BM25-only
+    /// retrieval.
+    pub fn record_postgres_fts_duration(&self, elapsed_ms: f64) {
+        self.postgres_fts_duration_ms.record(elapsed_ms, &[]);
+    }
+
+    /// Record the latency of a single embedder call.
+    ///
+    /// Covers `Embedder::embed_text` end-to-end — OpenAI HTTP
+    /// round-trip plus retries, or local fastembed ONNX inference,
+    /// depending on the configured backend.
+    pub fn record_embedder_duration(&self, elapsed_ms: f64) {
+        self.embedder_duration_ms.record(elapsed_ms, &[]);
+    }
+
+    /// Record the latency of a Reciprocal Rank Fusion merge.
+    ///
+    /// Bounds the in-process CPU work in `ResultRanker::rank` and
+    /// excludes back-end I/O.
+    pub fn record_rrf_fusion_duration(&self, elapsed_ms: f64) {
+        self.rrf_fusion_duration_ms.record(elapsed_ms, &[]);
+    }
+
+    /// Record the latency of a single reranker call.
+    ///
+    /// Recorded by the router around `CrossEncoderReranker::rerank`,
+    /// so the measurement covers the HTTP round-trip and any
+    /// back-off-driven retries.
+    pub fn record_reranker_duration(&self, elapsed_ms: f64) {
+        self.reranker_duration_ms.record(elapsed_ms, &[]);
+    }
+
+    /// Record the latency of a single LLM grounding-verifier call.
+    ///
+    /// Wraps `GroundingVerifier::verify_with_llm` end-to-end so the
+    /// measurement reflects the rig-core / OpenAI prompt round-trip
+    /// users actually wait for.
+    pub fn record_llm_verifier_duration(&self, elapsed_ms: f64) {
+        self.llm_verifier_duration_ms.record(elapsed_ms, &[]);
+    }
+
+    /// Record one Qdrant→Postgres-FTS circuit-breaker fallback event,
+    /// labelled by the retrieval strategy that triggered it.
+    ///
+    /// Increments when the breaker is Open and the router degrades a
+    /// dense / hybrid request to BM25-only retrieval.
+    pub fn record_qdrant_circuit_breaker_fallback(&self, strategy: RetrievalStrategy) {
+        self.qdrant_circuit_breaker_fallback
+            .add(1, &[strategy_attr(strategy)]);
     }
 }
 
