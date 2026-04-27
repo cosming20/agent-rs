@@ -11,6 +11,7 @@
 
 use std::sync::Arc;
 
+use agent_rs_core::types::LangCode;
 use agent_rs_observability::metrics::RetrievalMetrics;
 use agent_rs_stores::neo4j::Neo4jStore;
 use tracing::{instrument, warn};
@@ -18,23 +19,18 @@ use tracing::{instrument, warn};
 use crate::context::QueryContext;
 use crate::coverage::{CoverageMode, CoveragePlan, SectionRef};
 
-/// Hard tokens that unambiguously mean "exhaustive coverage".
-///
-/// Bilingual (RO / EN). Matched case-insensitively on word boundaries.
-/// "complete" is intentionally absent — it is too broad ("complete picture"
-/// does not mean exhaustive enumeration) and lives in the soft set instead.
-const HARD_EXHAUSTIVE_TOKENS: &[&str] = &[
-    // RO
-    "toate",
-    "intreaga",
-    "exhaustiv",
-    "complet",
-    "enumera",
-    "enumeraza",
-    "lista",
-    "listeaza",
-    "cheatsheet",
-    // EN
+// ---- Per-language token tables ----
+//
+// These lists are best-effort starter sets — extend per language as user
+// feedback identifies gaps. Tokens are matched case-insensitively on word
+// boundaries (multi-word entries via substring); see [`contains_word`].
+//
+// "complete" is intentionally absent from the hard sets — it is too broad
+// ("complete picture" does not mean exhaustive enumeration) and lives in
+// the soft set instead.
+
+/// Hard exhaustive tokens — English.
+const HARD_EN: &[&str] = &[
     "all",
     "every",
     "exhaustive",
@@ -44,23 +40,132 @@ const HARD_EXHAUSTIVE_TOKENS: &[&str] = &[
     "comprehensive",
 ];
 
-/// Soft quantifiers — alone they do not trigger exhaustive mode but they
-/// log a signal so the rule set can be tuned when users complain.
-///
-/// "complete" is deliberately here (not in the hard set): "complete X"
-/// often means thorough but not necessarily list-all — e.g. "the complete
-/// picture". Two soft tokens together promote to [`CoverageMode::Partial`].
-const SOFT_QUANTIFIER_TOKENS: &[&str] = &[
-    // RO
-    "majoritatea",
-    "fiecare",
-    "principalele",
-    // EN
-    "most",
-    "main",
-    "primary",
-    "complete",
+/// Hard exhaustive tokens — Romanian.
+const HARD_RO: &[&str] = &[
+    "toate",
+    "intreaga",
+    "exhaustiv",
+    "complet",
+    "enumera",
+    "enumeraza",
+    "lista",
+    "listeaza",
+    "cheatsheet",
 ];
+
+/// Hard exhaustive tokens — Spanish.
+const HARD_ES: &[&str] = &[
+    "todos",
+    "todas",
+    "cada",
+    "completo",
+    "exhaustivo",
+    "enumera",
+    "lista completa",
+];
+
+/// Hard exhaustive tokens — German.
+const HARD_DE: &[&str] = &[
+    "alle",
+    "jede",
+    "jeder",
+    "jedes",
+    "vollständig",
+    "vollstandig",
+    "erschöpfend",
+    "erschoepfend",
+];
+
+/// Hard exhaustive tokens — French.
+const HARD_FR: &[&str] = &[
+    "tous",
+    "toutes",
+    "chaque",
+    "complet",
+    "complète",
+    "exhaustif",
+    "exhaustive",
+    "liste complète",
+];
+
+/// Hard exhaustive tokens — Italian.
+const HARD_IT: &[&str] = &[
+    "tutti",
+    "tutte",
+    "ogni",
+    "completo",
+    "esaustivo",
+    "elenco completo",
+];
+
+/// Hard exhaustive tokens — Portuguese.
+const HARD_PT: &[&str] = &[
+    "todos",
+    "todas",
+    "cada",
+    "completo",
+    "exaustivo",
+    "lista completa",
+];
+
+/// Soft quantifier tokens — English.
+///
+/// Alone they do not trigger exhaustive mode but they log a signal so the
+/// rule set can be tuned when users complain. Two soft tokens together
+/// promote to [`CoverageMode::Partial`].
+const SOFT_EN: &[&str] = &["most", "main", "primary", "complete"];
+
+/// Soft quantifier tokens — Romanian.
+const SOFT_RO: &[&str] = &["majoritatea", "fiecare", "principalele"];
+
+/// Soft quantifier tokens — Spanish.
+const SOFT_ES: &[&str] = &["mayoría", "mayoria", "principales", "principal"];
+
+/// Soft quantifier tokens — German.
+const SOFT_DE: &[&str] = &["meisten", "wichtigsten", "haupt", "primär", "primaer"];
+
+/// Soft quantifier tokens — French.
+const SOFT_FR: &[&str] = &["plupart", "principaux", "principales", "principal"];
+
+/// Soft quantifier tokens — Italian.
+const SOFT_IT: &[&str] = &["maggior", "principali", "principale"];
+
+/// Soft quantifier tokens — Portuguese.
+const SOFT_PT: &[&str] = &["maioria", "principais", "principal"];
+
+/// Return the hard-exhaustive token list for `lang`.
+///
+/// `LangCode::Other` falls back to the English list — a safe default that
+/// keeps coverage detection working for the most common cross-language
+/// case (English-loanword queries) while avoiding domain-specific bias.
+fn hard_tokens(lang: LangCode) -> &'static [&'static str] {
+    match lang {
+        LangCode::En => HARD_EN,
+        LangCode::Ro => HARD_RO,
+        LangCode::Es => HARD_ES,
+        LangCode::De => HARD_DE,
+        LangCode::Fr => HARD_FR,
+        LangCode::It => HARD_IT,
+        LangCode::Pt => HARD_PT,
+        LangCode::Other => HARD_EN,
+    }
+}
+
+/// Return the soft-quantifier token list for `lang`.
+///
+/// Mirrors [`hard_tokens`]: `LangCode::Other` falls back to English.
+fn soft_tokens(lang: LangCode) -> &'static [&'static str] {
+    match lang {
+        LangCode::En => SOFT_EN,
+        LangCode::Ro => SOFT_RO,
+        LangCode::Es => SOFT_ES,
+        LangCode::De => SOFT_DE,
+        LangCode::Fr => SOFT_FR,
+        LangCode::It => SOFT_IT,
+        LangCode::Pt => SOFT_PT,
+        LangCode::Other => SOFT_EN,
+    }
+}
 
 /// Pre-agent step: detect exhaustive intent and build a [`CoveragePlan`].
 ///
@@ -93,7 +198,7 @@ impl CoveragePlanner {
     /// (degraded mode — the pipeline continues without coverage tracking).
     #[instrument(skip(self, ctx), fields(trace_id = ?ctx.trace_id))]
     pub async fn plan(&self, ctx: &mut QueryContext) {
-        let intent = detect_intent_with_signal(&ctx.query);
+        let intent = detect_intent_with_signal(&ctx.query, ctx.detected_lang);
 
         if intent.soft_heuristic_fired && intent.mode == CoverageMode::None {
             warn!(
@@ -201,16 +306,17 @@ fn contains_word(text: &str, token: &str) -> bool {
     false
 }
 
-/// Return the [`CoverageMode`] for `q` using the bilingual rule table.
+/// Return the [`CoverageMode`] for `q` using the rule table for `lang`.
 ///
 /// Convenience wrapper around [`detect_intent_with_signal`] for callers
 /// that only need the mode.
-pub fn detect_intent(q: &str) -> CoverageMode {
-    detect_intent_with_signal(q).mode
+pub fn detect_intent(q: &str, lang: LangCode) -> CoverageMode {
+    detect_intent_with_signal(q, lang).mode
 }
 
 /// Classify `q` and return a full [`IntentSignal`] (mode + soft-heuristic
-/// metadata for observability).
+/// metadata for observability), driven by the language-specific token table
+/// selected via `lang`.
 ///
 /// # Rules (in priority order)
 ///
@@ -218,10 +324,15 @@ pub fn detect_intent(q: &str) -> CoverageMode {
 /// 2. Two or more soft-quantifier tokens → `Partial` with soft heuristic.
 /// 3. Exactly one soft-quantifier token → `None` with soft heuristic.
 /// 4. No tokens matched → `None`, no heuristic.
-pub(crate) fn detect_intent_with_signal(q: &str) -> IntentSignal {
+///
+/// `lang` selects which per-language list to consult; `LangCode::Other`
+/// falls back to English. Mis-detected language therefore degrades to the
+/// English list, not to silence — but tokens specific to the actual query
+/// language will be missed in that case.
+pub(crate) fn detect_intent_with_signal(q: &str, lang: LangCode) -> IntentSignal {
     let lc = q.to_lowercase();
 
-    if HARD_EXHAUSTIVE_TOKENS.iter().any(|t| contains_word(&lc, t)) {
+    if hard_tokens(lang).iter().any(|t| contains_word(&lc, t)) {
         return IntentSignal {
             mode: CoverageMode::Exhaustive,
             soft_heuristic_fired: false,
@@ -229,7 +340,7 @@ pub(crate) fn detect_intent_with_signal(q: &str) -> IntentSignal {
         };
     }
 
-    let soft_count = SOFT_QUANTIFIER_TOKENS
+    let soft_count = soft_tokens(lang)
         .iter()
         .filter(|t| contains_word(&lc, t))
         .count();
@@ -262,28 +373,96 @@ mod tests {
     #[test]
     fn detects_exhaustive_intent_via_toate() {
         assert_eq!(
-            detect_intent("vreau toate metodele de segmentare"),
+            detect_intent("vreau toate metodele de segmentare", LangCode::Ro),
             CoverageMode::Exhaustive
         );
     }
 
     #[test]
     fn detects_exhaustive_intent_via_cheatsheet() {
+        // "cheatsheet" is in the RO list; an English-tagged query still
+        // matches because EN's "all" fires first.
         assert_eq!(
-            detect_intent("write a cheatsheet of all methods"),
+            detect_intent("write a cheatsheet of all methods", LangCode::En),
             CoverageMode::Exhaustive
         );
     }
 
     #[test]
     fn does_not_detect_exhaustive_for_definition_query() {
-        assert_eq!(detect_intent("ce este metoda Otsu"), CoverageMode::None);
+        assert_eq!(
+            detect_intent("ce este metoda Otsu", LangCode::Ro),
+            CoverageMode::None
+        );
     }
 
     #[test]
     fn soft_heuristic_logs_when_partial_signal_without_hard_match() {
-        let r = detect_intent_with_signal("give me the complete picture");
+        let r = detect_intent_with_signal("give me the complete picture", LangCode::En);
         assert_eq!(r.mode, CoverageMode::None);
         assert!(r.soft_heuristic_fired);
+    }
+
+    #[test]
+    fn german_query_detects_alle_as_hard_exhaustive() {
+        assert_eq!(
+            detect_intent("Erkläre alle Methoden", LangCode::De),
+            CoverageMode::Exhaustive
+        );
+    }
+
+    #[test]
+    fn spanish_query_detects_todos_as_hard_exhaustive() {
+        assert_eq!(
+            detect_intent("Explica todos los métodos", LangCode::Es),
+            CoverageMode::Exhaustive
+        );
+    }
+
+    #[test]
+    fn french_query_detects_tous_as_hard_exhaustive() {
+        assert_eq!(
+            detect_intent("Explique tous les méthodes", LangCode::Fr),
+            CoverageMode::Exhaustive
+        );
+    }
+
+    #[test]
+    fn italian_query_detects_tutti_as_hard_exhaustive() {
+        assert_eq!(
+            detect_intent("Elenca tutti i metodi", LangCode::It),
+            CoverageMode::Exhaustive
+        );
+    }
+
+    #[test]
+    fn portuguese_query_detects_todos_as_hard_exhaustive() {
+        assert_eq!(
+            detect_intent("Explique todos os métodos", LangCode::Pt),
+            CoverageMode::Exhaustive
+        );
+    }
+
+    #[test]
+    fn english_word_in_french_lang_misses_french_list() {
+        // NOTE: language misdetection makes intent detection miss. Here a
+        // plainly English query is mistagged as French — the FR table has
+        // no "all", so the hard rule does not fire. This test documents
+        // the known limitation: lang-detect quality directly bounds intent
+        // detection quality. Mitigation: keep LangCode::Other (and English
+        // as the fallback) as the default for low-confidence detections.
+        assert_eq!(
+            detect_intent("explain all methods", LangCode::Fr),
+            CoverageMode::None
+        );
+    }
+
+    #[test]
+    fn lang_code_other_falls_back_to_english() {
+        // `Other` selects the EN list, so EN tokens still fire.
+        assert_eq!(
+            detect_intent("list all the methods", LangCode::Other),
+            CoverageMode::Exhaustive
+        );
     }
 }
