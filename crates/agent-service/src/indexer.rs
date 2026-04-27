@@ -38,11 +38,16 @@ use agent_rs_core::config::IngestBackend;
 use agent_rs_core::types::{CollectionName, UserId};
 use agent_rs_queue::{IndexHandler, IndexJob};
 use agent_rs_retrieval::embedder::Embedder;
-use agent_rs_retrieval::ingestion::docling_client::DoclingSidecarClient;
-use agent_rs_retrieval::ingestion::summarizer::{
-    ChunkSummarizer, SummarizeItem, SummaryStatus,
+use agent_rs_retrieval::ingestion::docling_client::{DoclingResponse, DoclingSidecarClient};
+use agent_rs_retrieval::ingestion::marker_client::MarkerSidecarClient;
+use agent_rs_retrieval::ingestion::metadata::{ChunkExtras, ChunkMetadata, extract_metadata};
+use agent_rs_retrieval::ingestion::payload::{
+    ChunkPayloadInput, SummaryPayloadInput, TripletPayloadInput, build_chunk_payload,
+    build_summary_payload, build_triplet_payload,
 };
+use agent_rs_retrieval::ingestion::summarizer::{ChunkSummarizer, SummarizeItem, SummaryStatus};
 use agent_rs_retrieval::ingestion::{ChunkerConfig, LlmGraphExtractor, chunk_document};
+use agent_rs_stores::MinimalChunkRow;
 use agent_rs_stores::minio::MinioStore;
 use agent_rs_stores::neo4j::Neo4jStore;
 use agent_rs_stores::postgres::PgStore;
@@ -50,14 +55,26 @@ use agent_rs_stores::qdrant::QdrantStore;
 use agent_rs_stores::traits::VectorStore;
 use agent_rs_stores::types::VectorPoint;
 use async_trait::async_trait;
-use serde_json::json;
 use sha2::{Digest, Sha256};
 use tracing::{error, info, instrument, warn};
 
 /// Default in-flight LLM summarisation requests per indexer job.
-const DEFAULT_SUMMARIZER_CONCURRENCY: usize = 4;
+///
+/// Bumped from 4 → 32 to match what the library's tuning comment
+/// (`DEFAULT_SUMMARIZER_CONCURRENCY = 20` in
+/// [`agent_rs_retrieval::ingestion::summarizer`]) already validated, with
+/// extra headroom for bursty throughput. At 32 concurrent calls on
+/// `gpt-5.4-mini` a single worker stays well under OpenAI's per-key
+/// TPM/RPM ceiling on the standard paid tier; re-tune downward if
+/// scaling to N workers per API key causes 429 storms.
+const DEFAULT_SUMMARIZER_CONCURRENCY: usize = 32;
 /// Default in-flight LLM KG-extraction requests per indexer job.
-const DEFAULT_KG_CONCURRENCY: usize = 4;
+///
+/// Same rationale as [`DEFAULT_SUMMARIZER_CONCURRENCY`]: 4 → 32 to
+/// saturate the long per-call LLM latency (5–16 s on gpt-5.x reasoning
+/// models) so the KG phase finishes in ~`ceil(n_chunks / 32)` waves
+/// rather than `ceil(n_chunks / 4)`.
+const DEFAULT_KG_CONCURRENCY: usize = 32;
 
 /// Dependency bundle passed to [`AgentIndexHandler::new`].
 ///
@@ -80,6 +97,10 @@ pub struct AgentIndexHandlerDeps {
     /// `ingest_backend` allows Docling, PDF ingestion uses the sidecar's
     /// structural chunking; otherwise the `pdf-extract` fallback runs.
     pub docling: Option<Arc<DoclingSidecarClient>>,
+    /// Optional Marker sidecar. When `Some` and `ingest_backend` is
+    /// `Marker` / `MarkerWithLegacyFallback`, PDF ingestion uses
+    /// Marker's MPS-native pipeline. Ignored otherwise.
+    pub marker: Option<Arc<MarkerSidecarClient>>,
     pub ingest_backend: IngestBackend,
     /// Optional per-chunk summariser. Best-effort; failures log + skip.
     pub summarizer: Option<Arc<ChunkSummarizer>>,
@@ -99,6 +120,7 @@ pub struct AgentIndexHandler {
     triplet_collection: CollectionName,
     chunker_config: ChunkerConfig,
     docling: Option<Arc<DoclingSidecarClient>>,
+    marker: Option<Arc<MarkerSidecarClient>>,
     ingest_backend: IngestBackend,
     summarizer: Option<Arc<ChunkSummarizer>>,
     extractor: Option<Arc<LlmGraphExtractor>>,
@@ -118,6 +140,7 @@ impl AgentIndexHandler {
             triplet_collection: deps.triplet_collection,
             chunker_config: deps.chunker_config,
             docling: deps.docling,
+            marker: deps.marker,
             ingest_backend: deps.ingest_backend,
             summarizer: deps.summarizer,
             extractor: deps.extractor,
@@ -143,8 +166,8 @@ impl AgentIndexHandler {
         )
     )]
     async fn index(&self, job: &IndexJob) -> Result<IndexSummary, IndexError> {
-        let user_id = UserId::try_new(&job.user_id)
-            .map_err(|e| IndexError::InvalidUser(e.to_string()))?;
+        let user_id =
+            UserId::try_new(&job.user_id).map_err(|e| IndexError::InvalidUser(e.to_string()))?;
 
         // CAS pending → indexing. If another worker already claimed it
         // (`Ok(false)`), acknowledge and skip.
@@ -198,32 +221,44 @@ impl AgentIndexHandler {
         }
 
         // ---- 4. build VectorPoints --------------------------------------
+        //
+        // Payload construction is delegated to
+        // [`agent_rs_retrieval::ingestion::payload::build_chunk_payload`]
+        // so every persisted field name comes from the single
+        // `agent_rs_core::payload` schema module — preventing the
+        // indexer-vs-retriever key-name drift that produces silent
+        // zero-result searches.
+        //
+        // `doc_id` is the MinIO key in the stateless architecture (the
+        // original upload filename lives on the web side); `source` is
+        // the ranker-facing identifier, same string in this pipeline.
         let points: Vec<VectorPoint> = chunks
             .iter()
             .zip(embeddings.into_iter())
-            .map(|(c, emb)| VectorPoint {
-                id: c.chunk_id.clone(),
-                embedding: emb,
-                text: c.raw_text.clone(),
-                payload: json!({
-                    "user_id": user_id.as_str(),
-                    "minio_object_key": job.minio_object_key,
-                    // `source` is what the ranker uses to build the
-                    // "evidence came from X" header. We don't carry the
-                    // original filename on the agent side (web owns it),
-                    // so the MinIO key is the closest stable identifier
-                    // — better than the "unknown" fallback and keeps
-                    // source-count histograms useful.
-                    "source": job.minio_object_key,
-                    "chunk_id": c.chunk_id,
-                    "chunk_text": c.raw_text,
-                    "chunk_index": c.chunk_index,
-                    "total_chunks": c.total_chunks,
-                    "section_id": c.section_id,
-                    "section_path": c.section_path,
-                    "page_start": c.page_start,
-                    "page_end": c.page_end,
-                }),
+            .map(|(c, emb)| {
+                let payload = build_chunk_payload(
+                    ChunkPayloadInput {
+                        user_id: user_id.as_str(),
+                        doc_id: &job.minio_object_key,
+                        minio_object_key: &job.minio_object_key,
+                        source: &job.minio_object_key,
+                        chunk_id: &c.chunk_id,
+                        chunk_text: &c.raw_text,
+                        chunk_index: c.chunk_index,
+                        total_chunks: c.total_chunks,
+                        section_id: c.section_id.as_deref(),
+                        section_path: c.section_path.as_deref(),
+                        page_start: c.page_start,
+                        page_end: c.page_end,
+                    },
+                    Some(&c.metadata),
+                );
+                VectorPoint {
+                    id: c.chunk_id.clone(),
+                    embedding: emb,
+                    text: c.raw_text.clone(),
+                    payload,
+                }
             })
             .collect();
 
@@ -253,22 +288,29 @@ impl AgentIndexHandler {
         // chunks fall back to a preview of the chunk content. Either way
         // we emit one `Section` per chunk so `coverage_planner` and
         // `outline_corpus` have a flat TOC to walk.
-        let section_headings: Vec<String> = chunks
+        //
+        // Chunk ids come from the same `IndexedChunk.chunk_id` values we
+        // just upserted to Qdrant, so `search_sections` /
+        // `fetch_section_chunks` can follow `IN_SECTION` from Neo4j back
+        // into the payloads on the vector side.
+        let minimal_rows: Vec<MinimalChunkRow> = chunks
             .iter()
-            .map(|c| {
-                c.section_path
-                    .clone()
-                    .unwrap_or_else(|| c.raw_text.clone())
+            .map(|c| MinimalChunkRow {
+                chunk_id: c.chunk_id.clone(),
+                heading: c.section_path.clone().unwrap_or_else(|| c.raw_text.clone()),
+                chunk_index: c.chunk_index as i64,
+                page_start: c.page_start.map(|p| p as i64),
+                page_end: c.page_end.map(|p| p as i64),
             })
             .collect();
-        let n_sections = section_headings.len();
+        let n_sections = minimal_rows.len();
         self.neo4j
             .upsert_minimal_document(
                 &user_id,
                 &job.minio_object_key,
                 &sha256,
                 &job.minio_object_key,
-                &section_headings,
+                &minimal_rows,
             )
             .await
             .map_err(|e| IndexError::Upsert(e.to_string()))?;
@@ -325,39 +367,76 @@ impl AgentIndexHandler {
         tracing::Span::current().record("ext", &ext);
 
         let is_pdf = ext == "pdf";
-        let docling_preferred = matches!(
-            self.ingest_backend,
-            IngestBackend::Docling | IngestBackend::DoclingWithLegacyFallback
-        );
 
-        if is_pdf && docling_preferred {
-            if let Some(docling) = self.docling.as_ref() {
-                match self.chunk_via_docling(docling, minio_key, bytes).await {
-                    Ok(result) => {
-                        tracing::Span::current().record("backend", "docling");
-                        tracing::Span::current().record("n_chunks", result.0.len());
-                        tracing::Span::current().record("n_pages", result.1);
-                        return Ok(result);
-                    }
-                    Err(e) => {
-                        if matches!(
-                            self.ingest_backend,
-                            IngestBackend::DoclingWithLegacyFallback
-                        ) {
-                            warn!(
-                                error = %e,
-                                fallback = "pdf-extract",
-                                "docling failed; falling back to pdf-extract"
-                            );
-                        } else {
-                            return Err(e);
+        // Primary/fallback dispatch for PDF inputs.
+        //
+        // - Docling / Marker: sidecar required; error propagates on failure.
+        // - DoclingWithLegacyFallback / MarkerWithLegacyFallback: try the
+        //   sidecar, fall through to pdf-extract on error.
+        // - Legacy: skip both sidecars entirely.
+        if is_pdf {
+            match self.ingest_backend {
+                IngestBackend::Docling | IngestBackend::DoclingWithLegacyFallback => {
+                    if let Some(docling) = self.docling.as_ref() {
+                        match self.chunk_via_docling(docling, minio_key, bytes).await {
+                            Ok(result) => {
+                                tracing::Span::current().record("backend", "docling");
+                                tracing::Span::current().record("n_chunks", result.0.len());
+                                tracing::Span::current().record("n_pages", result.1);
+                                return Ok(result);
+                            }
+                            Err(e) => {
+                                if matches!(
+                                    self.ingest_backend,
+                                    IngestBackend::DoclingWithLegacyFallback
+                                ) {
+                                    warn!(
+                                        error = %e,
+                                        fallback = "pdf-extract",
+                                        "docling failed; falling back to pdf-extract"
+                                    );
+                                } else {
+                                    return Err(e);
+                                }
+                            }
                         }
+                    } else if matches!(self.ingest_backend, IngestBackend::Docling) {
+                        return Err(IndexError::Parse(
+                            "Docling backend required but no sidecar client configured".into(),
+                        ));
                     }
                 }
-            } else if matches!(self.ingest_backend, IngestBackend::Docling) {
-                return Err(IndexError::Parse(
-                    "Docling backend required but no sidecar client configured".into(),
-                ));
+                IngestBackend::Marker | IngestBackend::MarkerWithLegacyFallback => {
+                    if let Some(marker) = self.marker.as_ref() {
+                        match self.chunk_via_marker(marker, minio_key, bytes).await {
+                            Ok(result) => {
+                                tracing::Span::current().record("backend", "marker");
+                                tracing::Span::current().record("n_chunks", result.0.len());
+                                tracing::Span::current().record("n_pages", result.1);
+                                return Ok(result);
+                            }
+                            Err(e) => {
+                                if matches!(
+                                    self.ingest_backend,
+                                    IngestBackend::MarkerWithLegacyFallback
+                                ) {
+                                    warn!(
+                                        error = %e,
+                                        fallback = "pdf-extract",
+                                        "marker failed; falling back to pdf-extract"
+                                    );
+                                } else {
+                                    return Err(e);
+                                }
+                            }
+                        }
+                    } else if matches!(self.ingest_backend, IngestBackend::Marker) {
+                        return Err(IndexError::Parse(
+                            "Marker backend required but no sidecar client configured".into(),
+                        ));
+                    }
+                }
+                IngestBackend::Legacy => {}
             }
         }
 
@@ -379,7 +458,32 @@ impl AgentIndexHandler {
             .chunk_document(bytes.to_vec(), minio_key, minio_key, "application/pdf")
             .await
             .map_err(|e| IndexError::Parse(format!("docling: {e}")))?;
+        Ok(Self::sidecar_response_to_chunks(response, minio_key))
+    }
 
+    async fn chunk_via_marker(
+        &self,
+        marker: &MarkerSidecarClient,
+        minio_key: &str,
+        bytes: &[u8],
+    ) -> Result<(Vec<IndexedChunk>, i32), IndexError> {
+        let response = marker
+            .chunk_document(bytes.to_vec(), minio_key, minio_key, "application/pdf")
+            .await
+            .map_err(|e| IndexError::Parse(format!("marker: {e}")))?;
+        Ok(Self::sidecar_response_to_chunks(response, minio_key))
+    }
+
+    /// Common mapping from a sidecar [`DoclingResponse`] (also used by
+    /// Marker — same proto) to the crate's [`IndexedChunk`] shape.
+    ///
+    /// Page count is derived from the maximum `page_end` across chunks
+    /// because neither sidecar footer carries a page-count field. Falls
+    /// back to 1 when every chunk is page-less.
+    fn sidecar_response_to_chunks(
+        response: DoclingResponse,
+        minio_key: &str,
+    ) -> (Vec<IndexedChunk>, i32) {
         let total = response.chunks.len() as u32;
         let chunks: Vec<IndexedChunk> = response
             .chunks
@@ -391,6 +495,7 @@ impl AgentIndexHandler {
                 } else {
                     Some(c.heading_path.join(" / "))
                 };
+                let metadata = metadata_for_chunk(&c.raw_text, minio_key);
                 IndexedChunk {
                     chunk_id: c.chunk_id,
                     chunk_index: i,
@@ -413,19 +518,13 @@ impl AgentIndexHandler {
                     } else {
                         Some(c.page_end)
                     },
+                    metadata,
                 }
             })
             .collect();
 
-        // Docling's footer does not carry a page count; derive it from
-        // the maximum page_end across all chunks. Falls back to 1 when
-        // chunks are page-less.
-        let n_pages = chunks
-            .iter()
-            .filter_map(|c| c.page_end)
-            .max()
-            .unwrap_or(1) as i32;
-        Ok((chunks, n_pages))
+        let n_pages = chunks.iter().filter_map(|c| c.page_end).max().unwrap_or(1) as i32;
+        (chunks, n_pages)
     }
 
     /// Best-effort per-chunk LLM summarisation.
@@ -447,12 +546,7 @@ impl AgentIndexHandler {
             n_upserted = tracing::field::Empty,
         )
     )]
-    async fn run_summaries(
-        &self,
-        user_id: &UserId,
-        minio_key: &str,
-        chunks: &[IndexedChunk],
-    ) {
+    async fn run_summaries(&self, user_id: &UserId, minio_key: &str, chunks: &[IndexedChunk]) {
         let Some(summarizer) = self.summarizer.as_ref() else {
             return;
         };
@@ -489,16 +583,28 @@ impl AgentIndexHandler {
         let embeddings = match self.embedder.embed_documents(&texts).await {
             Ok(v) => v,
             Err(e) => {
-                warn!(error = %e, "summary embedding failed; skipping summaries upsert");
+                // Drops ALL summaries for this document silently from the
+                // retrieval index. Logged at ERROR so Sentry / PagerDuty
+                // alerting catches it — a paying tenant's `Summaries`
+                // strategy will silently return nothing otherwise.
+                tracing::error!(
+                    error = %e,
+                    user_id = %user_id,
+                    minio_key,
+                    n_summaries = usable.len(),
+                    "summary embedding failed; dropping all summaries for this document"
+                );
                 return;
             }
         };
 
         if embeddings.len() != usable.len() {
-            warn!(
+            tracing::error!(
                 got = embeddings.len(),
                 expected = usable.len(),
-                "summary embedding count mismatch; skipping upsert"
+                user_id = %user_id,
+                minio_key,
+                "summary embedding count mismatch — embedder contract violation; dropping summaries"
             );
             return;
         }
@@ -506,24 +612,34 @@ impl AgentIndexHandler {
         let points: Vec<VectorPoint> = usable
             .iter()
             .zip(embeddings.into_iter())
-            .map(|(s, emb)| VectorPoint {
-                id: s.summary_id.clone(),
-                embedding: emb,
-                text: s.summary_text.clone(),
-                payload: json!({
-                    "user_id": user_id.as_str(),
-                    "minio_object_key": minio_key,
-                    "chunk_id": s.chunk_id,
-                    "section_id": s.section_id,
-                    "summary_id": s.summary_id,
-                    "summary_text": s.summary_text,
-                }),
+            .map(|(s, emb)| {
+                let payload = build_summary_payload(SummaryPayloadInput {
+                    user_id: user_id.as_str(),
+                    minio_object_key: minio_key,
+                    chunk_id: &s.chunk_id,
+                    section_id: s.section_id.as_deref(),
+                    summary_id: &s.summary_id,
+                    summary_text: &s.summary_text,
+                });
+                VectorPoint {
+                    id: s.summary_id.clone(),
+                    embedding: emb,
+                    text: s.summary_text.clone(),
+                    payload,
+                }
             })
             .collect();
 
         let n_points = points.len();
         if let Err(e) = self.qdrant.upsert(&self.summaries_collection, points).await {
-            warn!(error = %e, n_dropped = n_points, "summary Qdrant upsert failed; continuing");
+            tracing::error!(
+                error = %e,
+                user_id = %user_id,
+                minio_key,
+                n_dropped = n_points,
+                collection = %self.summaries_collection,
+                "summary Qdrant upsert failed; tenant summaries lost for this document"
+            );
         } else {
             tracing::Span::current().record("n_upserted", n_points);
             info!(
@@ -554,12 +670,7 @@ impl AgentIndexHandler {
             n_upserted = tracing::field::Empty,
         )
     )]
-    async fn run_kg_extraction(
-        &self,
-        user_id: &UserId,
-        minio_key: &str,
-        chunks: &[IndexedChunk],
-    ) {
+    async fn run_kg_extraction(&self, user_id: &UserId, minio_key: &str, chunks: &[IndexedChunk]) {
         let Some(extractor) = self.extractor.as_ref() else {
             return;
         };
@@ -569,9 +680,7 @@ impl AgentIndexHandler {
             .extract_batch(&chunk_texts, DEFAULT_KG_CONCURRENCY)
             .await;
 
-        // Flatten (graph × chunk) → triplet rows.
-        let mut triplets: Vec<(String, String, String, String, String, String, String)> =
-            Vec::new();
+        let mut triplets: Vec<TripletRecord> = Vec::new();
         for (chunk, graph) in chunks.iter().zip(graphs.iter()) {
             if graph.is_empty() {
                 continue;
@@ -599,19 +708,17 @@ impl AgentIndexHandler {
                     edge.source_node_id, edge.relationship_name, edge.target_node_id
                 );
                 let id = uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_OID, key.as_bytes()).to_string();
-                let triplet_text = format!(
-                    "{src_name} -> {} -> {dst_name}",
-                    edge.relationship_name
-                );
-                triplets.push((
+                let text = format!("{src_name} -> {} -> {dst_name}", edge.relationship_name);
+                triplets.push(TripletRecord {
                     id,
-                    chunk.chunk_id.clone(),
-                    edge.source_node_id.clone(),
+                    chunk_id: chunk.chunk_id.clone(),
+                    src_node_id: edge.source_node_id.clone(),
                     src_name,
-                    edge.relationship_name.clone(),
-                    edge.target_node_id.clone(),
-                    triplet_text,
-                ));
+                    rel_name: edge.relationship_name.clone(),
+                    dst_node_id: edge.target_node_id.clone(),
+                    dst_name,
+                    text,
+                });
             }
         }
 
@@ -621,19 +728,31 @@ impl AgentIndexHandler {
             return;
         }
 
-        let texts: Vec<&str> = triplets.iter().map(|t| t.6.as_str()).collect();
+        let texts: Vec<&str> = triplets.iter().map(|t| t.text.as_str()).collect();
         let embeddings = match self.embedder.embed_documents(&texts).await {
             Ok(v) => v,
             Err(e) => {
-                warn!(error = %e, "triplet embedding failed; skipping KG upsert");
+                // Drops ALL triplets for this document silently — every
+                // future GraphHybrid / GraphCoT query on this tenant
+                // will operate with reduced graph coverage. Bump to
+                // ERROR so alerting catches it.
+                tracing::error!(
+                    error = %e,
+                    user_id = %user_id,
+                    minio_key,
+                    n_triplets = triplets.len(),
+                    "triplet embedding failed; dropping all KG triplets for this document"
+                );
                 return;
             }
         };
         if embeddings.len() != triplets.len() {
-            warn!(
+            tracing::error!(
                 got = embeddings.len(),
                 expected = triplets.len(),
-                "triplet embedding count mismatch; skipping upsert"
+                user_id = %user_id,
+                minio_key,
+                "triplet embedding count mismatch — embedder contract violation; dropping triplets"
             );
             return;
         }
@@ -641,26 +760,36 @@ impl AgentIndexHandler {
         let points: Vec<VectorPoint> = triplets
             .iter()
             .zip(embeddings.into_iter())
-            .map(|(t, emb)| VectorPoint {
-                id: t.0.clone(),
-                embedding: emb,
-                text: t.6.clone(),
-                payload: json!({
-                    "user_id": user_id.as_str(),
-                    "minio_object_key": minio_key,
-                    "chunk_id": t.1,
-                    "source_node_id": t.2,
-                    "source_node_name": t.3,
-                    "relationship_name": t.4,
-                    "target_node_id": t.5,
-                    "triplet_text": t.6,
-                }),
+            .map(|(t, emb)| {
+                let payload = build_triplet_payload(TripletPayloadInput {
+                    user_id: user_id.as_str(),
+                    chunk_id: &t.chunk_id,
+                    source_node_id: &t.src_node_id,
+                    source_node_name: &t.src_name,
+                    relationship_name: &t.rel_name,
+                    target_node_id: &t.dst_node_id,
+                    target_node_name: &t.dst_name,
+                    triplet_text: &t.text,
+                });
+                VectorPoint {
+                    id: t.id.clone(),
+                    embedding: emb,
+                    text: t.text.clone(),
+                    payload,
+                }
             })
             .collect();
 
         let n_points = points.len();
         if let Err(e) = self.qdrant.upsert(&self.triplet_collection, points).await {
-            warn!(error = %e, n_dropped = n_points, "triplets Qdrant upsert failed; continuing");
+            tracing::error!(
+                error = %e,
+                user_id = %user_id,
+                minio_key,
+                n_dropped = n_points,
+                collection = %self.triplet_collection,
+                "triplets Qdrant upsert failed; tenant KG triplets lost for this document"
+            );
         } else {
             tracing::Span::current().record("n_upserted", n_points);
             info!(
@@ -687,17 +816,21 @@ impl AgentIndexHandler {
         let total = doc_chunks.len();
         let chunks: Vec<IndexedChunk> = doc_chunks
             .into_iter()
-            .map(|c| IndexedChunk {
-                chunk_id: c.chunk_id,
-                chunk_index: c.chunk_index,
-                total_chunks: total,
-                // pdf-extract has no context-enriched form — reuse raw.
-                embed_text: c.content.clone(),
-                raw_text: c.content,
-                section_id: None,
-                section_path: None,
-                page_start: None,
-                page_end: None,
+            .map(|c| {
+                let metadata = metadata_for_chunk(&c.content, minio_key);
+                IndexedChunk {
+                    chunk_id: c.chunk_id,
+                    chunk_index: c.chunk_index,
+                    total_chunks: total,
+                    // pdf-extract has no context-enriched form — reuse raw.
+                    embed_text: c.content.clone(),
+                    raw_text: c.content,
+                    section_id: None,
+                    section_path: None,
+                    page_start: None,
+                    page_end: None,
+                    metadata,
+                }
             })
             .collect();
         Ok((chunks, n_pages))
@@ -706,10 +839,7 @@ impl AgentIndexHandler {
 
 #[async_trait]
 impl IndexHandler for AgentIndexHandler {
-    async fn handle(
-        &self,
-        job: IndexJob,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    async fn handle(&self, job: IndexJob) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         match self.index(&job).await {
             Ok(summary) => {
                 if summary.claimed {
@@ -789,6 +919,45 @@ struct IndexedChunk {
     section_path: Option<String>,
     page_start: Option<u32>,
     page_end: Option<u32>,
+    /// Content-type signals + `section_title` / `language` heuristics
+    /// derived from `raw_text`. Populated unconditionally at chunk
+    /// construction so every `IndexedChunk` downstream sees the same
+    /// schema — the payload builder relies on these fields being present
+    /// so the retrieval-side `MetadataFilterExtractor` has a non-empty
+    /// target for `has_table` / `has_formula` / `has_code` predicates.
+    metadata: ChunkMetadata,
+}
+
+/// Flattened `(graph × chunk)` triplet row produced during KG extraction.
+///
+/// Carries every field `build_triplet_payload` needs, by name. The
+/// previous implementation used a seven-element tuple which silently
+/// lost `dst_name` — keeping `target_node_name` as a distinct named
+/// field makes it a compile error to forget the display name again.
+struct TripletRecord {
+    /// Deterministic UUIDv5 derived from `src|rel|dst` so re-ingesting
+    /// the same edge from a different chunk is idempotent.
+    id: String,
+    /// Chunk that sourced this triplet (for lineage / citation).
+    chunk_id: String,
+    src_node_id: String,
+    src_name: String,
+    rel_name: String,
+    dst_node_id: String,
+    /// Human-readable display name for the destination node. Used as
+    /// `target_node_name` in the Qdrant payload so citations can render
+    /// the triplet without a separate Neo4j lookup.
+    dst_name: String,
+    /// `src_name -> rel_name -> dst_name` — also the text embedded.
+    text: String,
+}
+
+/// Compute [`ChunkMetadata`] for the given chunk text.
+///
+/// Centralises the enrichment call so both the Docling and pdf-extract
+/// paths produce byte-identical metadata for identical input.
+fn metadata_for_chunk(raw_text: &str, source: &str) -> ChunkMetadata {
+    extract_metadata(raw_text, source, &[], ChunkExtras::default())
 }
 
 /// Determine text content from the raw bytes using the object key's

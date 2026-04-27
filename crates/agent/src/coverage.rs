@@ -121,8 +121,16 @@ mod tests {
         let plan = CoveragePlan {
             mode: CoverageMode::Exhaustive,
             target_sections: vec![
-                SectionRef { section_id: "s1".into(), doc_id: "d".into(), heading: "5.1".into() },
-                SectionRef { section_id: "s2".into(), doc_id: "d".into(), heading: "5.2".into() },
+                SectionRef {
+                    section_id: "s1".into(),
+                    doc_id: "d".into(),
+                    heading: "5.1".into(),
+                },
+                SectionRef {
+                    section_id: "s2".into(),
+                    doc_id: "d".into(),
+                    heading: "5.2".into(),
+                },
             ],
         };
         let evidence_section_ids = ["s1", "s2"].into_iter().map(String::from).collect();
@@ -138,9 +146,21 @@ mod tests {
         let plan = CoveragePlan {
             mode: CoverageMode::Exhaustive,
             target_sections: vec![
-                SectionRef { section_id: "s1".into(), doc_id: "d".into(), heading: "5.1".into() },
-                SectionRef { section_id: "s2".into(), doc_id: "d".into(), heading: "5.2".into() },
-                SectionRef { section_id: "s3".into(), doc_id: "d".into(), heading: "5.3".into() },
+                SectionRef {
+                    section_id: "s1".into(),
+                    doc_id: "d".into(),
+                    heading: "5.1".into(),
+                },
+                SectionRef {
+                    section_id: "s2".into(),
+                    doc_id: "d".into(),
+                    heading: "5.2".into(),
+                },
+                SectionRef {
+                    section_id: "s3".into(),
+                    doc_id: "d".into(),
+                    heading: "5.3".into(),
+                },
             ],
         };
         let evidence_section_ids = ["s1"].into_iter().map(String::from).collect();

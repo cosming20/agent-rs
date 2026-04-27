@@ -67,10 +67,7 @@ pub fn build_user_filter(
         "user_id must not be empty for Qdrant user filter"
     );
     let mut conds: Vec<Condition> = Vec::new();
-    conds.push(Condition::matches(
-        PAYLOAD_KEY_USER,
-        user_id.to_string(),
-    ));
+    conds.push(Condition::matches(PAYLOAD_KEY_USER, user_id.to_string()));
     if let Some(key) = minio_object_key {
         conds.push(Condition::matches(PAYLOAD_KEY_DOCUMENT, key.to_string()));
     }
@@ -125,11 +122,7 @@ mod tests {
 
     #[test]
     fn build_user_filter_with_user_doc_section() {
-        let f = build_user_filter(
-            "alice",
-            Some("users/alice/docs/abc.pdf"),
-            Some("sec-1"),
-        );
+        let f = build_user_filter("alice", Some("users/alice/docs/abc.pdf"), Some("sec-1"));
         assert_eq!(f.must.len(), 3, "user+doc+section -> 3 must clauses");
     }
 

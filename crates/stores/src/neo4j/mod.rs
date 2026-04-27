@@ -54,6 +54,281 @@ impl Neo4jStore {
         tracing::info!("connected to neo4j at {}", endpoint);
         Ok(Self { graph })
     }
+
+    /// Find knowledge-graph nodes whose name-like properties match a
+    /// free-form mention.
+    ///
+    /// Backed by the `entity_mention_fts` Lucene fulltext index created
+    /// by [`crate::neo4j::structural::Neo4jStore::ensure_structural_constraints`].
+    /// The index spans `(name, title, heading)` across
+    /// `Document|Section|Chunk|Entity`, so a mention like `"FCM"` finds
+    /// Entity nodes, Section nodes (e.g. *"Clustering fuzzy (FCM)"*),
+    /// and Chunk nodes uniformly.
+    ///
+    /// Results are scoped by a `WHERE node.user_id = $user_id` clause
+    /// — the fulltext index cannot be a multi-property composite with a
+    /// user-scope filter in Neo4j, so enforcement happens at the MATCH
+    /// layer.
+    ///
+    /// Returns `Ok(Vec::new())` when:
+    /// - `mention` trims to empty;
+    /// - the fulltext index is missing (e.g. on a cold cluster before
+    ///   `ensure_structural_constraints` has been called);
+    /// - the Lucene query is malformed after escaping.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::InvalidData`] when `user_id` is empty — an
+    /// empty tenant id would cause the `WHERE node.user_id = $uid` clause
+    /// to match nothing tenant-scoped (and would accept any entity with
+    /// a missing `user_id` property, breaking tenant isolation). Every
+    /// other failure is returned from the underlying driver via
+    /// [`StoreError::from`].
+    #[instrument(
+        name = "neo4j_store.find_entities_by_mention",
+        skip(self, mention),
+        fields(
+            user_id = %user_id,
+            mention_len = mention.len(),
+            limit = limit,
+            n_matches = tracing::field::Empty,
+        )
+    )]
+    pub async fn find_entities_by_mention(
+        &self,
+        user_id: &agent_rs_core::UserId,
+        mention: &str,
+        limit: usize,
+    ) -> Result<Vec<crate::types::EntityMatch>, StoreError> {
+        if user_id.as_str().is_empty() {
+            return Err(StoreError::InvalidData(
+                "find_entities_by_mention: empty user_id is forbidden".into(),
+            ));
+        }
+
+        let mention_trim = mention.trim();
+        if mention_trim.is_empty() || limit == 0 {
+            // Not a warn — empty mention / zero limit is a legitimate
+            // input pattern from the router. DEBUG keeps the signal
+            // queryable without polluting production logs.
+            tracing::debug!(
+                reason = "empty_mention_or_zero_limit",
+                mention_len = mention.len(),
+                limit,
+                "find_entities_by_mention: early-returning empty result"
+            );
+            tracing::Span::current().record("n_matches", 0u64);
+            return Ok(Vec::new());
+        }
+
+        // Escape Lucene reserved characters then build a tolerant query:
+        // exact-phrase boost ∘ single-token wildcard. The wildcard form
+        // lets a mention like "FCM" match against a node titled
+        // "Fuzzy ISODATA (FCM)" where the indexed token chain keeps FCM
+        // as its own token. Prefix wildcards are disabled by default in
+        // Lucene (they force a full-index scan), so we keep a suffix
+        // wildcard plus the exact-phrase form to cover both positions.
+        //
+        // `escaped_phrase` is safe to embed inside quotes as-is because
+        // `lucene_escape` also escapes `"`. `escaped_term` strips any
+        // trailing special characters so the appended `*` does not
+        // produce a malformed parse like `foo\**` when the input ends in
+        // a reserved char.
+        let escaped_phrase = lucene_escape(mention_trim);
+        let escaped_term = trim_trailing_lucene_escape(&escaped_phrase);
+        // When the trimmed term is empty, the mention was made up entirely
+        // of Lucene-reserved characters (e.g. `"&&"`). Appending `*` to
+        // nothing produces a bare-wildcard query which Lucene rejects, so
+        // fall back to the exact-phrase form only.
+        let lucene_query = if escaped_term.is_empty() {
+            format!("\"{escaped_phrase}\"^2")
+        } else {
+            format!("\"{escaped_phrase}\"^2 OR {escaped_term}*")
+        };
+
+        let cypher = "CALL db.index.fulltext.queryNodes(\"entity_mention_fts\", $q) \
+                      YIELD node, score \
+                      WHERE node.user_id = $uid \
+                      RETURN node.id AS id, \
+                             coalesce(node.name, node.title, node.heading, '') AS display_name, \
+                             head(labels(node)) AS label, \
+                             score \
+                      ORDER BY score DESC LIMIT $lim";
+
+        let q = query(cypher)
+            .param("q", lucene_query)
+            .param("uid", user_id.as_str())
+            .param("lim", limit as i64);
+
+        let mut result = match self.graph.execute(q).await {
+            Ok(r) => r,
+            Err(e) => {
+                // Missing fulltext index → treat as "no matches" so the
+                // entity-linking pipeline fails open instead of breaking.
+                //
+                // Detection uses a structured Neo4jError code match (via
+                // `is_fulltext_index_missing`) with a free-text fallback
+                // kept only as a last resort. Every fail-open path emits
+                // a `reason=` field so dashboards can alert on sustained
+                // rates of each specific degradation cause rather than
+                // merging everything into a single "entity linker failed"
+                // counter.
+                if is_fulltext_index_missing(&e) {
+                    tracing::warn!(
+                        reason = "fulltext_index_missing",
+                        index = "entity_mention_fts",
+                        user_id = %user_id,
+                        "fulltext index missing; entity linking returns empty. \
+                         Run `ensure_structural_constraints` on this cluster."
+                    );
+                    tracing::Span::current().record("n_matches", 0u64);
+                    return Ok(Vec::new());
+                }
+                tracing::warn!(
+                    reason = "query_execute_failed",
+                    user_id = %user_id,
+                    error = %e,
+                    "find_entities_by_mention: propagating execute error to caller"
+                );
+                return Err(StoreError::from(e));
+            }
+        };
+
+        let mut out: Vec<crate::types::EntityMatch> = Vec::new();
+        while let Some(row) = result.next().await.map_err(StoreError::from)? {
+            let id: String = match row.get::<String>("id") {
+                Ok(v) => v,
+                Err(err) => {
+                    tracing::warn!(
+                        reason = "row_missing_id_field",
+                        user_id = %user_id,
+                        error = ?err,
+                        "fulltext row lacks `id` field; skipping"
+                    );
+                    continue;
+                }
+            };
+            let display_name: String = row.get::<String>("display_name").unwrap_or_default();
+            let label: String = row.get::<String>("label").unwrap_or_default();
+            let score: f64 = row.get::<f64>("score").unwrap_or(0.0);
+            out.push(crate::types::EntityMatch {
+                node_id: id,
+                display_name,
+                label,
+                score,
+            });
+        }
+        tracing::Span::current().record("n_matches", out.len());
+        Ok(out)
+    }
+}
+
+/// Return `true` iff `e` signals a missing `entity_mention_fts`
+/// fulltext index. Prefers the structured Neo4j error code
+/// (`Neo.ClientError.Procedure.ProcedureCallFailed` or
+/// `Neo.ClientError.Schema.IndexNotFound`) and falls back to the raw
+/// message only for driver versions that do not populate the code.
+fn is_fulltext_index_missing(e: &neo4rs::Error) -> bool {
+    if let neo4rs::Error::Neo4j(ne) = e
+        && (ne.code().contains("IndexNotFound")
+            || (ne.code().contains("Procedure") && ne.message().contains("entity_mention_fts")))
+    {
+        return true;
+    }
+    let msg = e.to_string();
+    msg.contains("entity_mention_fts")
+        && (msg.contains("not found") || msg.contains("There is no such"))
+}
+
+/// Escape Lucene query-syntax reserved characters so that an arbitrary
+/// user mention can be embedded into a fulltext query without aborting
+/// the parse or changing the query semantics.
+///
+/// Handles both the single-char reserved set
+/// (`+ - ! ( ) { } [ ] ^ " ~ * ? : \ /`) and the two-char boolean
+/// operators `&&` and `||`. The two-char operators are substituted
+/// first (`&& → \&\&`, `|| → \|\|`) so a char-by-char pass cannot
+/// accidentally split them. Bare `&` and `|` are not operators in
+/// Lucene and pass through unchanged.
+///
+/// The output is used exactly once per mention, so a preallocated
+/// `String` keeps the overhead trivial.
+fn lucene_escape(q: &str) -> String {
+    // Pre-pass: substitute the two-char operators. Walk the chars and
+    // emit `\&\&` / `\|\|` when a pair is seen; fall through to the
+    // single-char pass otherwise. We write directly into `out` to avoid
+    // an intermediate allocation.
+    let mut out = String::with_capacity(q.len() + 8);
+    let mut chars = q.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '&' if chars.peek() == Some(&'&') => {
+                chars.next();
+                out.push_str("\\&\\&");
+            }
+            '|' if chars.peek() == Some(&'|') => {
+                chars.next();
+                out.push_str("\\|\\|");
+            }
+            '+' | '-' | '!' | '(' | ')' | '{' | '}' | '[' | ']' | '^' | '"' | '~' | '*' | '?'
+            | ':' | '\\' | '/' => {
+                out.push('\\');
+                out.push(c);
+            }
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
+/// Strip every trailing `\X` escape pair from an already-escaped Lucene
+/// term so that appending a wildcard suffix cannot produce malformed
+/// output like `foo\**` (single-char case) or `foo\&*` (two-char
+/// boolean-op case where `lucene_escape` emits `\&\&` for `&&`).
+///
+/// Iterates: a single call strips every trailing `\X` pair until the
+/// string either becomes empty or ends in a non-escape character. This
+/// matters for inputs like `"foo&&"` whose escape output is `foo\&\&`
+/// (4 bytes of trailing escape) — a single-pass trim would leave `\&`
+/// dangling and the appended `*` would attach to a literal `&` instead
+/// of operating as a prefix wildcard on `foo`.
+///
+/// All reserved chars handled by `lucene_escape` are single-byte ASCII,
+/// so byte-indexing from the end is UTF-8 safe: `bytes[len - 2] == b'\\'`
+/// can only be true when the previous byte is a literal backslash, not
+/// the final continuation byte of a multi-byte character.
+fn trim_trailing_lucene_escape(mut escaped: &str) -> &str {
+    loop {
+        let bytes = escaped.as_bytes();
+        if bytes.len() < 2 || bytes[bytes.len() - 2] != b'\\' {
+            return escaped;
+        }
+        let last = bytes[bytes.len() - 1];
+        if !matches!(
+            last,
+            b'+' | b'-'
+                | b'!'
+                | b'('
+                | b')'
+                | b'{'
+                | b'}'
+                | b'['
+                | b']'
+                | b'^'
+                | b'"'
+                | b'~'
+                | b'*'
+                | b'?'
+                | b':'
+                | b'\\'
+                | b'/'
+                | b'&'
+                | b'|'
+        ) {
+            return escaped;
+        }
+        escaped = &escaped[..escaped.len() - 2];
+    }
 }
 
 // ---- GraphStore impl ----
@@ -375,6 +650,16 @@ impl GraphStore for Neo4jStore {
         Neo4jStore::ensure_structural_constraints(self).await
     }
 
+    /// Delegate to the inherent `find_entities_by_mention`.
+    async fn find_entities_by_mention(
+        &self,
+        user_id: &agent_rs_core::UserId,
+        mention: &str,
+        limit: usize,
+    ) -> Result<Vec<crate::types::EntityMatch>, StoreError> {
+        Neo4jStore::find_entities_by_mention(self, user_id, mention, limit).await
+    }
+
     /// Delegate to the inherent `upsert_document_structure` on [`Neo4jStore`]
     /// implemented in `structural.rs`.
     async fn upsert_document_structure(
@@ -492,4 +777,78 @@ fn bolt_path_to_graph_path(path: neo4rs::Path) -> Result<GraphPath, StoreError> 
         nodes: graph_nodes,
         edges: graph_edges,
     })
+}
+
+#[cfg(test)]
+mod lucene_escape_tests {
+    use super::*;
+
+    #[test]
+    fn escapes_single_char_reserved() {
+        assert_eq!(lucene_escape("foo+bar"), "foo\\+bar");
+        assert_eq!(lucene_escape("a*b"), "a\\*b");
+        assert_eq!(lucene_escape("A (B)"), "A \\(B\\)");
+    }
+
+    #[test]
+    fn escapes_boolean_operators() {
+        assert_eq!(lucene_escape("A && B"), "A \\&\\& B");
+        assert_eq!(lucene_escape("A || B"), "A \\|\\| B");
+        // Bare `&` / `|` are not operators, so pass through.
+        assert_eq!(lucene_escape("Tom & Jerry"), "Tom & Jerry");
+        assert_eq!(lucene_escape("pipe | sep"), "pipe | sep");
+    }
+
+    #[test]
+    fn escapes_backslash() {
+        assert_eq!(lucene_escape("a\\b"), "a\\\\b");
+    }
+
+    #[test]
+    fn trims_trailing_escape_before_wildcard() {
+        // Input: "foo*" → escaped "foo\*" → trimmed "foo" so suffix `*`
+        // yields the expected wildcard "foo*", not "foo\**".
+        let escaped = lucene_escape("foo*");
+        assert_eq!(escaped, "foo\\*");
+        assert_eq!(trim_trailing_lucene_escape(&escaped), "foo");
+    }
+
+    #[test]
+    fn trim_is_noop_on_plain_term() {
+        let escaped = lucene_escape("FCM");
+        assert_eq!(escaped, "FCM");
+        assert_eq!(trim_trailing_lucene_escape(&escaped), "FCM");
+    }
+
+    #[test]
+    fn trim_strips_trailing_two_char_operators() {
+        // "foo&&" → escape "foo\&\&" → trim iteratively drops 4 bytes,
+        // leaving "foo" so the caller's `*` suffix attaches cleanly.
+        let escaped = lucene_escape("foo&&");
+        assert_eq!(escaped, "foo\\&\\&");
+        assert_eq!(trim_trailing_lucene_escape(&escaped), "foo");
+
+        let escaped = lucene_escape("bar||");
+        assert_eq!(escaped, "bar\\|\\|");
+        assert_eq!(trim_trailing_lucene_escape(&escaped), "bar");
+    }
+
+    #[test]
+    fn trim_fully_empties_all_special_term() {
+        // A mention made entirely of reserved chars trims to an empty
+        // term; the caller must fall back to a phrase-only query.
+        let escaped = lucene_escape("&&||**");
+        assert_eq!(trim_trailing_lucene_escape(&escaped), "");
+    }
+
+    #[test]
+    fn lucene_escape_preserves_unicode() {
+        // Byte indexing in `trim_trailing_lucene_escape` is only safe
+        // because reserved chars are ASCII — pin that contract with a
+        // mixed-alphabet input so any regression in the escape path or
+        // the trim helper shows up here.
+        let escaped = lucene_escape("北京 (PEK)");
+        assert_eq!(escaped, "北京 \\(PEK\\)");
+        assert_eq!(trim_trailing_lucene_escape(&escaped), "北京 \\(PEK");
+    }
 }

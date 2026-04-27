@@ -52,8 +52,8 @@ pub struct MemoryRow {
 impl MemoryRow {
     pub fn into_domain(self) -> Result<Memory, StoreError> {
         use agent_rs_core::UserId;
-        let user_id = UserId::try_new(&self.user_id)
-            .map_err(|e| StoreError::InvalidData(e.to_string()))?;
+        let user_id =
+            UserId::try_new(&self.user_id).map_err(|e| StoreError::InvalidData(e.to_string()))?;
         Ok(Memory {
             id: self.id,
             user_id,
@@ -107,11 +107,11 @@ pub struct QueryRunRow {
 impl QueryRunRow {
     pub fn into_domain(self) -> Result<QueryRun, StoreError> {
         use agent_rs_core::UserId;
-        let user_id = UserId::try_new(&self.user_id)
-            .map_err(|e| StoreError::InvalidData(e.to_string()))?;
+        let user_id =
+            UserId::try_new(&self.user_id).map_err(|e| StoreError::InvalidData(e.to_string()))?;
         let strategy = str_to_strategy(&self.strategy)?;
-        let confidence = Confidence::new(self.confidence)
-            .map_err(|e| StoreError::InvalidData(e.to_string()))?;
+        let confidence =
+            Confidence::new(self.confidence).map_err(|e| StoreError::InvalidData(e.to_string()))?;
         Ok(QueryRun {
             id: self.id,
             trace_id: self.trace_id,

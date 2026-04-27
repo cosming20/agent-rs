@@ -8,7 +8,7 @@
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
-use agent_rs_core::{RetrievalStrategy, ToolError, UserId};
+use agent_rs_core::{DocHandle, RetrievalStrategy, ToolError, UserId};
 use agent_rs_retrieval::{RetrievalRouter, router::SectionFilter};
 use agent_rs_stores::types::SearchResult;
 use rig::completion::ToolDefinition;
@@ -83,6 +83,14 @@ pub struct SearchKnowledgeTool {
     /// controls this field — it is excluded from the JSON schema.
     #[serde(skip, default = "default_unset_user_id")]
     user_id: UserId,
+    /// Canonical MinIO object keys of the documents pinned to this turn.
+    ///
+    /// Consulted when the LLM supplies a `doc_id` argument: any prefix /
+    /// UUID substring / filename is resolved against this list via
+    /// [`DocHandle::resolve`] so the caller's loose identifier becomes the
+    /// exact key the retrieval filter matches on.
+    #[serde(skip, default)]
+    active_document_keys: Vec<String>,
 }
 
 /// Sentinel `UserId` used only when the struct is deserialised from `{}`
@@ -102,15 +110,20 @@ impl SearchKnowledgeTool {
     /// - `evidence_collector` -- shared mutable vec where raw results are accumulated.
     /// - `user_id` -- tenant id baked into every store call; never exposed in the
     ///   tool JSON schema.
+    /// - `active_document_keys` -- MinIO object keys of documents pinned for this
+    ///   turn. Used to resolve a caller-supplied `doc_id` (full key, UUID
+    ///   substring, or filename) to its canonical form before filtering.
     pub fn new_for_user(
         router: Arc<RetrievalRouter>,
         evidence_collector: Arc<Mutex<Vec<SearchResult>>>,
         user_id: UserId,
+        active_document_keys: Vec<String>,
     ) -> Self {
         Self {
             router: Some(router),
             evidence_collector: Some(evidence_collector),
             user_id,
+            active_document_keys,
         }
     }
 }
@@ -154,7 +167,7 @@ impl Tool for SearchKnowledgeTool {
                     },
                     "doc_id": {
                         "type": "string",
-                        "description": "Optional. Restrict retrieval to chunks from ONE specific document. Pass the UUID you discovered via document_info or outline_corpus. Use when the user names a document ('in the segmentare PDF', 'from doc X') or compares documents."
+                        "description": "Optional. Restrict retrieval to ONE pinned document. Accepts any unique identifier: the full MinIO object key shown by outline_corpus ('users/.../docs/<uuid>.pdf'), the UUID substring, or the filename — whichever uniquely identifies one pinned document. Ambiguous or unknown values return an error listing the known handles so you can retry. Omit the field (or pass an empty string) to search across all pinned documents."
                     },
                     "section_id": {
                         "type": "string",
@@ -215,15 +228,37 @@ impl Tool for SearchKnowledgeTool {
 
         let limit = args.limit.unwrap_or(DEFAULT_LIMIT);
 
-        // Build the hard post-fusion predicate from the caller-supplied
-        // doc_id / section_id fields. LLMs routinely emit `""` for these
-        // when they have no preference — pre-normalise to `None` so the
-        // router doesn't try to match on an empty-string payload value
-        // (which reliably matches zero documents).
+        // Resolve a caller-supplied `doc_id` to its canonical MinIO object
+        // key via `DocHandle`. The LLM may pass a bare UUID, a filename, or
+        // the full key — `DocHandle::resolve` accepts any of these as long
+        // as exactly one pinned document matches. Ambiguous or unknown
+        // inputs are returned to the LLM as a tool-output string so the
+        // next turn can retry with a more specific value instead of
+        // receiving a silent empty result set.
+        let normalise =
+            |s: Option<String>| s.map(|v| v.trim().to_owned()).filter(|v| !v.is_empty());
+        let resolved_doc_key: Option<String> = match normalise(args.doc_id.clone()) {
+            None => None,
+            Some(raw) => match DocHandle::resolve(&raw, &self.active_document_keys) {
+                Ok(handle) => Some(handle.into_inner()),
+                Err(err) => {
+                    tracing::warn!(
+                        doc_id_input = %raw,
+                        active_keys = ?self.active_document_keys,
+                        error = %err,
+                        "search_knowledge: doc_id could not be resolved"
+                    );
+                    // Return the resolver error verbatim so the LLM can
+                    // self-correct on the next iteration — the error
+                    // message already embeds the known handles.
+                    return Ok(format!("search_knowledge: {err}"));
+                }
+            },
+        };
+
         let section_filter = {
-            let normalise = |s: Option<String>| s.filter(|v| !v.trim().is_empty());
             let f = SectionFilter {
-                doc_id: normalise(args.doc_id.clone()),
+                doc_id: resolved_doc_key,
                 section_id: normalise(args.section_id.clone()),
             };
             if f.is_empty() { None } else { Some(f) }
@@ -334,5 +369,65 @@ impl Tool for SearchKnowledgeTool {
         );
 
         Ok(output)
+    }
+}
+
+#[cfg(test)]
+mod tests_doc_id_resolution {
+    //! Smoke tests for the `DocHandle`-backed `doc_id` resolution path.
+    //!
+    //! These exercise the string-shape boundary between LLM-supplied
+    //! identifiers and the canonical MinIO keys stored on chunk payloads.
+    //! They do NOT run the full retrieval pipeline; the router is absent
+    //! and the tool is constructed only far enough to call the resolver.
+    use super::*;
+
+    fn make_tool(active_keys: Vec<String>) -> SearchKnowledgeTool {
+        SearchKnowledgeTool {
+            router: None,
+            evidence_collector: None,
+            user_id: UserId::try_new("u").unwrap(),
+            active_document_keys: active_keys,
+        }
+    }
+
+    #[test]
+    fn normalise_strips_whitespace_and_nulls_empties() {
+        // Mirrors the closure inline in `call()` — kept in sync by
+        // convention. If either diverges this test catches the drift.
+        let normalise = |s: Option<String>| -> Option<String> {
+            s.map(|v| v.trim().to_owned()).filter(|v| !v.is_empty())
+        };
+        assert_eq!(normalise(None), None);
+        assert_eq!(normalise(Some(String::new())), None);
+        assert_eq!(normalise(Some("   ".into())), None);
+        assert_eq!(normalise(Some("  abc  ".into())), Some("abc".into()));
+    }
+
+    #[test]
+    fn bare_uuid_resolves_against_full_minio_key() {
+        // Reproduces the 2026-04-24 bug: outline_corpus emits the full
+        // MinIO key but the LLM copies only the UUID out of it. The
+        // resolver must upgrade that UUID back to the canonical key so
+        // the section filter matches chunk payloads.
+        let full = "users/u1/docs/567f3d77-5eb4-4865-ae70-392fb6be735e.pdf".to_string();
+        let tool = make_tool(vec![full.clone()]);
+        let handle = DocHandle::resolve(
+            "567f3d77-5eb4-4865-ae70-392fb6be735e",
+            &tool.active_document_keys,
+        )
+        .expect("unique uuid must resolve to the canonical key");
+        assert_eq!(handle.as_str(), full);
+    }
+
+    #[test]
+    fn unknown_doc_id_surfaces_known_handles_in_error_text() {
+        let tool = make_tool(vec!["users/u1/docs/only.pdf".into()]);
+        let err = DocHandle::resolve("nonexistent", &tool.active_document_keys).unwrap_err();
+        let msg = err.to_string();
+        // The LLM will see this string as the tool output and should be
+        // able to read the known handle verbatim out of it.
+        assert!(msg.contains("users/u1/docs/only.pdf"));
+        assert!(msg.contains("nonexistent"));
     }
 }

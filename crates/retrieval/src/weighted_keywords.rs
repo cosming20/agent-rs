@@ -344,7 +344,21 @@ impl WeightedKeywordExtractor {
     pub async fn extract(&self, query: &str) -> Result<WeightedKeywords, RetrievalError> {
         let endpoint = self.config.endpoint.as_deref().unwrap_or(OPENAI_CHAT_URL);
 
-        let body = serde_json::json!({
+        // Determinism controls. The weighted-keyword output is a ranking
+        // signal — two different extractions for the same query yield
+        // different RRF orderings, which breaks A/B evaluation.
+        //
+        // On non-reasoning models `temperature: 0.0` + an explicit `seed`
+        // pin the output to a reproducible distribution (OpenAI's `seed`
+        // parameter is best-effort but dramatically cuts variance).
+        //
+        // On gpt-5.x / o-series reasoning models the `temperature` field
+        // is rejected (HTTP 400); determinism comes from the schema-
+        // constrained structured output plus `reasoning_effort`.
+        // [`agent_rs_core::config::temperature_for`] drops the field for
+        // those models, and we keep `seed` unconditionally since reasoning
+        // models accept it.
+        let mut body = serde_json::json!({
             "model": self.config.model,
             "response_format": {
                 "type": "json_schema",
@@ -377,15 +391,15 @@ impl WeightedKeywordExtractor {
                 {"role": "system", "content": WEIGHTED_KEYWORDS_SYSTEM_PROMPT},
                 {"role": "user", "content": query},
             ],
-            // Determinism controls. The weighted-keyword output is a
-            // ranking signal — two different extractions for the same
-            // query yield different RRF orderings, which breaks A/B
-            // evaluation. `temperature: 0.0` + an explicit seed pin the
-            // output to a reproducible distribution (OpenAI's `seed`
-            // parameter is best-effort but dramatically cuts variance).
-            "temperature": 0.0_f32,
             "seed": RANKING_LLM_SEED,
         });
+        if let (Some(obj), Some(t)) = (
+            body.as_object_mut(),
+            agent_rs_core::config::temperature_for(&self.config.model, 0.0),
+        ) && let Some(n) = serde_json::Number::from_f64(f64::from(t))
+        {
+            obj.insert("temperature".into(), serde_json::Value::Number(n));
+        }
 
         let call = || async {
             let started = std::time::Instant::now();

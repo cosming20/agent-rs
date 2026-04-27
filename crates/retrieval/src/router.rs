@@ -605,7 +605,7 @@ impl RetrievalRouter {
 
         let entity_link_fut = async {
             if let Some(linker) = self.entity_linker.as_ref() {
-                let link_result = linker.link(query).await;
+                let link_result = linker.link(user_id, query).await;
                 if link_result.prefer_graph {
                     tracing::info!(
                         linked = link_result.linked_count,
@@ -1167,16 +1167,23 @@ impl RetrievalRouter {
             // ---- Single-backend: keyword ----
             // Query text is forwarded to Qdrant as a `Document { model: "qdrant/bm25" }`
             // for server-side BM25 sparse inference — no local SPLADE model needed.
-            // User scope is enforced via a merged payload filter.
+            // User scope is enforced via a merged payload filter at the store layer.
+            // `keyword_search_for_user` returns `Ok(vec![])` gracefully when the
+            // collection has no sparse vector configured (dense-only installs);
+            // other transport failures are absorbed here so the strategy
+            // still returns an empty answer rather than a 500. The warning
+            // is structured so operators can alert on sustained rates.
             RetrievalStrategy::Keyword => {
-                // Build an extra filter from any metadata hints; user_id scope is
-                // applied unconditionally by search_for_user.
-                let kw_extra = extra_filter.cloned();
-                let results = self
-                    .vector_store
-                    .search_for_user(&self.collection, user_id, dense, limit, kw_extra)
-                    .await
-                    .map_err(RetrievalError::Store)?;
+                let results = keyword_search_or_warn(
+                    &*self.vector_store,
+                    &self.collection,
+                    user_id,
+                    query_str,
+                    limit,
+                    extra_filter.cloned(),
+                    "Keyword",
+                )
+                .await;
                 Ok(vec![results])
             }
 
@@ -1286,8 +1293,13 @@ impl RetrievalRouter {
             }
 
             // ---- Parallel: vector + keyword (HYBRID) ----
+            //
+            // The vector branch runs dense ANN; the keyword branch runs
+            // server-side BM25 against the sparse named vector. Both are
+            // user-scoped at the store layer. If the collection has no
+            // sparse vector, `keyword_search_for_user` gracefully returns
+            // an empty list — RRF fusion downstream ignores it.
             RetrievalStrategy::Hybrid => {
-                // Both vector and keyword branches are user-scoped via search_for_user.
                 let (vector_result, keyword_result) = tokio::join!(
                     self.vector_store.search_for_user(
                         &self.collection,
@@ -1296,21 +1308,26 @@ impl RetrievalRouter {
                         limit,
                         extra_filter.cloned(),
                     ),
-                    self.vector_store.search_for_user(
+                    keyword_search_or_warn(
+                        &*self.vector_store,
                         &self.collection,
                         user_id,
-                        dense,
+                        query_str,
                         limit,
                         extra_filter.cloned(),
+                        "Hybrid",
                     ),
                 );
                 Ok(vec![
                     vector_result.map_err(RetrievalError::Store)?,
-                    keyword_result.map_err(RetrievalError::Store)?,
+                    keyword_result,
                 ])
             }
 
             // ---- Parallel: vector + keyword + graph (GRAPH_HYBRID) ----
+            //
+            // Dense ANN + server-side BM25 + graph traversal, all fused by
+            // RRF. Keyword branch gracefully no-ops when sparse is absent.
             RetrievalStrategy::GraphHybrid => {
                 let seeds = self
                     .derive_seed_ids(user_id, query_str, dense, limit)
@@ -1323,12 +1340,14 @@ impl RetrievalRouter {
                         limit,
                         extra_filter.cloned(),
                     ),
-                    self.vector_store.search_for_user(
+                    keyword_search_or_warn(
+                        &*self.vector_store,
                         &self.collection,
                         user_id,
-                        dense,
+                        query_str,
                         limit,
                         extra_filter.cloned(),
+                        "GraphHybrid",
                     ),
                     graph_search(
                         &*self.graph_store,
@@ -1343,7 +1362,7 @@ impl RetrievalRouter {
                 );
                 Ok(vec![
                     vector_result.map_err(RetrievalError::Store)?,
-                    keyword_result.map_err(RetrievalError::Store)?,
+                    keyword_result,
                     graph_result?,
                 ])
             }
@@ -1384,6 +1403,45 @@ impl RetrievalRouter {
 // ---------------------------------------------------------------------------
 // Private helpers
 // ---------------------------------------------------------------------------
+
+/// Fail-open wrapper around [`VectorStore::keyword_search_for_user`].
+///
+/// Any error from the keyword branch is logged at WARN with structured
+/// fields (`strategy`, `collection`, `user_id`, `error`) and collapsed
+/// to an empty `Vec`. The surrounding RRF-fusion flow treats the empty
+/// result as "no keyword contribution" and continues with the dense /
+/// graph branches intact — a transient Qdrant hiccup degrades the
+/// answer quality rather than 500'ing the whole query.
+///
+/// `strategy` is a caller-supplied tag (`"Keyword"` / `"Hybrid"` /
+/// `"GraphHybrid"`) so dashboards can attribute fail-open events to
+/// the retrieval path that triggered them.
+async fn keyword_search_or_warn(
+    vector_store: &dyn VectorStore,
+    collection: &CollectionName,
+    user_id: &UserId,
+    query_str: &str,
+    limit: usize,
+    extra_filter: Option<serde_json::Value>,
+    strategy: &'static str,
+) -> Vec<agent_rs_stores::types::SearchResult> {
+    match vector_store
+        .keyword_search_for_user(collection, user_id, query_str, limit, extra_filter)
+        .await
+    {
+        Ok(results) => results,
+        Err(e) => {
+            tracing::warn!(
+                strategy,
+                collection = %collection,
+                user_id = %user_id,
+                error = %e,
+                "keyword branch failed; fusing without BM25 contribution"
+            );
+            Vec::new()
+        }
+    }
+}
 
 /// Convert a slice of [`FilterCondition`] into the `serde_json::Value` format
 /// accepted by [`VectorStore::search_for_user`] as `extra_filter_json`.

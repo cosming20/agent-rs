@@ -13,7 +13,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use agent_rs::bootstrap::ensure_collections;
+use agent_rs::bootstrap::{ensure_collections, ensure_graph_indexes, probe_retrieval_coverage};
 use agent_rs::embedder::build_embedder;
 use agent_rs::router::{RouterFeatures, build_router};
 use agent_rs::stores::connect_stores;
@@ -68,6 +68,27 @@ async fn main() -> Result<()> {
     )
     .await
     .context("ensure Qdrant collections")?;
+
+    // Idempotent Neo4j bootstrap — guarantees the uniqueness
+    // constraints and the `entity_mention_fts` fulltext index exist
+    // before the first `Ask` RPC runs entity linking. Without this the
+    // linker fails silently (`ProcedureCallFailed: no such fulltext
+    // schema index`) and `GraphHybrid` degrades to dense-only on every
+    // query.
+    ensure_graph_indexes(&stores.neo4j)
+        .await
+        .context("ensure Neo4j graph indexes")?;
+
+    // Emit boot-time coverage report — empty summaries / triplets
+    // collections silently degrade `GraphHybrid` retrieval, so operators
+    // need to see this at startup not during an incident.
+    probe_retrieval_coverage(
+        &stores.qdrant,
+        &collection,
+        &summaries_collection,
+        &triplet_collection,
+    )
+    .await;
 
     let router = build_router(
         &settings,

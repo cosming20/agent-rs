@@ -14,16 +14,17 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use agent_rs::bootstrap::ensure_collections;
+use agent_rs::bootstrap::{ensure_collections, ensure_graph_indexes};
 use agent_rs::embedder::build_embedder;
 use agent_rs::stores::connect_stores;
 use agent_rs_agent_service::indexer::{AgentIndexHandler, AgentIndexHandlerDeps};
-use agent_rs_core::config::{IngestBackend, Settings};
+use agent_rs_core::config::{DEFAULT_LLM_MODEL, IngestBackend, Settings};
 use agent_rs_core::types::CollectionName;
 use agent_rs_observability::metrics::RetrievalMetrics;
 use agent_rs_observability::tracing::init_tracing;
 use agent_rs_queue::run_indexer;
 use agent_rs_retrieval::ingestion::docling_client::DoclingSidecarClient;
+use agent_rs_retrieval::ingestion::marker_client::MarkerSidecarClient;
 use agent_rs_retrieval::ingestion::summarizer::ChunkSummarizer;
 use agent_rs_retrieval::ingestion::{ChunkerConfig, LlmGraphExtractor};
 use anyhow::{Context, Result};
@@ -33,6 +34,18 @@ use tracing::{info, warn};
 /// MVP pipeline (~200 MiB peak per job). Override via
 /// `AGENT_RS__INDEXER__PREFETCH` without rebuilding.
 const DEFAULT_PREFETCH: u16 = 5;
+
+/// HTTP client request timeout for every LLM call issued by the
+/// indexer (`ChunkSummarizer` + `LlmGraphExtractor`).
+///
+/// Sized for cold-start latency on GPT-class models — the embedding
+/// endpoint usually answers in < 3 s but a large summarise-this-chunk
+/// prompt against a model that just cold-started can run 30-60 s. The
+/// 120 s budget keeps the first-request case responsive while still
+/// catching hung connections before the RabbitMQ prefetch window
+/// starves. Not configurable via env to keep worker tuning hermetic;
+/// raise this const if the configured LLM regularly exceeds 120 s.
+const LLM_HTTP_CLIENT_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Parse a boolean-shaped env var. Accepts `1`, `true` (case-insensitive);
 /// everything else, including unset, is `false`.
@@ -72,6 +85,16 @@ async fn main() -> Result<()> {
     )
     .await
     .context("ensure Qdrant collections")?;
+
+    // Idempotent Neo4j bootstrap — the indexer writes Document /
+    // Page / Section / Chunk nodes whose uniqueness constraints live
+    // alongside `entity_mention_fts`. Running the same helper here as
+    // in agent-service keeps constraint creation race-free: whichever
+    // binary boots first on a cold cluster creates the schema, the
+    // second is a no-op.
+    ensure_graph_indexes(&stores.neo4j)
+        .await
+        .context("ensure Neo4j graph indexes")?;
     // Metrics handle kept for parity with the gRPC service and to keep
     // the retrieval-metrics registration path hot for future Qdrant /
     // Neo4j instrumentation of the indexing hot loop.
@@ -97,10 +120,11 @@ async fn main() -> Result<()> {
                     );
                     Some(Arc::new(client))
                 }
-                Err(e) if matches!(
-                    settings.ingest_backend,
-                    IngestBackend::DoclingWithLegacyFallback
-                ) =>
+                Err(e)
+                    if matches!(
+                        settings.ingest_backend,
+                        IngestBackend::DoclingWithLegacyFallback
+                    ) =>
                 {
                     warn!(error = %e, "Docling sidecar unreachable; falling back to pdf-extract");
                     None
@@ -112,65 +136,160 @@ async fn main() -> Result<()> {
                 }
             }
         }
-        IngestBackend::Legacy => None,
+        IngestBackend::Marker | IngestBackend::MarkerWithLegacyFallback | IngestBackend::Legacy => {
+            None
+        }
+    };
+
+    // Marker sidecar client. Constructed only when the active backend
+    // is `Marker` / `MarkerWithLegacyFallback` so we don't speculatively
+    // open a gRPC channel to a sidecar that isn't running.
+    let marker: Option<Arc<MarkerSidecarClient>> = match settings.ingest_backend {
+        IngestBackend::Marker | IngestBackend::MarkerWithLegacyFallback => {
+            match MarkerSidecarClient::connect(
+                settings.marker.endpoint.clone(),
+                Duration::from_secs(settings.marker.connect_timeout_s),
+                Duration::from_secs(settings.marker.stream_idle_timeout_s),
+            )
+            .await
+            {
+                Ok(client) => {
+                    info!(
+                        endpoint = %settings.marker.endpoint,
+                        "Marker sidecar client ready"
+                    );
+                    Some(Arc::new(client))
+                }
+                Err(e)
+                    if matches!(
+                        settings.ingest_backend,
+                        IngestBackend::MarkerWithLegacyFallback
+                    ) =>
+                {
+                    warn!(error = %e, "Marker sidecar unreachable; falling back to pdf-extract");
+                    None
+                }
+                Err(e) => {
+                    return Err(anyhow::anyhow!(
+                        "Marker backend required but sidecar unavailable: {e}"
+                    ));
+                }
+            }
+        }
+        IngestBackend::Docling
+        | IngestBackend::DoclingWithLegacyFallback
+        | IngestBackend::Legacy => None,
     };
 
     // Optional LLM stages (per-chunk summaries + KG triplets).
     //
-    // Controlled by:
-    //   - OPENAI_API_KEY / LLM_API_KEY env — turned into a shared key.
-    //   - AGENT_RS__INDEXER__ENABLE_SUMMARIES (default false)
-    //   - AGENT_RS__INDEXER__ENABLE_KG        (default false)
+    // Policy — **fail-open when an LLM key is available**. Summaries and
+    // KG-triplet extraction are what make `RetrievalStrategy::GraphHybrid`
+    // (the documented flagship strategy, `uses_triplets = true`) produce
+    // its full signal set. Leaving them off-by-default silently degrades
+    // retrieval quality on every fresh deployment. Enterprise deployments
+    // typically *already* gate LLM spend at the key level — the indexer
+    // does not need a second off-switch.
     //
-    // Both default off so a fresh deployment does not accidentally spend
-    // LLM budget on every ingested document. Flip the flags on when the
-    // deployment has observability + rate-limit protection in place.
+    // Controls:
+    //   - `OPENAI_API_KEY` / `LLM_API_KEY` — presence of either enables
+    //     both stages. The key lives in an env var, not config, so it is
+    //     never written to disk by a misconfigured operator.
+    //   - `AGENT_RS__INDEXER__DISABLE_SUMMARIES=true` — explicit opt-out.
+    //   - `AGENT_RS__INDEXER__DISABLE_KG=true`        — explicit opt-out.
+    //
+    // **Model name** — sourced from `settings.llm.model`
+    // (`AGENT_RS__LLM__MODEL` env var overrides the `config.toml` value
+    // via figment). Falls back to [`DEFAULT_LLM_MODEL`] only when the
+    // `Settings::default()` path fires and the operator has supplied no
+    // override. A legacy `LLM_MODEL` env var is no longer honoured here
+    // because it would diverge from the value the retrieval path reads
+    // from `settings.llm.model`.
+    //
+    // Missing LLM key → both stages off, with a single WARN so operators
+    // see the degraded retrieval capability at startup rather than
+    // discover it by an empty `default_triplets` collection weeks later.
     let llm_api_key = std::env::var("OPENAI_API_KEY")
         .or_else(|_| std::env::var("LLM_API_KEY"))
         .ok();
-    let llm_model =
-        std::env::var("LLM_MODEL").unwrap_or_else(|_| "gpt-5.4-mini-2026-03-17".into());
-    let http_client = Arc::new(reqwest::Client::builder()
-        .timeout(Duration::from_secs(120))
-        .build()
-        .context("build shared HTTP client")?);
-
-    let summarizer = if env_flag("AGENT_RS__INDEXER__ENABLE_SUMMARIES") {
-        match llm_api_key.as_deref() {
-            Some(key) => {
-                info!(model = %llm_model, "summarizer enabled");
-                Some(Arc::new(ChunkSummarizer::new(
-                    key.to_owned(),
-                    llm_model.clone(),
-                    Arc::clone(&http_client),
-                )))
-            }
-            None => {
-                warn!("AGENT_RS__INDEXER__ENABLE_SUMMARIES=true but no OPENAI_API_KEY set; disabling");
-                None
-            }
-        }
+    let llm_model = if settings.llm.model.is_empty() {
+        warn!(
+            default_model = DEFAULT_LLM_MODEL,
+            "settings.llm.model is empty — using compile-time default; set AGENT_RS__LLM__MODEL to override"
+        );
+        DEFAULT_LLM_MODEL.to_owned()
     } else {
-        None
+        settings.llm.model.clone()
+    };
+    let http_client = Arc::new(
+        reqwest::Client::builder()
+            .timeout(LLM_HTTP_CLIENT_TIMEOUT)
+            .build()
+            .context("build shared HTTP client")?,
+    );
+
+    let summaries_opt_out = env_flag("AGENT_RS__INDEXER__DISABLE_SUMMARIES");
+    let kg_opt_out = env_flag("AGENT_RS__INDEXER__DISABLE_KG");
+
+    let summarizer = match (llm_api_key.as_deref(), summaries_opt_out) {
+        (Some(key), false) => {
+            info!(
+                model = %llm_model,
+                control = "AGENT_RS__INDEXER__DISABLE_SUMMARIES",
+                "summarizer enabled (opt out with DISABLE_SUMMARIES=true)"
+            );
+            Some(Arc::new(ChunkSummarizer::new(
+                key.to_owned(),
+                llm_model.clone(),
+                Arc::clone(&http_client),
+            )))
+        }
+        (Some(_), true) => {
+            info!(
+                control = "AGENT_RS__INDEXER__DISABLE_SUMMARIES",
+                "summarizer disabled by operator — `RetrievalStrategy::Summaries` will be empty"
+            );
+            None
+        }
+        (None, _) => {
+            warn!(
+                reason = "no_llm_key",
+                "summarizer disabled: neither OPENAI_API_KEY nor LLM_API_KEY set — \
+                 `default_summaries` will remain empty and summary-aware retrieval is degraded"
+            );
+            None
+        }
     };
 
-    let extractor = if env_flag("AGENT_RS__INDEXER__ENABLE_KG") {
-        match llm_api_key.as_deref() {
-            Some(key) => {
-                info!(model = %llm_model, "KG extractor enabled");
-                Some(Arc::new(LlmGraphExtractor::new(
-                    key.to_owned(),
-                    llm_model.clone(),
-                    Arc::clone(&http_client),
-                )))
-            }
-            None => {
-                warn!("AGENT_RS__INDEXER__ENABLE_KG=true but no OPENAI_API_KEY set; disabling");
-                None
-            }
+    let extractor = match (llm_api_key.as_deref(), kg_opt_out) {
+        (Some(key), false) => {
+            info!(
+                model = %llm_model,
+                control = "AGENT_RS__INDEXER__DISABLE_KG",
+                "KG extractor enabled (opt out with DISABLE_KG=true)"
+            );
+            Some(Arc::new(LlmGraphExtractor::new(
+                key.to_owned(),
+                llm_model.clone(),
+                Arc::clone(&http_client),
+            )))
         }
-    } else {
-        None
+        (Some(_), true) => {
+            info!(
+                control = "AGENT_RS__INDEXER__DISABLE_KG",
+                "KG extractor disabled by operator — `default_triplets` will stay empty \
+                 and `RetrievalStrategy::GraphHybrid` will run with reduced signal coverage"
+            );
+            None
+        }
+        (None, _) => {
+            warn!(
+                reason = "no_llm_key",
+                "KG extractor disabled: neither OPENAI_API_KEY nor LLM_API_KEY set — \
+                 `default_triplets` will remain empty and graph-hybrid retrieval is degraded"
+            );
+            None
+        }
     };
 
     let handler = Arc::new(AgentIndexHandler::new(AgentIndexHandlerDeps {
@@ -188,6 +307,7 @@ async fn main() -> Result<()> {
         triplet_collection,
         chunker_config: ChunkerConfig::default(),
         docling,
+        marker,
         ingest_backend: settings.ingest_backend,
         summarizer,
         extractor,

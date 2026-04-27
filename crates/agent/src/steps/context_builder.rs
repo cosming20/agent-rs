@@ -14,7 +14,6 @@
 
 use std::sync::Arc;
 
-use agent_rs_core::config::ContextConfig;
 use agent_rs_core::errors::AgentError;
 use agent_rs_stores::postgres::PgStore;
 use tracing::{info, instrument, warn};
@@ -28,20 +27,12 @@ use crate::context::QueryContext;
 /// - Append the user's query + strategy hint at the end.
 pub struct ContextBuilder {
     pg: Arc<PgStore>,
-    #[allow(dead_code)]
-    max_messages: usize,
-    #[allow(dead_code)]
-    max_chars_per_msg: usize,
 }
 
 impl ContextBuilder {
     /// Create a new ContextBuilder.
-    pub fn new(pg: Arc<PgStore>, context_config: &ContextConfig) -> Self {
-        Self {
-            pg,
-            max_messages: context_config.max_messages,
-            max_chars_per_msg: context_config.max_chars_per_msg,
-        }
+    pub fn new(pg: Arc<PgStore>) -> Self {
+        Self { pg }
     }
 
     /// Inject long-term memories + append the user query with a strategy hint.
@@ -79,7 +70,10 @@ impl ContextBuilder {
         }
 
         // 2. Append the new user query with a strategy hint.
-        let hint = format!("\n\n[System hint: prefer '{}' search strategy]", ctx.strategy);
+        let hint = format!(
+            "\n\n[System hint: prefer '{}' search strategy]",
+            ctx.strategy
+        );
         ctx.chat_messages.push(format!("{}{hint}", ctx.query));
 
         Ok(())

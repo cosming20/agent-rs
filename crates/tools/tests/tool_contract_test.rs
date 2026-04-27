@@ -106,6 +106,7 @@ fn test_brave_config() -> BraveConfig {
         api_key: "test-key".into(),
         base_url: "https://api.search.brave.com/res/v1".into(),
         timeout_s: 5,
+        max_results: 10,
     }
 }
 
@@ -409,8 +410,8 @@ async fn fetch_section_chunks_tool_definition_contract() {
 
 #[tokio::test]
 async fn search_sections_tool_definition_contract() {
-    let tool: SearchSectionsTool = serde_json::from_value(json!({}))
-        .expect("SearchSectionsTool should deserialize from {}");
+    let tool: SearchSectionsTool =
+        serde_json::from_value(json!({})).expect("SearchSectionsTool should deserialize from {}");
     let def = tool.definition(String::new()).await;
     assert_eq!(def.name, "search_sections");
     assert_tool_contract(&def.name, &def.description, &def.parameters);
@@ -430,8 +431,8 @@ async fn search_sections_tool_definition_contract() {
 async fn outline_corpus_tool_definition_contract() {
     // All store fields are `#[serde(skip)]`, so `{}` deserializes to `None`
     // for each. `definition()` never touches the stores.
-    let tool: OutlineCorpusTool = serde_json::from_value(json!({}))
-        .expect("OutlineCorpusTool should deserialize from {}");
+    let tool: OutlineCorpusTool =
+        serde_json::from_value(json!({})).expect("OutlineCorpusTool should deserialize from {}");
     let def = tool.definition(String::new()).await;
     assert_eq!(def.name, "outline_corpus");
     assert_tool_contract(&def.name, &def.description, &def.parameters);

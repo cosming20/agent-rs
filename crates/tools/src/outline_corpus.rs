@@ -15,7 +15,7 @@
 
 use std::sync::Arc;
 
-use agent_rs_core::{ToolError, UserId};
+use agent_rs_core::{DocHandle, ToolError, UserId};
 use agent_rs_stores::neo4j::Neo4jStore;
 use agent_rs_stores::neo4j::coverage::SectionRow;
 use agent_rs_stores::qdrant::QdrantStore;
@@ -112,7 +112,7 @@ impl Tool for OutlineCorpusTool {
                 "properties": {
                     "doc_id": {
                         "type": "string",
-                        "description": "Optional MinIO object key; omit for the full pinned-corpus outline."
+                        "description": "Optional. Restrict the outline to ONE pinned document. Accepts any unique identifier: the full MinIO object key ('users/.../docs/<uuid>.pdf'), the UUID substring, or the filename. Ambiguous or unknown values return an error listing the known handles. Omit (or pass an empty string) for the full pinned-corpus outline."
                     },
                     "max_sections": {
                         "type": "integer",
@@ -146,12 +146,9 @@ impl Tool for OutlineCorpusTool {
             .qdrant
             .as_ref()
             .ok_or_else(|| ToolError::McpClient("outline_corpus: QdrantStore missing".into()))?;
-        let summaries_coll = self
-            .summaries_collection
-            .as_ref()
-            .ok_or_else(|| {
-                ToolError::McpClient("outline_corpus: summaries_collection missing".into())
-            })?;
+        let summaries_coll = self.summaries_collection.as_ref().ok_or_else(|| {
+            ToolError::McpClient("outline_corpus: summaries_collection missing".into())
+        })?;
 
         if self.active_document_keys.is_empty() {
             return Ok("No documents are pinned to this turn.".into());
@@ -159,22 +156,53 @@ impl Tool for OutlineCorpusTool {
 
         let max = args.max_sections.unwrap_or(DEFAULT_MAX_SECTIONS);
 
-        let doc_id_filter = args.doc_id.as_deref().filter(|s| !s.is_empty());
+        // Resolve a caller-supplied `doc_id` to a canonical key via the same
+        // resolver the other tools use. Any prefix / UUID / filename that
+        // uniquely identifies a pinned document is accepted; ambiguous or
+        // unknown values return an LLM-friendly error string so the next
+        // turn can retry with a specific handle instead of an empty outline.
+        let doc_id_filter: Option<String> = match args
+            .doc_id
+            .as_ref()
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+        {
+            None => None,
+            Some(raw) => match DocHandle::resolve(raw, &self.active_document_keys) {
+                Ok(handle) => Some(handle.into_inner()),
+                Err(err) => {
+                    tracing::warn!(
+                        doc_id_input = %raw,
+                        active_keys = ?self.active_document_keys,
+                        error = %err,
+                        "outline_corpus: doc_id could not be resolved"
+                    );
+                    return Ok(format!("outline_corpus: {err}"));
+                }
+            },
+        };
 
         let mut out = String::new();
         for key in &self.active_document_keys {
-            if let Some(want) = doc_id_filter {
+            if let Some(ref want) = doc_id_filter {
                 if key != want {
                     continue;
                 }
             }
 
-            out.push_str(&format!("Document: {key}\n"));
+            // Emit the document handle in an explicitly copy-literal form
+            // (`[id=<full-key>]`) so the LLM does not tokenise the path and
+            // copy only a UUID substring on the next tool call. The leading
+            // `filename:` line is a human-readable companion.
+            let filename = key.rsplit('/').next().unwrap_or(key);
+            out.push_str(&format!("Document [id={key}]\n"));
+            out.push_str(&format!("  filename: {filename}\n"));
 
-            let mut rows: Vec<SectionRow> = neo4j
-                .list_sections_for_doc(&self.user_id, key)
-                .await
-                .map_err(|e| ToolError::McpClient(format!("outline_corpus: sections: {e}")))?;
+            let mut rows: Vec<SectionRow> =
+                neo4j
+                    .list_sections_for_doc(&self.user_id, key)
+                    .await
+                    .map_err(|e| ToolError::McpClient(format!("outline_corpus: sections: {e}")))?;
 
             rows.truncate(max);
 

@@ -148,8 +148,7 @@ fn parse_strategy(raw: &str) -> RetrievalStrategy {
 
 // ---- streaming type alias ---------------------------------------------------
 
-type AskEventStream =
-    Pin<Box<dyn Stream<Item = Result<pb::AskEvent, Status>> + Send + 'static>>;
+type AskEventStream = Pin<Box<dyn Stream<Item = Result<pb::AskEvent, Status>> + Send + 'static>>;
 
 // ---- Agent trait impl -------------------------------------------------------
 
@@ -208,7 +207,11 @@ impl Agent for AgentServer {
             tracing::Span::current().record("trace_id", tid.to_string().as_str());
         }
 
-        let limit = if req.limit == 0 { 8 } else { req.limit as usize };
+        let limit = if req.limit == 0 {
+            8
+        } else {
+            req.limit as usize
+        };
 
         let history: Vec<ChatTurn> = req
             .history

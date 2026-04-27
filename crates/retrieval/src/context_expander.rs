@@ -200,7 +200,9 @@ impl ContextExpander {
                 continue;
             }
 
-            let expanded = self.expand_single(user_id, chunk_id, original_text, &hit_ids).await;
+            let expanded = self
+                .expand_single(user_id, chunk_id, original_text, &hit_ids)
+                .await;
 
             let neighbor_count = {
                 let e = match &expanded {
@@ -291,7 +293,10 @@ impl ContextExpander {
 
         // ---- IN_SECTION siblings (optional) ----
         let section_siblings = if self.config.expand_section {
-            match self.fetch_section_siblings(user_id, chunk_id, &seen_ids).await {
+            match self
+                .fetch_section_siblings(user_id, chunk_id, &seen_ids)
+                .await
+            {
                 Ok(siblings) => siblings,
                 Err(e) => {
                     warn!(

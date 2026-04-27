@@ -9,7 +9,7 @@ use async_trait::async_trait;
 use uuid::Uuid;
 
 use crate::types::{
-    CollectionConfig, EvidenceItem, FilterSpec, GraphEdge, GraphNode, GraphPath,
+    CollectionConfig, EntityMatch, EvidenceItem, FilterSpec, GraphEdge, GraphNode, GraphPath,
     Memory, NodeLabel, PointPayload, QueryRun, RelationType, SearchResult, VectorPoint,
 };
 
@@ -87,6 +87,48 @@ pub trait VectorStore: Send + Sync {
         extra_filter_json: Option<serde_json::Value>,
     ) -> Result<Vec<SearchResult>, StoreError>;
 
+    /// Sparse BM25 keyword search scoped to a specific user.
+    ///
+    /// Dispatches a server-side BM25 inference query — the backend
+    /// tokenises `query_text`, weighs terms against corpus statistics, and
+    /// scores points via their stored sparse named vector. No client-side
+    /// embedding is performed.
+    ///
+    /// # Graceful degradation
+    ///
+    /// Collections created without a sparse named vector (dense-only)
+    /// MUST return `Ok(Vec::new())` rather than an error. This lets hybrid
+    /// retrieval paths call `keyword_search_for_user` unconditionally and
+    /// lets RRF fusion treat a missing lexical signal as a no-op rather
+    /// than a hard failure. The same contract applies when `query_text`
+    /// trims to empty — return an empty vector, never error.
+    ///
+    /// # Scope
+    ///
+    /// Implementations MUST apply a mandatory `user_id` payload filter so
+    /// that no cross-tenant data can be returned — identical invariant to
+    /// [`VectorStore::search_for_user`].
+    ///
+    /// `extra_filter_json` conditions are merged with the user scope
+    /// filter when provided (same `{"must": [...]}` schema).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::InvalidData`] when `user_id` is empty —
+    /// [`UserId::from_string`](agent_rs_core::UserId::from_string)
+    /// bypasses validation, so every trait impl MUST reject an empty
+    /// newtype at the API boundary rather than rely on `UserId`'s
+    /// construction-time invariants. Returns [`StoreError`] on backend
+    /// failure *other than* a missing sparse vector configuration.
+    async fn keyword_search_for_user(
+        &self,
+        collection: &CollectionName,
+        user_id: &UserId,
+        query_text: &str,
+        limit: usize,
+        extra_filter_json: Option<serde_json::Value>,
+    ) -> Result<Vec<SearchResult>, StoreError>;
+
     /// Fetch payload-only projections for a list of chunk IDs, scoped to a user.
     ///
     /// Implementations MUST drop any returned point whose payload `user_id`
@@ -96,11 +138,10 @@ pub trait VectorStore: Send + Sync {
     ///
     /// # Errors
     ///
-    /// Returns [`StoreError`] on backend failure.
-    ///
-    /// # Panics
-    ///
-    /// Implementations MUST panic when `user_id` is empty.
+    /// Returns [`StoreError::InvalidData`] when `user_id` is empty and
+    /// [`StoreError`] on backend failure. Empty user scope is rejected
+    /// at the API boundary because it would bypass the mandatory
+    /// defence-in-depth payload filter.
     async fn retrieve_chunks_for_user(
         &self,
         collection: &CollectionName,
@@ -201,6 +242,46 @@ pub trait GraphStore: Send + Sync {
         params: std::collections::HashMap<String, String>,
         columns: &[&str],
     ) -> Result<Vec<std::collections::HashMap<String, serde_json::Value>>, StoreError>;
+
+    /// Locate knowledge-graph nodes whose name-like properties match a
+    /// free-form entity mention.
+    ///
+    /// Returns up to `limit` matches ranked by backend-defined relevance,
+    /// restricted to nodes whose `user_id` property equals `user_id`.
+    ///
+    /// # Property coverage
+    ///
+    /// Implementations MUST consult every property that a node in any
+    /// indexed label might use for its human-readable name — typically
+    /// `name`, `title`, and `heading` — and return the first non-empty
+    /// one as [`EntityMatch::display_name`] via a `coalesce`-style
+    /// selection. Requiring only `name` was the original
+    /// `EntityLinker` bug: the ingester writes structural nodes with
+    /// `title` / `heading`, so a name-only lookup misses all of them.
+    ///
+    /// # Scalability
+    ///
+    /// Implementations MUST back this by a full-text index (Neo4j
+    /// fulltext / Lucene equivalent) rather than a linear
+    /// `WHERE CONTAINS` scan. For small corpora both produce the same
+    /// result; for any production corpus the linear path becomes the
+    /// dominant retrieval latency.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::InvalidData`] when `user_id` is empty and
+    /// [`StoreError`] on backend failure. An empty `mention` or a
+    /// backend that lacks the fulltext index MUST return
+    /// `Ok(Vec::new())` — never an error — so the retrieval router's
+    /// entity-linking step can fail open. Empty `user_id` is the single
+    /// exception because it is an API-boundary programming error, not a
+    /// degraded backend state.
+    async fn find_entities_by_mention(
+        &self,
+        user_id: &UserId,
+        mention: &str,
+        limit: usize,
+    ) -> Result<Vec<EntityMatch>, StoreError>;
 
     /// Delete a node and its edges by ID.
     async fn delete_node(&self, id: &str) -> Result<(), StoreError>;

@@ -60,14 +60,77 @@ pub struct ClaimConfidence {
     pub source_indices: Vec<usize>,
 }
 
+/// Kind of a single claim extracted by the verifier.
+///
+/// The LLM classifies each atomic statement in the answer into one of
+/// these categories; the Rust code then applies the grounding rule
+/// **deterministically** based on the label, never on language-specific
+/// lexical patterns. This keeps the verifier corpus-agnostic (works for
+/// Romanian, English, Spanish, Turkish, …) because the semantic work of
+/// deciding "is this sentence a factual claim about the document or is
+/// it the model talking about itself" is done once by a capable model,
+/// and consumed by tiny switch statements in typed code.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ClaimType {
+    /// A concrete assertion about the subject matter (a formula, a
+    /// definition, a quoted passage, a numeric value from the document).
+    /// Only `Factual` claims affect `is_grounded`.
+    Factual,
+    /// A description of the answering process itself:
+    /// "I verified the sources", "Am căutat în material", "I reviewed
+    /// the retrieved chunks". Not a claim about the document — ignored.
+    Process,
+    /// A reference to a prior draft / iteration of the answer:
+    /// "Compared to my earlier response", "Ce am eliminat din răspunsul
+    /// anterior", "Correction: replace X with Y". Ignored.
+    SelfReference,
+    /// A remark about citation conventions / formatting rather than
+    /// about the document's content: "The citation IDs do not match",
+    /// "I used `[cite:<id>]` markers". Ignored.
+    CitationMeta,
+    /// An explicit hedge about completeness / exhaustiveness:
+    /// "Cannot confirm this list is exhaustive", "Nu pot confirma
+    /// exhaustivitatea". Ignored.
+    Hedge,
+}
+
+/// One classified claim produced by the verifier.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+struct VerifierClaim {
+    /// The claim text, copied verbatim from the answer.
+    text: String,
+    /// Category the LLM assigned to this claim (see [`ClaimType`]).
+    #[serde(rename = "type")]
+    claim_type: ClaimType,
+    /// Whether the claim is supported by the evidence. Must be set for
+    /// `Factual` claims; `None` is acceptable for every other type (they
+    /// do not affect grounding and the LLM may leave this field out).
+    #[serde(default)]
+    supported: Option<bool>,
+}
+
 /// Raw JSON structure expected from the LLM verifier response.
+///
+/// `is_grounded` is derived in Rust from the `claims` array (any
+/// `Factual` claim with `supported=false` renders the answer ungrounded),
+/// so we do NOT ask the LLM for a pre-computed verdict — the LLM only
+/// classifies; the code decides. This moves the grounding rule out of
+/// prompt text (opaque, model-dependent) into typed Rust (testable,
+/// corpus-agnostic).
 #[derive(Debug, Deserialize)]
 struct VerifierLlmResponse {
-    is_grounded: bool,
+    /// Verifier's overall confidence in its classification (0.0–1.0).
+    /// Used as `VerificationResult.confidence` when grounded; when
+    /// ungrounded the user-facing confidence is clamped to 0 by the
+    /// synthesizer anyway, so this value's influence is limited.
     confidence: f64,
+    /// Short prose explanation — surfaced in logs only.
     reasoning: String,
+    /// Classified atomic claims. Empty list means "no factual claims in
+    /// the answer" (e.g. a pure refusal), which is trivially grounded.
     #[serde(default)]
-    ungrounded_claims: Vec<String>,
+    claims: Vec<VerifierClaim>,
 }
 
 /// Stop words excluded from heuristic token overlap scoring.
@@ -199,6 +262,12 @@ impl GroundingVerifier {
         use rig::client::CompletionClient;
         use rig::completion::Prompt;
 
+        // Emit each evidence block prefixed with the exact `[cite:<chunk_id>]`
+        // marker the answer is expected to use. Using a plain `[N]` index
+        // here (the previous behaviour) desynchronised the verifier from
+        // the prompt/synthesis contract — UUID citations in the answer
+        // looked "ungrounded" to the verifier even though the content was
+        // present, because the verifier never saw the UUIDs at all.
         let evidence_text: String = evidence
             .iter()
             .enumerate()
@@ -208,7 +277,12 @@ impl GroundingVerifier {
                     .get("chunk_text")
                     .and_then(|v| v.as_str())
                     .unwrap_or("");
-                format!("[{}] {}", i + 1, content)
+                let chunk_id = doc
+                    .payload
+                    .get("chunk_id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or(doc.id.as_str());
+                format!("[{}] [cite:{}] {}", i + 1, chunk_id, content)
             })
             .collect::<Vec<_>>()
             .join("\n\n");
@@ -245,11 +319,35 @@ impl GroundingVerifier {
         let confidence = Confidence::new(confidence_val)
             .map_err(|e| AgentError::Verification(format!("confidence error: {e}")))?;
 
+        // Derive the grounding verdict from the typed claims array.
+        // Rule: `is_grounded = true` iff every `Factual` claim is
+        // `supported == Some(true)`. Every other claim type (Process,
+        // SelfReference, CitationMeta, Hedge) is definitionally not a
+        // statement about the document and cannot render the answer
+        // ungrounded — its `supported` field is ignored.
+        //
+        // This moves the grounding rule out of prompt text into typed
+        // Rust code so it's language-agnostic (the LLM does classification,
+        // we do logic) and unit-testable.
+        let is_grounded = claims_are_grounded(&parsed.claims);
+
+        // Extract the subset of factual, unsupported claims to keep
+        // filling the back-compat `ungrounded_claims: Vec<String>`
+        // field on `VerificationResult` — downstream code (the retry
+        // prompt in `grounding_gate`) reads that list to produce
+        // targeted feedback. Only genuine factual failures end up here.
+        let ungrounded_claims: Vec<String> = parsed
+            .claims
+            .iter()
+            .filter(|c| c.claim_type == ClaimType::Factual && c.supported == Some(false))
+            .map(|c| c.text.clone())
+            .collect();
+
         Ok(VerificationResult {
-            is_grounded: parsed.is_grounded,
+            is_grounded,
             confidence,
             reasoning: parsed.reasoning,
-            ungrounded_claims: parsed.ungrounded_claims,
+            ungrounded_claims,
             claim_confidences: Vec::new(),
             method: "llm".to_string(),
         })
@@ -326,5 +424,133 @@ impl GroundingVerifier {
             claim_confidences: Vec::new(),
             method: "heuristic".to_string(),
         })
+    }
+}
+
+/// Decide whether the answer is grounded based on classified claims.
+///
+/// Rule: the answer is grounded iff every [`ClaimType::Factual`] claim
+/// has `supported == Some(true)`. Claims of any other type never block
+/// grounding — that's the whole point of classification: meta / process /
+/// self-reference statements are not propositions about the document and
+/// therefore cannot be "ungrounded with respect to the document".
+///
+/// An empty `claims` array is trivially grounded (no factual assertions
+/// to verify — a refusal or pure-meta answer).
+fn claims_are_grounded(claims: &[VerifierClaim]) -> bool {
+    claims
+        .iter()
+        .filter(|c| c.claim_type == ClaimType::Factual)
+        .all(|c| c.supported == Some(true))
+}
+
+#[cfg(test)]
+mod tests_typed_claims {
+    use super::*;
+
+    fn claim(text: &str, claim_type: ClaimType, supported: Option<bool>) -> VerifierClaim {
+        VerifierClaim {
+            text: text.to_string(),
+            claim_type,
+            supported,
+        }
+    }
+
+    #[test]
+    fn empty_claims_are_grounded() {
+        assert!(claims_are_grounded(&[]));
+    }
+
+    #[test]
+    fn all_factual_supported_is_grounded() {
+        let claims = vec![
+            claim(
+                "ε = P₀σ₀² + P₁σ₁² appears in (5.14)",
+                ClaimType::Factual,
+                Some(true),
+            ),
+            claim(
+                "σ_k = √(1/|m_k|) appears in (5.9)",
+                ClaimType::Factual,
+                Some(true),
+            ),
+        ];
+        assert!(claims_are_grounded(&claims));
+    }
+
+    #[test]
+    fn one_factual_unsupported_breaks_grounding() {
+        let claims = vec![
+            claim("ε = P₀σ₀² + P₁σ₁²", ClaimType::Factual, Some(true)),
+            claim(
+                "FCM folosește explicit varianța",
+                ClaimType::Factual,
+                Some(false),
+            ),
+        ];
+        assert!(!claims_are_grounded(&claims));
+    }
+
+    #[test]
+    fn meta_claims_never_break_grounding() {
+        // All five non-Factual types present; even if "supported" is
+        // None or false, the answer stays grounded because none of
+        // these are propositions about the document.
+        let claims = vec![
+            claim("ε = P₀σ₀² + P₁σ₁²", ClaimType::Factual, Some(true)),
+            claim("I verified the sources", ClaimType::Process, None),
+            claim(
+                "Ce am eliminat din răspunsul anterior…",
+                ClaimType::SelfReference,
+                None,
+            ),
+            claim(
+                "Citation IDs don't match",
+                ClaimType::CitationMeta,
+                Some(false),
+            ),
+            claim("Cannot confirm exhaustive", ClaimType::Hedge, None),
+        ];
+        assert!(claims_are_grounded(&claims));
+    }
+
+    #[test]
+    fn factual_with_missing_supported_is_ungrounded() {
+        // Defensive: if the LLM forgets to set `supported` on a factual
+        // claim, we treat it as ungrounded (safer than the opposite —
+        // an unreviewed claim is not a verified claim).
+        let claims = vec![claim("Some factual statement", ClaimType::Factual, None)];
+        assert!(!claims_are_grounded(&claims));
+    }
+
+    #[test]
+    fn deserializes_typed_claim_json() {
+        // End-to-end serde test: the JSON the LLM emits must round-trip
+        // into VerifierClaim + ClaimType enum via serde(rename_all).
+        let json = r#"{
+            "text": "T = (μ0+μ1)/2 - (σ²/(μ0-μ1)) ln(P0/P1)",
+            "type": "factual",
+            "supported": true
+        }"#;
+        let parsed: VerifierClaim = serde_json::from_str(json).expect("must parse");
+        assert_eq!(parsed.claim_type, ClaimType::Factual);
+        assert_eq!(parsed.supported, Some(true));
+    }
+
+    #[test]
+    fn deserializes_snake_case_claim_types() {
+        for (label, ty) in [
+            ("factual", ClaimType::Factual),
+            ("process", ClaimType::Process),
+            ("self_reference", ClaimType::SelfReference),
+            ("citation_meta", ClaimType::CitationMeta),
+            ("hedge", ClaimType::Hedge),
+        ] {
+            let json = format!(r#"{{"text":"x","type":"{label}"}}"#);
+            let parsed: VerifierClaim =
+                serde_json::from_str(&json).expect("every variant must parse");
+            assert_eq!(parsed.claim_type, ty);
+            assert_eq!(parsed.supported, None, "`supported` is optional");
+        }
     }
 }

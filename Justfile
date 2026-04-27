@@ -184,6 +184,19 @@ docling-native:
     @test -d .venv/docling-sidecar || python3 -m venv .venv/docling-sidecar
     @.venv/docling-sidecar/bin/pip install --quiet --upgrade pip
     @.venv/docling-sidecar/bin/pip install --quiet -e infra/docling-sidecar
+    # Regenerate protobuf stubs into the installed source tree. Mirrors the
+    # Dockerfile codegen step (Dockerfile:60-67) so Docker and native runs
+    # stay behaviourally identical. Idempotent — grpc_tools.protoc overwrites
+    # stubs each time. Required because `from agentic_rag.v1 import ...` in
+    # server.py resolves against files generated here.
+    @mkdir -p infra/docling-sidecar/src/agentic_rag/v1
+    @touch infra/docling-sidecar/src/agentic_rag/__init__.py
+    @touch infra/docling-sidecar/src/agentic_rag/v1/__init__.py
+    @.venv/docling-sidecar/bin/python -m grpc_tools.protoc \
+        --proto_path=proto \
+        --python_out=infra/docling-sidecar/src \
+        --grpc_python_out=infra/docling-sidecar/src \
+        proto/agentic_rag/v1/chunker.proto
     @echo "Starting docling sidecar on host (MPS will be auto-detected if available)..."
     DOCLING_GRPC_HOST=0.0.0.0 \
     DOCLING_GRPC_PORT=1068 \
@@ -195,6 +208,68 @@ docling-native:
     DOCLING_STREAM_IDLE_TIMEOUT_S=600 \
     DOCLING_MAX_CHUNKS_PER_DOC=10000 \
     .venv/docling-sidecar/bin/python -m docling_sidecar
+
+# Start the Marker sidecar natively on the host using a local Python venv.
+# Marker is MPS-native on Apple Silicon (surya layout + texify formulas)
+# and avoids Docling's CodeFormulaV2 bottleneck — formula-heavy PDFs
+# ingest ~10-20× faster on a Mac. Uses port 1073 (1069 is taken by
+# MinIO in the docker-compose dev stack); Docling on 1068 can stay up
+# in parallel for A/B comparison.
+#
+# First time: creates .venv/marker-sidecar, installs deps, compiles
+# protobuf stubs into the installed source tree (mirrors the Dockerfile
+# codegen step). Subsequent runs reuse the venv but always regenerate
+# the stubs so proto edits do not drift.
+#
+# Usage: `just marker-native`
+#        `AGENT_RS__INGEST_BACKEND=marker just worker`    # point the worker at it
+#        `MARKER_USE_LLM=true just marker-native`         # enable Marker's LLM enrichment
+marker-native:
+    @test -d .venv/marker-sidecar || python3 -m venv .venv/marker-sidecar
+    @.venv/marker-sidecar/bin/pip install --quiet --upgrade pip
+    @.venv/marker-sidecar/bin/pip install --quiet -e infra/marker-sidecar
+    @mkdir -p infra/marker-sidecar/src/agentic_rag/v1
+    @touch infra/marker-sidecar/src/agentic_rag/__init__.py
+    @touch infra/marker-sidecar/src/agentic_rag/v1/__init__.py
+    @.venv/marker-sidecar/bin/python -m grpc_tools.protoc \
+        --proto_path=proto \
+        --python_out=infra/marker-sidecar/src \
+        --grpc_python_out=infra/marker-sidecar/src \
+        proto/agentic_rag/v1/chunker.proto
+    @echo "Starting Marker sidecar on host (MPS will be auto-detected if available)..."
+    MARKER_GRPC_HOST=0.0.0.0 \
+    MARKER_GRPC_PORT=1073 \
+    MARKER_MAX_PDF_BYTES=104857600 \
+    MARKER_MAX_PAGES=500 \
+    MARKER_PARSE_TIMEOUT_S=600 \
+    MARKER_STREAM_IDLE_TIMEOUT_S=600 \
+    MARKER_MAX_CHUNKS_PER_DOC=10000 \
+    .venv/marker-sidecar/bin/python -m marker_sidecar
+
+# Bootstrap a remote Docling sidecar on a GPU host and tunnel it to
+# localhost:1068. Uses scripts/docling-remote.sh which rsyncs the
+# sidecar source, `docker compose up --build`s it with `--gpus all`,
+# and opens a persistent SSH port-forward so the local worker is
+# unchanged.
+#
+# Requirements on the remote host:
+#   - Docker + NVIDIA runtime (`docker run --gpus all` must work)
+#   - rsync + git
+#   - SSH access via key (scripts use BatchMode — no password prompts)
+#
+# Usage:
+#   just docling-remote ubuntu@runpod-12345.ssh.runpod.io
+#   just docling-remote-down ubuntu@runpod-12345.ssh.runpod.io
+#
+# After `up` completes, run `just worker` normally — the DoclingConfig
+# endpoint is already `http://localhost:1068`, which is now tunneled
+# to the remote GPU box. Per-formula latency drops from ~60s on Mac
+# CPU to ~2-5s on a cloud A10/A10G.
+docling-remote host:
+    ./scripts/docling-remote.sh {{host}} up
+
+docling-remote-down host:
+    ./scripts/docling-remote.sh {{host}} down
 
 # ─── Runtime binaries ─────────────────────────────────────────────────────
 

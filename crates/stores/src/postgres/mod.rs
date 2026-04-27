@@ -50,9 +50,7 @@ pub struct CountRow {
     pub count: i64,
 }
 
-use models::{
-    EvidenceItemRow, MemoryRow, NewEvidenceItem, NewMemory, NewQueryRun, QueryRunRow,
-};
+use models::{EvidenceItemRow, MemoryRow, NewEvidenceItem, NewMemory, NewQueryRun, QueryRunRow};
 use schema::{evidence_items, memories, query_runs};
 
 // ---------------------------------------------------------------------------
@@ -116,7 +114,9 @@ impl PgStore {
         let manager = AsyncDieselConnectionManager::<AsyncPgConnection>::new(database_url);
         let pool = Pool::builder()
             .max_size(config.max_connections)
-            .connection_timeout(std::time::Duration::from_millis(config.connection_timeout_ms))
+            .connection_timeout(std::time::Duration::from_millis(
+                config.connection_timeout_ms,
+            ))
             .build(manager)
             .await
             .map_err(|e| StoreError::ConnectionPool(e.to_string()))?;

@@ -8,3 +8,12 @@
 # Python venv for running the Docling sidecar natively (MPS on macOS).
 .venv/
 *.pdf
+
+# macOS metadata
+.DS_Store
+
+# Python build / cache artifacts (sidecars under infra/)
+__pycache__/
+*.py[cod]
+*.egg-info/
+*.egg

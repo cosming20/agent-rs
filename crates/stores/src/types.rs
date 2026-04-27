@@ -4,9 +4,7 @@
 //! trait methods. They bridge domain types from `agent-rs-core` with
 //! the storage-layer representations.
 
-use agent_rs_core::{
-    Confidence, Embedding, MessageRole, RetrievalStrategy, Score, UserId,
-};
+use agent_rs_core::{Confidence, Embedding, MessageRole, RetrievalStrategy, Score, UserId};
 use chrono::NaiveDateTime;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -373,4 +371,29 @@ pub struct EvidenceItem {
     pub source: String,
     pub score: f64,
     pub created_at: NaiveDateTime,
+}
+
+// ---- Graph Store: EntityMatch ----
+
+/// A single match returned by
+/// [`crate::traits::GraphStore::find_entities_by_mention`].
+///
+/// Produced by backend-side fulltext / substring search across the
+/// name-like properties of the knowledge graph. Scoring is
+/// backend-defined (Neo4j uses a Lucene BM25 score); callers should
+/// treat it as a strictly-orderable relevance signal with no absolute
+/// semantics.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EntityMatch {
+    /// Canonical node ID (`id` property on the matched node).
+    pub node_id: String,
+    /// Human-readable display name — `coalesce(name, title, heading)` at
+    /// the backend, so callers never need to probe multiple fields.
+    pub display_name: String,
+    /// Primary label of the matched node (e.g. `"Entity"`, `"Section"`,
+    /// `"Document"`, `"Chunk"`). Useful for downstream routing decisions
+    /// (e.g. "graph-first strategy only when an Entity matched").
+    pub label: String,
+    /// Backend-defined relevance score, higher is better.
+    pub score: f64,
 }

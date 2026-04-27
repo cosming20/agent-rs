@@ -3,8 +3,21 @@ name = "docling-sidecar"
 version = "0.1.0"
 requires-python = ">=3.12"
 dependencies = [
-    "docling==2.86.*",
-    "docling-core==2.73.*",
+    "docling==2.91.*",
+    "docling-core==2.74.*",
+    # `peft` is an optional runtime dep pulled in by any Docling VLM whose
+    # HuggingFace repo ships LoRA adapter weights (e.g. granite-4.0-3b-vision
+    # used by `do_chart_extraction`). Docling does not declare it because
+    # only some VLM paths need it — we pin it here so a fresh venv can
+    # load the chart-extraction stack without a surprise ImportError.
+    "peft>=0.17",
+    # pix2tex — purpose-built 80M-param LaTeX-OCR model used as a fast
+    # alternative to Docling's 1.8B CodeFormulaV2 for formula decoding
+    # on CPU / Apple Silicon. Selected via `DOCLING_FORMULA_BACKEND=pix2tex`
+    # (the default for local dev). Installing it pulls a hard pin on
+    # `x-transformers==0.15.0` — a different package from HF transformers,
+    # so there is no conflict with the rest of the Docling stack.
+    "pix2tex>=0.1.4",
     "grpcio==1.68.*",
     "grpcio-tools==1.68.*",
     "grpcio-health-checking==1.68.*",

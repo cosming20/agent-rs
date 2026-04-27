@@ -77,10 +77,7 @@ impl CoverageVerifier {
     ///
     /// Collects all `section_id` values from the `evidence` slice and
     /// delegates to [`CoverageReport::from_plan_and_evidence`].
-    pub(crate) fn build_report(
-        plan: &CoveragePlan,
-        evidence: &[&SearchResult],
-    ) -> CoverageReport {
+    pub(crate) fn build_report(plan: &CoveragePlan, evidence: &[&SearchResult]) -> CoverageReport {
         let ids: HashSet<String> = evidence
             .iter()
             .filter_map(|e| {

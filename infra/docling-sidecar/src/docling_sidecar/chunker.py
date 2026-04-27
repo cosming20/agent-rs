@@ -55,6 +55,56 @@ _SUPPORTED_MIMETYPES = frozenset(
 _MAGIC_PDF = b"%PDF"
 
 
+def _resolve_formula_backend() -> str:
+    """Which decoder to use for formulas.
+
+    Values (case-insensitive, stripped):
+      - ``pix2tex`` — local 80M-param specialist (~1-2 s/formula CPU).
+        **Default** — optimised for laptops / CPU-only deploys.
+      - ``codeformula`` — Docling's native 1.8B Idefics3 VLM
+        (~60 s/formula CPU, 2-5 s/formula CUDA). Pick this when
+        running the sidecar on a CUDA host.
+      - ``off`` — no decoding; formula items keep the placeholder text
+        `<!-- formula-not-decoded -->`. Fastest ingestion; formulas
+        are not searchable.
+    """
+    raw = os.environ.get("DOCLING_FORMULA_BACKEND", "pix2tex").strip().lower()
+    if raw in {"pix2tex", "codeformula", "off"}:
+        return raw
+    logger.warning(
+        "DOCLING_FORMULA_BACKEND=%r not recognised; falling back to pix2tex", raw
+    )
+    return "pix2tex"
+
+
+_FORMULA_BACKEND: str = _resolve_formula_backend()
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    """Parse a boolean-shaped env var with an explicit default.
+
+    Accepts (case-insensitive): `1`/`true`/`yes`/`on` → True,
+    `0`/`false`/`no`/`off` → False. Any other value falls back to
+    `default` with a warning — silently accepting typos like
+    `FORMULA=ture` would defeat the point of the toggle.
+    """
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    v = raw.strip().lower()
+    if v in {"1", "true", "yes", "on"}:
+        return True
+    if v in {"0", "false", "no", "off"}:
+        return False
+    logger.warning(
+        "env %s=%r not parseable as bool; falling back to default=%s",
+        name,
+        raw,
+        default,
+    )
+    return default
+
+
 def _sniff_mimetype(content: bytes, hint: str) -> str:
     """Return the effective mimetype from hint or magic bytes."""
     if hint:
@@ -108,6 +158,19 @@ class ChunkerPool:
         self._converter = self._build_converter()
         self._chunker = self._build_chunker()
         self._enc = tiktoken.encoding_for_model("text-embedding-3-large")
+        # Optional secondary formula decoder (pix2tex). Constructed lazy —
+        # the model only loads on first formula encountered, so docs
+        # without math pay zero cost. `None` when backend != "pix2tex".
+        self._pix2tex_enricher: Any | None = None
+        if _FORMULA_BACKEND == "pix2tex":
+            from .formula_enrichment import Pix2TexEnricher
+
+            self._pix2tex_enricher = Pix2TexEnricher()
+            logger.info("Formula backend: pix2tex (model loads on first use)")
+        elif _FORMULA_BACKEND == "codeformula":
+            logger.info("Formula backend: codeformula (Docling's 1.8B VLM)")
+        else:
+            logger.info("Formula backend: off (formulas stay as placeholders)")
         logger.info("ChunkerPool ready.")
 
     # ------------------------------------------------------------------
@@ -172,6 +235,19 @@ class ChunkerPool:
             meta = doc.metadata
             if hasattr(meta, "title") and meta.title:
                 title = str(meta.title)
+
+        # --- pix2tex formula enrichment (backend-gated) ---
+        # Runs before chunking so HybridChunker picks up the decoded
+        # LaTeX text on each FormulaItem. No-op when backend != pix2tex
+        # or when the document contains zero formulas.
+        if self._pix2tex_enricher is not None:
+            try:
+                self._pix2tex_enricher.enrich_document(doc)
+            except Exception as exc:  # noqa: BLE001 — never fail ingest on enrichment
+                logger.warning(
+                    "pix2tex enrichment raised; formulas stay as placeholders: %s",
+                    exc,
+                )
 
         # --- chunking ---
         try:
@@ -388,12 +464,37 @@ class ChunkerPool:
     def _build_converter() -> DocumentConverter:
         """Build a DocumentConverter for production PDF ingestion.
 
-        Table structure mode is configurable via `DOCLING_TABLEFORMER_MODE`
-        env var: "accurate" (default in spec) or "fast" (3-4 GB lower peak
-        memory usage — required when Docker Desktop VM is <12 GB).
+        All enrichment stages default **on** so a freshly deployed
+        sidecar captures formulas, code blocks, and scanned text out of
+        the box — the defect this pipeline fought before was silently
+        dropping formulas to `<!-- formula-not-decoded -->` placeholders
+        because `do_formula_enrichment` was unset. Operators on memory-
+        constrained hosts can opt out per stage via env vars below.
 
-        Accelerator is configurable via `DOCLING_ACCELERATOR`: cpu | cuda |
-        mps | auto. See `_resolve_accelerator` for the precedence rules.
+        Env-driven toggles (all accept `1`/`true` / `0`/`false`, case-
+        insensitive; unset uses the documented default):
+
+        - `DOCLING_TABLEFORMER_MODE` — `accurate` (default) or `fast`.
+        - `DOCLING_DO_OCR`                   — default `true`.
+        - `DOCLING_DO_FORMULA_ENRICHMENT`    — default `true`.
+        - `DOCLING_DO_CODE_ENRICHMENT`       — default `true`.
+        - `DOCLING_DO_PICTURE_CLASSIFICATION`— default `true`.
+        - `DOCLING_DO_PICTURE_DESCRIPTION`   — default `false`
+          (requires a VLM; enabling without one will fail at convert
+          time).
+        - `DOCLING_DO_CHART_EXTRACTION`      — default `false`. Added
+          in Docling 2.91 — extracts bar / pie / line chart data as a
+          table so retrieval can match on chart values. Default off
+          because it depends on `ibm-granite/granite-4.0-3b-vision`
+          (~8 GB download + LoRA adapters, needs `peft`), and Docling
+          2.91's chart engine declares `supported_devices=[CPU, CUDA]`
+          only — Apple Silicon falls back to CPU and the transformers
+          sync load is prone to deadlocking inside the asyncio gRPC
+          handler on macOS. Enable in Linux/CUDA deployments where
+          chart data matters for retrieval.
+        - `DOCLING_GENERATE_PICTURE_IMAGES`  — default `true`.
+        - `DOCLING_IMAGES_SCALE`             — float, default `2.0`.
+        - `DOCLING_ACCELERATOR`              — cpu | cuda | mps | auto.
         """
         from docling.datamodel.pipeline_options import (
             AcceleratorOptions,
@@ -411,9 +512,63 @@ class ChunkerPool:
         accelerator_device = ChunkerPool._resolve_accelerator()
         accelerator_options = AcceleratorOptions(device=accelerator_device)
 
+        do_ocr = _env_bool("DOCLING_DO_OCR", True)
+        # Backend-aware formula flag: let Docling's internal VLM run only
+        # when explicitly selected. For `pix2tex` and `off` we skip the
+        # slow path — pix2tex runs as a post-convert enrichment pass
+        # instead (see formula_enrichment.py).
+        if _FORMULA_BACKEND == "codeformula":
+            do_formula = _env_bool("DOCLING_DO_FORMULA_ENRICHMENT", True)
+        else:
+            do_formula = False
+        do_code = _env_bool("DOCLING_DO_CODE_ENRICHMENT", True)
+        do_pic_class = _env_bool("DOCLING_DO_PICTURE_CLASSIFICATION", True)
+        do_pic_desc = _env_bool("DOCLING_DO_PICTURE_DESCRIPTION", False)
+        do_chart = _env_bool("DOCLING_DO_CHART_EXTRACTION", False)
+        gen_pic_images = _env_bool("DOCLING_GENERATE_PICTURE_IMAGES", True)
+        # pix2tex needs page-level raster images to crop formula bboxes.
+        # Force page-image generation when pix2tex is active, regardless
+        # of the individual env var the user might set.
+        gen_page_images = (
+            _FORMULA_BACKEND == "pix2tex"
+            or _env_bool("DOCLING_GENERATE_PAGE_IMAGES", False)
+        )
+        try:
+            images_scale = float(os.environ.get("DOCLING_IMAGES_SCALE", "2.0"))
+        except ValueError:
+            logger.warning(
+                "DOCLING_IMAGES_SCALE not parseable as float; falling back to 2.0"
+            )
+            images_scale = 2.0
+
+        logger.info(
+            "Docling enrichment: ocr=%s formula_backend=%s (docling_formula=%s) "
+            "code=%s picture_classification=%s picture_description=%s "
+            "chart_extraction=%s generate_picture_images=%s "
+            "generate_page_images=%s images_scale=%.2f",
+            do_ocr,
+            _FORMULA_BACKEND,
+            do_formula,
+            do_code,
+            do_pic_class,
+            do_pic_desc,
+            do_chart,
+            gen_pic_images,
+            gen_page_images,
+            images_scale,
+        )
+
         pdf_options = PdfPipelineOptions(
-            do_ocr=False,
+            do_ocr=do_ocr,
             do_table_structure=True,
+            do_formula_enrichment=do_formula,
+            do_code_enrichment=do_code,
+            do_picture_classification=do_pic_class,
+            do_picture_description=do_pic_desc,
+            do_chart_extraction=do_chart,
+            generate_picture_images=gen_pic_images,
+            generate_page_images=gen_page_images,
+            images_scale=images_scale,
             table_structure_options=TableStructureOptions(mode=mode),
             accelerator_options=accelerator_options,
         )

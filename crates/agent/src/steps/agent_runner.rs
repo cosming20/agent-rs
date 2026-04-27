@@ -290,8 +290,8 @@ impl AgentRunner {
     /// sees the list of section ids it must call `search_sections` with
     /// immediately before it decides which tool to invoke.
     fn build_prompt(&self, ctx: &QueryContext) -> String {
-        let coverage_suffix = prompts::build_coverage_plan_block(ctx.coverage_plan.as_ref())
-            .unwrap_or_default();
+        let coverage_suffix =
+            prompts::build_coverage_plan_block(ctx.coverage_plan.as_ref()).unwrap_or_default();
 
         if ctx.chat_messages.is_empty() {
             return format!("{}{}", ctx.query, coverage_suffix);
@@ -539,7 +539,10 @@ mod tests {
         }
         let mut parts: Vec<String> = Vec::new();
         if !ctx.conversation_context.is_empty() {
-            parts.push(format!("[Conversation context]\n{}", ctx.conversation_context));
+            parts.push(format!(
+                "[Conversation context]\n{}",
+                ctx.conversation_context
+            ));
         }
         if let Some(last) = ctx.chat_messages.last() {
             parts.push(last.clone());

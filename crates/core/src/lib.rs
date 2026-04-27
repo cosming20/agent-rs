@@ -4,14 +4,18 @@
 //! All cross-crate contracts reference types defined here.
 
 pub mod config;
+pub mod doc_handle;
 pub mod errors;
 pub mod logging;
+pub mod payload;
 pub mod types;
 
 // Re-export commonly used items at crate root for ergonomic imports.
 pub use config::{
-    DoclingConfig, IngestBackend, LatencyMode, RerankerConfig, RerankerProvider, Settings,
+    DEFAULT_LLM_MODEL, DEFAULT_REASONING_EFFORT, DoclingConfig, IngestBackend, LatencyMode,
+    RerankerConfig, RerankerProvider, Settings, temperature_for,
 };
+pub use doc_handle::{DocHandle, DocHandleError};
 pub use errors::{AgentError, AgentRsError, RetrievalError, StoreError, ToolError};
 pub use types::{
     CollectionName, Confidence, DatasetName, Embedding, IngestStatus, InvalidIngestStatus,

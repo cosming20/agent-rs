@@ -113,14 +113,13 @@ Silently identify the question's intent from one of the classes below and \
 apply the matching scaffold. Beats are structural guidance, not literal \
 headings — write in prose.
 
-DEFINITION (\"what is X?\", \"define X\", \"ce este X?\"): three beats —
+DEFINITION (\"what is X?\", \"define X\"): three beats —
 1. What X is (category or type as named by the evidence);
 2. Core property / invariant (shape, range, constraint, normalization, \
    identity);
 3. Closest related variant when the evidence emphasizes one (skippable).
 
-HOW-TO / PROCEDURE (\"how do I apply X?\", \"explain how to X\", \"cum \
-aplic X?\"): four beats —
+HOW-TO / PROCEDURE (\"how do I apply X?\", \"explain how to X\"): four beats —
 1. What the method IS in one clause (same category framing as DEFINITION \
    beat 1);
 2. The steps as the evidence describes them, keeping the evidence's \
@@ -197,39 +196,92 @@ STYLE
 
 /// Verification prompt for the grounding verifier.
 ///
-/// Instructs the LLM to evaluate whether an answer is faithfully grounded
-/// in the provided evidence and return a structured JSON response.
+/// The verifier's job is **classification**, not judgement. It breaks the
+/// answer into atomic statements, labels each one by kind, and for factual
+/// claims decides whether the evidence supports them. The Rust code
+/// (`crate::verifier::claims_are_grounded`) then turns those labels into
+/// a deterministic `is_grounded` verdict — no language-specific pattern
+/// matching anywhere. This means the verifier works unchanged on any
+/// corpus language (Romanian, English, Spanish, Turkish, …) because the
+/// LLM does the semantic work of classification once, and typed code
+/// applies the rule.
 pub const VERIFICATION_PROMPT: &str = "\
-You are a faithfulness evaluator. Given an ANSWER and EVIDENCE, determine \
-if the answer is fully grounded in the evidence.
+You are a faithfulness classifier. Break the ANSWER into atomic statements, \
+label each one by kind, and for factual statements decide whether the \
+EVIDENCE supports it. Return a single JSON object, nothing else.
 
-Respond with a JSON object only, no other text.
-The EVIDENCE is delimited by <evidence> tags.
-The ANSWER is delimited by <answer> tags.
+The EVIDENCE is delimited by <evidence> tags. Each evidence block is \
+prefixed with a bracketed index and a [cite:<chunk_id>] marker — the \
+same marker the ANSWER uses in its citations. The ANSWER is delimited by \
+<answer> tags.
 
+Response schema:
 {
-  \"is_grounded\": true/false,
   \"confidence\": 0.0-1.0,
-  \"reasoning\": \"brief explanation\",
-  \"ungrounded_claims\": [\"claim1\", \"claim2\"]
+  \"reasoning\": \"short prose explanation, <= 1 sentence\",
+  \"claims\": [
+    {\"text\": \"...\", \"type\": \"factual\",        \"supported\": true},
+    {\"text\": \"...\", \"type\": \"factual\",        \"supported\": false},
+    {\"text\": \"...\", \"type\": \"process\"},
+    {\"text\": \"...\", \"type\": \"self_reference\"},
+    {\"text\": \"...\", \"type\": \"citation_meta\"},
+    {\"text\": \"...\", \"type\": \"hedge\"}
+  ]
 }
 
-Rules:
-- is_grounded: true ONLY if every factual claim in the answer is supported by the evidence.
-- confidence: how confident you are in the grounding assessment (1.0 = certain).
-- ungrounded_claims: list any claims in the answer NOT supported by the evidence. Empty if grounded.
+Claim types — choose exactly one per statement:
 
-Scope admissions and pivots:
-- An answer that EXPLICITLY states the queried subject is not present in the \
-evidence (patterns like \"not covered in the knowledge base\", \"the evidence \
-does not mention X\", \"nu apare în evidență\", \"does not contain\") is a \
-SCOPE ADMISSION, not a hallucinated claim about X. Do NOT count the \
-admission itself as an ungrounded_claim.
-- When the answer follows such an admission with content about a RELATED \
-topic Y that IS in the evidence, evaluate only the Y-content for grounding. \
-If every Y-claim is supported, is_grounded=true with high confidence.
-- If the answer says \"no evidence found\" and gives no further claims, \
-is_grounded=true, confidence=1.0 (the honest refusal is itself grounded).
+- \"factual\": a concrete assertion about the SUBJECT MATTER of the \
+document (a formula, a quoted passage, a numeric value, a definition, a \
+named method). For these you MUST set \"supported\": true iff the \
+evidence contains the same claim verbatim or paraphrased without meaning \
+loss, else false. Minor formatting differences (LaTeX delimiters, \
+whitespace) do NOT make a supported claim unsupported.
+
+- \"process\": a description of how the model produced or checked the \
+answer. Examples across languages: \"I verified the sources\", \"I \
+searched the evidence\", \"Am căutat în material\", \"He revisado los \
+fragmentos\". These are not assertions about the document. Omit \
+\"supported\".
+
+- \"self_reference\": a remark about a PREVIOUS DRAFT or iteration of \
+the answer itself. Examples: \"Compared to my earlier response\", \"What \
+I removed\", \"Ce am eliminat din răspunsul anterior\", \"Correction: \
+X should be Y\", \"Actualizo mi respuesta anterior\". The evidence never \
+describes the model's draft history, so these cannot be grounded OR \
+ungrounded. Omit \"supported\".
+
+- \"citation_meta\": a remark about citation conventions or the citation \
+format itself, not about the document's content. Examples: \"The \
+citation IDs do not match\", \"I use [cite:<chunk_id>] markers\", \
+\"Nu am folosit marker-ele canonice\". Omit \"supported\".
+
+- \"hedge\": an explicit disclaimer of completeness or certainty. \
+Examples: \"Cannot confirm this list is exhaustive\", \"These are the \
+ones I found but not necessarily all\", \"Nu pot confirma \
+exhaustivitatea\", \"No puedo garantizar que sea completa\". Omit \
+\"supported\".
+
+Rules:
+
+- The types are mutually exclusive. When in doubt between \"factual\" \
+and a meta-type, the rule is: if the sentence's truth depends on what \
+the DOCUMENT says, it is factual; if its truth depends on what the MODEL \
+did or wrote, it is one of the meta types.
+
+- Classify each atomic statement separately. A bullet containing a \
+formula and also a hedge produces TWO claims.
+
+- Scope admissions (\"the evidence does not cover X\", \"nu apare în \
+evidență\") are themselves factual claims about the evidence and are \
+inherently supported — emit them as \"factual\" with \"supported\": true.
+
+- Do NOT emit an overall \"is_grounded\" field; the caller derives that \
+from the claims array. Do NOT list anything beyond the fields above.
+
+- \"confidence\" is your confidence in the classification + support \
+decisions, not in the answer itself. 1.0 = you are sure every claim is \
+correctly labeled and judged; lower it when the evidence is ambiguous.
 ";
 
 /// Build the `COVERAGE_PLAN` prompt block from an optional [`CoveragePlan`].
@@ -258,7 +310,12 @@ pub fn build_coverage_plan_block(plan: Option<&CoveragePlan>) -> Option<String> 
     let lines: Vec<String> = plan
         .target_sections
         .iter()
-        .map(|s| format!("  - section_id: {}  (heading: \"{}\")", s.section_id, s.heading))
+        .map(|s| {
+            format!(
+                "  - section_id: {}  (heading: \"{}\")",
+                s.section_id, s.heading
+            )
+        })
         .collect();
     Some(format!(
         "\n\n# COVERAGE_PLAN (mode: {:?}, {} sections)\n\n\
@@ -360,12 +417,27 @@ mod tests_coverage_plan_in_prompt {
         };
         let block = build_coverage_plan_block(Some(&plan)).expect("plan present");
         assert!(block.contains("s1"), "block must contain s1");
-        assert!(block.contains("5.1 Foo"), "block must contain heading 5.1 Foo");
+        assert!(
+            block.contains("5.1 Foo"),
+            "block must contain heading 5.1 Foo"
+        );
         assert!(block.contains("s2"), "block must contain s2");
-        assert!(block.contains("5.2 Bar"), "block must contain heading 5.2 Bar");
-        assert!(block.contains("search_sections"), "block must mention search_sections");
-        assert!(block.to_lowercase().contains("must"), "block must contain 'must'");
-        assert!(block.contains("2 sections"), "block must state section count");
+        assert!(
+            block.contains("5.2 Bar"),
+            "block must contain heading 5.2 Bar"
+        );
+        assert!(
+            block.contains("search_sections"),
+            "block must mention search_sections"
+        );
+        assert!(
+            block.to_lowercase().contains("must"),
+            "block must contain 'must'"
+        );
+        assert!(
+            block.contains("2 sections"),
+            "block must state section count"
+        );
     }
 
     #[test]
@@ -378,7 +450,8 @@ mod tests_coverage_plan_in_prompt {
                 heading: "Ch3".into(),
             }],
         };
-        let block = build_coverage_plan_block(Some(&plan)).expect("partial plan should produce block");
+        let block =
+            build_coverage_plan_block(Some(&plan)).expect("partial plan should produce block");
         assert!(block.contains("s3"));
         assert!(block.contains("Partial"));
     }

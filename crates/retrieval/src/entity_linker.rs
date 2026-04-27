@@ -7,13 +7,13 @@
 //!
 //! This implements spec item **B3** from the Cognitive Retrieval Architecture.
 
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 use tracing::instrument;
 
 use crate::error::RetrievalError;
+use agent_rs_core::{UserId, config::DEFAULT_LLM_MODEL};
 use agent_rs_stores::traits::GraphStore;
 
 // ---------------------------------------------------------------------------
@@ -54,7 +54,9 @@ pub struct EntityLinkerConfig {
     pub max_entities: usize,
     /// OpenAI API key for entity extraction.
     pub api_key: String,
-    /// Model to use (default gpt-5.4-mini-2026-03-17).
+    /// Model to use. Defaults to
+    /// [`agent_rs_core::config::DEFAULT_LLM_MODEL`] when constructed via
+    /// [`EntityLinkerConfig::default`].
     pub model: String,
 }
 
@@ -63,7 +65,7 @@ impl Default for EntityLinkerConfig {
         Self {
             max_entities: 5,
             api_key: String::new(),
-            model: "gpt-5.4-mini-2026-03-17".to_owned(),
+            model: DEFAULT_LLM_MODEL.to_owned(),
         }
     }
 }
@@ -103,10 +105,14 @@ impl EntityLinker {
 
     /// Extract entities from the query and attempt to link them to KG nodes.
     ///
+    /// Results are scoped to `user_id` — the underlying store enforces
+    /// `node.user_id = $user_id` inside the fulltext query so cross-tenant
+    /// entity bleed is impossible.
+    ///
     /// On any failure (LLM error, Neo4j unavailable), returns an empty result
     /// with `prefer_graph = false` — never blocks the retrieval pipeline.
-    #[instrument(skip(self), fields(query_len = query.len()))]
-    pub async fn link(&self, query: &str) -> EntityLinkResult {
+    #[instrument(skip(self, user_id), fields(query_len = query.len(), user_id = %user_id))]
+    pub async fn link(&self, user_id: &UserId, query: &str) -> EntityLinkResult {
         let trimmed = query.trim();
         if trimmed.is_empty() {
             return EntityLinkResult::empty();
@@ -129,7 +135,7 @@ impl EntityLinker {
         // Step 2: link each mention to Neo4j.
         let mut entities = Vec::with_capacity(mentions.len());
         for mention in mentions.into_iter().take(self.max_entities) {
-            let linked = self.try_link_entity(&mention).await;
+            let linked = self.try_link_entity(user_id, &mention).await;
             entities.push(linked);
         }
 
@@ -153,14 +159,32 @@ impl EntityLinker {
 
     /// Extract entity mentions from the query via LLM.
     async fn extract_entities(&self, query: &str) -> Result<Vec<String>, RetrievalError> {
-        let body = serde_json::json!({
-            "model": &self.model,
-            "messages": [
+        // Build the request as a mutable `serde_json::Map` so we can
+        // conditionally include `temperature` (non-reasoning models only).
+        // gpt-5.x / o-series reject any explicit `temperature` value.
+        let mut body = serde_json::Map::new();
+        body.insert(
+            "model".into(),
+            serde_json::Value::String(self.model.clone()),
+        );
+        body.insert(
+            "messages".into(),
+            serde_json::json!([
                 { "role": "system", "content": ENTITY_EXTRACT_PROMPT },
                 { "role": "user", "content": query },
-            ],
-            "temperature": 0.0_f32,
-            "response_format": {
+            ]),
+        );
+        if let Some(t) = agent_rs_core::config::temperature_for(&self.model, 0.0) {
+            body.insert(
+                "temperature".into(),
+                serde_json::Number::from_f64(f64::from(t))
+                    .map(serde_json::Value::Number)
+                    .unwrap_or(serde_json::Value::Null),
+            );
+        }
+        body.insert(
+            "response_format".into(),
+            serde_json::json!({
                 "type": "json_schema",
                 "json_schema": {
                     "name": "entities",
@@ -178,8 +202,8 @@ impl EntityLinker {
                         "required": ["entities"]
                     }
                 }
-            }
-        });
+            }),
+        );
 
         let resp = self
             .client
@@ -239,39 +263,34 @@ impl EntityLinker {
     }
 
     /// Try to link a single entity mention to a Neo4j node.
-    async fn try_link_entity(&self, mention: &str) -> LinkedEntity {
-        // Case-insensitive substring search in Neo4j.
-        // Uses the query_raw method (added by W2) with parameterised Cypher.
-        let cypher = "MATCH (n) WHERE toLower(n.name) CONTAINS toLower($mention) \
-                      RETURN n.id AS id, n.name AS name LIMIT 1";
-
-        let mut params = HashMap::new();
-        params.insert("mention".to_owned(), mention.to_owned());
-
+    ///
+    /// Delegates to [`GraphStore::find_entities_by_mention`] which is
+    /// backed by a Lucene fulltext index over every name-like property
+    /// (`name`, `title`, `heading`) across `Document|Section|Chunk|Entity`
+    /// labels. The previous implementation hard-coded `n.name CONTAINS`
+    /// which silently missed every structural node (Section / Document /
+    /// Chunk), producing a zero-linkage rate on graph-backed corpora
+    /// that hadn't run the LLM knowledge-graph extractor.
+    async fn try_link_entity(&self, user_id: &UserId, mention: &str) -> LinkedEntity {
         match self
             .graph_store
-            .query_raw(cypher, params, &["id", "name"])
+            .find_entities_by_mention(user_id, mention, 1)
             .await
         {
-            Ok(rows) if !rows.is_empty() => {
-                let row = &rows[0];
-                let node_id = row.get("id").and_then(|v| v.as_str()).map(|s| s.to_owned());
-                let node_name = row
-                    .get("name")
-                    .and_then(|v| v.as_str())
-                    .map(|s| s.to_owned());
-
+            Ok(matches) if !matches.is_empty() => {
+                let m = &matches[0];
                 tracing::debug!(
                     mention,
-                    node_id = ?node_id,
-                    node_name = ?node_name,
+                    node_id = %m.node_id,
+                    display_name = %m.display_name,
+                    label = %m.label,
+                    score = m.score,
                     "entity linked to KG node"
                 );
-
                 LinkedEntity {
                     mention: mention.to_owned(),
-                    node_id,
-                    node_name,
+                    node_id: Some(m.node_id.clone()),
+                    node_name: Some(m.display_name.clone()),
                     is_linked: true,
                 }
             }

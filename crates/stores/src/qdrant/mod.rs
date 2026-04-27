@@ -16,6 +16,7 @@ mod collections;
 pub mod section_filter;
 
 use std::collections::HashMap;
+use std::sync::RwLock;
 
 use agent_rs_core::{CollectionName, Embedding, StoreError, UserId};
 use async_trait::async_trait;
@@ -37,8 +38,22 @@ use agent_rs_core::Score;
 ///
 /// Connects via gRPC using [`agent_rs_core::config::QdrantConfig`].
 /// All methods are fully instrumented with `tracing`.
+///
+/// # Capability cache
+///
+/// `sparse_capable` memoises, per collection name, whether the
+/// collection has a sparse named vector `"sparse"` configured. This is
+/// consulted by [`VectorStore::keyword_search_for_user`] so that a
+/// keyword search against a dense-only collection is a zero-round-trip
+/// no-op rather than an error.
+///
+/// The cache is populated lazily on first keyword-search per collection
+/// via a single `collection_info` gRPC call. Entries never expire
+/// because collection schema is effectively immutable once created —
+/// adding a sparse vector post-hoc is not a supported Qdrant operation.
 pub struct QdrantStore {
     client: Qdrant,
+    sparse_capable: RwLock<HashMap<String, bool>>,
 }
 
 impl QdrantStore {
@@ -61,7 +76,132 @@ impl QdrantStore {
             reason: e.to_string(),
         })?;
 
-        Ok(Self { client })
+        Ok(Self {
+            client,
+            sparse_capable: RwLock::new(HashMap::new()),
+        })
+    }
+
+    /// Count the points currently stored in a collection.
+    ///
+    /// Returns `Ok(None)` when the collection does not exist — a
+    /// non-existent collection is indistinguishable from an empty one for
+    /// the purposes of the boot-time coverage probe, so callers can
+    /// treat both the same without branching on error kinds.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError`] for any non-"collection not found" gRPC
+    /// failure. Transport / authentication errors propagate so the
+    /// caller can decide whether to abort or degrade.
+    pub async fn points_count(
+        &self,
+        collection: &CollectionName,
+    ) -> Result<Option<u64>, StoreError> {
+        match self
+            .client
+            .count(qdrant_client::qdrant::CountPointsBuilder::new(collection.as_str()).exact(true))
+            .await
+        {
+            Ok(resp) => Ok(resp.result.map(|r| r.count)),
+            Err(e) => {
+                let msg = e.to_string();
+                if msg.contains("not found") || msg.contains("doesn't exist") {
+                    Ok(None)
+                } else {
+                    Err(StoreError::from(e))
+                }
+            }
+        }
+    }
+
+    /// Probe whether `collection` has a sparse named vector configured.
+    ///
+    /// Result is memoised in [`QdrantStore::sparse_capable`] after the first
+    /// successful `collection_info` call. Returning `false` implies a
+    /// keyword/BM25 query would fail at the backend — callers use this to
+    /// short-circuit to an empty result set instead of returning an error
+    /// that callers would have to special-case.
+    ///
+    /// The capability is derived by testing whether
+    /// `collection_info.config.params.sparse_vectors_config` contains an
+    /// entry named `"sparse"` (the fixed name used by
+    /// [`crate::qdrant::collections::create_named_vector_collection`]).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError`] only when the underlying `collection_info`
+    /// call fails. Lock-poisoning is absorbed at the probe layer: a
+    /// poisoned `sparse_capable` lock logs `warn!` and returns
+    /// `Ok(false)`, so a stuck process falls back to dense-only search
+    /// instead of dropping every keyword query.
+    async fn has_sparse_vector(&self, collection: &str) -> Result<bool, StoreError> {
+        // Fail-open contract: a poisoned lock (some earlier holder
+        // panicked while mutating the map) collapses to `Ok(false)`
+        // rather than `Err`, so callers disable the keyword branch
+        // instead of 500'ing the whole retrieval. The event is still
+        // surfaced via `tracing::warn!` with a stable field so dashboards
+        // can alert on sustained poison rates.
+        //
+        // Fast path — cache hit under a read lock.
+        match self.sparse_capable.read() {
+            Ok(guard) => {
+                if let Some(&cached) = guard.get(collection) {
+                    return Ok(cached);
+                }
+            }
+            Err(_) => {
+                tracing::warn!(
+                    collection,
+                    reason = "lock_poisoned",
+                    "sparse_capable read lock poisoned; disabling keyword branch"
+                );
+                return Ok(false);
+            }
+        }
+
+        // Slow path — fetch from Qdrant; the read guard was dropped before
+        // this await so we never hold a lock across an await point.
+        let info = self
+            .client
+            .collection_info(collection)
+            .await
+            .map_err(StoreError::from)?;
+
+        let has_sparse = info
+            .result
+            .as_ref()
+            .and_then(|r| r.config.as_ref())
+            .and_then(|c| c.params.as_ref())
+            .and_then(|p| p.sparse_vectors_config.as_ref())
+            .map(|s| s.map.contains_key("sparse"))
+            .unwrap_or(false);
+
+        // Cache update. Concurrent probes that race here write the same
+        // value (collection schema is effectively immutable) so the last
+        // writer wins is safe. A poisoned write lock degrades to
+        // "don't cache" rather than an error — next call repeats the
+        // network round-trip, which is preferable to failing the query.
+        match self.sparse_capable.write() {
+            Ok(mut guard) => {
+                guard.insert(collection.to_owned(), has_sparse);
+            }
+            Err(_) => {
+                tracing::warn!(
+                    collection,
+                    reason = "lock_poisoned",
+                    "sparse_capable write lock poisoned; probe result not cached"
+                );
+            }
+        }
+
+        tracing::debug!(
+            collection,
+            has_sparse,
+            "probed sparse-vector capability for collection"
+        );
+
+        Ok(has_sparse)
     }
 }
 
@@ -310,6 +450,104 @@ impl VectorStore for QdrantStore {
             .collect()
     }
 
+    /// Sparse BM25 keyword search scoped to a specific user.
+    ///
+    /// Dispatches a server-side BM25 inference query: Qdrant tokenises
+    /// `query_text` and scores points via the collection's `"sparse"` named
+    /// vector (configured with [`Modifier::Idf`] — see
+    /// [`crate::qdrant::collections::create_named_vector_collection`]).
+    /// No client-side sparse embedding is performed.
+    ///
+    /// Returns `Ok(Vec::new())` — never an error — when:
+    /// - the collection lacks a sparse named vector configuration
+    ///   ([`QdrantStore::has_sparse_vector`] returns `false`), or
+    /// - `query_text` trims to empty.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::InvalidData`] when `user_id` is empty, and
+    /// [`StoreError`] on Qdrant gRPC failure (other than missing sparse
+    /// configuration, which is silently absorbed).
+    #[instrument(
+        skip(self, query_text, extra_filter_json),
+        fields(
+            collection = %collection,
+            user_id = %user_id,
+            limit = limit,
+            query_len = query_text.len(),
+            has_sparse = tracing::field::Empty,
+            n_points = tracing::field::Empty,
+            with_extra_filter = extra_filter_json.is_some(),
+        )
+    )]
+    async fn keyword_search_for_user(
+        &self,
+        collection: &CollectionName,
+        user_id: &UserId,
+        query_text: &str,
+        limit: usize,
+        extra_filter_json: Option<serde_json::Value>,
+    ) -> Result<Vec<SearchResult>, StoreError> {
+        use crate::qdrant::section_filter::{build_user_filter, merge_user_filter};
+
+        if user_id.as_str().is_empty() {
+            return Err(StoreError::InvalidData(
+                "keyword_search_for_user: empty user_id is forbidden".into(),
+            ));
+        }
+
+        // Trivial input → empty result. Matches the upsert-time behaviour
+        // where an empty `p.text` omits the sparse vector entirely.
+        if query_text.trim().is_empty() {
+            tracing::Span::current().record("n_points", 0u64);
+            return Ok(Vec::new());
+        }
+
+        // Capability probe — skip the round-trip to Qdrant when the
+        // collection has no sparse vector. `has_sparse_vector` is cached
+        // after the first call per collection.
+        let has_sparse = self.has_sparse_vector(collection.as_str()).await?;
+        tracing::Span::current().record("has_sparse", has_sparse);
+        if !has_sparse {
+            tracing::Span::current().record("n_points", 0u64);
+            return Ok(Vec::new());
+        }
+
+        let user_scope = build_user_filter(user_id.as_str(), None, None);
+        let extra_qdrant = extra_filter_json.map(json_to_qdrant_filter).transpose()?;
+        let merged = merge_user_filter(user_scope, extra_qdrant);
+
+        // Server-side BM25 inference via the built-in `qdrant/bm25` model.
+        // The server tokenises + weights against corpus IDF statistics;
+        // we forward only the raw text. `Document` → `VectorInput`
+        // → `Query::new_nearest` is the canonical path in qdrant-client
+        // 1.17 for inference-at-query-time.
+        let bm25_query =
+            qdrant_client::qdrant::Query::new_nearest(Document::new(query_text, "qdrant/bm25"));
+
+        let response = self
+            .client
+            .query(
+                QueryPointsBuilder::new(collection.as_str())
+                    .query(bm25_query)
+                    .using("sparse")
+                    .limit(limit as u64)
+                    .filter(merged)
+                    .with_payload(true),
+            )
+            .await
+            .map_err(StoreError::from)?;
+
+        let n_points = response.result.len();
+        tracing::Span::current().record("n_points", n_points);
+
+        response
+            .result
+            .into_iter()
+            .map(scored_point_to_result)
+            .collect()
+    }
+
     /// Fetch payload-only projections scoped to a user.
     ///
     /// Delegates to [`QdrantStore::get_payloads_by_ids`] and then drops any
@@ -318,11 +556,10 @@ impl VectorStore for QdrantStore {
     ///
     /// # Errors
     ///
-    /// Returns [`StoreError`] on Qdrant gRPC failure.
-    ///
-    /// # Panics
-    ///
-    /// Panics when `user_id` is empty.
+    /// Returns [`StoreError::InvalidData`] when `user_id` is empty (see
+    /// [`crate::types::UserId::from_string`], which bypasses validation
+    /// and can produce an empty newtype). Other failures originate from
+    /// the Qdrant gRPC layer.
     #[instrument(skip(self, ids), fields(collection = %collection, user_id = %user_id, n_ids = ids.len()))]
     async fn retrieve_chunks_for_user(
         &self,
@@ -330,10 +567,11 @@ impl VectorStore for QdrantStore {
         user_id: &UserId,
         ids: &[String],
     ) -> Result<Vec<crate::types::PointPayload>, StoreError> {
-        assert!(
-            !user_id.as_str().is_empty(),
-            "retrieve_chunks_for_user: empty user_id is forbidden"
-        );
+        if user_id.as_str().is_empty() {
+            return Err(StoreError::InvalidData(
+                "retrieve_chunks_for_user: empty user_id is forbidden".into(),
+            ));
+        }
 
         if ids.is_empty() {
             return Ok(Vec::new());
@@ -413,9 +651,12 @@ impl QdrantStore {
     ///
     /// Returns [`StoreError`] on Qdrant gRPC failure.
     ///
-    /// # Panics
+    /// # Errors
     ///
-    /// Panics if `user_id` is empty — empty user scope is forbidden.
+    /// Returns [`StoreError::InvalidData`] when `user_id` is empty.
+    /// Empty user scope is forbidden because it would bypass the
+    /// defence-in-depth filter below, letting a caller with a
+    /// mis-constructed [`UserId`] read cross-tenant points.
     #[instrument(skip(self, ids), fields(collection, user_id = %user_id, n_ids = ids.len()))]
     pub async fn retrieve_chunks_by_ids(
         &self,
@@ -423,10 +664,11 @@ impl QdrantStore {
         user_id: &UserId,
         ids: &[String],
     ) -> Result<Vec<crate::types::PointPayload>, StoreError> {
-        assert!(
-            !user_id.as_str().is_empty(),
-            "retrieve_chunks_by_ids: empty user_id is forbidden"
-        );
+        if user_id.as_str().is_empty() {
+            return Err(StoreError::InvalidData(
+                "retrieve_chunks_by_ids: empty user_id is forbidden".into(),
+            ));
+        }
 
         if ids.is_empty() {
             return Ok(Vec::new());

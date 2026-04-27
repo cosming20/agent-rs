@@ -200,9 +200,18 @@ pub async fn build_router(
     // Entity → KG linker.
     if !features.skip_entity_linker {
         if let Some(key) = api_key() {
+            // Model sourced from `settings.llm.model` so a single
+            // `AGENT_RS__LLM__MODEL` override applies across every
+            // LLM-calling component. Empty settings value falls back
+            // to the compile-time default const.
+            let model = if settings.llm.model.is_empty() {
+                agent_rs_core::config::DEFAULT_LLM_MODEL.to_owned()
+            } else {
+                settings.llm.model.clone()
+            };
             let config = EntityLinkerConfig {
                 api_key: key,
-                model: "gpt-5.4-mini-2026-03-17".to_owned(),
+                model,
                 max_entities: 5,
             };
             let linker = Arc::new(EntityLinker::new(

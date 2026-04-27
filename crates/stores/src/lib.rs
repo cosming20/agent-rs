@@ -17,5 +17,6 @@ pub mod qdrant;
 // Re-export structural graph types so callers can use `agent_rs_stores::DocumentHeaderSnapshot`
 // without reaching into the nested module path.
 pub use neo4j::structural::{
-    DocumentHeaderSnapshot, PageInfo, StructuralChunk, StructuralPicture, StructuralTable,
+    DocumentHeaderSnapshot, MinimalChunkRow, PageInfo, StructuralChunk, StructuralPicture,
+    StructuralTable,
 };

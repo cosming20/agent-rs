@@ -43,14 +43,15 @@ use crate::error::RetrievalError;
 // ---------------------------------------------------------------------------
 
 /// Default OpenAI model for summarization. Chosen for cost/latency:
-/// gpt-5.4-mini runs with `reasoning_effort=minimal` so per-chunk
-/// latency stays in the sub-second range.
-const DEFAULT_MODEL: &str = "gpt-5.4-mini-2026-03-17";
+/// gpt-5.4-mini runs with the centralised [`REASONING_EFFORT`] so
+/// per-chunk latency stays in the sub-second range.
+const DEFAULT_MODEL: &str = agent_rs_core::config::DEFAULT_LLM_MODEL;
 
-/// Default reasoning effort for gpt-5.x / o-series models. `"minimal"`
-/// skips most hidden thinking tokens, which dominates latency for a
-/// summary-granularity call.
-const DEFAULT_REASONING_EFFORT: &str = "minimal";
+/// Reasoning-effort hint for gpt-5.x / o-series models. Sourced from
+/// [`agent_rs_core::config::DEFAULT_REASONING_EFFORT`] so a shift in
+/// OpenAI's accepted enum is a one-line fix in core rather than a
+/// fan-out across ingestion components.
+const REASONING_EFFORT: &str = agent_rs_core::config::DEFAULT_REASONING_EFFORT;
 
 /// OpenAI chat completions endpoint.
 const CHAT_COMPLETIONS_URL: &str = "https://api.openai.com/v1/chat/completions";
@@ -168,7 +169,12 @@ pub struct SummarizeItem<'a> {
 struct ChatRequest<'a> {
     model: &'a str,
     messages: Vec<ChatMessage<'a>>,
-    temperature: f32,
+    /// `temperature` — only serialised for non-reasoning models.
+    /// gpt-5.x / o-series reject any non-default value (HTTP 400), so
+    /// [`agent_rs_core::config::temperature_for`] returns `None` and
+    /// this field is dropped from the wire body.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    temperature: Option<f32>,
     /// `reasoning_effort` — gpt-5.x / o-series hint. Serialised only when
     /// present; older non-reasoning models (gpt-4o, 3.5) ignore unknown
     /// fields but we keep the wire clean.
@@ -213,11 +219,6 @@ struct ApiErrorResponse {
 #[derive(Debug, Deserialize)]
 struct ApiErrorDetail {
     message: String,
-    #[serde(rename = "type")]
-    #[allow(dead_code)]
-    error_type: Option<String>,
-    #[allow(dead_code)]
-    code: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -334,7 +335,7 @@ impl ChunkSummarizer {
                     content: payload_text,
                 },
             ],
-            temperature: 0.0,
+            temperature: agent_rs_core::config::temperature_for(self.model.as_str(), 0.0),
             reasoning_effort: reasoning_effort_for(self.model.as_str()),
         };
 
@@ -582,7 +583,7 @@ impl ChunkSummarizer {
 /// confusing dashboards that might misread an inert field as a signal.
 fn reasoning_effort_for(model: &str) -> Option<&'static str> {
     if model.starts_with("gpt-5") || model.starts_with("o1") || model.starts_with("o3") {
-        Some(DEFAULT_REASONING_EFFORT)
+        Some(REASONING_EFFORT)
     } else {
         None
     }

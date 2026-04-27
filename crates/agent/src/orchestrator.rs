@@ -92,12 +92,11 @@ impl AgentOrchestrator {
         // Step 1: Context builder — now only reads user-level memories; no
         // session / history DB reads (history is replayed inline by the
         // client via `AskRequest.history`).
-        let context_builder = ContextBuilder::new(Arc::clone(&pg_store), &settings.context);
+        let context_builder = ContextBuilder::new(Arc::clone(&pg_store));
 
         // Step 1.5: Coverage planner — no-op for non-exhaustive queries.
         // Clone before passing so neo4j remains available for the tool factory.
-        let coverage_planner =
-            CoveragePlanner::new(Arc::clone(&neo4j), Arc::clone(&metrics));
+        let coverage_planner = CoveragePlanner::new(Arc::clone(&neo4j), Arc::clone(&metrics));
 
         // Tool factory (shared across requests; creates per-request tool sets).
         // Receives the concrete pg_store so DocumentInfoTool/OutlineCorpusTool
@@ -134,17 +133,34 @@ impl AgentOrchestrator {
         let coverage_verifier = CoverageVerifier::new(Arc::clone(&metrics));
 
         // Step 4: Grounding gate
+        //
+        // The verifier can be run on a different (typically stronger)
+        // model than the primary retrieval LLM — set
+        // `verifier.model = "gpt-5.4-mini"` (or similar) in settings to
+        // override. When unset, falls back to the main `llm.model`.
+        let verifier_model = settings
+            .verifier
+            .model
+            .as_deref()
+            .unwrap_or(settings.llm.model.as_str());
         let verifier = Arc::new(GroundingVerifier::new(
             settings.verifier.confidence_threshold,
             &settings.llm.api_key,
-            &settings.llm.model,
+            verifier_model,
         ));
-        let grounding_gate =
-            GroundingGate::new(verifier, settings.agent.max_retries, Arc::clone(&metrics));
+        let grounding_gate = GroundingGate::new(
+            verifier,
+            settings.agent.max_retries,
+            settings.grounding.subject_min_token_len,
+            Arc::clone(&metrics),
+        );
 
         // Step 5: Result persister — writes query_run + evidence_items for
         // telemetry. No longer writes chat_messages (that table is gone).
-        let synthesizer = ResponseSynthesizer::new(settings.synthesis.max_snippet_length);
+        let synthesizer = ResponseSynthesizer::new(
+            settings.synthesis.max_snippet_length,
+            settings.synthesis.fallback_citation_count,
+        );
         let result_persister = ResultPersister::new(synthesizer, store, metrics);
 
         Ok(Self {

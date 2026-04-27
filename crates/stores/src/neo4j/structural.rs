@@ -69,6 +69,12 @@ pub(crate) const LABEL_PAGE: &str = "Page";
 pub(crate) const LABEL_SECTION: &str = "Section";
 const LABEL_TABLE: &str = "Table";
 const LABEL_PICTURE: &str = "Picture";
+/// Label for chunk nodes.
+///
+/// Kept in sync with the `MATCH (c:Chunk {id: row.id})` in
+/// [`update_chunk_structural_props`] and the queries in
+/// [`crate::neo4j::coverage::Neo4jStore::chunks_in_sections`].
+const LABEL_CHUNK: &str = "Chunk";
 
 // Structural relation type tokens — hardcoded, never accepted from user/sidecar input.
 //
@@ -257,6 +263,16 @@ impl Neo4jStore {
              FOR (pic:Picture) REQUIRE pic.id IS UNIQUE",
             "CREATE CONSTRAINT chunk_id_unique IF NOT EXISTS \
              FOR (c:Chunk) REQUIRE c.id IS UNIQUE",
+            // Fulltext index over every name-like property on every node
+            // label that can serve as an entity match target. Powers
+            // `GraphStore::find_entities_by_mention` via
+            // `db.index.fulltext.queryNodes`. Idempotent via
+            // `IF NOT EXISTS`. Adding labels or properties here is
+            // backward-compatible — existing indexes survive untouched
+            // when the spec matches.
+            "CREATE FULLTEXT INDEX entity_mention_fts IF NOT EXISTS \
+             FOR (n:Document|Section|Chunk|Entity) \
+             ON EACH [n.name, n.title, n.heading]",
         ];
 
         for stmt in stmts {
@@ -266,7 +282,7 @@ impl Neo4jStore {
                 .map_err(StoreError::from)?;
         }
 
-        tracing::info!("structural constraints verified (6 constraints)");
+        tracing::info!("structural constraints verified (6 constraints + entity_mention_fts)");
         Ok(())
     }
 
@@ -683,17 +699,22 @@ impl Neo4jStore {
     /// Minimal structural upsert used by the RabbitMQ `IndexerWorker`
     /// MVP path (pre-Docling integration).
     ///
-    /// Writes:
-    ///   - One `Document { id: minio_object_key, user_id, sha256, source,
-    ///     n_chunks }` node.
-    ///   - One `Section { id: <uuidv5(minio_key, "section-{i}")>,
-    ///     doc_id: minio_object_key, heading: <first ~80 chars of chunk
-    ///     text>, section_order: i, first_chunk_index: i,
-    ///     is_preamble: false }` per chunk.
-    ///   - `(Document)-[:HAS_SECTION]->(Section)` edges so
-    ///     `list_sections_for_doc(user_id, minio_key)` returns one row
-    ///     per chunk — enough for `coverage_planner` and
-    ///     `outline_corpus` to emit a flat TOC.
+    /// Writes one Document node, one Section node and one Chunk node per
+    /// indexed chunk, plus every edge the retrieval tools expect:
+    ///
+    ///   - `(Document)-[:HAS_SECTION]->(Section)` — consumed by
+    ///     `list_sections_for_doc` / `outline_corpus`.
+    ///   - `(Document)-[:CONTAINS_CHUNK]->(Chunk)` — consumed by
+    ///     ownership checks.
+    ///   - `(Chunk)-[:IN_SECTION]->(Section)` — consumed by
+    ///     `chunks_in_sections` (which backs `search_sections` and
+    ///     `fetch_section_chunks`).
+    ///   - `(Chunk_i)-[:FOLLOWS]->(Chunk_{i+1})` — consumed by
+    ///     `context_expander` for neighbour lookups.
+    ///
+    /// Section ids are stable: `UUIDv5(minio_key, "section-{i}")`.
+    /// Chunk ids come from the caller and must match the `chunk_id`
+    /// payload field stored on the corresponding Qdrant point.
     ///
     /// Rich Docling-derived structure (real sections, pages, tables,
     /// pictures) continues to flow through [`Self::upsert_document_structure`];
@@ -707,11 +728,11 @@ impl Neo4jStore {
     ///
     /// Returns [`StoreError`] on Neo4j query failure or props serialisation.
     #[instrument(
-        skip(self, chunk_headings),
+        skip(self, chunks),
         fields(
             user_id = %user_id,
             minio_object_key = %minio_object_key,
-            n_sections = chunk_headings.len(),
+            n_chunks = chunks.len(),
         )
     )]
     pub async fn upsert_minimal_document(
@@ -720,7 +741,7 @@ impl Neo4jStore {
         minio_object_key: &str,
         sha256: &str,
         source: &str,
-        chunk_headings: &[String],
+        chunks: &[MinimalChunkRow],
     ) -> Result<(), StoreError> {
         let run_id = Uuid::new_v4().to_string();
 
@@ -733,29 +754,28 @@ impl Neo4jStore {
             json!({
                 "sha256": sha256,
                 "source": source,
-                "n_chunks": chunk_headings.len() as i64,
+                "n_chunks": chunks.len() as i64,
             }),
         )
         .await?;
 
-        if chunk_headings.is_empty() {
+        if chunks.is_empty() {
             return Ok(());
         }
 
-        // ---- Section nodes ---------------------------------------------
+        // ---- Section nodes (one per chunk in the minimal path) ---------
         //
         // Derive stable section ids from (minio_key, index) so re-indexing
         // the same document hits the same Section nodes under MERGE
         // instead of creating duplicates.
         let doc_namespace = synthetic_doc_namespace(minio_object_key);
-        let section_rows: Vec<NodeRow> = chunk_headings
+        let section_rows: Vec<NodeRow> = chunks
             .iter()
             .enumerate()
-            .map(|(i, heading)| {
-                let short = heading_preview(heading);
+            .map(|(i, c)| {
+                let short = heading_preview(&c.heading);
                 NodeRow {
-                    id: Uuid::new_v5(&doc_namespace, format!("section-{i}").as_bytes())
-                        .to_string(),
+                    id: Uuid::new_v5(&doc_namespace, format!("section-{i}").as_bytes()).to_string(),
                     run_id: run_id.clone(),
                     props: json!({
                         "doc_id": minio_object_key,
@@ -763,7 +783,7 @@ impl Neo4jStore {
                         "title": short,
                         "section_order": i as i64,
                         "first_chunk_index": i as i64,
-                        "page_start": 1,
+                        "page_start": c.page_start.unwrap_or(1),
                         "is_preamble": false,
                     }),
                 }
@@ -771,7 +791,29 @@ impl Neo4jStore {
             .collect();
         upsert_nodes_batch(&self.graph, LABEL_SECTION, &section_rows).await?;
 
-        // ---- HAS_SECTION edges -----------------------------------------
+        // ---- Chunk nodes -----------------------------------------------
+        //
+        // The chunk id is whatever the caller already registered with
+        // Qdrant, so retrieval can cross-reference payload `chunk_id` ↔
+        // Neo4j `Chunk.id` in both directions. Keep the property set
+        // narrow (id + index + pages); the rest of the chunk metadata
+        // lives on the Qdrant payload and doesn't need to be duplicated.
+        let chunk_rows: Vec<NodeRow> = chunks
+            .iter()
+            .map(|c| NodeRow {
+                id: c.chunk_id.clone(),
+                run_id: run_id.clone(),
+                props: json!({
+                    "chunk_index": c.chunk_index,
+                    "page_start": c.page_start,
+                    "page_end": c.page_end,
+                    "document_id": minio_object_key,
+                }),
+            })
+            .collect();
+        upsert_nodes_batch(&self.graph, LABEL_CHUNK, &chunk_rows).await?;
+
+        // ---- HAS_SECTION edges (Document → Section) --------------------
         let has_section_rows: Vec<EdgeRow> = section_rows
             .iter()
             .map(|s| EdgeRow {
@@ -782,14 +824,84 @@ impl Neo4jStore {
             .collect();
         upsert_edges_batch(&self.graph, REL_HAS_SECTION, &has_section_rows).await?;
 
+        // ---- CONTAINS_CHUNK edges (Document → Chunk) -------------------
+        let contains_chunk_rows: Vec<EdgeRow> = chunk_rows
+            .iter()
+            .map(|c| EdgeRow {
+                src: minio_object_key.to_owned(),
+                dst: c.id.clone(),
+                run_id: run_id.clone(),
+            })
+            .collect();
+        upsert_edges_batch(&self.graph, REL_CONTAINS_CHUNK, &contains_chunk_rows).await?;
+
+        // ---- IN_SECTION edges (Chunk_i → Section_i) --------------------
+        //
+        // In the minimal path we emit one section per chunk, so the
+        // mapping is trivial: chunk_rows[i] belongs to section_rows[i].
+        // This edge is the load-bearing one for `search_sections` /
+        // `fetch_section_chunks` — missing it collapses the entire
+        // exhaustive-coverage flow to "(no chunks in …)".
+        let in_section_rows: Vec<EdgeRow> = chunk_rows
+            .iter()
+            .zip(section_rows.iter())
+            .map(|(c, s)| EdgeRow {
+                src: c.id.clone(),
+                dst: s.id.clone(),
+                run_id: run_id.clone(),
+            })
+            .collect();
+        upsert_edges_batch(&self.graph, REL_IN_SECTION, &in_section_rows).await?;
+
+        // ---- FOLLOWS edges (Chunk_i → Chunk_{i+1}) ---------------------
+        //
+        // Consumed by the context expander to fetch neighbour text when
+        // reranking. Cheap to maintain and a no-op when the doc has a
+        // single chunk.
+        let follows_rows: Vec<EdgeRow> = chunk_rows
+            .windows(2)
+            .map(|pair| EdgeRow {
+                src: pair[0].id.clone(),
+                dst: pair[1].id.clone(),
+                run_id: run_id.clone(),
+            })
+            .collect();
+        upsert_edges_batch(&self.graph, REL_FOLLOWS, &follows_rows).await?;
+
         tracing::info!(
             user_id = %user_id,
             minio_object_key = %minio_object_key,
             n_sections = section_rows.len(),
+            n_chunks = chunk_rows.len(),
+            n_in_section_edges = in_section_rows.len(),
+            n_follows_edges = follows_rows.len(),
             "minimal structure upserted"
         );
         Ok(())
     }
+}
+
+/// Per-chunk row consumed by [`Neo4jStore::upsert_minimal_document`].
+///
+/// Kept narrow on purpose: carries exactly the fields needed to create the
+/// `Chunk` node and wire it into the `Section`/`Document` skeleton. Richer
+/// structural fields (tables, pictures, formulas) flow through the full
+/// [`Neo4jStore::upsert_document_structure`] path instead.
+#[derive(Debug, Clone)]
+pub struct MinimalChunkRow {
+    /// Stable chunk identifier — must match the `chunk_id` payload field
+    /// on the corresponding Qdrant point so retrieval can cross-reference
+    /// the graph and the vector store.
+    pub chunk_id: String,
+    /// Short heading / title used as the Section label. Truncated to
+    /// [`heading_preview`]'s cap before write.
+    pub heading: String,
+    /// Position of the chunk within its document (0-based).
+    pub chunk_index: i64,
+    /// First page covered by the chunk (1-based), when available.
+    pub page_start: Option<i64>,
+    /// Last page covered by the chunk (1-based), when available.
+    pub page_end: Option<i64>,
 }
 
 /// Build the UUIDv5 namespace for synthetic Section ids derived from a
@@ -1017,13 +1129,21 @@ async fn update_chunk_structural_props(
 
 /// Upsert the `Document` node with its `user_id` property.
 ///
-/// Uses `MERGE … ON CREATE SET` so that both `user_id` and `ingest_run_id`
-/// are written only when the node is first created. Re-ingesting the same
-/// `doc_id` leaves the original `user_id` intact (idempotent per the
-/// additive-only invariant).
+/// A single global uniqueness constraint (`document_id_unique`) prevents
+/// two `Document` nodes from sharing the same `id`, so tenant isolation
+/// cannot be enforced by putting `user_id` into the MERGE pattern (a
+/// second tenant's MERGE would violate the constraint). Instead we
+/// MERGE on `id` and then verify ownership with an explicit WHERE clause:
 ///
-/// Extra payload properties (sha256, title, etc.) are merged separately via
-/// `ON CREATE SET n += props` so they follow the same one-shot pattern.
+/// - On create: `ON CREATE SET` writes `user_id`; the WHERE passes.
+/// - On match, same owner: WHERE passes; properties are refreshed via
+///   `ON MATCH SET` so the latest header values win.
+/// - On match, different owner: WHERE filters the row out, zero rows
+///   come back, the function returns
+///   [`StoreError::DocumentNotOwnedByUser`]. This converts the
+///   tenant-leak scenario (same `doc_id` re-ingested under a different
+///   tenant) from a silent corruption into a loud, caller-catchable
+///   error.
 async fn upsert_document_node(
     graph: &Graph,
     doc_id: &str,
@@ -1031,28 +1151,119 @@ async fn upsert_document_node(
     user_id: &str,
     props: serde_json::Value,
 ) -> Result<(), StoreError> {
+    // Ownership check happens *between* MERGE and the property SET so
+    // that a node owned by a different tenant is never mutated. The
+    // global `document_id_unique` constraint means MERGE will always
+    // MATCH an existing node in the cross-tenant case (never CREATE a
+    // duplicate), so the write path is:
+    //
+    // - create:     ON CREATE SET writes user_id.   WHERE passes.  SET runs.
+    // - match same: ON CREATE SET skipped.          WHERE passes.  SET runs.
+    // - match diff: ON CREATE SET skipped.          WHERE fails.   SET skipped.
+    //                                                              → zero rows returned.
     const CYPHER: &str = "\
         MERGE (n:Document {id: $doc_id}) \
-        ON CREATE SET \
-            n += $props, \
-            n.user_id = $user_id, \
-            n.ingest_run_id = $run_id";
+        ON CREATE SET n.user_id = $user_id \
+        WITH n \
+        WHERE n.user_id = $user_id \
+        SET n += $props, n.ingest_run_id = $run_id \
+        RETURN n.user_id AS owner";
 
     let bolt_props = neo4rs::BoltType::try_from(props)
         .map_err(|e| StoreError::Serialization(format!("Document props serialize: {e}")))?;
 
     let mut txn = graph.start_txn().await.map_err(StoreError::from)?;
-    txn.run(
-        query(CYPHER)
-            .param("doc_id", doc_id)
-            .param("props", bolt_props)
-            .param("user_id", user_id)
-            .param("run_id", run_id),
-    )
-    .await
-    .map_err(StoreError::from)?;
-    txn.commit().await.map_err(StoreError::from)?;
+
+    // Helper closure turning any constraint-violation variant of
+    // `neo4rs::Error` into `StoreError::DocumentNotOwnedByUser`. Handles
+    // the concurrent-first-ingest race where two tenants both see the
+    // `Document.id` as absent and race to CREATE — the `document_id_unique`
+    // constraint rejects the loser at commit time.
+    let classify_err = |e: neo4rs::Error| -> StoreError {
+        if is_document_id_unique_violation(&e) {
+            StoreError::DocumentNotOwnedByUser {
+                document_id: doc_id.to_owned(),
+                user_id: user_id.to_owned(),
+            }
+        } else {
+            StoreError::from(e)
+        }
+    };
+
+    let mut stream = match txn
+        .execute(
+            query(CYPHER)
+                .param("doc_id", doc_id)
+                .param("props", bolt_props)
+                .param("user_id", user_id)
+                .param("run_id", run_id),
+        )
+        .await
+    {
+        Ok(s) => s,
+        Err(e) => {
+            let mapped = classify_err(e);
+            // Best-effort rollback; if the txn is already invalidated by
+            // the constraint violation the error is discarded.
+            let _ = txn.rollback().await;
+            return Err(mapped);
+        }
+    };
+
+    // Drain fully so the transaction state is clean before commit/rollback.
+    // The query returns at most one row (RETURN on a single MERGE'd node
+    // after a WHERE filter) — a zero-row result means the ownership check
+    // filtered the row out.
+    let mut matched = false;
+    loop {
+        match stream.next(txn.handle()).await {
+            Ok(Some(_row)) => matched = true,
+            Ok(None) => break,
+            Err(e) => {
+                let mapped = classify_err(e);
+                let _ = txn.rollback().await;
+                return Err(mapped);
+            }
+        }
+    }
+    if !matched {
+        // MERGE succeeded but ownership check filtered the row out → the
+        // node exists under a different user_id. Abort the transaction so
+        // no partial phase-1 state is committed.
+        //
+        // We deliberately do NOT include the other tenant's user_id in
+        // the error; that would leak cross-tenant existence information.
+        txn.rollback().await.map_err(StoreError::from)?;
+        return Err(StoreError::DocumentNotOwnedByUser {
+            document_id: doc_id.to_owned(),
+            user_id: user_id.to_owned(),
+        });
+    }
+    if let Err(e) = txn.commit().await {
+        return Err(classify_err(e));
+    }
     Ok(())
+}
+
+/// Return `true` iff `e` is a Neo4j constraint-violation error for the
+/// `document_id_unique` constraint (or an equivalent surrogate).
+///
+/// We match on the Neo4j status code (`Neo.ClientError.Schema.*`) plus
+/// a substring of the human message so the detection works across
+/// driver versions without coupling to neo4rs internals. Matching on
+/// the code alone is preferred; the message-substring fallback handles
+/// drivers that report only a raw message.
+fn is_document_id_unique_violation(e: &neo4rs::Error) -> bool {
+    let neo4rs::Error::Neo4j(ne) = e else {
+        return false;
+    };
+    if ne.code().contains("ConstraintValidationFailed")
+        || ne.code().contains("Schema.ConstraintValidationFailed")
+    {
+        return true;
+    }
+    let msg = ne.message();
+    msg.contains("document_id_unique") || msg.contains("already exists with label")
 }
 
 /// Upsert a batch of nodes of a single label.

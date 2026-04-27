@@ -63,10 +63,7 @@ impl IndexPublisher {
     ///
     /// Returns [`QueueError::Connect`] if the AMQP dial fails.
     #[instrument(skip_all, fields(endpoint = %endpoint, pool_size))]
-    pub async fn connect_with_pool(
-        endpoint: &str,
-        pool_size: usize,
-    ) -> Result<Self, QueueError> {
+    pub async fn connect_with_pool(endpoint: &str, pool_size: usize) -> Result<Self, QueueError> {
         let pool_size = pool_size.max(1);
         tracing::Span::current().record("pool_size", pool_size);
 

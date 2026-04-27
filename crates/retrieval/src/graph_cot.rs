@@ -964,7 +964,8 @@ fn merge_dedup(
 struct CotDecision {
     answered: bool,
     follow_up_question: Option<String>,
-    #[allow(dead_code)]
+    /// Surfaced into the debug trace at the call site so operators can
+    /// see the LLM's stated rationale next to the structured fields.
     reasoning: String,
     tokens_used: u64,
 }

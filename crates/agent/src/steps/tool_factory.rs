@@ -144,6 +144,7 @@ impl ToolFactory {
                 Arc::clone(&self.router),
                 Arc::clone(&evidence_collector),
                 user_id.clone(),
+                active_document_keys.clone(),
             )),
             Box::new(SearchWebTool::new(
                 Arc::clone(&budget),

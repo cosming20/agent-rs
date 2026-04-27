@@ -66,11 +66,8 @@ impl EvidenceFuser {
             // Build the initial set from the ranked tier, then grow it as we
             // push new coverage chunks so self-duplicates in coverage_evidence
             // are also filtered out.
-            let mut existing_ids: HashSet<String> = ctx
-                .evidence
-                .iter()
-                .map(|e| e.id.clone())
-                .collect();
+            let mut existing_ids: HashSet<String> =
+                ctx.evidence.iter().map(|e| e.id.clone()).collect();
 
             let before = ctx.evidence.len();
             for cov in &ctx.coverage_evidence {
@@ -188,11 +185,7 @@ mod tests {
         ctx.kb_evidence.push(dummy_result("cov-1"));
         let fuser = make_fuser();
         fuser.fuse(&mut ctx);
-        let count_cov1 = ctx
-            .evidence
-            .iter()
-            .filter(|e| e.id == "cov-1")
-            .count();
+        let count_cov1 = ctx.evidence.iter().filter(|e| e.id == "cov-1").count();
         assert_eq!(
             count_cov1, 1,
             "cov-1 should appear exactly once after dedup"
@@ -208,11 +201,7 @@ mod tests {
         ctx.coverage_evidence.push(dummy_result("cov-1"));
         let fuser = make_fuser();
         fuser.fuse(&mut ctx);
-        let count_cov1 = ctx
-            .evidence
-            .iter()
-            .filter(|e| e.id == "cov-1")
-            .count();
+        let count_cov1 = ctx.evidence.iter().filter(|e| e.id == "cov-1").count();
         assert_eq!(
             count_cov1, 1,
             "cov-1 should appear exactly once even when duplicated in coverage_evidence"

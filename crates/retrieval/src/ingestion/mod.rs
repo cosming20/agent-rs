@@ -22,8 +22,10 @@ pub mod chunker;
 pub mod docling_client;
 pub mod entity_id;
 pub mod graph_extractor;
+pub mod marker_client;
 pub mod metadata;
 pub mod mock_docling;
+pub mod payload;
 pub mod summarizer;
 pub mod text_normalize;
 pub mod types;
@@ -34,6 +36,11 @@ pub use graph_extractor::{
     DEFAULT_BATCH_CONCURRENCY, ExtractedEdge, ExtractedNode, KnowledgeGraph, LlmGraphExtractor,
     Triplet,
 };
+pub use marker_client::{MarkerResponse, MarkerSidecarClient};
 pub use metadata::{ChunkExtras, ChunkMetadata};
+pub use payload::{
+    ChunkPayloadInput, SummaryPayloadInput, TripletPayloadInput, build_chunk_payload,
+    build_summary_payload, build_triplet_payload,
+};
 pub use summarizer::{ChunkSummarizer, ChunkSummary, DEFAULT_SUMMARIZER_CONCURRENCY};
 pub use types::IngestErrorCode;

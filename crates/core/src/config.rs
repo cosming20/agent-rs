@@ -17,6 +17,68 @@ use std::fmt;
 
 use crate::errors::ConfigError;
 
+// ---- Constants ----
+
+/// Default model identifier used across every LLM-calling component
+/// (summarizer, KG extractor, entity linker, agent orchestrator) when
+/// no explicit override is configured.
+///
+/// Centralised here so a version bump touches one line instead of
+/// fanning out across every binary and every config fixture. Deployments
+/// that want a different model set `AGENT_RS__LLM__MODEL` or pass
+/// `--model` / the component-specific override env var.
+pub const DEFAULT_LLM_MODEL: &str = "gpt-5.4-mini-2026-03-17";
+
+/// Return the `temperature` to serialize for an OpenAI Chat Completion
+/// request, or `None` when the field must be omitted from the body.
+///
+/// gpt-5.x / o1 / o3 **reasoning models** only accept the default
+/// `temperature` of `1`; sending any other value (including `0.0` for
+/// deterministic extraction) returns HTTP 400
+/// `Unsupported value: 'temperature' does not support X`. For those
+/// models, return `None` — call sites thread this through
+/// `#[serde(skip_serializing_if = "Option::is_none")]` or conditional
+/// `json!{}` inclusion so the field is dropped from the wire body.
+///
+/// For non-reasoning models (gpt-4o, gpt-4.1, older) the caller's
+/// `preferred` value is forwarded. Callers should pass the value they
+/// *want* (e.g. `0.0` for deterministic JSON extraction); this helper
+/// either honours it or omits it depending on what the model supports.
+///
+/// Determinism on reasoning models comes from `reasoning_effort` +
+/// schema-constrained structured output, not from `temperature`.
+pub fn temperature_for(model: &str, preferred: f32) -> Option<f32> {
+    if is_reasoning_model(model) {
+        None
+    } else {
+        Some(preferred)
+    }
+}
+
+/// Return `true` iff `model` belongs to a family that rejects
+/// non-default `temperature`. Currently the gpt-5.x, o1-*, o3-* lines;
+/// extend here when OpenAI ships new families with the same constraint.
+fn is_reasoning_model(model: &str) -> bool {
+    model.starts_with("gpt-5") || model.starts_with("o1") || model.starts_with("o3")
+}
+
+/// Default `reasoning_effort` forwarded to OpenAI Chat Completions for
+/// gpt-5.x / o-series reasoning models.
+///
+/// OpenAI's enum for this field shifted over the lifetime of gpt-5.x:
+/// the previously-valid `"minimal"` now returns HTTP 400 on
+/// `gpt-5.4-mini-2026-03-17` and related models. The current accepted
+/// set is `"none"`, `"low"`, `"medium"`, `"high"`, `"xhigh"`. `"low"`
+/// is the lowest setting that still leaves non-zero reasoning on (as
+/// opposed to `"none"` which disables it entirely), which is the
+/// latency/quality sweet spot for summarisation + KG extraction +
+/// metadata-filter rewriting — the places that rely on *some* hidden
+/// reasoning to avoid degraded structured-output quality.
+///
+/// Centralised here so a future enum shift is a one-line change, same
+/// rationale as [`DEFAULT_LLM_MODEL`].
+pub const DEFAULT_REASONING_EFFORT: &str = "low";
+
 // ---- Sub-configs ----
 
 /// LLM provider configuration.
@@ -154,21 +216,15 @@ pub struct AgentConfig {
     pub max_retries: usize,
     pub system_prompt_file: String,
     /// Reasoning-effort hint forwarded to OpenAI Chat Completions for
-    /// gpt-5.x / o-series models. Valid values: `"minimal"`, `"low"`,
-    /// `"medium"`, `"high"`. Empty string disables the field (older
-    /// non-reasoning models simply ignore unknown fields, so leaving the
-    /// default is safe). `"minimal"` skips most hidden thinking tokens,
-    /// which is the largest single lever on final-answer latency for
-    /// reasoning models.
+    /// gpt-5.x / o-series models. Valid values as of
+    /// `gpt-5.4-mini-2026-03-17`: `"none"`, `"low"`, `"medium"`,
+    /// `"high"`, `"xhigh"`. Empty string disables the field (non-reasoning
+    /// models ignore unknown fields, so leaving the default is safe).
+    ///
+    /// See [`DEFAULT_REASONING_EFFORT`] for rationale on the low-setting
+    /// default.
     #[serde(default)]
     pub reasoning_effort: String,
-}
-
-/// Context window management configuration.
-#[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct ContextConfig {
-    pub max_messages: usize,
-    pub max_chars_per_msg: usize,
 }
 
 /// Evidence pack configuration.
@@ -182,6 +238,18 @@ pub struct EvidenceConfig {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct SynthesisConfig {
     pub max_snippet_length: usize,
+    /// Number of top-evidence items to use as fallback citations when the
+    /// LLM produced no inline `[cite:<id>]` markers in its answer. Tunable
+    /// because it is a UX/quality trade-off: too few hides the source set
+    /// from the user, too many dilutes attribution.
+    ///
+    /// Override via `AGENT_RS__SYNTHESIS__FALLBACK_CITATION_COUNT`.
+    #[serde(default = "default_fallback_citation_count")]
+    pub fallback_citation_count: usize,
+}
+
+fn default_fallback_citation_count() -> usize {
+    5
 }
 
 /// Reciprocal rank fusion configuration.
@@ -267,7 +335,51 @@ impl fmt::Debug for RerankerConfig {
 /// Faithfulness verifier configuration.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct VerifierConfig {
+    /// Minimum confidence threshold for the heuristic fallback verifier
+    /// to return `is_grounded = true`. The LLM-based verifier ignores
+    /// this field; its verdict is derived from typed claims.
     pub confidence_threshold: f64,
+    /// Optional model override for the grounding verifier. When `None`
+    /// (default), the verifier uses the global `llm.model`. Set this to
+    /// a stronger model (e.g. `gpt-5.4-mini`) to improve claim
+    /// classification quality without upgrading the primary retrieval
+    /// LLM. Reads from `AGENT_RS__VERIFIER__MODEL`.
+    #[serde(default)]
+    pub model: Option<String>,
+}
+
+/// Grounding gate heuristic configuration.
+///
+/// Controls the language-agnostic subject-presence check that runs before
+/// the LLM verifier as a cheap pre-filter. Centralised here so corpus
+/// operators can tune the heuristic per dataset (e.g. a corpus of
+/// short-form Q&A may want `subject_min_token_len = 3`) without a
+/// recompile.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct GroundingConfig {
+    /// Minimum character length for a query token to be considered a
+    /// content-bearing word. Tokens shorter than this are treated as
+    /// function words / particles regardless of language.
+    ///
+    /// `4` is the empirical sweet spot across EN, RO, ES, DE — it drops
+    /// pronouns and short conjunctions while preserving real nouns. Bump
+    /// to `5` for noisier corpora; lower only with care.
+    ///
+    /// Override via `AGENT_RS__GROUNDING__SUBJECT_MIN_TOKEN_LEN`.
+    #[serde(default = "default_subject_min_token_len")]
+    pub subject_min_token_len: usize,
+}
+
+fn default_subject_min_token_len() -> usize {
+    4
+}
+
+impl Default for GroundingConfig {
+    fn default() -> Self {
+        Self {
+            subject_min_token_len: default_subject_min_token_len(),
+        }
+    }
 }
 
 /// Web search budget configuration.
@@ -289,6 +401,18 @@ pub struct BraveConfig {
     pub base_url: String,
     /// Request timeout in seconds.
     pub timeout_s: u64,
+    /// Maximum number of results to surface to the agent per
+    /// `search_web` / `search_news` invocation. Brave returns more than
+    /// this in many cases — capping the formatted output keeps token
+    /// pressure on the agent predictable.
+    ///
+    /// Override via `AGENT_RS__BRAVE__MAX_RESULTS`.
+    #[serde(default = "default_brave_max_results")]
+    pub max_results: usize,
+}
+
+fn default_brave_max_results() -> usize {
+    10
 }
 
 impl fmt::Debug for BraveConfig {
@@ -297,6 +421,7 @@ impl fmt::Debug for BraveConfig {
             .field("api_key", &"***")
             .field("base_url", &self.base_url)
             .field("timeout_s", &self.timeout_s)
+            .field("max_results", &self.max_results)
             .finish()
     }
 }
@@ -374,6 +499,16 @@ pub enum IngestBackend {
     /// On `retryable = true` errors, retry Docling once with backoff before
     /// falling back.
     DoclingWithLegacyFallback,
+    /// Use the Marker sidecar exclusively. Marker is MPS-native on Apple
+    /// Silicon (surya layout + texify formulas) — ~10-20× faster than
+    /// Docling on macOS for formula-heavy PDFs while matching quality on
+    /// well-typeset printed math.
+    Marker,
+    /// Try Marker first; fall back to legacy on errors where
+    /// `triggers_legacy_fallback = true`. Useful when Marker is the
+    /// primary but the deployment still needs a graceful degradation
+    /// path for malformed PDFs Marker rejects.
+    MarkerWithLegacyFallback,
 }
 
 /// Configuration for the Docling sidecar gRPC connection.
@@ -405,6 +540,29 @@ pub struct DoclingConfig {
     /// Maximum page count the client will request.
     ///
     /// Override via `AGENT_RS__DOCLING__MAX_PAGES`.
+    pub max_pages: u32,
+}
+
+/// Configuration for the Marker sidecar gRPC connection.
+///
+/// Same shape as [`DoclingConfig`] — Marker is a drop-in backend that
+/// speaks the same proto. All fields override via
+/// `AGENT_RS__MARKER__<FIELD>` env vars.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct MarkerConfig {
+    /// Full gRPC endpoint URL, e.g. `http://localhost:1073`.
+    ///
+    /// Override via `AGENT_RS__MARKER__ENDPOINT`. Defaults to 1073
+    /// (not 1069 — that's taken by MinIO in the dev compose stack).
+    /// Docling on 1068 can run in parallel for A/B comparison.
+    pub endpoint: String,
+    /// Timeout in seconds for establishing the gRPC channel.
+    pub connect_timeout_s: u64,
+    /// Maximum idle time between stream messages (seconds).
+    pub stream_idle_timeout_s: u64,
+    /// Maximum document size the client will send (bytes).
+    pub max_pdf_bytes: u32,
+    /// Maximum page count the client will request.
     pub max_pages: u32,
 }
 
@@ -512,6 +670,19 @@ fn default_max_in_flight() -> usize {
     512
 }
 
+/// Default Marker sidecar connection settings. Used both by
+/// [`Settings::default`] and as a serde default so older config files
+/// missing the `marker.*` section still parse.
+fn default_marker_config() -> MarkerConfig {
+    MarkerConfig {
+        endpoint: "http://localhost:1073".into(),
+        connect_timeout_s: 10,
+        stream_idle_timeout_s: 600,
+        max_pdf_bytes: 100 * 1024 * 1024, // 100 MiB
+        max_pages: 500,
+    }
+}
+
 impl ServerConfig {
     /// Full bind address string (e.g., `[::]:1059`).
     pub fn bind_addr(&self) -> String {
@@ -532,13 +703,14 @@ pub struct Settings {
     pub postgres: PostgresConfig,
     pub neo4j: Neo4jConfig,
     pub agent: AgentConfig,
-    pub context: ContextConfig,
     pub evidence: EvidenceConfig,
     pub synthesis: SynthesisConfig,
     pub ranker: RankerConfig,
     #[serde(default)]
     pub reranker: RerankerConfig,
     pub verifier: VerifierConfig,
+    #[serde(default)]
+    pub grounding: GroundingConfig,
     pub web_budget: WebBudgetConfig,
     pub brave: BraveConfig,
     pub fetch: FetchConfig,
@@ -550,6 +722,12 @@ pub struct Settings {
     pub ingest_backend: IngestBackend,
     /// Docling sidecar gRPC connection settings.
     pub docling: DoclingConfig,
+    /// Marker sidecar gRPC connection settings.
+    ///
+    /// Loaded even when `ingest_backend != Marker*` so operators can
+    /// flip backends via env var alone without editing config files.
+    #[serde(default = "default_marker_config")]
+    pub marker: MarkerConfig,
     /// MinIO / S3-compatible object storage settings.
     #[serde(default)]
     pub minio: MinioConfig,
@@ -563,7 +741,7 @@ impl Default for Settings {
         Self {
             llm: LlmConfig {
                 api_key: String::new(),
-                model: "gpt-5.4-mini-2026-03-17".into(),
+                model: DEFAULT_LLM_MODEL.to_owned(),
             },
             qdrant: QdrantConfig {
                 host: "localhost".into(),
@@ -596,11 +774,7 @@ impl Default for Settings {
                 max_steps: 5,
                 max_retries: 1,
                 system_prompt_file: String::new(),
-                reasoning_effort: "minimal".into(),
-            },
-            context: ContextConfig {
-                max_messages: 10,
-                max_chars_per_msg: 2000,
+                reasoning_effort: DEFAULT_REASONING_EFFORT.to_owned(),
             },
             evidence: EvidenceConfig {
                 max_evidence_chars: 60000,
@@ -608,6 +782,7 @@ impl Default for Settings {
             },
             synthesis: SynthesisConfig {
                 max_snippet_length: 5000,
+                fallback_citation_count: default_fallback_citation_count(),
             },
             ranker: RankerConfig { rrf_k: 60 },
             reranker: RerankerConfig {
@@ -621,7 +796,9 @@ impl Default for Settings {
             },
             verifier: VerifierConfig {
                 confidence_threshold: 0.5,
+                model: None,
             },
+            grounding: GroundingConfig::default(),
             web_budget: WebBudgetConfig {
                 max_searches: 3,
                 max_news: 2,
@@ -633,6 +810,7 @@ impl Default for Settings {
                 api_key: String::new(),
                 base_url: "https://api.search.brave.com/res/v1".into(),
                 timeout_s: 15,
+                max_results: default_brave_max_results(),
             },
             fetch: FetchConfig {
                 max_length: 30000,
@@ -669,6 +847,7 @@ impl Default for Settings {
                 max_pdf_bytes: 100 * 1024 * 1024, // 100 MiB
                 max_pages: 500,
             },
+            marker: default_marker_config(),
             minio: MinioConfig::default(),
             rabbitmq: RabbitmqConfig::default(),
         }

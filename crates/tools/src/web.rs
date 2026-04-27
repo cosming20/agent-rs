@@ -188,7 +188,7 @@ impl Tool for SearchWebTool {
 
         let mut output = format!("Web search results for '{}':\n\n", args.query);
 
-        for (i, result) in results.iter().enumerate().take(10) {
+        for (i, result) in results.iter().enumerate().take(config.max_results) {
             let title = result.title.as_deref().unwrap_or("(no title)");
             let url = result.url.as_deref().unwrap_or("(no url)");
             let desc = result.description.as_deref().unwrap_or("(no description)");
@@ -339,7 +339,7 @@ impl Tool for SearchNewsTool {
 
         let mut output = format!("News results for '{}':\n\n", args.query);
 
-        for (i, result) in results.iter().enumerate().take(10) {
+        for (i, result) in results.iter().enumerate().take(config.max_results) {
             let title = result.title.as_deref().unwrap_or("(no title)");
             let url = result.url.as_deref().unwrap_or("(no url)");
             let desc = result.description.as_deref().unwrap_or("(no description)");

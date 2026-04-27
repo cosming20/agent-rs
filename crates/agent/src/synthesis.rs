@@ -63,12 +63,18 @@ pub struct SynthesizedResponse {
 pub struct ResponseSynthesizer {
     /// Maximum character length for citation snippets.
     max_snippet_length: usize,
+    /// Number of top-evidence items used as fallback citations when the
+    /// LLM produced no inline `[cite:<id>]` markers.
+    fallback_citation_count: usize,
 }
 
 impl ResponseSynthesizer {
     /// Create a new synthesizer.
-    pub fn new(max_snippet_length: usize) -> Self {
-        Self { max_snippet_length }
+    pub fn new(max_snippet_length: usize, fallback_citation_count: usize) -> Self {
+        Self {
+            max_snippet_length,
+            fallback_citation_count,
+        }
     }
 
     /// Build a response with citations from evidence documents.
@@ -103,14 +109,15 @@ impl ResponseSynthesizer {
 
         // Resolve citations by stable chunk_id first ([cite:<id>]), with
         // fallback to legacy [N] positional markers during transition.
-        // When the LLM cited nothing, fall back to the top-5 evidence items.
+        // When the LLM cited nothing, fall back to the top-N evidence items
+        // (N = `fallback_citation_count`).
         let citations = {
             let resolved = resolve_cite_markers(answer, evidence);
             if resolved.is_empty() {
                 evidence
                     .iter()
                     .enumerate()
-                    .take(5)
+                    .take(self.fallback_citation_count)
                     .map(|(i, ev)| make_citation(i + 1, ev, self.max_snippet_length))
                     .collect()
             } else {
@@ -216,7 +223,6 @@ impl ResponseSynthesizer {
             coverage_report: coverage_report.cloned(),
         })
     }
-
 }
 
 /// Resolve citation markers in the answer text into [`Citation`]s.
@@ -239,8 +245,7 @@ pub(crate) fn resolve_cite_markers(answer: &str, evidence: &[SearchResult]) -> V
             .expect("resolve_cite_markers UUID regex is statically valid")
     });
     static IDX_RE: std::sync::LazyLock<Regex> = std::sync::LazyLock::new(|| {
-        Regex::new(r"\[(\d+)\]")
-            .expect("resolve_cite_markers index regex is statically valid")
+        Regex::new(r"\[(\d+)\]").expect("resolve_cite_markers index regex is statically valid")
     });
 
     // Determine the natural snippet length — use a conservative default when
@@ -257,11 +262,7 @@ pub(crate) fn resolve_cite_markers(answer: &str, evidence: &[SearchResult]) -> V
             continue;
         }
         if let Some((idx, ev)) = evidence.iter().enumerate().find(|(_, e)| {
-            e.id == id
-                || e.payload
-                    .get("chunk_id")
-                    .and_then(|v| v.as_str())
-                    == Some(id)
+            e.id == id || e.payload.get("chunk_id").and_then(|v| v.as_str()) == Some(id)
         }) {
             seen_ids.insert(id.to_string());
             out.push(make_citation(idx + 1, ev, DEFAULT_SNIPPET_LEN));
@@ -296,10 +297,7 @@ fn make_citation(index: usize, ev: &SearchResult, max_snippet_len: usize) -> Cit
         .unwrap_or("");
 
     let snippet = if content.chars().count() > max_snippet_len {
-        format!(
-            "{}...",
-            truncate_to_char_boundary(content, max_snippet_len)
-        )
+        format!("{}...", truncate_to_char_boundary(content, max_snippet_len))
     } else {
         content.to_owned()
     };
@@ -445,10 +443,7 @@ mod tests_cite_v2 {
     #[test]
     fn uuid_markers_take_priority_over_legacy() {
         // When BOTH [cite:...] and [N] are present, only UUID form is used.
-        let evidence = vec![
-            ev_with_chunk_id("id-a"),
-            ev_with_chunk_id("id-b"),
-        ];
+        let evidence = vec![ev_with_chunk_id("id-a"), ev_with_chunk_id("id-b")];
         let answer = "UUID [cite:id-a] and legacy [1].";
         let cites = resolve_cite_markers(answer, &evidence);
         // Only the UUID hit should be returned (out.is_empty() guard blocks

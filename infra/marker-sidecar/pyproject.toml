@@ -1,0 +1,33 @@
+[project]
+name = "marker-sidecar"
+version = "0.1.0"
+requires-python = ">=3.12"
+dependencies = [
+    # Marker replaces the Docling PDF pipeline with a lighter, MPS-native
+    # stack (surya layout + texify formulas). Pinned to a compatible range
+    # so a `pip install -e` on a fresh venv picks up stable APIs.
+    "marker-pdf>=1.10,<2",
+    "grpcio==1.68.*",
+    "grpcio-tools==1.68.*",
+    "grpcio-health-checking==1.68.*",
+    "grpcio-reflection==1.68.*",
+    "protobuf==5.*",
+    "tiktoken>=0.7",
+    "blake3>=1.0",
+    # BeautifulSoup handles Marker's HTML block content when we extract
+    # raw text + caption strings.
+    "beautifulsoup4>=4.12",
+]
+
+[project.scripts]
+marker-sidecar = "marker_sidecar.__main__:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-dir]
+"" = "src"

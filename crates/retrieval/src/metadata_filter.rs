@@ -48,12 +48,13 @@ use crate::error::RetrievalError;
 // Constants
 // ---------------------------------------------------------------------------
 
-/// Default OpenAI model for metadata hint extraction.
-///
-/// `gpt-5.4-mini` with `reasoning_effort=minimal` is fast and cheap —
-/// appropriate for a best-effort pre-filter step that must not add
-/// measurable latency to the retrieval path.
-const DEFAULT_MODEL: &str = "gpt-5.4-mini-2026-03-17";
+/// Default OpenAI model for metadata hint extraction. Sourced from
+/// [`agent_rs_core::config::DEFAULT_LLM_MODEL`] so a version bump is
+/// one line in core. This extractor deliberately does NOT forward
+/// `reasoning_effort` — the prompt is small and schema-constrained,
+/// so the extra hidden-token cost of any non-zero reasoning setting
+/// is pure latency tax.
+const DEFAULT_MODEL: &str = agent_rs_core::config::DEFAULT_LLM_MODEL;
 
 /// OpenAI chat completions endpoint.
 const CHAT_COMPLETIONS_URL: &str = "https://api.openai.com/v1/chat/completions";
@@ -463,6 +464,14 @@ impl MetadataFilterExtractor {
             return None;
         }
 
+        // Payload field names come from the single `agent_rs_core::payload`
+        // schema module so a typo here is a compile-time error — and,
+        // critically, so the indexer (which writes these fields via
+        // `ingestion::payload::build_chunk_payload`) and this extractor
+        // cannot silently drift into filtering on a key the indexer
+        // never wrote.
+        use agent_rs_core::payload;
+
         let mut conditions: Vec<FilterCondition> = Vec::new();
 
         // Page range — use overlap logic so a chunk that spans pages 45-50
@@ -470,12 +479,12 @@ impl MetadataFilterExtractor {
         // Overlap condition: chunk.page_start <= range_end AND chunk.page_end >= range_start
         if let Some((page_start, page_end)) = hints.page_range {
             conditions.push(FilterCondition::Range {
-                field: "page_start".to_owned(),
+                field: payload::PAGE_START.as_str().to_owned(),
                 gte: None,
                 lte: Some(f64::from(page_end)),
             });
             conditions.push(FilterCondition::Range {
-                field: "page_end".to_owned(),
+                field: payload::PAGE_END.as_str().to_owned(),
                 gte: Some(f64::from(page_start)),
                 lte: None,
             });
@@ -484,7 +493,7 @@ impl MetadataFilterExtractor {
         // Article number — section_title contains the number.
         if let Some(ref article) = hints.article_number {
             conditions.push(FilterCondition::Contains {
-                field: "section_title".to_owned(),
+                field: payload::SECTION_TITLE.as_str().to_owned(),
                 text: article.clone(),
             });
         }
@@ -501,7 +510,7 @@ impl MetadataFilterExtractor {
                 .unwrap_or(false);
             if !already_covered {
                 conditions.push(FilterCondition::Contains {
-                    field: "section_title".to_owned(),
+                    field: payload::SECTION_TITLE.as_str().to_owned(),
                     text: section.clone(),
                 });
             }
@@ -510,19 +519,19 @@ impl MetadataFilterExtractor {
         // Boolean payload fields.
         if hints.requires_table {
             conditions.push(FilterCondition::Match {
-                field: "has_table".to_owned(),
+                field: payload::HAS_TABLE.as_str().to_owned(),
                 value: serde_json::Value::Bool(true),
             });
         }
         if hints.requires_formula {
             conditions.push(FilterCondition::Match {
-                field: "has_formula".to_owned(),
+                field: payload::HAS_FORMULA.as_str().to_owned(),
                 value: serde_json::Value::Bool(true),
             });
         }
         if hints.requires_code {
             conditions.push(FilterCondition::Match {
-                field: "has_code".to_owned(),
+                field: payload::HAS_CODE.as_str().to_owned(),
                 value: serde_json::Value::Bool(true),
             });
         }
@@ -605,7 +614,10 @@ impl MetadataFilterExtractor {
 struct ChatRequest<'a> {
     model: &'a str,
     messages: Vec<ChatMessage<'a>>,
-    temperature: f32,
+    /// Only serialised for non-reasoning models — gpt-5.x / o-series
+    /// require the default value and reject explicit overrides.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    temperature: Option<f32>,
     response_format: ResponseFormat,
     prompt_cache_key: &'static str,
 }
@@ -745,7 +757,7 @@ fn build_request_body<'a>(model: &'a str, query: &'a str, temperature: f32) -> C
                 content: query,
             },
         ],
-        temperature,
+        temperature: agent_rs_core::config::temperature_for(model, temperature),
         response_format: ResponseFormat {
             format_type: "json_schema",
             json_schema: JsonSchemaWrapper {

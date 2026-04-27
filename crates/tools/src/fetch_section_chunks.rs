@@ -16,8 +16,8 @@
 
 use std::sync::Arc;
 
-use agent_rs_core::{ToolError, UserId};
 use agent_rs_core::types::Score;
+use agent_rs_core::{ToolError, UserId};
 use agent_rs_stores::neo4j::Neo4jStore;
 use agent_rs_stores::qdrant::QdrantStore;
 use agent_rs_stores::types::SearchResult;
@@ -101,10 +101,7 @@ impl FetchSectionChunksTool {
     /// Each [`SearchResult`] fetched by this tool is pushed into the collector
     /// so the orchestrator can drain it into `ctx.coverage_evidence` for the
     /// [`CoverageVerifier`] step.
-    pub fn with_coverage_collector(
-        mut self,
-        collector: Arc<Mutex<Vec<SearchResult>>>,
-    ) -> Self {
+    pub fn with_coverage_collector(mut self, collector: Arc<Mutex<Vec<SearchResult>>>) -> Self {
         self.coverage_collector = Some(collector);
         self
     }
@@ -208,10 +205,7 @@ impl Tool for FetchSectionChunksTool {
             .map_err(|e| ToolError::McpClient(format!("fetch_section_chunks: chunks: {e}")))?;
 
         if chunk_ids.is_empty() {
-            return Ok(format!(
-                "No chunks found in section {}.",
-                args.section_id
-            ));
+            return Ok(format!("No chunks found in section {}.", args.section_id));
         }
 
         // Retrieve full payloads from Qdrant (no vectors).
