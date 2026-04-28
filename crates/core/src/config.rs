@@ -79,6 +79,27 @@ fn is_reasoning_model(model: &str) -> bool {
 /// rationale as [`DEFAULT_LLM_MODEL`].
 pub const DEFAULT_REASONING_EFFORT: &str = "low";
 
+/// Default `seed` forwarded to OpenAI Chat Completions for output
+/// determinism.
+///
+/// OpenAI honours `seed` on every model family: same prompt + same
+/// `seed` yields deterministic output (exact for non-reasoning models,
+/// best-effort for gpt-5.x / o-series where hidden reasoning may
+/// introduce minor drift). Pinning this makes:
+///
+/// - Grounding tests reproducible — a verdict flip cannot be blamed on
+///   sampling drift.
+/// - Eval harness signals stable across runs.
+/// - Prompt-engineering A/B comparisons valid (the only difference
+///   between runs is the prompt change).
+///
+/// `42` is a small fixed positive value with no production meaning;
+/// operators who want a specific seed override via
+/// `AGENT_RS__AGENT__SEED`. Note that `0` is **not** a "disable
+/// seeding" sentinel — OpenAI treats it as just another seed value
+/// (as is `42`). The seed field is always sent on the wire.
+pub const DEFAULT_AGENT_SEED: u64 = 42;
+
 // ---- Sub-configs ----
 
 /// LLM provider configuration.
@@ -286,6 +307,23 @@ pub struct AgentConfig {
     /// default.
     #[serde(default)]
     pub reasoning_effort: String,
+    /// Seed forwarded as the `seed` top-level field on every Chat
+    /// Completions request from the agent runner. See
+    /// [`DEFAULT_AGENT_SEED`] for rationale and the determinism
+    /// contract. The field is always sent (no "disable" sentinel) — set
+    /// any explicit `u64` value to pin runs.
+    ///
+    /// Override via `AGENT_RS__AGENT__SEED`.
+    #[serde(default = "default_agent_seed")]
+    pub seed: u64,
+}
+
+/// Default-providing helper for [`AgentConfig::seed`] used by the
+/// `#[serde(default = ...)]` attribute. Re-exports the
+/// [`DEFAULT_AGENT_SEED`] constant so call sites observe the canonical
+/// value.
+fn default_agent_seed() -> u64 {
+    DEFAULT_AGENT_SEED
 }
 
 /// Evidence pack configuration.
@@ -407,6 +445,18 @@ pub struct VerifierConfig {
     /// LLM. Reads from `AGENT_RS__VERIFIER__MODEL`.
     #[serde(default)]
     pub model: Option<String>,
+    /// Optional `seed` override for the grounding verifier's LLM call.
+    ///
+    /// `None` (default) means "inherit from `agent.seed`" — the verifier
+    /// runs with the same determinism as the main agent, so a verdict
+    /// flip can be reproduced by re-running the same query.
+    /// `Some(x)` overrides — useful when running an A/B comparison
+    /// between verifier prompts and wanting the verifier to converge
+    /// on a different seed than the main agent (rare).
+    ///
+    /// Override via `AGENT_RS__VERIFIER__SEED`.
+    #[serde(default)]
+    pub seed: Option<u64>,
 }
 
 /// Strategy used by the grounding gate when the verifier reports the
@@ -948,6 +998,7 @@ impl Default for Settings {
                 max_retries: 1,
                 system_prompt_file: String::new(),
                 reasoning_effort: DEFAULT_REASONING_EFFORT.to_owned(),
+                seed: DEFAULT_AGENT_SEED,
             },
             evidence: EvidenceConfig {
                 max_evidence_chars: 60000,
@@ -970,6 +1021,7 @@ impl Default for Settings {
             verifier: VerifierConfig {
                 confidence_threshold: 0.5,
                 model: None,
+                seed: None,
             },
             grounding: GroundingConfig::default(),
             web_budget: WebBudgetConfig {

@@ -781,7 +781,11 @@ mod tests_claim_directed_retry {
         // heuristic (overlap can never exceed 1.0), but for these
         // tests we never call `verify_and_retry` end-to-end, only the
         // helper methods that don't invoke the verifier.
-        let verifier = Arc::new(crate::verifier::GroundingVerifier::new(1.1, "", "test"));
+        // Seed `0` is fine for the test path — the verifier never
+        // hits the network here (empty api_key disables the LLM
+        // client), so determinism wiring is exercised purely at the
+        // type level.
+        let verifier = Arc::new(crate::verifier::GroundingVerifier::new(1.1, "", "test", 0));
         GroundingGate::new(
             verifier,
             searcher,

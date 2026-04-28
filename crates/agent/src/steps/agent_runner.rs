@@ -25,6 +25,43 @@ use crate::steps::tool_factory::ToolFactory;
 
 // ---- AgentRunner -------------------------------------------------------
 
+/// Construction parameters for [`AgentRunner::new`].
+///
+/// Bundled into a struct so the constructor signature stays compact as
+/// new top-level options accrete (reasoning effort, seed, future
+/// determinism / caching knobs). Per-field doc comments describe the
+/// runtime contract.
+pub struct AgentRunnerConfig<'a> {
+    /// OpenAI API key forwarded to `rig::providers::openai::Client`.
+    pub api_key: &'a str,
+    /// Model identifier (e.g., `"gpt-4o"`, `"gpt-5.4-mini-2026-03-17"`).
+    pub model: &'a str,
+    /// Maximum number of tool-calling turns the rig agent is allowed
+    /// before it must produce a final response.
+    pub max_turns: usize,
+    /// Optional path to a system-prompt override file. Empty string
+    /// uses the embedded [`crate::prompts::DEFAULT_SYSTEM_PROMPT`].
+    pub system_prompt_file: &'a str,
+    /// Shared per-request tool factory. Each [`AgentRunner::run`]
+    /// constructs a fresh tool set from this factory.
+    pub tool_factory: Arc<ToolFactory>,
+    /// Value forwarded as the `reasoning_effort` top-level field on
+    /// every Chat Completions request. Applies to gpt-5.x / o-series
+    /// reasoning models; non-reasoning models ignore the unknown field.
+    /// Empty string disables the override entirely (the `seed` field is
+    /// still sent).
+    pub reasoning_effort: &'a str,
+    /// Value forwarded as the `seed` top-level field on every Chat
+    /// Completions request. Always sent (no "disable" sentinel — `0` is
+    /// just another seed value to OpenAI). See
+    /// [`agent_rs_core::config::DEFAULT_AGENT_SEED`] for rationale.
+    pub seed: u64,
+    /// Shared metrics surface routed into [`AgentRsHook`] so every
+    /// turn's `record_llm_call` lands on the same histograms across
+    /// pipeline steps.
+    pub metrics: Arc<RetrievalMetrics>,
+}
+
 /// Runs the Rig agent with tools and extracts the answer.
 ///
 /// Each call to [`Self::run`] builds a fresh agent with per-request
@@ -43,8 +80,9 @@ pub struct AgentRunner {
     /// Tool factory for building per-request tool sets.
     tool_factory: Arc<ToolFactory>,
     /// Extra top-level fields merged into every Chat Completions request
-    /// body (e.g. `{"reasoning_effort": "minimal"}`). `None` = no extras.
-    /// Computed once at construction.
+    /// body (e.g. `{"reasoning_effort": "low", "seed": 42}`). `None` =
+    /// no extras. Computed once at construction. Always populated when
+    /// `seed` is set (currently unconditional — see [`Self::new`]).
     additional_params: Option<serde_json::Value>,
     /// Shared observability surface — fed into the per-request hook
     /// so [`RetrievalMetrics::record_llm_call`] fires on every model
@@ -62,32 +100,35 @@ impl AgentRunner {
     /// - `max_turns` -- Maximum tool-calling turns.
     /// - `system_prompt_file` -- Path to custom system prompt file (empty = default).
     /// - `tool_factory` -- Shared tool factory for building per-request tools.
-    /// - `reasoning_effort` -- Value forwarded as the `reasoning_effort`
-    ///   top-level field on every Chat Completions request. Applies to
-    ///   gpt-5.x / o-series reasoning models; non-reasoning models ignore
-    ///   the unknown field. Empty string disables the override entirely.
-    /// - `metrics` -- Shared metrics surface routed into [`AgentRsHook`].
+    /// - `cfg` -- bundled construction parameters. See
+    ///   [`AgentRunnerConfig`] for per-field documentation.
     ///
     /// # Errors
     ///
     /// Returns `AgentError::Orchestrator` if the OpenAI client cannot be created.
-    pub fn new(
-        api_key: &str,
-        model: &str,
-        max_turns: usize,
-        system_prompt_file: &str,
-        tool_factory: Arc<ToolFactory>,
-        reasoning_effort: &str,
-        metrics: Arc<RetrievalMetrics>,
-    ) -> Result<Self, AgentError> {
+    pub fn new(cfg: AgentRunnerConfig<'_>) -> Result<Self, AgentError> {
+        let AgentRunnerConfig {
+            api_key,
+            model,
+            max_turns,
+            system_prompt_file,
+            tool_factory,
+            reasoning_effort,
+            seed,
+            metrics,
+        } = cfg;
         let system_prompt = prompts::load_system_prompt(system_prompt_file);
         let llm_client = rig::providers::openai::Client::new(api_key).map_err(|e| {
             AgentError::Orchestrator(format!("failed to create OpenAI client: {e}"))
         })?;
+        // We always send `seed` (operator-tunable knob for determinism,
+        // not an opt-in feature), and conditionally include
+        // `reasoning_effort` when the operator opted in. `seed = 0` is a
+        // valid seed to OpenAI — never elide.
         let additional_params = if reasoning_effort.is_empty() {
-            None
+            Some(json!({ "seed": seed }))
         } else {
-            Some(json!({ "reasoning_effort": reasoning_effort }))
+            Some(json!({ "reasoning_effort": reasoning_effort, "seed": seed }))
         };
         Ok(Self {
             llm_client,

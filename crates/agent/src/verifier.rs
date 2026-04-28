@@ -15,6 +15,7 @@ use agent_rs_observability::metrics::RetrievalMetrics;
 use agent_rs_stores::types::SearchResult;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+use serde_json::json;
 use tracing::{info, instrument};
 use unicode_segmentation::UnicodeSegmentation;
 
@@ -171,6 +172,11 @@ pub struct GroundingVerifier {
     llm_client: Option<rig::providers::openai::Client>,
     /// Model to use for LLM verification.
     model: String,
+    /// Seed forwarded as the `seed` top-level field on the verifier's
+    /// `prompt_typed` call. Always sent so reproducibility of the
+    /// verifier verdict matches the agent runner's. See
+    /// [`agent_rs_core::config::DEFAULT_AGENT_SEED`] for rationale.
+    seed: u64,
     /// Optional shared metrics handle.
     ///
     /// When `Some`, the LLM verifier:
@@ -195,7 +201,13 @@ impl GroundingVerifier {
     /// - `confidence_threshold` -- Minimum confidence for grounded verdict.
     /// - `api_key` -- OpenAI API key. If empty, uses heuristic only.
     /// - `model` -- Model for verification (e.g., "gpt-4o-mini").
-    pub fn new(confidence_threshold: f64, api_key: &str, model: &str) -> Self {
+    /// - `seed` -- Value forwarded as the `seed` top-level field on the
+    ///   verifier's `prompt_typed` request. Pinning this makes verifier
+    ///   verdicts reproducible across runs of the same query +
+    ///   evidence. Set from
+    ///   [`agent_rs_core::config::VerifierConfig::seed`] (which falls
+    ///   back to [`agent_rs_core::config::AgentConfig::seed`]).
+    pub fn new(confidence_threshold: f64, api_key: &str, model: &str, seed: u64) -> Self {
         let llm_client = if api_key.is_empty() {
             None
         } else {
@@ -215,6 +227,7 @@ impl GroundingVerifier {
             confidence_threshold,
             llm_client,
             model: model.to_owned(),
+            seed,
             metrics: None,
         }
     }
@@ -344,9 +357,15 @@ impl GroundingVerifier {
         let user_message =
             format!("<evidence>\n{evidence_text}\n</evidence>\n\n<answer>\n{answer}\n</answer>");
 
+        // Always send `seed` so verifier runs are reproducible. We
+        // skip `reasoning_effort` here because the verifier task is
+        // pure classification — the default reasoning level is fine
+        // and changing it per-call would only re-introduce drift.
+        let additional_params = json!({ "seed": self.seed });
         let agent = client
             .agent(&self.model)
             .preamble(VERIFICATION_PROMPT)
+            .additional_params(additional_params)
             .build();
 
         let started = Instant::now();

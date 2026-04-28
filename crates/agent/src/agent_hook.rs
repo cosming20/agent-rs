@@ -189,6 +189,7 @@ where
         let usage = token_usage_from_rig(response.usage);
         let prompt_tokens = u64::from(usage.prompt_tokens);
         let completion_tokens = u64::from(usage.completion_tokens);
+        let cached_tokens = u64::from(usage.cached_input_tokens);
         let started_at = self.started_at;
 
         async move {
@@ -207,6 +208,23 @@ where
                 prompt_tokens,
                 completion_tokens,
                 latency_ms,
+            );
+            // Per-call cache-hit signal. Kept at DEBUG to bound the
+            // event cardinality on busy hosts (one event per LLM
+            // round-trip × per turn × per pipeline step). Dashboards
+            // compute hit-rate as `cached_tokens / prompt_tokens`;
+            // expose this only when the operator opts into DEBUG
+            // logging for the agent crate. Emitting at INFO would
+            // double up with the per-request snapshot in the
+            // orchestrator (which already carries `cached_input_tokens`
+            // via the budget aggregator).
+            tracing::debug!(
+                llm.component = component,
+                llm.model = %model,
+                prompt_tokens,
+                cached_tokens,
+                completion_tokens,
+                "llm call usage (cached subset reflects OpenAI prompt-cache hit)"
             );
             HookAction::cont()
         }

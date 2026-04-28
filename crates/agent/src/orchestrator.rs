@@ -22,7 +22,7 @@ use uuid::Uuid;
 use crate::claim_searcher::{ClaimSearcher, RouterClaimSearcher};
 use crate::context::QueryContext;
 use crate::lang::detect_lang;
-use crate::steps::agent_runner::AgentRunner;
+use crate::steps::agent_runner::{AgentRunner, AgentRunnerConfig};
 use crate::steps::context_builder::ContextBuilder;
 use crate::steps::coverage_planner::CoveragePlanner;
 use crate::steps::coverage_verifier::CoverageVerifier;
@@ -175,15 +175,16 @@ impl AgentOrchestrator {
         // Step 2: Agent runner — receives the shared metrics handle
         // because the per-request `AgentRsHook` plumbs every LLM
         // round-trip through `RetrievalMetrics::record_llm_call`.
-        let agent_runner = AgentRunner::new(
-            &settings.llm.api_key,
-            &settings.llm.model,
-            settings.agent.max_steps,
-            &settings.agent.system_prompt_file,
+        let agent_runner = AgentRunner::new(AgentRunnerConfig {
+            api_key: &settings.llm.api_key,
+            model: &settings.llm.model,
+            max_turns: settings.agent.max_steps,
+            system_prompt_file: &settings.agent.system_prompt_file,
             tool_factory,
-            &settings.agent.reasoning_effort,
-            Arc::clone(&metrics),
-        )?;
+            reasoning_effort: &settings.agent.reasoning_effort,
+            seed: settings.agent.seed,
+            metrics: Arc::clone(&metrics),
+        })?;
 
         // Step 3: Evidence fuser
         let ranker = ResultRanker::new(settings.ranker.rrf_k);
@@ -203,11 +204,18 @@ impl AgentOrchestrator {
             .model
             .as_deref()
             .unwrap_or(settings.llm.model.as_str());
+        // Verifier seed: explicit override → inherit from `agent.seed`.
+        // Inheriting by default keeps verifier verdicts reproducible
+        // alongside the agent's run; operators set
+        // `AGENT_RS__VERIFIER__SEED` only when intentionally A/B-ing
+        // verifier-specific determinism.
+        let verifier_seed = settings.verifier.seed.unwrap_or(settings.agent.seed);
         let verifier = Arc::new(
             GroundingVerifier::new(
                 settings.verifier.confidence_threshold,
                 &settings.llm.api_key,
                 verifier_model,
+                verifier_seed,
             )
             .with_metrics(Arc::clone(&metrics)),
         );
