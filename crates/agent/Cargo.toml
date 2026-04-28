@@ -45,3 +45,8 @@ whatlang = "0.18"
 
 # Unicode word segmentation for the lang-agnostic heuristic verifier.
 unicode-segmentation = "1.13"
+
+# JSON schema derivation for `prompt_typed::<T>` (rig's structured
+# outputs). Pinned to the same version rig-core 0.34 uses internally
+# so the two `JsonSchema` derive macros never disagree.
+schemars = "1.0.4"

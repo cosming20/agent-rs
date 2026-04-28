@@ -172,7 +172,9 @@ impl AgentOrchestrator {
             web_budget_config: settings.web_budget.clone(),
         })?);
 
-        // Step 2: Agent runner
+        // Step 2: Agent runner — receives the shared metrics handle
+        // because the per-request `AgentRsHook` plumbs every LLM
+        // round-trip through `RetrievalMetrics::record_llm_call`.
         let agent_runner = AgentRunner::new(
             &settings.llm.api_key,
             &settings.llm.model,
@@ -180,6 +182,7 @@ impl AgentOrchestrator {
             &settings.agent.system_prompt_file,
             tool_factory,
             &settings.agent.reasoning_effort,
+            Arc::clone(&metrics),
         )?;
 
         // Step 3: Evidence fuser

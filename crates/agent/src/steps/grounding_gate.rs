@@ -238,7 +238,11 @@ impl GroundingGate {
         evidence_fuser: &EvidenceFuser,
     ) -> Result<(), AgentError> {
         // Initial verification
-        ctx.verification = Some(self.verifier.verify(&ctx.answer, &ctx.evidence).await?);
+        ctx.verification = Some(
+            self.verifier
+                .verify(&ctx.answer, &ctx.evidence, &ctx.budget)
+                .await?,
+        );
 
         ctx.retries = 0;
 
@@ -332,8 +336,11 @@ impl GroundingGate {
                     // with the augmented evidence. The agent's previous
                     // answer is left in place; the verifier may now see
                     // support for the previously-unsupported claims.
-                    ctx.verification =
-                        Some(self.verifier.verify(&ctx.answer, &ctx.evidence).await?);
+                    ctx.verification = Some(
+                        self.verifier
+                            .verify(&ctx.answer, &ctx.evidence, &ctx.budget)
+                            .await?,
+                    );
 
                     if let Some(ref v) = ctx.verification {
                         info!(
@@ -506,7 +513,11 @@ impl GroundingGate {
                 evidence_fuser.fuse(ctx);
 
                 // Re-verify
-                ctx.verification = Some(self.verifier.verify(&ctx.answer, &ctx.evidence).await?);
+                ctx.verification = Some(
+                    self.verifier
+                        .verify(&ctx.answer, &ctx.evidence, &ctx.budget)
+                        .await?,
+                );
 
                 if let Some(ref v) = ctx.verification {
                     info!(

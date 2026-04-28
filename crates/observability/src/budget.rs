@@ -29,6 +29,20 @@
 //! current OpenAI pricing as of 2026-Q1 — they should be updated when
 //! pricing changes. Unknown models fall back to a conservative default
 //! (gpt-4o-mini pricing) and emit a `tracing::warn` once per process.
+//!
+//! # Wiring (Tier-1 combined refactor)
+//!
+//! Wired into `rig` via `agent_rs_agent::AgentRsHook` — usage flows
+//! through rig's [`PromptHook::on_completion_response`] callback for
+//! both `prompt_typed` (typed structured outputs) and
+//! `prompt(...).extended_details()` calls. The verifier and the agent
+//! runner both attach this hook per request. There is no longer an
+//! "opaque path" gap — every LLM call dispatched through rig records
+//! into the budget.
+//!
+//! Ingestion-time callers (summarizer, graph extractor) still use
+//! their own observability surfaces because they are not bound to a
+//! per-query [`RequestBudget`].
 
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -41,30 +55,60 @@ const MICROCENTS_PER_USD: f64 = 1_000_000.0;
 
 /// Tokens consumed by a single LLM call.
 ///
-/// Both fields are typically lifted from the provider's `usage` object
-/// on a chat-completion response. When the provider does not surface
-/// usage (e.g. rig-core's `agent.prompt` opaque path), call sites
-/// should pass `TokenUsage::default()` and rely on the latency-only
-/// signal — the budget snapshot will under-count, which is preferable
-/// to fabricating a number.
+/// All three fields are typically lifted from the provider's `usage`
+/// object on a chat-completion response. The agent crate provides a
+/// `From<rig::completion::Usage>` adapter that maps:
+///
+/// - `prompt_tokens          <- input_tokens`
+/// - `completion_tokens      <- output_tokens`
+/// - `cached_input_tokens    <- cached_input_tokens` (OpenAI prompt
+///   cache hits — billed at a discount, see [`estimate_cost_usd`]).
+///
+/// `cached_input_tokens` is a **subset** of `prompt_tokens` (the slice
+/// served from the provider's prompt cache). It is not added on top.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct TokenUsage {
     /// Prompt-side tokens (system + user + tool messages).
     pub prompt_tokens: u32,
     /// Completion-side tokens (assistant + tool-call output).
     pub completion_tokens: u32,
+    /// Subset of `prompt_tokens` served from the provider's prompt
+    /// cache. Discounted in [`estimate_cost_usd`]. Defaults to `0`
+    /// when the provider does not surface a cache field, which keeps
+    /// the cost estimate identical to the pre-cache behaviour.
+    pub cached_input_tokens: u32,
 }
 
 impl TokenUsage {
-    /// Construct a [`TokenUsage`] from raw `u32` fields.
+    /// Construct a [`TokenUsage`] from prompt + completion fields with
+    /// no cache hits. Backward-compatible shorthand for the common
+    /// case where the caller does not surface cached tokens.
     pub fn new(prompt_tokens: u32, completion_tokens: u32) -> Self {
         Self {
             prompt_tokens,
             completion_tokens,
+            cached_input_tokens: 0,
         }
     }
 
-    /// Sum of prompt and completion tokens.
+    /// Construct a [`TokenUsage`] including the cached-input subset.
+    ///
+    /// `cached_input_tokens` should be `<= prompt_tokens`; the
+    /// estimator clamps to that invariant defensively.
+    pub fn with_cache(
+        prompt_tokens: u32,
+        completion_tokens: u32,
+        cached_input_tokens: u32,
+    ) -> Self {
+        Self {
+            prompt_tokens,
+            completion_tokens,
+            cached_input_tokens,
+        }
+    }
+
+    /// Sum of prompt and completion tokens. Cached-input is a subset
+    /// of `prompt_tokens` and therefore not added separately.
     pub fn total(self) -> u32 {
         self.prompt_tokens.saturating_add(self.completion_tokens)
     }
@@ -80,6 +124,7 @@ impl TokenUsage {
 pub struct RequestBudget {
     prompt_tokens: AtomicU64,
     completion_tokens: AtomicU64,
+    cached_input_tokens: AtomicU64,
     call_count: AtomicU64,
     /// Microcents (USD * 1e6) so cost stays integer-safe in atomics.
     cost_microcents: AtomicU64,
@@ -104,6 +149,8 @@ impl RequestBudget {
             .fetch_add(u64::from(usage.prompt_tokens), Ordering::Relaxed);
         self.completion_tokens
             .fetch_add(u64::from(usage.completion_tokens), Ordering::Relaxed);
+        self.cached_input_tokens
+            .fetch_add(u64::from(usage.cached_input_tokens), Ordering::Relaxed);
 
         let cost_usd = estimate_cost_usd(model, usage);
         // Cost is held in microcents (u64) so concurrent accumulation is
@@ -128,12 +175,14 @@ impl RequestBudget {
     pub fn snapshot(&self) -> BudgetSnapshot {
         let prompt = self.prompt_tokens.load(Ordering::Relaxed);
         let completion = self.completion_tokens.load(Ordering::Relaxed);
+        let cached = self.cached_input_tokens.load(Ordering::Relaxed);
         let calls = self.call_count.load(Ordering::Relaxed);
         let microcents = self.cost_microcents.load(Ordering::Relaxed);
         BudgetSnapshot {
             call_count: calls,
             prompt_tokens: prompt,
             completion_tokens: completion,
+            cached_input_tokens: cached,
             total_tokens: prompt.saturating_add(completion),
             cost_usd: (microcents as f64) / MICROCENTS_PER_USD,
         }
@@ -150,6 +199,13 @@ pub struct BudgetSnapshot {
     pub prompt_tokens: u64,
     /// Sum of completion-side tokens across all recorded calls.
     pub completion_tokens: u64,
+    /// Sum of prompt-cache-hit tokens across all recorded calls. This
+    /// is the *subset* of `prompt_tokens` that was billed at the
+    /// cached-input rate (50% discount on OpenAI's gpt-4o / gpt-5.4
+    /// families as of 2026-Q1). Operators inspect the
+    /// `cached_input_tokens / prompt_tokens` ratio to gauge how well
+    /// cache-friendly prompt construction is performing.
+    pub cached_input_tokens: u64,
     /// Convenience: `prompt_tokens + completion_tokens`.
     pub total_tokens: u64,
     /// Estimated USD spend across all calls.
@@ -228,11 +284,31 @@ fn rate_for(model: &str) -> Option<ModelRate> {
 /// so the multiplier in [`estimate_cost_usd`] documents itself.
 const TOKENS_PER_MILLION: f64 = 1_000_000.0;
 
+/// OpenAI prompt-cache discount multiplier — cached input tokens are
+/// billed at 50% of the regular input rate as of 2026-Q1.
+///
+/// Source: OpenAI pricing page (gpt-4o, gpt-5.4 families both apply
+/// the 50% cached-input discount). Update if the published rate
+/// changes; centralised here so a price refresh is a one-line edit.
+const CACHED_INPUT_DISCOUNT: f64 = 0.5;
+
 /// Estimate USD cost from token usage for a given model.
 ///
 /// Uses a small built-in price table. Unknown models fall back to
 /// gpt-4o-mini pricing and emit a `tracing::warn!` the first time a
 /// given unknown name is seen per process.
+///
+/// # Cached-input pricing
+///
+/// `usage.cached_input_tokens` is treated as a **subset** of
+/// `usage.prompt_tokens`. The full-price input portion is
+/// `prompt_tokens - cached_input_tokens` and is billed at
+/// `prompt_per_1m_usd`; the cached portion is billed at
+/// `prompt_per_1m_usd * CACHED_INPUT_DISCOUNT` (50% off as of
+/// 2026-Q1). If a provider reports `cached_input_tokens >
+/// prompt_tokens` (it shouldn't, but defensive against bugs), we
+/// clamp to `prompt_tokens` so the full-price slice cannot go
+/// negative.
 ///
 /// Returns `0.0` for `usage.total() == 0` (no tokens consumed) without
 /// touching the warn path.
@@ -247,11 +323,18 @@ pub fn estimate_cost_usd(model: &str, usage: TokenUsage) -> f64 {
             FALLBACK_RATE
         }
     };
-    let prompt_cost =
-        (f64::from(usage.prompt_tokens) / TOKENS_PER_MILLION) * rate.prompt_per_1m_usd;
+
+    // Clamp `cached <= prompt` to keep the full-price slice >= 0.
+    let cached = usage.cached_input_tokens.min(usage.prompt_tokens);
+    let full_price_input = usage.prompt_tokens.saturating_sub(cached);
+
+    let full_price_cost =
+        (f64::from(full_price_input) / TOKENS_PER_MILLION) * rate.prompt_per_1m_usd;
+    let cached_cost =
+        (f64::from(cached) / TOKENS_PER_MILLION) * rate.prompt_per_1m_usd * CACHED_INPUT_DISCOUNT;
     let completion_cost =
         (f64::from(usage.completion_tokens) / TOKENS_PER_MILLION) * rate.completion_per_1m_usd;
-    prompt_cost + completion_cost
+    full_price_cost + cached_cost + completion_cost
 }
 
 /// Emit a `tracing::warn!` the first time `model` is observed without
@@ -344,6 +427,58 @@ mod tests {
     fn zero_usage_short_circuits_to_zero_cost() {
         let cost = estimate_cost_usd("never-seen-model", TokenUsage::default());
         assert_eq!(cost, 0.0);
+    }
+
+    #[test]
+    fn cached_input_tokens_apply_50_percent_discount() {
+        // gpt-4o flagship: $2.50/1M prompt, $10.00/1M completion.
+        // 1000 prompt tokens of which 600 are cache-hits.
+        // Full-price input  : 400 tokens * $2.50/1M = $0.001000
+        // Cached input      : 600 tokens * $2.50/1M * 0.5 = $0.000750
+        // Completion        : 1000 tokens * $10.00/1M = $0.010000
+        // Total             : $0.011750
+        let usage = TokenUsage::with_cache(1000, 1000, 600);
+        let cost = estimate_cost_usd("gpt-4o", usage);
+        assert!(
+            (cost - 0.011_750).abs() < 1e-9,
+            "expected ≈ $0.011750 with 60% cache hit, got {cost}"
+        );
+
+        // Sanity: zero cache hits matches the legacy non-cached cost.
+        let no_cache = estimate_cost_usd("gpt-4o", TokenUsage::new(1000, 1000));
+        // (1000/1e6)*2.50 + (1000/1e6)*10.00 = 0.0125
+        assert!((no_cache - 0.0125).abs() < 1e-9);
+
+        // Full cache hit: 1000 * $2.50/1M * 0.5 = $0.001250 input,
+        // plus completion $0.010000 = $0.011250. Less than no_cache.
+        let full_cache = estimate_cost_usd("gpt-4o", TokenUsage::with_cache(1000, 1000, 1000));
+        assert!((full_cache - 0.011_250).abs() < 1e-9);
+        assert!(full_cache < no_cache);
+    }
+
+    #[test]
+    fn cached_input_clamps_when_provider_returns_oversized_count() {
+        // Defensive: if a provider reports cached > prompt, the
+        // full-price slice would be negative without clamping. Verify
+        // the clamp keeps the cost identical to "all input cached".
+        let oversized = TokenUsage::with_cache(500, 100, 999_999);
+        let clamped = TokenUsage::with_cache(500, 100, 500);
+        assert!(
+            (estimate_cost_usd("gpt-4o", oversized) - estimate_cost_usd("gpt-4o", clamped)).abs()
+                < 1e-12,
+            "clamping must produce the same cost as the all-cached case"
+        );
+    }
+
+    #[test]
+    fn snapshot_exposes_cached_input_total() {
+        let budget = RequestBudget::new();
+        budget.record_call("gpt-4o", TokenUsage::with_cache(100, 50, 30));
+        budget.record_call("gpt-4o", TokenUsage::with_cache(200, 75, 80));
+        let snap = budget.snapshot();
+        assert_eq!(snap.cached_input_tokens, 110);
+        assert_eq!(snap.prompt_tokens, 300);
+        assert_eq!(snap.completion_tokens, 125);
     }
 
     #[test]

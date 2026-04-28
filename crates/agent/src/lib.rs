@@ -15,6 +15,7 @@
 //! - [`prompts`] -- System prompt constants
 //! - [`steps`] -- Pipeline step implementations
 
+pub mod agent_hook;
 pub mod claim_searcher;
 pub mod context;
 pub mod coverage;
@@ -25,6 +26,7 @@ pub mod steps;
 pub mod synthesis;
 pub mod verifier;
 
+pub use agent_hook::{AgentRsHook, COMPONENT_AGENT_RUNNER, COMPONENT_VERIFIER};
 pub use claim_searcher::{ClaimSearcher, RouterClaimSearcher};
 pub use context::QueryContext;
 pub use orchestrator::{AgentOrchestrator, OrchestratorDeps, QueryRequest};

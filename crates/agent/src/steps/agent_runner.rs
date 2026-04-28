@@ -2,88 +2,35 @@
 //! accumulates evidence from tool calls.
 //!
 //! Builds a per-request Rig agent with tools from the ToolFactory,
-//! runs it with multi-turn tool calling, and extracts the text answer
-//! and accumulated evidence.
+//! runs it with multi-turn tool calling via [`AgentRsHook`] for
+//! observability, and extracts the text answer along with accumulated
+//! evidence.
 
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::Mutex;
 
 use agent_rs_core::errors::AgentError;
+use agent_rs_observability::metrics::RetrievalMetrics;
 use agent_rs_stores::types::SearchResult;
 use rig::client::CompletionClient;
-use rig::completion::{Prompt, ToolDefinition};
-use rig::tool::{ToolDyn, ToolError};
-use rig::wasm_compat::WasmBoxedFuture;
+use rig::completion::Prompt;
 use serde_json::json;
 use tracing::{error, info, instrument};
 
+use crate::agent_hook::{AgentRsHook, COMPONENT_AGENT_RUNNER, drain_tool_calls};
 use crate::context::QueryContext;
-use crate::coverage::ToolCallRecord;
 use crate::prompts;
 use crate::steps::tool_factory::ToolFactory;
-
-// ---- Tool-call recording -----------------------------------------------
-
-/// Shared sink that `RecordingToolDyn` writes into after each tool call.
-type ToolCallSink = Arc<Mutex<Vec<ToolCallRecord>>>;
-
-/// Object-safe wrapper around any `Box<dyn ToolDyn>` that records
-/// each invocation's name and raw JSON args into a shared sink before
-/// delegating to the inner tool.
-///
-/// Because [`ToolDyn::call`] already receives `args` as a raw JSON `String`,
-/// no `Serialize` bound is required on the tool's concrete `Args` type.
-struct RecordingToolDyn {
-    inner: Box<dyn ToolDyn>,
-    sink: ToolCallSink,
-}
-
-impl ToolDyn for RecordingToolDyn {
-    fn name(&self) -> String {
-        self.inner.name()
-    }
-
-    fn definition<'a>(&'a self, prompt: String) -> WasmBoxedFuture<'a, ToolDefinition> {
-        self.inner.definition(prompt)
-    }
-
-    fn call<'a>(&'a self, args: String) -> WasmBoxedFuture<'a, Result<String, ToolError>> {
-        Box::pin(async move {
-            // Capture before delegating so we record even if the tool errors.
-            let record = ToolCallRecord {
-                tool_name: self.inner.name(),
-                args_json: args.clone(),
-            };
-            {
-                let mut guard = self.sink.lock().await;
-                guard.push(record);
-            }
-            self.inner.call(args).await
-        })
-    }
-}
-
-/// Wrap every tool in the given vector with a `RecordingToolDyn` that writes
-/// into `sink`. Returns the new vec of boxed tools.
-fn wrap_tools(tools: Vec<Box<dyn ToolDyn>>, sink: ToolCallSink) -> Vec<Box<dyn ToolDyn>> {
-    tools
-        .into_iter()
-        .map(|inner| -> Box<dyn ToolDyn> {
-            Box::new(RecordingToolDyn {
-                inner,
-                sink: Arc::clone(&sink),
-            })
-        })
-        .collect()
-}
 
 // ---- AgentRunner -------------------------------------------------------
 
 /// Runs the Rig agent with tools and extracts the answer.
 ///
-/// Each call to [`run`] builds a fresh agent with per-request tools
-/// and evidence collectors.
+/// Each call to [`Self::run`] builds a fresh agent with per-request
+/// tools, attaches a per-request [`AgentRsHook`] for budget + tool-
+/// call observability, and drains accumulated evidence into the
+/// query context.
 pub struct AgentRunner {
     /// rig-core OpenAI client for agent creation.
     llm_client: rig::providers::openai::Client,
@@ -99,6 +46,10 @@ pub struct AgentRunner {
     /// body (e.g. `{"reasoning_effort": "minimal"}`). `None` = no extras.
     /// Computed once at construction.
     additional_params: Option<serde_json::Value>,
+    /// Shared observability surface — fed into the per-request hook
+    /// so [`RetrievalMetrics::record_llm_call`] fires on every model
+    /// round-trip without manual call-site instrumentation.
+    metrics: Arc<RetrievalMetrics>,
 }
 
 impl AgentRunner {
@@ -115,6 +66,7 @@ impl AgentRunner {
     ///   top-level field on every Chat Completions request. Applies to
     ///   gpt-5.x / o-series reasoning models; non-reasoning models ignore
     ///   the unknown field. Empty string disables the override entirely.
+    /// - `metrics` -- Shared metrics surface routed into [`AgentRsHook`].
     ///
     /// # Errors
     ///
@@ -126,6 +78,7 @@ impl AgentRunner {
         system_prompt_file: &str,
         tool_factory: Arc<ToolFactory>,
         reasoning_effort: &str,
+        metrics: Arc<RetrievalMetrics>,
     ) -> Result<Self, AgentError> {
         let system_prompt = prompts::load_system_prompt(system_prompt_file);
         let llm_client = rig::providers::openai::Client::new(api_key).map_err(|e| {
@@ -143,6 +96,7 @@ impl AgentRunner {
             system_prompt,
             tool_factory,
             additional_params,
+            metrics,
         })
     }
 
@@ -168,11 +122,6 @@ impl AgentRunner {
             .tool_factory
             .build(&ctx.user_id, ctx.active_document_keys.clone());
 
-        // Wrap each tool in a recording adapter that captures (tool_name,
-        // args_json) into `tool_call_sink` before delegating to the real tool.
-        let tool_call_sink: ToolCallSink = Arc::new(Mutex::new(Vec::new()));
-        let recording_tools = wrap_tools(tools, Arc::clone(&tool_call_sink));
-
         // Build the prompt from chat history + current query
         let full_prompt = self.build_prompt(ctx);
 
@@ -183,22 +132,43 @@ impl AgentRunner {
             .llm_client
             .agent(&self.model)
             .preamble(&self.system_prompt)
-            .tools(recording_tools);
+            .tools(tools);
         let agent = match self.additional_params.as_ref() {
             Some(params) => builder.additional_params(params.clone()).build(),
             None => builder.build(),
         };
 
+        // Per-request hook: budget recording + tool-call recording +
+        // per-call observability metrics. Replaces the previous
+        // `RecordingToolDyn` indirection and the (planned but never
+        // wired) manual budget recording around `agent.prompt(...)`.
+        let tool_call_sink = AgentRsHook::new_tool_call_sink();
+        let hook = AgentRsHook::new(
+            COMPONENT_AGENT_RUNNER,
+            self.model.clone(),
+            Arc::clone(&ctx.budget),
+            Arc::clone(&tool_call_sink),
+            Arc::clone(&self.metrics),
+            start,
+        );
+
+        // `extended_details()` swaps the request's response type from
+        // `String` to `PromptResponse { output, usage, messages }` —
+        // we still hand the textual `output` back to the context, but
+        // the hook handles `usage` accumulation per turn so we don't
+        // also need the trailing `usage` here.
         let response = agent
             .prompt(&full_prompt)
             .max_turns(self.max_turns)
+            .with_hook(hook)
+            .extended_details()
             .await
             .map_err(|err| {
                 error!(error = %err, "agent run failed");
                 AgentError::Orchestrator(format!("agent run failed: {err}"))
             })?;
 
-        ctx.answer = response;
+        ctx.answer = response.output;
         info!(
             latency_ms = start.elapsed().as_millis() as u64,
             answer_len = ctx.answer.len(),
@@ -213,8 +183,9 @@ impl AgentRunner {
         drain_evidence(&coverage_collector, &mut ctx.coverage_evidence).await;
 
         // Drain recorded tool call args into ctx.tool_calls for use by
-        // the grounding gate (Task 5.1).
-        drain_tool_calls(&tool_call_sink, &mut ctx.tool_calls).await;
+        // the grounding gate (Task 5.1). The hook captured them via
+        // `on_tool_call` synchronously before each tool fired.
+        drain_tool_calls(&tool_call_sink, &mut ctx.tool_calls);
 
         ctx.agent_latency_ms = start.elapsed().as_millis() as u64;
         Ok(())
@@ -238,29 +209,43 @@ impl AgentRunner {
         // `drain_evidence` / `drain_tool_calls` use `append`, so new data
         // merges with existing.
 
+        let start = Instant::now();
+
         // Build per-request tools, KB evidence collector, and coverage collector
         // for the retry. Coverage evidence accumulates across retries via append.
         let (tools, evidence_collector, coverage_collector) = self
             .tool_factory
             .build(&ctx.user_id, ctx.active_document_keys.clone());
 
-        // Wrap tools with recording adapters for this retry round.
-        let tool_call_sink: ToolCallSink = Arc::new(Mutex::new(Vec::new()));
-        let recording_tools = wrap_tools(tools, Arc::clone(&tool_call_sink));
-
         let builder = self
             .llm_client
             .agent(&self.model)
             .preamble(&self.system_prompt)
-            .tools(recording_tools);
+            .tools(tools);
         let agent = match self.additional_params.as_ref() {
             Some(params) => builder.additional_params(params.clone()).build(),
             None => builder.build(),
         };
 
-        match agent.prompt(retry_prompt).max_turns(self.max_turns).await {
+        let tool_call_sink = AgentRsHook::new_tool_call_sink();
+        let hook = AgentRsHook::new(
+            COMPONENT_AGENT_RUNNER,
+            self.model.clone(),
+            Arc::clone(&ctx.budget),
+            Arc::clone(&tool_call_sink),
+            Arc::clone(&self.metrics),
+            start,
+        );
+
+        match agent
+            .prompt(retry_prompt)
+            .max_turns(self.max_turns)
+            .with_hook(hook)
+            .extended_details()
+            .await
+        {
             Ok(response) => {
-                ctx.answer = response;
+                ctx.answer = response.output;
             }
             Err(err) => {
                 return Err(AgentError::Orchestrator(format!(
@@ -277,7 +262,7 @@ impl AgentRunner {
         drain_evidence(&coverage_collector, &mut ctx.coverage_evidence).await;
 
         // Drain retry tool-call records (accumulated alongside evidence).
-        drain_tool_calls(&tool_call_sink, &mut ctx.tool_calls).await;
+        drain_tool_calls(&tool_call_sink, &mut ctx.tool_calls);
 
         Ok(())
     }
@@ -327,15 +312,6 @@ async fn drain_evidence(collector: &Arc<Mutex<Vec<SearchResult>>>, target: &mut 
     target.append(&mut collected);
 }
 
-/// Drain recorded tool-call records from the shared sink into `ctx.tool_calls`.
-///
-/// `append` is used so that retry rounds accumulate on top of the initial run's
-/// records — the grounding gate (Task 5.1) needs the full picture across turns.
-async fn drain_tool_calls(sink: &ToolCallSink, target: &mut Vec<ToolCallRecord>) {
-    let mut guard = sink.lock().await;
-    target.append(&mut guard);
-}
-
 // ---- Unit tests --------------------------------------------------------
 
 #[cfg(test)]
@@ -344,129 +320,6 @@ mod tests {
     use crate::context::QueryContext;
     use crate::coverage::{CoverageMode, CoveragePlan, SectionRef};
     use agent_rs_core::types::{RetrievalStrategy, UserId};
-    use rig::completion::ToolDefinition;
-    use serde_json::json;
-
-    // Minimal stand-in tool that echoes its raw JSON args back.
-    struct EchoTool {
-        name: String,
-    }
-
-    impl ToolDyn for EchoTool {
-        fn name(&self) -> String {
-            self.name.clone()
-        }
-
-        fn definition<'a>(&'a self, _prompt: String) -> WasmBoxedFuture<'a, ToolDefinition> {
-            let name = self.name.clone();
-            Box::pin(async move {
-                ToolDefinition {
-                    name,
-                    description: "Echo tool".into(),
-                    parameters: json!({}),
-                }
-            })
-        }
-
-        fn call<'a>(&'a self, args: String) -> WasmBoxedFuture<'a, Result<String, ToolError>> {
-            Box::pin(async move { Ok(args) })
-        }
-    }
-
-    #[tokio::test]
-    async fn recording_tool_captures_args_json_into_sink() {
-        let sink: ToolCallSink = Arc::new(Mutex::new(Vec::new()));
-        let recording = RecordingToolDyn {
-            inner: Box::new(EchoTool {
-                name: "echo".to_string(),
-            }),
-            sink: Arc::clone(&sink),
-        };
-
-        let args_json = r#"{"query":"segmentare metode"}"#;
-        let result = recording.call(args_json.to_string()).await;
-
-        // The inner echo tool returns the args unchanged.
-        assert!(result.is_ok(), "expected Ok from echo tool");
-        assert_eq!(result.unwrap(), args_json);
-
-        // The sink must contain exactly one record with the correct fields.
-        let guard = sink.lock().await;
-        assert_eq!(guard.len(), 1, "expected one recorded tool call");
-        assert_eq!(guard[0].tool_name, "echo");
-        assert_eq!(guard[0].args_json, args_json);
-    }
-
-    #[tokio::test]
-    async fn recording_tool_captures_multiple_calls() {
-        let sink: ToolCallSink = Arc::new(Mutex::new(Vec::new()));
-        let recording = RecordingToolDyn {
-            inner: Box::new(EchoTool {
-                name: "search_knowledge".to_string(),
-            }),
-            sink: Arc::clone(&sink),
-        };
-
-        recording
-            .call(r#"{"query":"first"}"#.to_string())
-            .await
-            .unwrap();
-        recording
-            .call(r#"{"query":"second"}"#.to_string())
-            .await
-            .unwrap();
-
-        let guard = sink.lock().await;
-        assert_eq!(guard.len(), 2);
-        assert_eq!(guard[0].args_json, r#"{"query":"first"}"#);
-        assert_eq!(guard[1].args_json, r#"{"query":"second"}"#);
-    }
-
-    #[tokio::test]
-    async fn drain_tool_calls_appends_to_existing() {
-        let sink: ToolCallSink = Arc::new(Mutex::new(vec![ToolCallRecord {
-            tool_name: "search_knowledge".into(),
-            args_json: r#"{"query":"new"}"#.into(),
-        }]));
-
-        let mut target = vec![ToolCallRecord {
-            tool_name: "search_web".into(),
-            args_json: r#"{"q":"existing"}"#.into(),
-        }];
-
-        drain_tool_calls(&sink, &mut target).await;
-
-        assert_eq!(target.len(), 2);
-        assert_eq!(target[0].tool_name, "search_web");
-        assert_eq!(target[1].tool_name, "search_knowledge");
-
-        // Sink must be empty after drain.
-        let guard = sink.lock().await;
-        assert!(guard.is_empty());
-    }
-
-    #[tokio::test]
-    async fn wrap_tools_records_into_shared_sink() {
-        let sink: ToolCallSink = Arc::new(Mutex::new(Vec::new()));
-        let tools: Vec<Box<dyn ToolDyn>> = vec![
-            Box::new(EchoTool {
-                name: "tool_a".to_string(),
-            }),
-            Box::new(EchoTool {
-                name: "tool_b".to_string(),
-            }),
-        ];
-        let wrapped = wrap_tools(tools, Arc::clone(&sink));
-
-        // Call each wrapped tool once.
-        wrapped[0].call(r#"{"a":1}"#.to_string()).await.unwrap();
-        wrapped[1].call(r#"{"b":2}"#.to_string()).await.unwrap();
-
-        let guard = sink.lock().await;
-        assert_eq!(guard.len(), 2);
-        assert_eq!(guard[0].tool_name, "tool_a");
-        assert_eq!(guard[1].tool_name, "tool_b");
-    }
 
     // ---- build_prompt + coverage plan injection tests -----
 
@@ -484,9 +337,6 @@ mod tests {
 
     #[test]
     fn build_prompt_no_coverage_plan_returns_query() {
-        // Create a minimal AgentRunner-like struct to call build_prompt.
-        // We can't construct AgentRunner without a real API key, so we test
-        // the helper function directly via the free function below.
         let ctx = make_ctx("what is segmentation?");
         let prompt = build_prompt_for_test(&ctx);
         assert_eq!(prompt, "what is segmentation?");
