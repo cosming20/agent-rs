@@ -100,7 +100,6 @@ pub struct QueryRunRow {
     pub answer: String,
     pub strategy: String,
     pub confidence: f64,
-    pub is_grounded: bool,
     pub created_at: DateTime<Utc>,
 }
 
@@ -120,7 +119,6 @@ impl QueryRunRow {
             answer: self.answer,
             strategy,
             confidence,
-            is_grounded: self.is_grounded,
             created_at: self.created_at.naive_utc(),
         })
     }
@@ -136,7 +134,6 @@ pub struct NewQueryRun<'a> {
     pub answer: &'a str,
     pub strategy: &'a str,
     pub confidence: f64,
-    pub is_grounded: bool,
 }
 
 impl<'a> NewQueryRun<'a> {
@@ -149,7 +146,6 @@ impl<'a> NewQueryRun<'a> {
             answer: &run.answer,
             strategy: strategy_to_str(run.strategy),
             confidence: run.confidence.value(),
-            is_grounded: run.is_grounded,
         }
     }
 }

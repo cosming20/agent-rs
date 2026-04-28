@@ -46,7 +46,6 @@ diesel::table! {
         answer -> Text,
         strategy -> Text,
         confidence -> Float8,
-        is_grounded -> Bool,
         created_at -> Timestamptz,
     }
 }
@@ -60,7 +59,6 @@ diesel::table! {
         strategy -> Text,
         evidence_count -> Int4,
         avg_relevance_score -> Nullable<Float4>,
-        is_grounded -> Nullable<Bool>,
         confidence -> Nullable<Float4>,
         latency_ms -> Int8,
         required_retry -> Bool,

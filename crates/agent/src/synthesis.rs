@@ -63,12 +63,12 @@ pub struct Citation {
 
 /// Final agent response with citations and provenance.
 ///
-/// The previous verifier-driven `is_grounded` / `claim_confidences` /
-/// `ungrounded_claims` fields were dropped when the LLM grounding gate
-/// was removed. Coverage callers continue to read [`Self::coverage_report`]
-/// for exhaustive-flow signals; non-exhaustive consumers rely on
-/// [`Self::confidence`] (now a deterministic answer-vs-evidence token
-/// overlap) plus the answer prose itself.
+/// Coverage callers read [`Self::coverage_report`] for exhaustive-flow
+/// signals; non-exhaustive consumers rely on [`Self::confidence`] (a
+/// deterministic answer-vs-evidence token overlap) plus the answer prose
+/// itself. There is no separate verifier-driven grounding signal — the
+/// confidence scalar is the single source of truth for "did the answer
+/// stay anchored in retrieved evidence?".
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SynthesizedResponse {
     /// The synthesized answer text.

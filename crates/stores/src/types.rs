@@ -358,7 +358,6 @@ pub struct QueryRun {
     pub answer: String,
     pub strategy: RetrievalStrategy,
     pub confidence: Confidence,
-    pub is_grounded: bool,
     pub created_at: NaiveDateTime,
 }
 
