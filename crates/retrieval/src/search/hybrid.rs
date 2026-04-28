@@ -21,7 +21,11 @@ use agent_rs_stores::{
 };
 use tracing::instrument;
 
-use super::{graph::graph_search, keyword::keyword_search, vector::vector_search};
+use super::{
+    graph::{GraphSearchInputs, graph_search},
+    keyword::keyword_search,
+    vector::vector_search,
+};
 use crate::error::RetrievalError;
 
 // ---- HybridResults ----
@@ -164,16 +168,16 @@ pub async fn graph_hybrid_search(
             params.query_text,
             params.limit
         ),
-        graph_search(
-            graph_store,
-            vector_store,
+        graph_search(GraphSearchInputs {
+            graph: graph_store,
+            vectors: vector_store,
             collection,
             user_id,
-            params.query,
-            params.seed_node_ids,
-            params.max_depth,
-            params.limit
-        ),
+            query: params.query,
+            seed_node_ids: params.seed_node_ids,
+            max_depth: params.max_depth,
+            limit: params.limit,
+        }),
     );
 
     Ok(HybridResults {

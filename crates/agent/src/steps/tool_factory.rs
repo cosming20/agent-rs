@@ -33,6 +33,37 @@ pub type ToolSet = (
     Arc<Mutex<Vec<SearchResult>>>,
 );
 
+/// Dependencies required to build a [`ToolFactory`].
+///
+/// Bundles the four shared store / router handles, the two collection
+/// names, and the three external-tool config blocks so the constructor
+/// signature stays compact and call sites read top-down by group rather
+/// than as a long positional list.
+///
+/// Constructed once at startup; the factory clones internal `Arc`s and
+/// owned config values so the caller may continue to use the originals
+/// after passing this struct to [`ToolFactory::new`].
+pub struct ToolFactoryDeps {
+    /// Shared retrieval router for knowledge search.
+    pub router: Arc<RetrievalRouter>,
+    /// Shared Postgres handle for memory / telemetry tools.
+    pub pg_store: Arc<PgStore>,
+    /// Shared Neo4j store for coverage-aware tools.
+    pub neo4j: Arc<Neo4jStore>,
+    /// Shared Qdrant store for coverage-aware tools.
+    pub qdrant: Arc<QdrantStore>,
+    /// Primary Qdrant chunk collection name.
+    pub default_collection: String,
+    /// Per-section summaries Qdrant collection name.
+    pub summaries_collection: String,
+    /// Brave Search API configuration.
+    pub brave_config: BraveConfig,
+    /// URL fetch configuration.
+    pub fetch_config: FetchConfig,
+    /// Per-query web budget limits.
+    pub web_budget_config: WebBudgetConfig,
+}
+
 /// Builds per-request tool sets for the Rig agent.
 ///
 /// Constructed once at startup with shared dependencies. Each call to
@@ -72,32 +103,25 @@ impl ToolFactory {
     ///
     /// # Parameters
     ///
-    /// - `router` -- shared retrieval router for knowledge search.
-    /// - `pg_store` -- shared Postgres handle for memory / telemetry tools.
-    /// - `neo4j` -- shared Neo4j store for coverage-aware tools.
-    /// - `qdrant` -- shared Qdrant store for coverage-aware tools.
-    /// - `default_collection` -- primary Qdrant chunk collection name.
-    /// - `summaries_collection` -- per-section summaries Qdrant collection name.
-    /// - `brave_config` -- Brave Search API configuration.
-    /// - `fetch_config` -- URL fetch configuration.
-    /// - `web_budget_config` -- per-query web budget limits.
+    /// - `deps` -- shared stores, collection names, and external-tool
+    ///   configuration bundled into [`ToolFactoryDeps`].
     ///
     /// # Errors
     ///
     /// Returns [`AgentError::Orchestrator`] if the shared HTTP client cannot
     /// be constructed (e.g. invalid TLS configuration).
-    #[allow(clippy::too_many_arguments)]
-    pub fn new(
-        router: Arc<RetrievalRouter>,
-        pg_store: Arc<PgStore>,
-        neo4j: Arc<Neo4jStore>,
-        qdrant: Arc<QdrantStore>,
-        default_collection: String,
-        summaries_collection: String,
-        brave_config: BraveConfig,
-        fetch_config: FetchConfig,
-        web_budget_config: WebBudgetConfig,
-    ) -> Result<Self, AgentError> {
+    pub fn new(deps: ToolFactoryDeps) -> Result<Self, AgentError> {
+        let ToolFactoryDeps {
+            router,
+            pg_store,
+            neo4j,
+            qdrant,
+            default_collection,
+            summaries_collection,
+            brave_config,
+            fetch_config,
+            web_budget_config,
+        } = deps;
         let http_client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(brave_config.timeout_s))
             .build()

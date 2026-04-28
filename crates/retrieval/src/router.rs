@@ -39,7 +39,8 @@ use crate::{
     reranker::{CrossEncoderReranker, RERANK_CANDIDATE_COUNT},
     search::{
         graph::{
-            graph_constrained_search, graph_cot_search, graph_rag_context_search, graph_search,
+            GraphSearchInputs, graph_constrained_search, graph_cot_search,
+            graph_rag_context_search, graph_search,
         },
         triplet::triplet_search,
     },
@@ -1268,16 +1269,16 @@ impl RetrievalRouter {
             // a Qdrant outage results in a partial answer, not a 500.
             RetrievalStrategy::Semantic => {
                 if !self.breaker_allows_qdrant(strategy) {
-                    let fallback = keyword_search_or_warn(
-                        &*self.vector_store,
-                        &self.collection,
+                    let fallback = keyword_search_or_warn(KeywordSearchArgs {
+                        vector_store: &*self.vector_store,
+                        collection: &self.collection,
                         user_id,
                         query_str,
                         limit,
-                        extra_filter.cloned(),
-                        "Semantic_fallback",
-                        m,
-                    )
+                        extra_filter: extra_filter.cloned(),
+                        strategy: "Semantic_fallback",
+                        metrics: m,
+                    })
                     .await;
                     return Ok(vec![fallback]);
                 }
@@ -1296,18 +1297,19 @@ impl RetrievalRouter {
             // ---- Single-backend: summaries vector ----
             RetrievalStrategy::Summaries => {
                 if !self.breaker_allows_qdrant(strategy) {
-                    let fallback = keyword_search_or_warn(
-                        &*self.vector_store,
-                        self.summaries_collection
+                    let fallback = keyword_search_or_warn(KeywordSearchArgs {
+                        vector_store: &*self.vector_store,
+                        collection: self
+                            .summaries_collection
                             .as_ref()
                             .unwrap_or(&self.collection),
                         user_id,
                         query_str,
                         limit,
-                        extra_filter.cloned(),
-                        "Summaries_fallback",
-                        m,
-                    )
+                        extra_filter: extra_filter.cloned(),
+                        strategy: "Summaries_fallback",
+                        metrics: m,
+                    })
                     .await;
                     return Ok(vec![fallback]);
                 }
@@ -1326,16 +1328,16 @@ impl RetrievalRouter {
             // ---- Single-backend: temporal vector ----
             RetrievalStrategy::Temporal => {
                 if !self.breaker_allows_qdrant(strategy) {
-                    let fallback = keyword_search_or_warn(
-                        &*self.vector_store,
-                        &self.collection,
+                    let fallback = keyword_search_or_warn(KeywordSearchArgs {
+                        vector_store: &*self.vector_store,
+                        collection: &self.collection,
                         user_id,
                         query_str,
                         limit,
-                        extra_filter.cloned(),
-                        "Temporal_fallback",
-                        m,
-                    )
+                        extra_filter: extra_filter.cloned(),
+                        strategy: "Temporal_fallback",
+                        metrics: m,
+                    })
                     .await;
                     return Ok(vec![fallback]);
                 }
@@ -1361,16 +1363,16 @@ impl RetrievalRouter {
             // still returns an empty answer rather than a 500. The warning
             // is structured so operators can alert on sustained rates.
             RetrievalStrategy::Keyword => {
-                let results = keyword_search_or_warn(
-                    &*self.vector_store,
-                    &self.collection,
+                let results = keyword_search_or_warn(KeywordSearchArgs {
+                    vector_store: &*self.vector_store,
+                    collection: &self.collection,
                     user_id,
                     query_str,
                     limit,
-                    extra_filter.cloned(),
-                    "Keyword",
-                    m,
-                )
+                    extra_filter: extra_filter.cloned(),
+                    strategy: "Keyword",
+                    metrics: m,
+                })
                 .await;
                 Ok(vec![results])
             }
@@ -1383,16 +1385,16 @@ impl RetrievalRouter {
                     .await?;
                 let results = self
                     .timed_graph(|| {
-                        graph_search(
-                            &*self.graph_store,
-                            &*self.vector_store,
-                            &self.collection,
+                        graph_search(GraphSearchInputs {
+                            graph: &*self.graph_store,
+                            vectors: &*self.vector_store,
+                            collection: &self.collection,
                             user_id,
-                            query_str,
-                            &seeds,
-                            DEFAULT_GRAPH_DEPTH,
+                            query: query_str,
+                            seed_node_ids: &seeds,
+                            max_depth: DEFAULT_GRAPH_DEPTH,
                             limit,
-                        )
+                        })
                     })
                     .await?;
                 Ok(vec![results])
@@ -1405,16 +1407,16 @@ impl RetrievalRouter {
                     .await?;
                 let results = self
                     .timed_graph(|| {
-                        graph_rag_context_search(
-                            &*self.graph_store,
-                            &*self.vector_store,
-                            &self.collection,
+                        graph_rag_context_search(GraphSearchInputs {
+                            graph: &*self.graph_store,
+                            vectors: &*self.vector_store,
+                            collection: &self.collection,
                             user_id,
-                            query_str,
-                            &seeds,
-                            DEFAULT_GRAPH_DEPTH,
+                            query: query_str,
+                            seed_node_ids: &seeds,
+                            max_depth: DEFAULT_GRAPH_DEPTH,
                             limit,
-                        )
+                        })
                     })
                     .await?;
                 Ok(vec![results])
@@ -1439,16 +1441,16 @@ impl RetrievalRouter {
                     .await?;
                 let initial = self
                     .timed_graph(|| {
-                        graph_cot_search(
-                            &*self.graph_store,
-                            &*self.vector_store,
-                            &self.collection,
+                        graph_cot_search(GraphSearchInputs {
+                            graph: &*self.graph_store,
+                            vectors: &*self.vector_store,
+                            collection: &self.collection,
                             user_id,
-                            query_str,
-                            &seeds,
-                            DEFAULT_GRAPH_DEPTH,
+                            query: query_str,
+                            seed_node_ids: &seeds,
+                            max_depth: DEFAULT_GRAPH_DEPTH,
                             limit,
-                        )
+                        })
                     })
                     .await?;
 
@@ -1466,16 +1468,16 @@ impl RetrievalRouter {
                             .derive_seed_ids(uid, &follow_up, &f_dense, cot_limit)
                             .await?;
                         this.timed_graph(|| {
-                            graph_search(
-                                &*this.graph_store,
-                                &*this.vector_store,
-                                &this.collection,
-                                uid,
-                                &follow_up,
-                                &f_seeds,
-                                depth,
-                                cot_limit,
-                            )
+                            graph_search(GraphSearchInputs {
+                                graph: &*this.graph_store,
+                                vectors: &*this.vector_store,
+                                collection: &this.collection,
+                                user_id: uid,
+                                query: &follow_up,
+                                seed_node_ids: &f_seeds,
+                                max_depth: depth,
+                                limit: cot_limit,
+                            })
                         })
                         .await
                     };
@@ -1504,16 +1506,16 @@ impl RetrievalRouter {
             // path), and the result list is wrapped in a single-list `Vec`.
             RetrievalStrategy::Hybrid => {
                 if !self.breaker_allows_qdrant(strategy) {
-                    let fallback = keyword_search_or_warn(
-                        &*self.vector_store,
-                        &self.collection,
+                    let fallback = keyword_search_or_warn(KeywordSearchArgs {
+                        vector_store: &*self.vector_store,
+                        collection: &self.collection,
                         user_id,
                         query_str,
                         limit,
-                        extra_filter.cloned(),
-                        "Hybrid_fallback",
-                        m,
-                    )
+                        extra_filter: extra_filter.cloned(),
+                        strategy: "Hybrid_fallback",
+                        metrics: m,
+                    })
                     .await;
                     return Ok(vec![fallback]);
                 }
@@ -1525,16 +1527,16 @@ impl RetrievalRouter {
                         limit,
                         extra_filter.cloned(),
                     ),
-                    keyword_search_or_warn(
-                        &*self.vector_store,
-                        &self.collection,
+                    keyword_search_or_warn(KeywordSearchArgs {
+                        vector_store: &*self.vector_store,
+                        collection: &self.collection,
                         user_id,
                         query_str,
                         limit,
-                        extra_filter.cloned(),
-                        "Hybrid",
-                        m,
-                    ),
+                        extra_filter: extra_filter.cloned(),
+                        strategy: "Hybrid",
+                        metrics: m,
+                    }),
                 );
                 Ok(vec![vector_result?, keyword_result])
             }
@@ -1566,26 +1568,26 @@ impl RetrievalRouter {
                 };
                 let (vector_result, keyword_result, graph_result) = tokio::join!(
                     dense_fut,
-                    keyword_search_or_warn(
-                        &*self.vector_store,
-                        &self.collection,
+                    keyword_search_or_warn(KeywordSearchArgs {
+                        vector_store: &*self.vector_store,
+                        collection: &self.collection,
                         user_id,
                         query_str,
                         limit,
-                        extra_filter.cloned(),
-                        "GraphHybrid",
-                        m,
-                    ),
-                    self.timed_graph(|| graph_search(
-                        &*self.graph_store,
-                        &*self.vector_store,
-                        &self.collection,
+                        extra_filter: extra_filter.cloned(),
+                        strategy: "GraphHybrid",
+                        metrics: m,
+                    }),
+                    self.timed_graph(|| graph_search(GraphSearchInputs {
+                        graph: &*self.graph_store,
+                        vectors: &*self.vector_store,
+                        collection: &self.collection,
                         user_id,
-                        query_str,
-                        &seeds,
-                        DEFAULT_GRAPH_DEPTH,
+                        query: query_str,
+                        seed_node_ids: &seeds,
+                        max_depth: DEFAULT_GRAPH_DEPTH,
                         limit,
-                    )),
+                    })),
                 );
                 Ok(vec![vector_result?, keyword_result, graph_result?])
             }
@@ -1609,30 +1611,30 @@ impl RetrievalRouter {
                     } else {
                         // Fall back to keyword so the strategy keeps a
                         // non-graph signal while the breaker is Open.
-                        Ok(keyword_search_or_warn(
-                            &*self.vector_store,
-                            &self.collection,
+                        Ok(keyword_search_or_warn(KeywordSearchArgs {
+                            vector_store: &*self.vector_store,
+                            collection: &self.collection,
                             user_id,
                             query_str,
                             limit,
-                            extra_filter.cloned(),
-                            "GraphConstrained_fallback",
-                            m,
-                        )
+                            extra_filter: extra_filter.cloned(),
+                            strategy: "GraphConstrained_fallback",
+                            metrics: m,
+                        })
                         .await)
                     }
                 };
                 let (graph_result, vector_result) = tokio::join!(
-                    self.timed_graph(|| graph_constrained_search(
-                        &*self.graph_store,
-                        &*self.vector_store,
-                        &self.collection,
+                    self.timed_graph(|| graph_constrained_search(GraphSearchInputs {
+                        graph: &*self.graph_store,
+                        vectors: &*self.vector_store,
+                        collection: &self.collection,
                         user_id,
-                        query_str,
-                        &seeds,
-                        DEFAULT_GRAPH_DEPTH,
+                        query: query_str,
+                        seed_node_ids: &seeds,
+                        max_depth: DEFAULT_GRAPH_DEPTH,
                         limit,
-                    )),
+                    })),
                     dense_fut,
                 );
                 Ok(vec![graph_result?, vector_result?])
@@ -1663,17 +1665,44 @@ impl RetrievalRouter {
 /// across the lexical/BM25 fallback path regardless of the underlying
 /// engine (Qdrant BM25 today, dedicated Postgres FTS in a future
 /// phase) so dashboards remain stable across infra migrations.
-#[allow(clippy::too_many_arguments)] // every argument is load-bearing wiring; bundling them into a config struct adds indirection without callsite clarity gains.
-async fn keyword_search_or_warn(
-    vector_store: &dyn VectorStore,
-    collection: &CollectionName,
-    user_id: &UserId,
-    query_str: &str,
+/// Per-call arguments to [`keyword_search_or_warn`].
+///
+/// Bundles the eight inputs into a single struct so every fanout call site
+/// in the retrieval router reads as one coherent unit — store + user-scoped
+/// query + breaker label + optional metrics — rather than as a long
+/// positional list whose argument order is easy to misread.
+struct KeywordSearchArgs<'a> {
+    /// Vector store handle that exposes the BM25 keyword path.
+    vector_store: &'a dyn VectorStore,
+    /// Qdrant collection to search.
+    collection: &'a CollectionName,
+    /// Calling user (results are filtered by tenant).
+    user_id: &'a UserId,
+    /// Raw query string used as the BM25 input.
+    query_str: &'a str,
+    /// Max number of results to return.
     limit: usize,
+    /// Optional Qdrant payload filter to AND with the user filter.
     extra_filter: Option<serde_json::Value>,
+    /// Strategy label used in warning logs ("Hybrid", "GraphHybrid", ...).
     strategy: &'static str,
-    metrics: Option<&RetrievalMetrics>,
+    /// Optional metric handle for `postgres.fts_duration_ms`.
+    metrics: Option<&'a RetrievalMetrics>,
+}
+
+async fn keyword_search_or_warn(
+    args: KeywordSearchArgs<'_>,
 ) -> Vec<agent_rs_stores::types::SearchResult> {
+    let KeywordSearchArgs {
+        vector_store,
+        collection,
+        user_id,
+        query_str,
+        limit,
+        extra_filter,
+        strategy,
+        metrics,
+    } = args;
     let started = Instant::now();
     let outcome = vector_store
         .keyword_search_for_user(collection, user_id, query_str, limit, extra_filter)

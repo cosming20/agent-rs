@@ -92,24 +92,51 @@ fn api_key() -> Option<String> {
 // Router builder
 // ---------------------------------------------------------------------------
 
+/// Inputs required to assemble a [`RetrievalRouter`].
+///
+/// Bundles the seven mandatory wiring handles (settings, stores, embedder,
+/// the three collection names, the feature toggle, and the shared metrics
+/// handle) so [`build_router`] stays at one positional argument and call
+/// sites can pass a structured init block built once at startup.
+///
+/// Caller retains ownership of the inner `Arc`s and is free to keep using
+/// them after the call returns — `build_router` clones the handles it
+/// needs and reads the rest by reference.
+pub struct RouterAssembly<'a> {
+    /// Application settings (reranker config, BM25 tuning, breaker, …).
+    pub settings: &'a Settings,
+    /// Shared store handles for Qdrant + Neo4j + Postgres.
+    pub stores: &'a Stores,
+    /// Embedder shared with the router and downstream cognitive features.
+    pub embedder: Arc<dyn Embedder + Send + Sync>,
+    /// Primary chunk collection (the router's default search target).
+    pub collection: &'a CollectionName,
+    /// Triplets collection used by the triplet retrieval back-end.
+    pub triplet_collection: &'a CollectionName,
+    /// Per-section summaries collection used by the summaries strategy.
+    pub summaries_collection: &'a CollectionName,
+    /// Cognitive-feature toggle bundle.
+    pub features: &'a RouterFeatures,
+    /// Shared metric handle for retrieval timing + counter instruments.
+    pub metrics: Arc<RetrievalMetrics>,
+}
+
 /// Build a fully-wired [`RetrievalRouter`] with cognitive retrieval features.
 ///
 /// Features (query rewriting, metadata filtering, context expansion,
 /// entity linking, reranking, GraphCoT) are each gated by the
-/// corresponding flag in `features` AND by the presence of an API key.
-// All arguments are mandatory wiring inputs; a config struct would add
-// indirection without clarity gains at these call sites.
-#[allow(clippy::too_many_arguments)]
-pub async fn build_router(
-    settings: &Settings,
-    stores: &Stores,
-    embedder: Arc<dyn Embedder + Send + Sync>,
-    collection: &CollectionName,
-    triplet_collection: &CollectionName,
-    summaries_collection: &CollectionName,
-    features: &RouterFeatures,
-    metrics: Arc<RetrievalMetrics>,
-) -> Result<Arc<RetrievalRouter>> {
+/// corresponding flag in `assembly.features` AND by the presence of an API key.
+pub async fn build_router(assembly: RouterAssembly<'_>) -> Result<Arc<RetrievalRouter>> {
+    let RouterAssembly {
+        settings,
+        stores,
+        embedder,
+        collection,
+        triplet_collection,
+        summaries_collection,
+        features,
+        metrics,
+    } = assembly;
     // Build one shared HTTP client for all LLM-calling components.
     // 60-second request timeout; connection timeout is 10 s (set in build_http_client).
     let http_client = build_http_client(Duration::from_secs(60))

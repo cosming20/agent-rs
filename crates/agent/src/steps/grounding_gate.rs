@@ -143,6 +143,25 @@ pub(crate) fn should_promote_via_coverage(report: Option<&CoverageReport>) -> bo
     report.is_some_and(|r| r.expected > 0 && r.is_complete())
 }
 
+/// Per-instance tuning knobs for the [`GroundingGate`].
+///
+/// Bundles the four scalar / enum fields that come straight from
+/// [`agent_rs_core::config::GroundingConfig`] so the constructor signature
+/// stays compact. Constructed once at startup; the gate reads each field
+/// per-request without further mutation.
+pub struct GroundingGateConfig {
+    /// Total number of retry iterations the gate may perform per request.
+    pub max_retries: usize,
+    /// Character threshold for the subject-absence pre-filter (sourced
+    /// from [`agent_rs_core::config::GroundingConfig::subject_min_token_len`]).
+    pub subject_min_token_len: usize,
+    /// Selects between claim-directed and agent-rerun retry semantics.
+    pub retry_strategy: RetryStrategy,
+    /// Per-claim retrieval breadth (consulted only under
+    /// [`RetryStrategy::ClaimDirected`]).
+    pub claim_search_top_k: usize,
+}
+
 /// Verify answer grounding and retry if needed.
 pub struct GroundingGate {
     verifier: Arc<GroundingVerifier>,
@@ -176,29 +195,24 @@ impl GroundingGate {
     /// # Parameters
     ///
     /// - `verifier` — LLM (or heuristic) faithfulness verifier.
-    /// - `max_retries` — total number of retry iterations the gate may
-    ///   perform per request.
-    /// - `subject_min_token_len` — character threshold for the
-    ///   subject-absence pre-filter (sourced from
-    ///   [`agent_rs_core::config::GroundingConfig`]).
     /// - `claim_searcher` — handle used by the claim-directed retry
     ///   path. Use [`crate::claim_searcher::RouterClaimSearcher`] in
     ///   production; mocks in tests.
-    /// - `retry_strategy` — selects between claim-directed and
-    ///   agent-rerun retry semantics.
-    /// - `claim_search_top_k` — per-claim retrieval breadth (consulted
-    ///   only under [`RetryStrategy::ClaimDirected`]).
     /// - `metrics` — shared OTel instruments for retry telemetry.
-    #[allow(clippy::too_many_arguments)]
+    /// - `config` — per-instance tuning knobs sourced from
+    ///   [`agent_rs_core::config::GroundingConfig`].
     pub fn new(
         verifier: Arc<GroundingVerifier>,
-        max_retries: usize,
-        subject_min_token_len: usize,
         claim_searcher: Arc<dyn ClaimSearcher>,
-        retry_strategy: RetryStrategy,
-        claim_search_top_k: usize,
         metrics: Arc<RetrievalMetrics>,
+        config: GroundingGateConfig,
     ) -> Self {
+        let GroundingGateConfig {
+            max_retries,
+            subject_min_token_len,
+            retry_strategy,
+            claim_search_top_k,
+        } = config;
         Self {
             verifier,
             max_retries,
@@ -759,12 +773,14 @@ mod tests_claim_directed_retry {
         let verifier = Arc::new(crate::verifier::GroundingVerifier::new(1.1, "", "test"));
         GroundingGate::new(
             verifier,
-            /* max_retries */ 1,
-            /* subject_min_token_len */ 4,
             searcher,
-            retry_strategy,
-            /* claim_search_top_k */ 3,
             metrics,
+            GroundingGateConfig {
+                max_retries: 1,
+                subject_min_token_len: 4,
+                retry_strategy,
+                claim_search_top_k: 3,
+            },
         )
     }
 

@@ -27,6 +27,6 @@ pub mod verifier;
 
 pub use claim_searcher::{ClaimSearcher, RouterClaimSearcher};
 pub use context::QueryContext;
-pub use orchestrator::AgentOrchestrator;
+pub use orchestrator::{AgentOrchestrator, OrchestratorDeps, QueryRequest};
 pub use synthesis::{Citation, ResponseSynthesizer, SynthesizedResponse};
 pub use verifier::{GroundingVerifier, VerificationResult};

@@ -25,7 +25,8 @@ pub mod vector;
 
 // Re-export frequently used items at the search module level.
 pub use graph::{
-    graph_constrained_search, graph_cot_search, graph_rag_context_search, graph_search,
+    GraphSearchInputs, graph_constrained_search, graph_cot_search, graph_rag_context_search,
+    graph_search,
 };
 pub use hybrid::{GraphHybridParams, HybridResults, graph_hybrid_search, hybrid_search};
 pub use keyword::keyword_search;

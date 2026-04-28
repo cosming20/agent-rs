@@ -680,7 +680,6 @@ impl GraphStore for Neo4jStore {
 /// The domain `id` property must be stored on the node as a string property
 /// named `"id"`. The first label is used as the [`crate::types::NodeLabel`].
 // StoreError is 184 bytes due to string variants — acceptable for internal conversion helper
-#[allow(clippy::result_large_err)]
 fn bolt_node_to_graph_node(node: neo4rs::Node) -> Result<GraphNode, StoreError> {
     let id: String = node
         .get("id")
@@ -723,7 +722,6 @@ fn bolt_node_to_graph_node(node: neo4rs::Node) -> Result<GraphNode, StoreError> 
 /// from the alternating node / relationship sequence. Bolt path
 /// relationships carry no start/end node ids, so we zip consecutive
 /// node pairs with the relation list.
-#[allow(clippy::result_large_err)]
 fn bolt_path_to_graph_path(path: neo4rs::Path) -> Result<GraphPath, StoreError> {
     let graph_nodes: Vec<GraphNode> = path
         .nodes()

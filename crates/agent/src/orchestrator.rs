@@ -27,11 +27,68 @@ use crate::steps::context_builder::ContextBuilder;
 use crate::steps::coverage_planner::CoveragePlanner;
 use crate::steps::coverage_verifier::CoverageVerifier;
 use crate::steps::evidence_fuser::EvidenceFuser;
-use crate::steps::grounding_gate::GroundingGate;
+use crate::steps::grounding_gate::{GroundingGate, GroundingGateConfig};
 use crate::steps::result_persister::ResultPersister;
-use crate::steps::tool_factory::ToolFactory;
+use crate::steps::tool_factory::{ToolFactory, ToolFactoryDeps};
 use crate::synthesis::{ResponseSynthesizer, SynthesizedResponse};
 use crate::verifier::GroundingVerifier;
+
+/// Shared dependencies required to build an [`AgentOrchestrator`].
+///
+/// Bundling these into a single struct keeps the constructor signature
+/// compact and call sites read as "give me an orchestrator with these
+/// stores + the retrieval router + metrics" rather than a long positional
+/// list of `Arc`s and collection names.
+///
+/// Construct once at startup; the orchestrator clones the shared `Arc`
+/// handles internally, so callers may continue to use the originals after
+/// passing this struct to [`AgentOrchestrator::new`].
+pub struct OrchestratorDeps {
+    /// Shared Neo4j graph store, used by the [`CoveragePlanner`] and the
+    /// coverage-aware tools (`outline_corpus`, `fetch_section_chunks`,
+    /// `search_sections`).
+    pub neo4j: Arc<Neo4jStore>,
+    /// Shared Postgres store for history, memory, runs, and ingested-
+    /// document listing.
+    pub pg_store: Arc<PgStore>,
+    /// Shared Qdrant vector store for coverage-aware tools.
+    pub qdrant: Arc<QdrantStore>,
+    /// Name of the primary Qdrant chunk collection.
+    pub default_collection: String,
+    /// Name of the per-section summaries collection.
+    pub summaries_collection: String,
+    /// Shared retrieval router for knowledge search and claim-directed
+    /// retries.
+    pub router: Arc<RetrievalRouter>,
+    /// Shared metric instruments for the retrieval pipeline.
+    pub metrics: Arc<RetrievalMetrics>,
+}
+
+/// Inputs for a single [`AgentOrchestrator::process_query`] invocation.
+///
+/// Bundled into a named struct so the entrypoint stays at one positional
+/// argument. Per-request — never reused across calls. Clone-on-construct
+/// patterns (`String`, `Vec<String>`) are preserved verbatim from the
+/// previous positional API to avoid surprising upstream gRPC handlers
+/// that build these from owned protobuf payloads.
+pub struct QueryRequest {
+    /// Raw user question or instruction.
+    pub query: String,
+    /// Identifier of the requesting user.
+    pub user_id: UserId,
+    /// Prior conversation turns. Empty for a fresh thread. Replayed
+    /// inline; never persisted on the agent side.
+    pub history: Vec<ChatTurn>,
+    /// MinIO keys of documents scoped to this request. The union
+    /// `active ∪ history` determines the retrieval filter.
+    pub active_document_keys: Vec<String>,
+    /// Retrieval strategy to use.
+    pub strategy: RetrievalStrategy,
+    /// Maximum number of evidence documents to retrieve.
+    pub limit: usize,
+    /// Optional client correlation UUID for log linking.
+    pub trace_id: Option<Uuid>,
+}
 
 /// Coordinates the full query processing pipeline.
 ///
@@ -69,31 +126,22 @@ impl AgentOrchestrator {
     /// # Parameters
     ///
     /// - `settings` -- application configuration.
-    /// - `neo4j` -- shared Neo4j graph store, used by [`CoveragePlanner`] and
-    ///   the coverage-aware tools (`outline_corpus`, `fetch_section_chunks`,
-    ///   `search_sections`).
-    /// - `pg_store` -- shared Postgres store for history, memory, runs, and
-    ///   ingested-document listing.
-    /// - `qdrant` -- shared Qdrant vector store for coverage-aware tools.
-    /// - `default_collection` -- name of the primary Qdrant chunk collection.
-    /// - `summaries_collection` -- name of the per-section summaries collection.
-    /// - `router` -- shared retrieval router for knowledge search.
-    /// - `metrics` -- shared metric instruments for the retrieval pipeline.
+    /// - `deps` -- shared stores, retrieval router, and metric handles
+    ///   bundled into [`OrchestratorDeps`].
     ///
     /// # Errors
     ///
     /// Returns `AgentError::Orchestrator` if the LLM client cannot be created.
-    #[allow(clippy::too_many_arguments)]
-    pub fn new(
-        settings: &Settings,
-        neo4j: Arc<Neo4jStore>,
-        pg_store: Arc<PgStore>,
-        qdrant: Arc<QdrantStore>,
-        default_collection: String,
-        summaries_collection: String,
-        router: Arc<RetrievalRouter>,
-        metrics: Arc<RetrievalMetrics>,
-    ) -> Result<Self, AgentError> {
+    pub fn new(settings: &Settings, deps: OrchestratorDeps) -> Result<Self, AgentError> {
+        let OrchestratorDeps {
+            neo4j,
+            pg_store,
+            qdrant,
+            default_collection,
+            summaries_collection,
+            router,
+            metrics,
+        } = deps;
         // Erase the concrete PgStore to the StateStore trait for the
         // persister path that only needs trait-level methods.
         let store: Arc<dyn StateStore> = Arc::clone(&pg_store) as _;
@@ -112,17 +160,17 @@ impl AgentOrchestrator {
         // can call PgStore::list_ingested_documents(), which isn't part of the
         // StateStore trait. Also receives neo4j and qdrant for the
         // coverage-aware tools registered in Phase 4.6.
-        let tool_factory = Arc::new(ToolFactory::new(
-            Arc::clone(&router),
-            Arc::clone(&pg_store),
+        let tool_factory = Arc::new(ToolFactory::new(ToolFactoryDeps {
+            router: Arc::clone(&router),
+            pg_store: Arc::clone(&pg_store),
             neo4j,
             qdrant,
             default_collection,
             summaries_collection,
-            settings.brave.clone(),
-            settings.fetch.clone(),
-            settings.web_budget.clone(),
-        )?);
+            brave_config: settings.brave.clone(),
+            fetch_config: settings.fetch.clone(),
+            web_budget_config: settings.web_budget.clone(),
+        })?);
 
         // Step 2: Agent runner
         let agent_runner = AgentRunner::new(
@@ -168,12 +216,14 @@ impl AgentOrchestrator {
             Arc::new(RouterClaimSearcher::new(Arc::clone(&router)));
         let grounding_gate = GroundingGate::new(
             verifier,
-            settings.agent.max_retries,
-            settings.grounding.subject_min_token_len,
             claim_searcher,
-            settings.grounding.retry_strategy,
-            settings.grounding.claim_search_top_k,
             Arc::clone(&metrics),
+            GroundingGateConfig {
+                max_retries: settings.agent.max_retries,
+                subject_min_token_len: settings.grounding.subject_min_token_len,
+                retry_strategy: settings.grounding.retry_strategy,
+                claim_search_top_k: settings.grounding.claim_search_top_k,
+            },
         );
 
         // Step 5: Result persister — writes query_run + evidence_items for
@@ -201,37 +251,31 @@ impl AgentOrchestrator {
     ///
     /// # Arguments
     ///
-    /// - `query` -- the raw user question or instruction.
-    /// - `user_id` -- identifier of the requesting user.
-    /// - `history` -- prior conversation turns (empty for a fresh thread).
-    ///   Replayed inline; never persisted on the agent side.
-    /// - `active_document_keys` -- MinIO keys of documents scoped to this
-    ///   request (union `active ∪ history` determines retrieval filter).
-    /// - `strategy` -- retrieval strategy to use.
-    /// - `limit` -- maximum number of evidence documents to retrieve.
-    /// - `trace_id` -- optional client correlation UUID for log linking.
+    /// - `request` -- per-call inputs bundled into [`QueryRequest`].
     ///
     /// # Errors
     ///
     /// Returns [`AgentError`] variants on pipeline failures.
-    #[allow(clippy::too_many_arguments)]
-    #[instrument(skip(self, query, history, active_document_keys), fields(
-        %user_id,
-        strategy = %strategy,
-        limit,
-        history_len = history.len(),
-        active_keys = active_document_keys.len(),
+    #[instrument(skip(self, request), fields(
+        user_id = %request.user_id,
+        strategy = %request.strategy,
+        limit = request.limit,
+        history_len = request.history.len(),
+        active_keys = request.active_document_keys.len(),
     ))]
     pub async fn process_query(
         &self,
-        query: String,
-        user_id: UserId,
-        history: Vec<ChatTurn>,
-        active_document_keys: Vec<String>,
-        strategy: RetrievalStrategy,
-        limit: usize,
-        trace_id: Option<Uuid>,
+        request: QueryRequest,
     ) -> Result<SynthesizedResponse, AgentError> {
+        let QueryRequest {
+            query,
+            user_id,
+            history,
+            active_document_keys,
+            strategy,
+            limit,
+            trace_id,
+        } = request;
         let mut ctx = QueryContext::new(
             query,
             user_id,

@@ -39,6 +39,38 @@ use crate::error::RetrievalError;
 /// `BASE_DEPTH_SCORE / d as f64`.
 const BASE_DEPTH_SCORE: f64 = 1.0;
 
+// ---- Shared input bundle ----
+
+/// Inputs shared by every `graph_*_search` entrypoint in this module.
+///
+/// Bundling these into one struct keeps the four graph-search functions
+/// at a single positional argument and lets call sites (the retrieval
+/// router, the hybrid fanout) reuse the same builder block across
+/// strategies. The two store handles, the user-scoped query inputs, and
+/// the traversal limits all live together because every function in this
+/// module needs every field — there is no logical sub-cluster that one
+/// strategy uses while another doesn't.
+pub struct GraphSearchInputs<'a> {
+    /// Graph backend handle (Neo4j) used for the traversal.
+    pub graph: &'a (dyn GraphStore + Send + Sync),
+    /// Vector store handle used to rehydrate chunk payloads.
+    pub vectors: &'a (dyn VectorStore + Send + Sync),
+    /// Qdrant collection holding the chunk payloads.
+    pub collection: &'a CollectionName,
+    /// Calling user (Qdrant filter scopes payload retrieval to this tenant).
+    pub user_id: &'a UserId,
+    /// Original user query — retained for trace-span provenance only and
+    /// not attached to the per-result payload (payloads come straight
+    /// from the vector store and already carry full chunk metadata).
+    pub query: &'a str,
+    /// Seed node IDs to traverse from.
+    pub seed_node_ids: &'a [String],
+    /// Maximum traversal depth from each seed.
+    pub max_depth: usize,
+    /// Maximum number of results to return.
+    pub limit: usize,
+}
+
 // ---- graph_search ----
 
 /// Perform a graph traversal search starting from `seed_node_ids`.
@@ -80,23 +112,25 @@ const BASE_DEPTH_SCORE: f64 = 1.0;
 /// `query` is retained for trace-span provenance only and is not attached to
 /// the per-result payload (payload comes from Qdrant and already contains the
 /// full chunk metadata).
-#[allow(clippy::too_many_arguments)]
-#[instrument(skip(graph, vectors), fields(
-    collection = %collection,
-    num_seeds = seed_node_ids.len(),
-    max_depth,
-    limit,
+#[instrument(skip(inputs), fields(
+    collection = %inputs.collection,
+    num_seeds = inputs.seed_node_ids.len(),
+    max_depth = inputs.max_depth,
+    limit = inputs.limit,
 ))]
 pub async fn graph_search(
-    graph: &(dyn GraphStore + Send + Sync),
-    vectors: &(dyn VectorStore + Send + Sync),
-    collection: &CollectionName,
-    user_id: &UserId,
-    query: &str,
-    seed_node_ids: &[String],
-    max_depth: usize,
-    limit: usize,
+    inputs: GraphSearchInputs<'_>,
 ) -> Result<Vec<SearchResult>, RetrievalError> {
+    let GraphSearchInputs {
+        graph,
+        vectors,
+        collection,
+        user_id,
+        query,
+        seed_node_ids,
+        max_depth,
+        limit,
+    } = inputs;
     let _ = query; // Reserved for future scoring heuristics; see docstring.
 
     // Push the Chunk label predicate into Cypher so we don't waste bandwidth
@@ -196,36 +230,18 @@ pub async fn graph_search(
 /// # Errors
 ///
 /// Returns [`RetrievalError::Store`] if the underlying traversal fails.
-#[allow(clippy::too_many_arguments)]
-#[instrument(skip(graph, vectors), fields(
-    collection = %collection,
-    num_seeds = seed_node_ids.len(),
-    max_depth,
-    limit,
+#[instrument(skip(inputs), fields(
+    collection = %inputs.collection,
+    num_seeds = inputs.seed_node_ids.len(),
+    max_depth = inputs.max_depth,
+    limit = inputs.limit,
 ))]
 pub async fn graph_cot_search(
-    graph: &(dyn GraphStore + Send + Sync),
-    vectors: &(dyn VectorStore + Send + Sync),
-    collection: &CollectionName,
-    user_id: &UserId,
-    query: &str,
-    seed_node_ids: &[String],
-    max_depth: usize,
-    limit: usize,
+    inputs: GraphSearchInputs<'_>,
 ) -> Result<Vec<SearchResult>, RetrievalError> {
     // The CoT iteration is applied by the router after this function returns.
     // Here we only produce the initial evidence pool.
-    graph_search(
-        graph,
-        vectors,
-        collection,
-        user_id,
-        query,
-        seed_node_ids,
-        max_depth,
-        limit,
-    )
-    .await
+    graph_search(inputs).await
 }
 
 // ---- graph_constrained_search ----
@@ -239,37 +255,19 @@ pub async fn graph_cot_search(
 /// # Errors
 ///
 /// Returns [`RetrievalError::Store`] if the underlying traversal fails.
-#[allow(clippy::too_many_arguments)]
-#[instrument(skip(graph, vectors), fields(
-    collection = %collection,
-    num_seeds = seed_node_ids.len(),
-    max_depth,
-    limit,
+#[instrument(skip(inputs), fields(
+    collection = %inputs.collection,
+    num_seeds = inputs.seed_node_ids.len(),
+    max_depth = inputs.max_depth,
+    limit = inputs.limit,
 ))]
 pub async fn graph_constrained_search(
-    graph: &(dyn GraphStore + Send + Sync),
-    vectors: &(dyn VectorStore + Send + Sync),
-    collection: &CollectionName,
-    user_id: &UserId,
-    query: &str,
-    seed_node_ids: &[String],
-    max_depth: usize,
-    limit: usize,
+    inputs: GraphSearchInputs<'_>,
 ) -> Result<Vec<SearchResult>, RetrievalError> {
     tracing::debug!(
         "graph_constrained_search: constraint filtering not yet implemented; using graph_search"
     );
-    graph_search(
-        graph,
-        vectors,
-        collection,
-        user_id,
-        query,
-        seed_node_ids,
-        max_depth,
-        limit,
-    )
-    .await
+    graph_search(inputs).await
 }
 
 // ---- graph_rag_context_search ----
@@ -283,35 +281,17 @@ pub async fn graph_constrained_search(
 /// # Errors
 ///
 /// Returns [`RetrievalError::Store`] if the underlying traversal fails.
-#[allow(clippy::too_many_arguments)]
-#[instrument(skip(graph, vectors), fields(
-    collection = %collection,
-    num_seeds = seed_node_ids.len(),
-    max_depth,
-    limit,
+#[instrument(skip(inputs), fields(
+    collection = %inputs.collection,
+    num_seeds = inputs.seed_node_ids.len(),
+    max_depth = inputs.max_depth,
+    limit = inputs.limit,
 ))]
 pub async fn graph_rag_context_search(
-    graph: &(dyn GraphStore + Send + Sync),
-    vectors: &(dyn VectorStore + Send + Sync),
-    collection: &CollectionName,
-    user_id: &UserId,
-    query: &str,
-    seed_node_ids: &[String],
-    max_depth: usize,
-    limit: usize,
+    inputs: GraphSearchInputs<'_>,
 ) -> Result<Vec<SearchResult>, RetrievalError> {
     tracing::debug!(
         "graph_rag_context_search: context injection not yet implemented; using graph_search"
     );
-    graph_search(
-        graph,
-        vectors,
-        collection,
-        user_id,
-        query,
-        seed_node_ids,
-        max_depth,
-        limit,
-    )
-    .await
+    graph_search(inputs).await
 }

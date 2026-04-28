@@ -15,9 +15,9 @@ use std::time::Duration;
 
 use agent_rs::bootstrap::{ensure_collections, ensure_graph_indexes, probe_retrieval_coverage};
 use agent_rs::embedder::build_embedder;
-use agent_rs::router::{RouterFeatures, build_router};
+use agent_rs::router::{RouterAssembly, RouterFeatures, build_router};
 use agent_rs::stores::connect_stores;
-use agent_rs_agent::orchestrator::AgentOrchestrator;
+use agent_rs_agent::orchestrator::{AgentOrchestrator, OrchestratorDeps};
 use agent_rs_core::config::Settings;
 use agent_rs_core::types::CollectionName;
 use agent_rs_observability::metrics::RetrievalMetrics;
@@ -90,28 +90,31 @@ async fn main() -> Result<()> {
     )
     .await;
 
-    let router = build_router(
-        &settings,
-        &stores,
+    let router_features = RouterFeatures::from_env();
+    let router = build_router(RouterAssembly {
+        settings: &settings,
+        stores: &stores,
         embedder,
-        &collection,
-        &triplet_collection,
-        &summaries_collection,
-        &RouterFeatures::from_env(),
-        Arc::clone(&metrics),
-    )
+        collection: &collection,
+        triplet_collection: &triplet_collection,
+        summaries_collection: &summaries_collection,
+        features: &router_features,
+        metrics: Arc::clone(&metrics),
+    })
     .await
     .context("build_router")?;
 
     let orchestrator = AgentOrchestrator::new(
         &settings,
-        stores.neo4j.clone(),
-        stores.postgres.clone(),
-        stores.qdrant.clone(),
-        collection.as_str().to_owned(),
-        summaries_collection.as_str().to_owned(),
-        Arc::clone(&router),
-        Arc::clone(&metrics),
+        OrchestratorDeps {
+            neo4j: stores.neo4j.clone(),
+            pg_store: stores.postgres.clone(),
+            qdrant: stores.qdrant.clone(),
+            default_collection: collection.as_str().to_owned(),
+            summaries_collection: summaries_collection.as_str().to_owned(),
+            router: Arc::clone(&router),
+            metrics: Arc::clone(&metrics),
+        },
     )
     .context("build AgentOrchestrator")?;
 

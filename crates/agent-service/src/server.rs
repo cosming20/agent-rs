@@ -14,7 +14,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use agent_rs::stores::Stores;
-use agent_rs_agent::orchestrator::AgentOrchestrator;
+use agent_rs_agent::orchestrator::{AgentOrchestrator, QueryRequest};
 use agent_rs_core::errors::AgentError;
 use agent_rs_core::types::{CollectionName, MessageRole, RetrievalStrategy, UserId};
 use agent_rs_queue::{IndexJob, IndexPublisher};
@@ -102,14 +102,15 @@ impl AgentServer {
 ///
 /// All malformed inputs map to `INVALID_ARGUMENT` with a generic message;
 /// verbose details stay in tracing so audit logs keep the exact input.
-// `tonic::Status` is inherently large (176 bytes); boxing it at a private
-// helper boundary would add indirection without benefit — callers always
-// propagate with `?`.
-#[allow(clippy::result_large_err)]
-fn validate_user_id(raw: &str) -> Result<UserId, Status> {
+///
+/// Returns the `Status` boxed so the caller's outer `Result<_, Status>`
+/// stays under clippy's `result_large_err` size threshold (`tonic::Status`
+/// is 176 bytes — well above the default 128 byte cap). Call sites unbox
+/// with `.map_err(|s| *s)?` before propagating.
+fn validate_user_id(raw: &str) -> Result<UserId, Box<Status>> {
     UserId::try_new(raw).map_err(|e: AgentError| {
         error!(raw = %raw, error = %e, "invalid user_id rejected at gRPC boundary");
-        Status::invalid_argument("invalid user_id")
+        Box::new(Status::invalid_argument("invalid user_id"))
     })
 }
 
@@ -192,7 +193,7 @@ impl Agent for AgentServer {
         request: Request<pb::AskRequest>,
     ) -> Result<Response<Self::AskStream>, Status> {
         let req = request.into_inner();
-        let user_id = validate_user_id(&req.user_id)?;
+        let user_id = validate_user_id(&req.user_id).map_err(|s| *s)?;
         tracing::Span::current().record("user_id", user_id.as_str());
 
         let strategy = parse_strategy(&req.strategy);
@@ -293,15 +294,15 @@ impl Agent for AgentServer {
             // ---- dispatch to orchestrator --------------------------------
             let t = Instant::now();
             let response = orchestrator
-                .process_query(
+                .process_query(QueryRequest {
                     query,
-                    user_id.clone(),
+                    user_id: user_id.clone(),
                     history,
-                    retrieval_keys,
+                    active_document_keys: retrieval_keys,
                     strategy,
                     limit,
                     trace_id,
-                )
+                })
                 .await
                 .map_err(|e| {
                     error!(error = %e, "process_query failed");
@@ -381,7 +382,7 @@ impl Agent for AgentServer {
         request: Request<pb::EnqueueIndexRequest>,
     ) -> Result<Response<pb::EnqueueIndexResponse>, Status> {
         let req = request.into_inner();
-        let user_id = validate_user_id(&req.user_id)?;
+        let user_id = validate_user_id(&req.user_id).map_err(|s| *s)?;
         tracing::Span::current().record("user_id", user_id.as_str());
 
         let key = req.minio_object_key;
@@ -450,7 +451,7 @@ impl Agent for AgentServer {
         request: Request<pb::GetDocumentStatusRequest>,
     ) -> Result<Response<pb::GetDocumentStatusResponse>, Status> {
         let req = request.into_inner();
-        let user_id = validate_user_id(&req.user_id)?;
+        let user_id = validate_user_id(&req.user_id).map_err(|s| *s)?;
         tracing::Span::current().record("user_id", user_id.as_str());
 
         let key = req.minio_object_key;
@@ -505,7 +506,7 @@ impl Agent for AgentServer {
         request: Request<pb::DeleteDocumentRequest>,
     ) -> Result<Response<pb::DeleteDocumentResponse>, Status> {
         let req = request.into_inner();
-        let user_id = validate_user_id(&req.user_id)?;
+        let user_id = validate_user_id(&req.user_id).map_err(|s| *s)?;
         tracing::Span::current().record("user_id", user_id.as_str());
 
         let key = req.minio_object_key;
