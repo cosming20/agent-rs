@@ -333,6 +333,14 @@ pub struct EvidenceConfig {
 }
 
 /// Response synthesis configuration.
+///
+/// Drives both the deterministic post-processor
+/// ([`agent_rs_agent::synthesis::ResponseSynthesizer`], which builds
+/// the citation list and the heuristic confidence) and the streaming
+/// LLM stage ([`agent_rs_agent::synthesis_agent::SynthesisAgent`],
+/// which produces the user-facing prose). The two stages run in
+/// sequence: the streaming agent's text is fed into the deterministic
+/// synthesizer to attach citations + confidence + coverage signals.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct SynthesisConfig {
     pub max_snippet_length: usize,
@@ -344,6 +352,24 @@ pub struct SynthesisConfig {
     /// Override via `AGENT_RS__SYNTHESIS__FALLBACK_CITATION_COUNT`.
     #[serde(default = "default_fallback_citation_count")]
     pub fallback_citation_count: usize,
+    /// Optional model override for the streaming synthesis agent.
+    /// `None` falls back to [`LlmConfig::model`] so the synth stage
+    /// runs on the same model as the agent runner.
+    ///
+    /// Override via `AGENT_RS__SYNTHESIS__MODEL`. Operators typically
+    /// route synthesis through a smaller / faster model (no tools,
+    /// no reasoning) than the agent runner.
+    #[serde(default)]
+    pub model: Option<String>,
+    /// Optional seed override for the streaming synthesis agent.
+    /// `None` falls back to [`AgentConfig::seed`] so the entire
+    /// pipeline runs deterministically off a single knob by default.
+    ///
+    /// Override via `AGENT_RS__SYNTHESIS__SEED`. Bumping just the
+    /// synth seed (without the agent seed) lets operators A/B prose
+    /// quality without disturbing the upstream tool-call sequence.
+    #[serde(default)]
+    pub seed: Option<u64>,
 }
 
 fn default_fallback_citation_count() -> usize {
@@ -933,6 +959,8 @@ impl Default for Settings {
             synthesis: SynthesisConfig {
                 max_snippet_length: 5000,
                 fallback_citation_count: default_fallback_citation_count(),
+                model: None,
+                seed: None,
             },
             ranker: RankerConfig { rrf_k: 60 },
             reranker: RerankerConfig {

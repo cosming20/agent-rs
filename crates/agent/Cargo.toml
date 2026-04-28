@@ -17,8 +17,12 @@ agent-rs-observability = { workspace = true }
 rig-core = { workspace = true }
 
 # Async
-tokio       = { workspace = true }
-async-trait = { workspace = true }
+tokio        = { workspace = true }
+async-trait  = { workspace = true }
+# Stream combinators + async_stream! macro for the streaming
+# orchestrator pipeline + the streaming synthesis agent.
+futures      = "0.3"
+async-stream = "0.3"
 
 # Serialization
 serde      = { workspace = true }

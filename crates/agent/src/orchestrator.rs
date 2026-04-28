@@ -2,8 +2,8 @@
 //!
 //! Wires together context building, coverage planning, agent execution,
 //! evidence fusion, deterministic coverage verification, an optional
-//! pre-synth subject-presence gate, and result persistence into the
-//! full query processing pipeline.
+//! pre-synth subject-presence gate, the streaming synthesis agent, and
+//! result persistence into the full query processing pipeline.
 //!
 //! The previous LLM-based grounding verifier and its retry loop were
 //! deleted as part of the synthesizer-streams refactor. Implicit
@@ -12,12 +12,25 @@
 //! [`crate::subject_check::subject_absent_v2`], which fires once
 //! before synthesis on out-of-corpus queries to skip the wasted LLM
 //! call.
+//!
+//! # Two entrypoints
+//!
+//! - [`AgentOrchestrator::process_query`] — unary: runs the full
+//!   pipeline and returns the [`SynthesizedResponse`] in one shot.
+//!   Internally drains the synthesis stream into the final text
+//!   before handing it to [`ResponseSynthesizer`].
+//! - [`AgentOrchestrator::process_query_streaming`] — streaming:
+//!   runs the same pipeline up through the subject-absent gate, then
+//!   yields a sequence of [`StreamEvent`]s. Used by the gRPC
+//!   server's `Ask` server-streaming RPC to surface text deltas as
+//!   they're generated.
 
 use std::sync::Arc;
 
-use agent_rs_core::config::{BudgetConfig, Settings};
+use agent_rs_core::config::{BudgetConfig, DEFAULT_AGENT_SEED, Settings};
 use agent_rs_core::errors::AgentError;
 use agent_rs_core::types::{RetrievalStrategy, UserId};
+use agent_rs_observability::budget::BudgetSnapshot;
 use agent_rs_observability::metrics::RetrievalMetrics;
 use agent_rs_retrieval::{ResultRanker, RetrievalRouter};
 use agent_rs_stores::neo4j::Neo4jStore;
@@ -25,7 +38,8 @@ use agent_rs_stores::postgres::PgStore;
 use agent_rs_stores::qdrant::QdrantStore;
 use agent_rs_stores::traits::StateStore;
 use agent_rs_stores::types::ChatTurn;
-use tracing::{info, instrument, warn};
+use futures::Stream;
+use tracing::{error, info, instrument, warn};
 use uuid::Uuid;
 
 use crate::context::QueryContext;
@@ -39,6 +53,7 @@ use crate::steps::result_persister::ResultPersister;
 use crate::steps::tool_factory::{ToolFactory, ToolFactoryDeps};
 use crate::subject_check::subject_absent_v2;
 use crate::synthesis::{ResponseSynthesizer, SynthesizedResponse, out_of_corpus_response};
+use crate::synthesis_agent::{SynthEvent, SynthesisAgent, SynthesisAgentConfig, SynthesisInputs};
 
 /// Shared dependencies required to build an [`AgentOrchestrator`].
 ///
@@ -112,15 +127,27 @@ pub struct QueryRequest {
 ///    short-circuit (see [`crate::subject_check::subject_absent_v2`])
 ///    that skips synthesis when no rewritten retrieval query shares
 ///    any content tokens with the fused evidence
-/// 7. **ResultPersister** -- synthesizes response with citations,
-///    persists run
+/// 7. **SynthesisAgent** -- streaming, tool-free LLM call that
+///    composes the user-facing answer; replaces the agent draft with
+///    citation-strict, language-mirroring prose
+/// 8. **ResultPersister** -- attaches citations + heuristic
+///    confidence to the synthesised text, persists run telemetry
 pub struct AgentOrchestrator {
     context_builder: ContextBuilder,
     coverage_planner: CoveragePlanner,
     agent_runner: AgentRunner,
     evidence_fuser: EvidenceFuser,
     coverage_verifier: CoverageVerifier,
+    /// Streaming synthesis stage. Runs ONE tool-free LLM call between
+    /// the subject-absent gate and the deterministic
+    /// [`ResponseSynthesizer`], shaping the user-facing prose.
+    synthesis_agent: SynthesisAgent,
     result_persister: ResultPersister,
+    /// Deterministic synthesizer used directly by the streaming path
+    /// (the unary path goes through [`ResultPersister`] which already
+    /// owns its own synthesizer instance — keeping the field here
+    /// avoids the streaming code having to dive into the persister).
+    streaming_synthesizer: ResponseSynthesizer,
     /// Minimum character length for a query token in the pre-synth
     /// subject-absent gate. Sourced from
     /// [`agent_rs_core::config::SubjectCheckConfig::subject_min_token_len`].
@@ -132,6 +159,33 @@ pub struct AgentOrchestrator {
     /// Per-request LLM budget thresholds. Read at end of
     /// `process_query` to decide whether to emit a soft-cap warning.
     budget_config: BudgetConfig,
+}
+
+/// Event emitted by [`AgentOrchestrator::process_query_streaming`].
+///
+/// Maps directly to the proto `AskEvent` `oneof` payload variants
+/// the gRPC server forwards to the client. Defined in the agent
+/// crate so non-gRPC consumers (eval harness, library integrators)
+/// can drive the streaming pipeline without depending on `tonic`.
+///
+/// Not `Clone` — the `Error` variant carries an [`AgentError`]
+/// (which is not `Clone` in the workspace error layer because
+/// inner store / retrieval errors don't all support cloning).
+/// Callers that need fanout should serialise events into the
+/// proto shape first, which is `Clone`.
+#[derive(Debug)]
+pub enum StreamEvent {
+    /// Streamed text delta from the synthesis agent.
+    /// Maps to proto `AskPartialAnswer.text_delta`.
+    TextDelta(String),
+    /// Terminal success event with the resolved structured response
+    /// (citations, confidence, coverage). Maps to proto `AskFinal`.
+    Final(SynthesizedResponse),
+    /// End-of-stream telemetry snapshot — one emission, after the
+    /// `Final` event. Maps to proto `BudgetSnapshot`.
+    Budget(BudgetSnapshot),
+    /// Terminal failure event. Maps to proto `AskError`.
+    Error(AgentError),
 }
 
 impl AgentOrchestrator {
@@ -207,9 +261,40 @@ impl AgentOrchestrator {
         // Step 3.5: Coverage verifier — no-op when coverage_plan is None.
         let coverage_verifier = CoverageVerifier::new(Arc::clone(&metrics));
 
+        // Step 4: Streaming synthesis agent. Independent model + seed
+        // knobs (default: inherit from the agent runner) so operators
+        // can route the user-facing answer through a smaller / faster
+        // model without touching the tool-calling stage.
+        let synth_model = settings
+            .synthesis
+            .model
+            .as_deref()
+            .unwrap_or(settings.llm.model.as_str());
+        let synth_seed = settings.synthesis.seed.unwrap_or(settings.agent.seed);
+        // Defensive: when neither override is set and the agent
+        // config seed somehow ends up at zero (an out-of-band test
+        // config), fall back to the canonical default rather than
+        // emitting `seed: 0` which is silently a valid but unhelpful
+        // seed value to OpenAI.
+        let synth_seed = if synth_seed == 0 {
+            DEFAULT_AGENT_SEED
+        } else {
+            synth_seed
+        };
+        let synthesis_agent = SynthesisAgent::new(SynthesisAgentConfig {
+            api_key: &settings.llm.api_key,
+            model: synth_model,
+            seed: synth_seed,
+            metrics: Arc::clone(&metrics),
+        })?;
+
         // Step 5: Result persister — writes query_run + evidence_items for
         // telemetry. No longer writes chat_messages (that table is gone).
         let synthesizer = ResponseSynthesizer::new(
+            settings.synthesis.max_snippet_length,
+            settings.synthesis.fallback_citation_count,
+        );
+        let streaming_synthesizer = ResponseSynthesizer::new(
             settings.synthesis.max_snippet_length,
             settings.synthesis.fallback_citation_count,
         );
@@ -221,7 +306,9 @@ impl AgentOrchestrator {
             agent_runner,
             evidence_fuser,
             coverage_verifier,
+            synthesis_agent,
             result_persister,
+            streaming_synthesizer,
             subject_min_token_len: settings.subject_check.subject_min_token_len,
             metrics,
             budget_config: settings.budget.clone(),
@@ -332,7 +419,38 @@ impl AgentOrchestrator {
             return Ok(response);
         }
 
-        // Step 5: Synthesize response with citations, persist run
+        // Step 5: Streaming synthesis (drained synchronously here).
+        //
+        // The unary path runs the synthesis agent in non-streaming
+        // mode (`SynthesisAgent::synthesize`) so the existing endpoint
+        // contract — "return one structured response" — keeps working
+        // unchanged. The accumulated text overrides `ctx.answer`
+        // before the deterministic synthesizer attaches citations
+        // and confidence: callers downstream of this orchestrator
+        // observe the polished prose, not the raw agent draft.
+        //
+        // The agent draft is moved out of the context (into an owned
+        // `String`) so the synthesis call can borrow it immutably
+        // without aliasing the assignment that overwrites
+        // `ctx.answer` after the call returns.
+        let agent_draft = std::mem::take(&mut ctx.answer);
+        let synth_inputs = SynthesisInputs {
+            query: &ctx.query,
+            agent_draft: &agent_draft,
+            evidence: &ctx.evidence,
+            detected_lang: ctx.detected_lang,
+            coverage_report: ctx.coverage_report.as_ref(),
+        };
+        let (synth_text, _usage) = self
+            .synthesis_agent
+            .synthesize(synth_inputs, Arc::clone(&ctx.budget))
+            .await?;
+        ctx.answer = synth_text;
+
+        // Step 6: Synthesize response with citations, persist run.
+        // ResultPersister now consumes the synthesis-stage text via
+        // `ctx.answer`, so its citation extraction and heuristic
+        // confidence reflect the final user-facing prose.
         let response = self.result_persister.persist(&ctx).await?;
 
         self.emit_request_budget_summary(&ctx);
@@ -345,6 +463,198 @@ impl AgentOrchestrator {
         );
 
         Ok(response)
+    }
+
+    /// Streaming variant of [`Self::process_query`].
+    ///
+    /// Runs the same pipeline through the subject-absent gate, then
+    /// yields a sequence of [`StreamEvent`]s representing the
+    /// in-progress synthesis. The terminal events are guaranteed:
+    ///
+    /// - [`StreamEvent::Final`] — exactly once on success, after any
+    ///   number of [`StreamEvent::TextDelta`]s. Carries the resolved
+    ///   [`SynthesizedResponse`] (citations, confidence, coverage).
+    /// - [`StreamEvent::Budget`] — exactly once after `Final`, with
+    ///   the per-request token + cost snapshot.
+    /// - [`StreamEvent::Error`] — exactly once on failure, no other
+    ///   terminal events follow.
+    ///
+    /// On the subject-absent short-circuit path no text deltas are
+    /// emitted; the stream yields one `Final` (out-of-corpus
+    /// response) followed by a `Budget` event.
+    ///
+    /// # Cancellation
+    ///
+    /// Dropping the returned stream cancels every in-flight `.await`
+    /// at the next yield point. The synthesis stream's cancellation
+    /// semantics are documented on
+    /// [`crate::synthesis_agent::SynthesisAgent::synthesize_stream`].
+    pub fn process_query_streaming<'a>(
+        &'a self,
+        request: QueryRequest,
+    ) -> impl Stream<Item = StreamEvent> + Send + 'a {
+        async_stream::stream! {
+            let QueryRequest {
+                query,
+                user_id,
+                history,
+                active_document_keys,
+                strategy,
+                limit,
+                trace_id,
+            } = request;
+
+            let mut ctx = QueryContext::new(
+                query,
+                user_id,
+                history,
+                active_document_keys,
+                strategy,
+                limit,
+                trace_id,
+            );
+            ctx.detected_lang = detect_lang(&ctx.query);
+
+            info!(
+                query = %ctx.query,
+                strategy = %ctx.strategy,
+                lang = %ctx.detected_lang,
+                "streaming pipeline started"
+            );
+
+            // ---- Pipeline up through subject-absent gate ----
+            macro_rules! bail_with_error {
+                ($e:expr) => {{
+                    let err: AgentError = $e;
+                    error!(error = %err, "streaming pipeline error before synthesis");
+                    yield StreamEvent::Error(err);
+                    return;
+                }};
+            }
+
+            if let Err(e) = self.context_builder.build(&mut ctx).await {
+                bail_with_error!(e);
+            }
+            self.coverage_planner.plan(&mut ctx).await;
+            if let Err(e) = self.agent_runner.run(&mut ctx).await {
+                bail_with_error!(e);
+            }
+            self.evidence_fuser.fuse(&mut ctx);
+            self.coverage_verifier.verify(&mut ctx);
+
+            // ---- Subject-absent short-circuit ----
+            if subject_absent_v2(
+                &ctx.query,
+                &ctx.tool_calls,
+                &ctx.evidence,
+                self.subject_min_token_len,
+            ) {
+                warn!(
+                    query = %ctx.query,
+                    evidence_count = ctx.evidence.len(),
+                    "streaming: subject-absent short-circuit"
+                );
+                self.metrics
+                    .record_subject_check_short_circuit(ctx.strategy);
+                let final_response = match out_of_corpus_response(
+                    &ctx.query,
+                    ctx.strategy,
+                    ctx.coverage_report.as_ref(),
+                ) {
+                    Ok(r) => r,
+                    Err(e) => bail_with_error!(e),
+                };
+                yield StreamEvent::Final(final_response);
+                yield StreamEvent::Budget(ctx.budget.snapshot());
+                self.emit_request_budget_summary(&ctx);
+                info!(
+                    elapsed_ms = ctx.elapsed_ms(),
+                    "streaming pipeline complete (subject-absent short-circuit)"
+                );
+                return;
+            }
+
+            // ---- Synthesis stream ----
+            //
+            // Move the agent draft out of the context so the synth
+            // borrow is independent of the post-stream assignment to
+            // `ctx.answer` (the borrow checker can't see through
+            // async_stream! macro state).
+            let agent_draft = std::mem::take(&mut ctx.answer);
+            let synth_inputs = SynthesisInputs {
+                query: &ctx.query,
+                agent_draft: &agent_draft,
+                evidence: &ctx.evidence,
+                detected_lang: ctx.detected_lang,
+                coverage_report: ctx.coverage_report.as_ref(),
+            };
+            let mut synth_stream = Box::pin(
+                self.synthesis_agent
+                    .synthesize_stream(synth_inputs, Arc::clone(&ctx.budget)),
+            );
+
+            let mut accumulated_text = String::new();
+            use futures::StreamExt;
+            while let Some(ev) = synth_stream.next().await {
+                match ev {
+                    SynthEvent::TextDelta(delta) => {
+                        accumulated_text.push_str(&delta);
+                        yield StreamEvent::TextDelta(delta);
+                    }
+                    SynthEvent::Done { full_text, .. } => {
+                        // Done events come once, at the end. Prefer
+                        // the aggregated `full_text` over the delta
+                        // accumulator (they're identical in normal
+                        // flows, but `full_text` is the authoritative
+                        // final from the synth agent).
+                        if !full_text.is_empty() {
+                            accumulated_text = full_text;
+                        }
+                    }
+                    SynthEvent::Error(msg) => {
+                        bail_with_error!(AgentError::Synthesis(msg));
+                    }
+                }
+            }
+            // Drop the borrow on `agent_draft`/etc. before mutating ctx.
+            drop(synth_stream);
+
+            // ---- Deterministic synthesis (citations, confidence) ----
+            let response = match self.streaming_synthesizer.synthesize(
+                &accumulated_text,
+                &ctx.evidence,
+                &ctx.query,
+                ctx.strategy,
+                ctx.coverage_report.as_ref(),
+            ) {
+                Ok(r) => r,
+                Err(e) => bail_with_error!(e),
+            };
+
+            // Mirror unary-path behaviour: stamp the polished text on
+            // ctx.answer so any future telemetry / persistence sees
+            // the synthesised prose rather than the agent draft.
+            //
+            // NOTE: The streaming path does not call
+            // [`ResultPersister::persist`]. Doing so would re-run the
+            // deterministic synthesizer against `ctx.answer`,
+            // doubling that work. Streaming-path telemetry rides on
+            // the per-call metrics emitted by the agent runner +
+            // synthesis hook plus the end-of-request budget summary
+            // below; persisted run rows for streaming consumers will
+            // be added in a follow-up that exposes a
+            // synth-result-aware persistence API on the persister.
+            ctx.answer = accumulated_text;
+
+            yield StreamEvent::Final(response);
+            yield StreamEvent::Budget(ctx.budget.snapshot());
+            self.emit_request_budget_summary(&ctx);
+
+            info!(
+                elapsed_ms = ctx.elapsed_ms(),
+                "streaming pipeline complete"
+            );
+        }
     }
 
     /// Emit per-request LLM budget histograms + structured logs.

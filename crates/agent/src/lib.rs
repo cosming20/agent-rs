@@ -17,6 +17,7 @@
 //! - [`context`] -- [`QueryContext`] mutable pipeline state
 //! - [`orchestrator`] -- [`AgentOrchestrator`] step pipeline coordinator
 //! - [`synthesis`] -- [`ResponseSynthesizer`] citation builder + heuristic confidence
+//! - [`synthesis_agent`] -- [`SynthesisAgent`] streaming user-facing LLM stage
 //! - [`subject_check`] -- deterministic pre-synth subject-presence gate
 //! - [`prompts`] -- System prompt constants
 //! - [`steps`] -- Pipeline step implementations
@@ -30,8 +31,12 @@ pub mod prompts;
 pub mod steps;
 pub mod subject_check;
 pub mod synthesis;
+pub mod synthesis_agent;
 
 pub use agent_hook::{AgentRsHook, COMPONENT_AGENT_RUNNER};
 pub use context::QueryContext;
-pub use orchestrator::{AgentOrchestrator, OrchestratorDeps, QueryRequest};
+pub use orchestrator::{AgentOrchestrator, OrchestratorDeps, QueryRequest, StreamEvent};
 pub use synthesis::{Citation, ResponseSynthesizer, SynthesizedResponse};
+pub use synthesis_agent::{
+    COMPONENT_SYNTHESIS_AGENT, SynthEvent, SynthesisAgent, SynthesisAgentConfig, SynthesisInputs,
+};

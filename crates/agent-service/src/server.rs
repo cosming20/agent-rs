@@ -14,13 +14,13 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use agent_rs::stores::Stores;
-use agent_rs_agent::orchestrator::{AgentOrchestrator, QueryRequest};
+use agent_rs_agent::orchestrator::{AgentOrchestrator, QueryRequest, StreamEvent};
 use agent_rs_core::errors::AgentError;
 use agent_rs_core::types::{CollectionName, MessageRole, RetrievalStrategy, UserId};
 use agent_rs_queue::{IndexJob, IndexPublisher};
 use agent_rs_stores::traits::VectorStore;
 use agent_rs_stores::types::{ChatTurn, FilterSpec};
-use futures::Stream;
+use futures::{Stream, StreamExt};
 use tokio::time::sleep;
 use tonic::{Request, Response, Status};
 use tracing::{error, info, instrument};
@@ -291,65 +291,95 @@ impl Agent for AgentServer {
                 sleep(INDEXING_POLL_INTERVAL).await;
             }
 
-            // ---- dispatch to orchestrator --------------------------------
+            // ---- dispatch to orchestrator (streaming) --------------------
+            //
+            // The streaming pipeline yields TextDelta events as the
+            // synthesis agent generates the user-facing answer, then a
+            // single Final event with the structured response, then a
+            // single Budget event with end-of-request token + cost
+            // totals. We translate each into the proto AskEvent shape
+            // and forward verbatim.
             let t = Instant::now();
-            let response = orchestrator
-                .process_query(QueryRequest {
-                    query,
-                    user_id: user_id.clone(),
-                    history,
-                    active_document_keys: retrieval_keys,
-                    strategy,
-                    limit,
-                    trace_id,
-                })
-                .await
-                .map_err(|e| {
-                    error!(error = %e, "process_query failed");
-                    Status::internal(format!("process_query: {e}"))
-                })?;
-            let elapsed_ms = t.elapsed().as_millis() as u32;
+            let mut events = Box::pin(orchestrator.process_query_streaming(QueryRequest {
+                query,
+                user_id: user_id.clone(),
+                history,
+                active_document_keys: retrieval_keys,
+                strategy,
+                limit,
+                trace_id,
+            }));
 
-            info!(
-                confidence = response.confidence.value(),
-                citations = response.citations.len(),
-                elapsed_ms,
-                "ask ok"
-            );
+            while let Some(ev) = events.next().await {
+                match ev {
+                    StreamEvent::TextDelta(text) => {
+                        yield pb::AskEvent {
+                            payload: Some(pb::ask_event::Payload::PartialAnswer(
+                                pb::AskPartialAnswer { text_delta: text },
+                            )),
+                        };
+                    }
+                    StreamEvent::Final(response) => {
+                        let elapsed_ms = t.elapsed().as_millis() as u32;
+                        info!(
+                            confidence = response.confidence.value(),
+                            citations = response.citations.len(),
+                            elapsed_ms,
+                            "ask ok"
+                        );
 
-            let citations: Vec<pb::Citation> = response
-                .citations
-                .iter()
-                .map(|c| pb::Citation {
-                    // Synthesizer already assigns 1-based indices — preserve
-                    // them so that textual `[n]` markers in `answer` continue
-                    // to line up with `citations[n-1]` even if synthesis
-                    // adds a filter/dedupe pass later.
-                    index: c.index as u32,
-                    chunk_id: c.chunk_id.clone(),
-                    content_snippet: c.content_snippet.clone(),
-                    minio_object_key: c.minio_object_key.clone(),
-                    section_path: c.section_path.clone(),
-                    score: c.score,
-                })
-                .collect();
+                        let citations: Vec<pb::Citation> = response
+                            .citations
+                            .iter()
+                            .map(|c| pb::Citation {
+                                // Synthesizer assigns 1-based indices — preserve
+                                // them so textual `[n]` markers in `answer`
+                                // line up with `citations[n-1]` after any
+                                // future filter/dedupe pass.
+                                index: c.index as u32,
+                                chunk_id: c.chunk_id.clone(),
+                                content_snippet: c.content_snippet.clone(),
+                                minio_object_key: c.minio_object_key.clone(),
+                                section_path: c.section_path.clone(),
+                                score: c.score,
+                            })
+                            .collect();
 
-            let coverage = response.coverage_report.as_ref().map(|cr| pb::CoverageReport {
-                expected: cr.expected as u32,
-                fetched: cr.fetched as u32,
-                missing_section_ids: cr.missing_section_ids.clone(),
-            });
+                        let coverage = response.coverage_report.as_ref().map(|cr| pb::CoverageReport {
+                            expected: cr.expected as u32,
+                            fetched: cr.fetched as u32,
+                            missing_section_ids: cr.missing_section_ids.clone(),
+                        });
 
-            yield pb::AskEvent {
-                payload: Some(pb::ask_event::Payload::Final(pb::AskFinal {
-                    answer: response.answer,
-                    citations,
-                    confidence: response.confidence.value(),
-                    elapsed_ms,
-                    strategy: strategy.as_db_str().to_owned(),
-                    coverage,
-                })),
-            };
+                        yield pb::AskEvent {
+                            payload: Some(pb::ask_event::Payload::Final(pb::AskFinal {
+                                answer: response.answer,
+                                citations,
+                                confidence: response.confidence.value(),
+                                elapsed_ms,
+                                strategy: strategy.as_db_str().to_owned(),
+                                coverage,
+                            })),
+                        };
+                    }
+                    StreamEvent::Budget(snapshot) => {
+                        yield pb::AskEvent {
+                            payload: Some(pb::ask_event::Payload::BudgetSnapshot(
+                                pb::BudgetSnapshot {
+                                    total_tokens: snapshot.total_tokens,
+                                    cached_input_tokens: snapshot.cached_input_tokens,
+                                    cost_usd: snapshot.cost_usd,
+                                    call_count: snapshot.call_count,
+                                },
+                            )),
+                        };
+                    }
+                    StreamEvent::Error(err) => {
+                        error!(error = %err, "process_query_streaming failed");
+                        Err(Status::internal(format!("process_query: {err}")))?;
+                    }
+                }
+            }
         };
 
         Ok(Response::new(Box::pin(stream)))
