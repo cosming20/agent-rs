@@ -2,6 +2,16 @@
 //!
 //! [`ResponseSynthesizer`] builds structured responses with numbered
 //! citations linking answer claims to source evidence documents.
+//!
+//! After the deletion of the LLM-based grounding verifier (see
+//! [`crate::orchestrator::AgentOrchestrator`] for the new pipeline
+//! shape), the synthesizer derives `confidence` from a deterministic
+//! token-overlap heuristic between the answer and the evidence pack.
+//! No LLM calls happen here. Implicit grounding is enforced by the
+//! synthesis-stage prompt's "only claim what's in evidence" contract,
+//! not by a post-hoc verifier.
+
+use std::collections::HashSet;
 
 use agent_rs_core::errors::AgentError;
 use agent_rs_core::types::{Confidence, RetrievalStrategy, truncate_to_char_boundary};
@@ -9,9 +19,24 @@ use agent_rs_stores::types::SearchResult;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use tracing::instrument;
+use unicode_segmentation::UnicodeSegmentation;
 
 use crate::coverage::CoverageReport;
-use crate::verifier::VerificationResult;
+
+/// Minimum length (in Unicode scalar values) for a token to enter the
+/// answer/evidence overlap calculation.
+///
+/// Anything shorter is dropped regardless of language. This filters
+/// out mono-/bi-character function words across scripts (Romance
+/// articles, English particles, CJK fillers) without a per-language
+/// stopword list, keeping the heuristic universal by construction.
+const HEURISTIC_MIN_TOKEN_CHARS: usize = 3;
+
+/// Confidence below which the synthesizer wraps the answer with a
+/// "please verify independently" caveat. Tuned alongside the heuristic
+/// confidence range so genuinely poorly-supported answers carry an
+/// explicit warning while well-supported answers stand on their own.
+const LOW_CONFIDENCE_HEDGE_THRESHOLD: f64 = 0.15;
 
 /// A citation linking a claim to its source evidence.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -37,6 +62,13 @@ pub struct Citation {
 }
 
 /// Final agent response with citations and provenance.
+///
+/// The previous verifier-driven `is_grounded` / `claim_confidences` /
+/// `ungrounded_claims` fields were dropped when the LLM grounding gate
+/// was removed. Coverage callers continue to read [`Self::coverage_report`]
+/// for exhaustive-flow signals; non-exhaustive consumers rely on
+/// [`Self::confidence`] (now a deterministic answer-vs-evidence token
+/// overlap) plus the answer prose itself.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SynthesizedResponse {
     /// The synthesized answer text.
@@ -45,10 +77,21 @@ pub struct SynthesizedResponse {
     pub citations: Vec<Citation>,
     /// Original user query.
     pub query: String,
-    /// User-facing answer quality score (0.0 to 1.0).
+    /// Heuristic confidence in `[0.0, 1.0]`, computed as the
+    /// case-folded Unicode-word token overlap between the answer and
+    /// the evidence pack.
+    ///
+    /// **Semantics**: `confidence = |answer_tokens ∩ evidence_tokens| /
+    /// |answer_tokens|`, where tokens are
+    /// [`unicode_segmentation::UnicodeSegmentation::unicode_words`]
+    /// outputs of length `>= 3` Unicode scalars. Defaults to `0.0`
+    /// when either the evidence pack or the answer-token set is
+    /// empty. Cheap (sub-millisecond), deterministic, and language-
+    /// agnostic by construction. **Not** an LLM-derived faithfulness
+    /// score — the synthesis prompt enforces grounding implicitly;
+    /// this number is a side-channel quality signal for dashboards
+    /// and out-of-corpus detection.
     pub confidence: Confidence,
-    /// Whether the answer passed grounding verification.
-    pub is_grounded: bool,
     /// Retrieval strategy used.
     pub strategy: RetrievalStrategy,
     /// Coverage report when the query was exhaustive-mode.
@@ -81,14 +124,23 @@ impl ResponseSynthesizer {
     ///
     /// # Confidence semantics
     ///
-    /// User-facing confidence reflects trust in the answer:
-    /// - Grounded answer → verifier confidence (verifier is confident in a grounded answer)
-    /// - Ungrounded answer → 0.0 (do not trust, regardless of verifier certainty)
+    /// `confidence` is computed inline as the case-folded
+    /// Unicode-word token overlap between `answer` and `evidence`:
     ///
-    /// The prior "invert ungrounded verifier confidence" path was mathematically
-    /// unsound: `1.0 - 0.05` flipped a low-certainty ungrounded verdict to 0.95
-    /// user-facing confidence, producing confident wrong answers.
-    #[instrument(skip(self, answer, evidence, verification, coverage_report), fields(
+    /// ```text
+    /// confidence = |answer_tokens ∩ evidence_tokens| / |answer_tokens|
+    /// ```
+    ///
+    /// Tokens are
+    /// [`unicode_segmentation::UnicodeSegmentation::unicode_words`]
+    /// outputs filtered to length ≥
+    /// [`HEURISTIC_MIN_TOKEN_CHARS`] Unicode scalars. The metric is
+    /// deterministic, language-agnostic, and runs in microseconds —
+    /// it replaces the previous LLM-verifier-driven score.
+    ///
+    /// Returns `0.0` whenever either token set is empty (zero
+    /// evidence, refusal-only answer). Capped at `1.0`.
+    #[instrument(skip(self, answer, evidence, coverage_report), fields(
         evidence_count = evidence.len(),
         strategy = %strategy,
     ))]
@@ -97,7 +149,6 @@ impl ResponseSynthesizer {
         answer: &str,
         evidence: &[SearchResult],
         query: &str,
-        verification: &VerificationResult,
         strategy: RetrievalStrategy,
         coverage_report: Option<&CoverageReport>,
     ) -> Result<SynthesizedResponse, AgentError> {
@@ -125,19 +176,14 @@ impl ResponseSynthesizer {
             }
         };
 
-        // User-facing confidence: trust verifier only when it says grounded.
-        let answer_confidence = if verification.is_grounded {
-            verification.confidence.value()
-        } else {
-            0.0
-        };
-
-        let confidence = Confidence::new(answer_confidence.clamp(0.0, 1.0))
+        let answer_confidence = heuristic_confidence(answer, evidence);
+        let confidence = Confidence::new(answer_confidence)
             .map_err(|e| AgentError::Synthesis(format!("confidence error: {e}")))?;
 
-        // "I don't know" boundary: when evidence is empty OR the answer is
-        // ungrounded, replace the synthesized answer with an honest admission
-        // rather than risking hallucination.
+        // "I don't know" boundary: when evidence is empty, replace the
+        // synthesized answer with an honest admission rather than
+        // risking hallucination. The synthesis prompt itself is supposed
+        // to refuse on zero-evidence input — this is a defence in depth.
         let final_answer = if evidence.is_empty() {
             tracing::warn!(
                 query,
@@ -148,59 +194,36 @@ impl ResponseSynthesizer {
              this question reliably. The retrieved evidence was insufficient \
              to support a grounded answer."
                 .to_owned()
-        } else if !verification.is_grounded {
+        } else if answer_confidence < LOW_CONFIDENCE_HEDGE_THRESHOLD {
+            // Low-overlap path: the answer barely mentions vocabulary
+            // from the evidence, suggesting either an out-of-corpus
+            // hedge or a tangential answer. Skip the wrapper when:
+            //   - coverage_report is present (callers read the report
+            //     directly; doubling up would confuse the UX), or
+            //   - the model already self-admitted scope ("not in the
+            //     evidence" / "nu apare în evidență").
             if coverage_report.is_some() {
-                // Coverage path: the report itself carries the truth signal
-                // (expected vs fetched sections, missing IDs). A prose hedge
-                // here would double-communicate and confuse the user.
-                // Per spec §14 Q4 — never append wrapper when coverage_report
-                // is present; callers read coverage_report from the response
-                // struct for any gate / UX decision.
                 tracing::info!(
                     query,
+                    confidence = answer_confidence,
                     strategy = %strategy,
-                    "answer ungrounded but coverage_report present — skipping wrapper"
+                    "low-confidence answer with coverage_report present — skipping wrapper"
                 );
                 answer.to_owned()
             } else if answer_self_admits_scope(answer) {
-                // Single-hedge guard: when the LLM already admitted scope
-                // ("not in the evidence" / "nu apare în evidență"), the wrapper
-                // adds nothing except confusion. Let the answer stand on its
-                // own honesty — the caller still sees confidence=0 and
-                // is_grounded=false via the struct fields.
-                tracing::info!(
-                    query,
-                    strategy = %strategy,
-                    "answer ungrounded but self-admits scope — skipping wrapper"
-                );
-                answer.to_owned()
-            } else {
-                tracing::warn!(
-                    query,
-                    strategy = %strategy,
-                    "answer ungrounded after retries — returning partial admission"
-                );
-                format!(
-                    "I found some potentially relevant information, but I'm not \
-                     confident it fully answers your question. Here's what I found, \
-                     but please verify independently:\n\n{}",
-                    answer
-                )
-            }
-        } else if answer_confidence < 0.15 {
-            // Same single-hedge logic for the very-low-confidence grounded path.
-            if answer_self_admits_scope(answer) {
                 tracing::info!(
                     query,
                     confidence = answer_confidence,
-                    "low-confidence grounded answer self-admits scope — skipping wrapper"
+                    strategy = %strategy,
+                    "low-confidence answer self-admits scope — skipping wrapper"
                 );
                 answer.to_owned()
             } else {
                 tracing::warn!(
                     query,
                     confidence = answer_confidence,
-                    "very low confidence grounded answer — caveat added"
+                    strategy = %strategy,
+                    "very low confidence answer — caveat added"
                 );
                 format!(
                     "I found some potentially relevant information, but I'm not \
@@ -218,11 +241,94 @@ impl ResponseSynthesizer {
             citations,
             query: query.to_owned(),
             confidence,
-            is_grounded: verification.is_grounded,
             strategy,
             coverage_report: coverage_report.cloned(),
         })
     }
+}
+
+/// Compute the answer-vs-evidence token-overlap confidence.
+///
+/// Both `answer` and `evidence` chunk bodies are tokenised with
+/// [`UnicodeSegmentation::unicode_words`] (universal across scripts —
+/// no per-language stopword list), case-folded, and filtered to a
+/// minimum of [`HEURISTIC_MIN_TOKEN_CHARS`] Unicode scalars to drop
+/// function words / particles.
+///
+/// Returns `0.0` when either token set is empty. Otherwise:
+///
+/// ```text
+/// |answer_tokens ∩ evidence_tokens| / |answer_tokens|
+/// ```
+///
+/// The result is clamped to `[0.0, 1.0]`. The function is `pub(crate)`
+/// for unit testability — callers use [`ResponseSynthesizer::synthesize`]
+/// rather than calling this directly.
+pub(crate) fn heuristic_confidence(answer: &str, evidence: &[SearchResult]) -> f64 {
+    let answer_tokens: HashSet<String> = answer
+        .to_lowercase()
+        .unicode_words()
+        .filter(|t| t.chars().count() >= HEURISTIC_MIN_TOKEN_CHARS)
+        .map(|s| s.to_owned())
+        .collect();
+
+    if answer_tokens.is_empty() || evidence.is_empty() {
+        return 0.0;
+    }
+
+    let mut evidence_tokens: HashSet<String> = HashSet::new();
+    for doc in evidence {
+        let text = doc
+            .payload
+            .get("chunk_text")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let lowered = text.to_lowercase();
+        for token in lowered.unicode_words() {
+            if token.chars().count() >= HEURISTIC_MIN_TOKEN_CHARS {
+                evidence_tokens.insert(token.to_owned());
+            }
+        }
+    }
+
+    let overlap = answer_tokens.intersection(&evidence_tokens).count();
+    (overlap as f64 / answer_tokens.len() as f64).clamp(0.0, 1.0)
+}
+
+/// Build a [`SynthesizedResponse`] for the pre-synth subject-absent
+/// short-circuit path.
+///
+/// Returns a polite "topic out of corpus" answer with `confidence =
+/// 0.0`, no citations, and the same `coverage_report` the caller would
+/// have observed otherwise. Used by the orchestrator when
+/// [`crate::subject_check::subject_absent_v2`] flags the query as
+/// out-of-corpus before the synthesis LLM call — saving the wasted
+/// round-trip while preserving the response shape downstream
+/// consumers (gRPC server, web app) expect.
+///
+/// # Errors
+///
+/// Returns [`AgentError::Synthesis`] only if the (statically zero)
+/// confidence value somehow fails [`Confidence::new`] — defensive
+/// path; the typed domain accepts `0.0`.
+pub fn out_of_corpus_response(
+    query: &str,
+    strategy: RetrievalStrategy,
+    coverage_report: Option<&CoverageReport>,
+) -> Result<SynthesizedResponse, AgentError> {
+    let confidence = Confidence::new(0.0)
+        .map_err(|e| AgentError::Synthesis(format!("confidence error: {e}")))?;
+    Ok(SynthesizedResponse {
+        answer: "I don't have enough information in my knowledge base to answer \
+                 this question reliably. The retrieved evidence does not cover \
+                 this topic."
+            .to_owned(),
+        citations: Vec::new(),
+        query: query.to_owned(),
+        confidence,
+        strategy,
+        coverage_report: coverage_report.cloned(),
+    })
 }
 
 /// Resolve citation markers in the answer text into [`Citation`]s.
@@ -512,5 +618,132 @@ mod regex_compile_tests {
         assert!(!answer_self_admits_scope(
             "Metoda Otsu este o metodă de segmentare."
         ));
+    }
+}
+
+#[cfg(test)]
+mod tests_heuristic_confidence {
+    //! Tests for the deterministic answer-vs-evidence token overlap
+    //! that powers [`SynthesizedResponse::confidence`]. The heuristic
+    //! replaces the deleted LLM grounding verifier — these tests pin
+    //! the boundary cases (empty answer, empty evidence, partial /
+    //! full overlap) so a future tokenizer change cannot silently
+    //! regress confidence semantics.
+    use super::*;
+    use agent_rs_core::types::Score;
+
+    fn ev(text: &str) -> SearchResult {
+        SearchResult {
+            id: String::new(),
+            score: Score::new(0.0),
+            payload: serde_json::json!({"chunk_text": text}),
+        }
+    }
+
+    #[test]
+    fn empty_evidence_yields_zero_confidence() {
+        assert_eq!(heuristic_confidence("anything goes here", &[]), 0.0);
+    }
+
+    #[test]
+    fn empty_answer_yields_zero_confidence() {
+        assert_eq!(heuristic_confidence("", &[ev("anything")]), 0.0);
+    }
+
+    #[test]
+    fn full_overlap_yields_one() {
+        let evidence = vec![ev("metoda otsu segmentare histogramă")];
+        // Answer uses every meaningful token from evidence — should max out.
+        let c = heuristic_confidence("metoda otsu segmentare histogramă", &evidence);
+        assert!((c - 1.0).abs() < f64::EPSILON, "got {c}");
+    }
+
+    #[test]
+    fn partial_overlap_returns_proportional_value() {
+        let evidence = vec![ev("metoda otsu segmentare")];
+        // Answer has 4 ≥3-char tokens; 3 of them ("metoda", "otsu",
+        // "segmentare") overlap with evidence. Confidence ≈ 0.75.
+        let c = heuristic_confidence("metoda otsu segmentare oranj", &evidence);
+        assert!((c - 0.75).abs() < 1e-9, "expected 0.75, got {c}");
+    }
+
+    #[test]
+    fn short_tokens_below_threshold_are_dropped() {
+        // The answer "no" has zero tokens ≥3 chars, so the overlap
+        // calculation falls into the empty-answer branch → 0.0.
+        let evidence = vec![ev("no")];
+        assert_eq!(heuristic_confidence("no", &evidence), 0.0);
+    }
+
+    #[test]
+    fn confidence_is_clamped_into_unit_range() {
+        // Sanity: ratio is bounded by construction; no input shape
+        // can make it exceed 1.0.
+        let evidence = vec![ev("alpha alpha alpha alpha")];
+        let c = heuristic_confidence("alpha", &evidence);
+        assert!((0.0..=1.0).contains(&c));
+    }
+}
+
+#[cfg(test)]
+mod tests_synthesize {
+    //! Integration tests on the new (verifier-less) synthesize path.
+    use super::*;
+    use agent_rs_core::types::{RetrievalStrategy, Score};
+
+    fn ev(id: &str, text: &str) -> SearchResult {
+        SearchResult {
+            id: id.to_string(),
+            score: Score::new(0.5),
+            payload: serde_json::json!({
+                "chunk_id": id,
+                "chunk_text": text,
+            }),
+        }
+    }
+
+    #[test]
+    fn empty_evidence_emits_idk_answer() {
+        let synth = ResponseSynthesizer::new(200, 5);
+        let resp = synth
+            .synthesize("anything", &[], "q", RetrievalStrategy::Semantic, None)
+            .expect("must build");
+        assert!(resp.answer.contains("don't have enough information"));
+        assert_eq!(resp.confidence.value(), 0.0);
+        assert!(resp.citations.is_empty());
+    }
+
+    #[test]
+    fn high_overlap_answer_passes_through_unchanged() {
+        let synth = ResponseSynthesizer::new(200, 5);
+        let evidence = vec![ev("c-1", "metoda otsu segmentare histogramă")];
+        let answer = "Metoda Otsu segmentare histogramă [cite:c-1].";
+        let resp = synth
+            .synthesize(answer, &evidence, "q", RetrievalStrategy::Semantic, None)
+            .expect("must build");
+        // No "please verify independently" wrapper for high-overlap.
+        assert!(!resp.answer.contains("please verify independently"));
+        assert!(resp.confidence.value() > LOW_CONFIDENCE_HEDGE_THRESHOLD);
+    }
+
+    #[test]
+    fn low_overlap_answer_with_self_admit_skips_wrapper() {
+        let synth = ResponseSynthesizer::new(200, 5);
+        let evidence = vec![ev("c-1", "totally unrelated content")];
+        let answer = "The retrieved evidence does not cover this topic.";
+        let resp = synth
+            .synthesize(answer, &evidence, "q", RetrievalStrategy::Semantic, None)
+            .expect("must build");
+        // Self-admit guard: no double-hedge.
+        assert!(!resp.answer.contains("please verify independently"));
+    }
+
+    #[test]
+    fn out_of_corpus_response_has_zero_confidence_and_no_citations() {
+        let resp =
+            out_of_corpus_response("q", RetrievalStrategy::Semantic, None).expect("must build");
+        assert_eq!(resp.confidence.value(), 0.0);
+        assert!(resp.citations.is_empty());
+        assert!(resp.answer.contains("does not cover"));
     }
 }

@@ -84,9 +84,6 @@ fn u32_saturate(value: u64) -> u32 {
 /// string so dashboards can filter by `llm.component=agent_runner`.
 const LLM_COMPONENT_AGENT_RUNNER: &str = "agent_runner";
 
-/// LLM component label used for the verifier's `prompt_typed` call.
-const LLM_COMPONENT_VERIFIER: &str = "verifier";
-
 /// Shared sink that the hook writes into after each tool call. The
 /// agent runner drains this sink into
 /// [`crate::context::QueryContext::tool_calls`] once the rig agent
@@ -165,9 +162,6 @@ impl AgentRsHook {
 /// call. Re-exported so call sites pass a typed constant rather than
 /// a stringly-typed `"agent_runner"` argument.
 pub const COMPONENT_AGENT_RUNNER: &str = LLM_COMPONENT_AGENT_RUNNER;
-
-/// Component label suitable for the verifier's `with_hook(...)` call.
-pub const COMPONENT_VERIFIER: &str = LLM_COMPONENT_VERIFIER;
 
 impl<M> PromptHook<M> for AgentRsHook
 where

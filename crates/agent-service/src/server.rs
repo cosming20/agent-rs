@@ -311,7 +311,6 @@ impl Agent for AgentServer {
             let elapsed_ms = t.elapsed().as_millis() as u32;
 
             info!(
-                is_grounded = response.is_grounded,
                 confidence = response.confidence.value(),
                 citations = response.citations.len(),
                 elapsed_ms,
@@ -346,7 +345,6 @@ impl Agent for AgentServer {
                     answer: response.answer,
                     citations,
                     confidence: response.confidence.value(),
-                    is_grounded: response.is_grounded,
                     elapsed_ms,
                     strategy: strategy.as_db_str().to_owned(),
                     coverage,

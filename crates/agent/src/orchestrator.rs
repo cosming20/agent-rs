@@ -1,8 +1,17 @@
 //! Agent orchestrator -- slim coordinator over pipeline step structs.
 //!
-//! Wires together context building, agent execution, evidence fusion,
-//! grounding verification, and result persistence into the full query
-//! processing pipeline.
+//! Wires together context building, coverage planning, agent execution,
+//! evidence fusion, deterministic coverage verification, an optional
+//! pre-synth subject-presence gate, and result persistence into the
+//! full query processing pipeline.
+//!
+//! The previous LLM-based grounding verifier and its retry loop were
+//! deleted as part of the synthesizer-streams refactor. Implicit
+//! grounding is enforced by the synthesis prompt ("only claim what's
+//! in evidence"); the only deterministic safety net that survives is
+//! [`crate::subject_check::subject_absent_v2`], which fires once
+//! before synthesis on out-of-corpus queries to skip the wasted LLM
+//! call.
 
 use std::sync::Arc;
 
@@ -19,7 +28,6 @@ use agent_rs_stores::types::ChatTurn;
 use tracing::{info, instrument, warn};
 use uuid::Uuid;
 
-use crate::claim_searcher::{ClaimSearcher, RouterClaimSearcher};
 use crate::context::QueryContext;
 use crate::lang::detect_lang;
 use crate::steps::agent_runner::{AgentRunner, AgentRunnerConfig};
@@ -27,11 +35,10 @@ use crate::steps::context_builder::ContextBuilder;
 use crate::steps::coverage_planner::CoveragePlanner;
 use crate::steps::coverage_verifier::CoverageVerifier;
 use crate::steps::evidence_fuser::EvidenceFuser;
-use crate::steps::grounding_gate::{GroundingGate, GroundingGateConfig};
 use crate::steps::result_persister::ResultPersister;
 use crate::steps::tool_factory::{ToolFactory, ToolFactoryDeps};
-use crate::synthesis::{ResponseSynthesizer, SynthesizedResponse};
-use crate::verifier::GroundingVerifier;
+use crate::subject_check::subject_absent_v2;
+use crate::synthesis::{ResponseSynthesizer, SynthesizedResponse, out_of_corpus_response};
 
 /// Shared dependencies required to build an [`AgentOrchestrator`].
 ///
@@ -96,21 +103,28 @@ pub struct QueryRequest {
 /// to [`process_query`] creates a [`QueryContext`] and runs it through
 /// the step pipeline:
 ///
-/// 1. **ContextBuilder** -- loads history, builds conversation context
+/// 1. **ContextBuilder** -- loads memories, materialises chat-history context
 /// 2. **CoveragePlanner** -- detects exhaustive intent, builds section plan (no-op otherwise)
 /// 3. **AgentRunner** -- runs the LLM agent with tools, accumulates evidence
 /// 4. **EvidenceFuser** -- merges KB + web evidence via RRF
 /// 5. **CoverageVerifier** -- checks plan satisfaction, populates coverage report (no-op when plan is None)
-/// 6. **GroundingGate** -- verifies grounding, retries if needed
-/// 7. **ResultPersister** -- synthesizes response with citations, persists run
+/// 6. **Pre-synth subject-absent check** -- deterministic out-of-corpus
+///    short-circuit (see [`crate::subject_check::subject_absent_v2`])
+///    that skips synthesis when no rewritten retrieval query shares
+///    any content tokens with the fused evidence
+/// 7. **ResultPersister** -- synthesizes response with citations,
+///    persists run
 pub struct AgentOrchestrator {
     context_builder: ContextBuilder,
     coverage_planner: CoveragePlanner,
     agent_runner: AgentRunner,
     evidence_fuser: EvidenceFuser,
     coverage_verifier: CoverageVerifier,
-    grounding_gate: GroundingGate,
     result_persister: ResultPersister,
+    /// Minimum character length for a query token in the pre-synth
+    /// subject-absent gate. Sourced from
+    /// [`agent_rs_core::config::SubjectCheckConfig::subject_min_token_len`].
+    subject_min_token_len: usize,
     /// Shared metric instruments. Reused at end-of-request to emit
     /// the per-request budget histograms once the
     /// [`crate::context::QueryContext::budget`] snapshot is available.
@@ -193,50 +207,6 @@ impl AgentOrchestrator {
         // Step 3.5: Coverage verifier — no-op when coverage_plan is None.
         let coverage_verifier = CoverageVerifier::new(Arc::clone(&metrics));
 
-        // Step 4: Grounding gate
-        //
-        // The verifier can be run on a different (typically stronger)
-        // model than the primary retrieval LLM — set
-        // `verifier.model = "gpt-5.4-mini"` (or similar) in settings to
-        // override. When unset, falls back to the main `llm.model`.
-        let verifier_model = settings
-            .verifier
-            .model
-            .as_deref()
-            .unwrap_or(settings.llm.model.as_str());
-        // Verifier seed: explicit override → inherit from `agent.seed`.
-        // Inheriting by default keeps verifier verdicts reproducible
-        // alongside the agent's run; operators set
-        // `AGENT_RS__VERIFIER__SEED` only when intentionally A/B-ing
-        // verifier-specific determinism.
-        let verifier_seed = settings.verifier.seed.unwrap_or(settings.agent.seed);
-        let verifier = Arc::new(
-            GroundingVerifier::new(
-                settings.verifier.confidence_threshold,
-                &settings.llm.api_key,
-                verifier_model,
-                verifier_seed,
-            )
-            .with_metrics(Arc::clone(&metrics)),
-        );
-        // Claim-directed retry handle. Wraps the same shared retrieval
-        // router the agent's `search_knowledge` tool uses, so a
-        // claim-directed search shares cache, embedder, and
-        // cross-encoder rerank state with the in-turn retrieval.
-        let claim_searcher: Arc<dyn ClaimSearcher> =
-            Arc::new(RouterClaimSearcher::new(Arc::clone(&router)));
-        let grounding_gate = GroundingGate::new(
-            verifier,
-            claim_searcher,
-            Arc::clone(&metrics),
-            GroundingGateConfig {
-                max_retries: settings.agent.max_retries,
-                subject_min_token_len: settings.grounding.subject_min_token_len,
-                retry_strategy: settings.grounding.retry_strategy,
-                claim_search_top_k: settings.grounding.claim_search_top_k,
-            },
-        );
-
         // Step 5: Result persister — writes query_run + evidence_items for
         // telemetry. No longer writes chat_messages (that table is gone).
         let synthesizer = ResponseSynthesizer::new(
@@ -251,8 +221,8 @@ impl AgentOrchestrator {
             agent_runner,
             evidence_fuser,
             coverage_verifier,
-            grounding_gate,
             result_persister,
+            subject_min_token_len: settings.subject_check.subject_min_token_len,
             metrics,
             budget_config: settings.budget.clone(),
         })
@@ -327,26 +297,64 @@ impl AgentOrchestrator {
         // and populates ctx.coverage_report. No-op when ctx.coverage_plan is None.
         self.coverage_verifier.verify(&mut ctx);
 
-        // Step 4: Verify grounding, retry if needed
-        self.grounding_gate
-            .verify_and_retry(&mut ctx, &self.agent_runner, &self.evidence_fuser)
-            .await?;
-
-        // Step 4.5: Re-run CoverageVerifier when the grounding gate performed
-        // at least one retry. Each retry drains a fresh coverage_collector into
-        // ctx.coverage_evidence (accumulated), so the stale pre-retry report
-        // must be refreshed to reflect the full post-retry evidence set.
-        if ctx.retries > 0 {
-            self.coverage_verifier.verify(&mut ctx);
+        // Step 4: Pre-synth subject-absent check.
+        //
+        // When the agent's rewritten retrieval queries share no
+        // content tokens with the fused evidence, the topic is
+        // effectively out-of-corpus. Skipping synthesis saves a full
+        // LLM round-trip (~40 s on reasoning models) and returns a
+        // polite "not in evidence" answer that downstream clients
+        // already handle. The subject-absent guard is purely
+        // deterministic (substring containment + tokenisation) — no
+        // LLM call, no retries.
+        if subject_absent_v2(
+            &ctx.query,
+            &ctx.tool_calls,
+            &ctx.evidence,
+            self.subject_min_token_len,
+        ) {
+            warn!(
+                query = %ctx.query,
+                evidence_count = ctx.evidence.len(),
+                "pre-synth subject-absent gate fired — short-circuiting synthesis"
+            );
+            self.metrics
+                .record_subject_check_short_circuit(ctx.strategy);
+            let response =
+                out_of_corpus_response(&ctx.query, ctx.strategy, ctx.coverage_report.as_ref())?;
+            self.emit_request_budget_summary(&ctx);
+            info!(
+                confidence = response.confidence.value(),
+                citations = response.citations.len(),
+                elapsed_ms = ctx.elapsed_ms(),
+                "pipeline complete (subject-absent short-circuit)"
+            );
+            return Ok(response);
         }
 
         // Step 5: Synthesize response with citations, persist run
         let response = self.result_persister.persist(&ctx).await?;
 
-        // Per-request LLM budget summary. Always logged so dashboards
-        // can graph cost per query; warns on top when a soft cap is
-        // exceeded. Histograms are emitted once per request so SLO
-        // calculators can pull P99 cost / tokens directly from OTel.
+        self.emit_request_budget_summary(&ctx);
+
+        info!(
+            confidence = response.confidence.value(),
+            citations = response.citations.len(),
+            elapsed_ms = ctx.elapsed_ms(),
+            "pipeline complete"
+        );
+
+        Ok(response)
+    }
+
+    /// Emit per-request LLM budget histograms + structured logs.
+    ///
+    /// Lifted out of [`Self::process_query`] so both the synthesis and
+    /// pre-synth-short-circuit paths emit the same telemetry without
+    /// duplicated code. Always logs at INFO so dashboards can graph
+    /// cost per query; escalates to WARN when a configured soft cap
+    /// is exceeded.
+    fn emit_request_budget_summary(&self, ctx: &QueryContext) {
         let snapshot = ctx.budget.snapshot();
         self.metrics
             .record_request_total_tokens(snapshot.total_tokens);
@@ -374,15 +382,5 @@ impl AgentOrchestrator {
                 "request exceeded soft budget threshold"
             );
         }
-
-        info!(
-            confidence = response.confidence.value(),
-            is_grounded = response.is_grounded,
-            citations = response.citations.len(),
-            elapsed_ms = ctx.elapsed_ms(),
-            "pipeline complete"
-        );
-
-        Ok(response)
     }
 }

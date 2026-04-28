@@ -14,8 +14,7 @@
 //!
 //! m.record_retrieval_latency(RetrievalStrategy::Hybrid, 0.142);
 //! m.record_retrieval_results(RetrievalStrategy::Hybrid, 8);
-//! m.record_grounding_pass();
-//! m.record_verification_confidence(0.87);
+//! m.record_subject_check_short_circuit(RetrievalStrategy::Hybrid);
 //! ```
 
 use agent_rs_core::types::RetrievalStrategy;
@@ -29,19 +28,17 @@ const METER_SCOPE: &str = "agent_rs.retrieval";
 const RETRIEVAL_LATENCY_SECONDS: &str = "retrieval.latency_seconds";
 const RETRIEVAL_RESULTS_TOTAL: &str = "retrieval.results_total";
 const RETRIEVAL_STRATEGY_USAGE: &str = "retrieval.strategy_usage";
-const VERIFICATION_CONFIDENCE: &str = "verification.confidence";
-const GROUNDING_PASS_TOTAL: &str = "grounding.pass_total";
-const GROUNDING_FAIL_TOTAL: &str = "grounding.fail_total";
 const ZERO_EVIDENCE_TOTAL: &str = "pipeline.zero_evidence_total";
 const WEB_BUDGET_EXHAUSTED_TOTAL: &str = "tools.web_budget_exhausted_total";
-const GROUNDING_RETRY_TOTAL: &str = "grounding.retry_total";
-const GROUNDING_RETRIES_EXHAUSTED_TOTAL: &str = "grounding.retries_exhausted_total";
-const GROUNDING_SUBJECT_ABSENT_TOTAL: &str = "grounding.subject_absent_short_circuit_total";
-const GROUNDING_CLAIM_DIRECTED_RETRY_TOTAL: &str = "grounding.claim_directed_retry_total";
-const GROUNDING_CLAIM_DIRECTED_NEW_EVIDENCE_COUNT: &str =
-    "grounding.claim_directed_new_evidence_count";
+/// Pre-synth subject-absent short-circuit counter.
+///
+/// Renamed from `grounding.subject_absent_short_circuit_total` when
+/// the LLM-based grounding gate was removed: the underlying check is
+/// the same deterministic substring-matching heuristic, but it now
+/// runs once before synthesis (rather than as a retry-loop pre-filter)
+/// and lives under [`crate::metrics::RetrievalMetrics::record_subject_check_short_circuit`].
+const SUBJECT_CHECK_SHORT_CIRCUIT_TOTAL: &str = "subject_check.short_circuit_total";
 const QUERY_DURATION_MS: &str = "pipeline.query_duration_ms";
-const VERIFIER_METHOD_TOTAL: &str = "verification.method_total";
 const RERANKER_FALLBACK_TOTAL: &str = "retrieval.reranker_fallback_total";
 const GRAPH_EXTRACTION_FAILURE_TOTAL: &str = "ingestion.graph_extraction_failure_total";
 const COVERAGE_PLANNER_UNMATCHED_TOTAL: &str = "agent.coverage_planner_unmatched_total";
@@ -84,7 +81,6 @@ const POSTGRES_FTS_DURATION_MS: &str = "postgres.fts_duration_ms";
 const EMBEDDER_DURATION_MS: &str = "embedder.duration_ms";
 const RRF_FUSION_DURATION_MS: &str = "rrf.fusion_duration_ms";
 const RERANKER_DURATION_MS: &str = "reranker.duration_ms";
-const LLM_VERIFIER_DURATION_MS: &str = "llm.verifier_duration_ms";
 const QDRANT_CIRCUIT_BREAKER_FALLBACK_TOTAL: &str = "qdrant.circuit_breaker_fallback_total";
 
 /// Histogram bucket boundaries for retrieval latency (seconds).
@@ -94,9 +90,6 @@ const QDRANT_CIRCUIT_BREAKER_FALLBACK_TOTAL: &str = "qdrant.circuit_breaker_fall
 const LATENCY_BUCKETS: &[f64] = &[
     0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0,
 ];
-
-/// Histogram bucket boundaries for confidence scores (dimensionless, 0–1).
-const CONFIDENCE_BUCKETS: &[f64] = &[0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0];
 
 /// Histogram bucket boundaries for query duration in milliseconds.
 const DURATION_MS_BUCKETS: &[f64] = &[
@@ -135,12 +128,6 @@ const CHUNK_CHARS_BUCKETS: &[f64] = &[
 /// Histogram buckets for heading-path depth. Depth 0 = chunk has no
 /// surrounding heading context (typically a preamble or page header).
 const CHUNK_HEADING_DEPTH_BUCKETS: &[f64] = &[0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 8.0, 10.0];
-
-/// Histogram buckets for the count of new evidence items surfaced by a
-/// single claim-directed search. The grounding gate caps per-claim
-/// retrieval at the configured `claim_search_top_k` (default 3);
-/// buckets up to 16 leave headroom for operators that tune higher.
-const CLAIM_DIRECTED_NEW_EVIDENCE_BUCKETS: &[f64] = &[0.0, 1.0, 2.0, 3.0, 5.0, 8.0, 12.0, 16.0];
 
 /// Per-backend latency buckets in milliseconds.
 ///
@@ -191,15 +178,6 @@ const LLM_REQUEST_TOTAL_TOKENS_BUCKETS: &[f64] = &[
 const LLM_REQUEST_TOTAL_COST_USD_BUCKETS: &[f64] =
     &[0.001, 0.01, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0];
 
-/// Latency buckets for the LLM grounding verifier.
-///
-/// Reasoning models (gpt-5.x with `low` effort) take 1–10 s typical and
-/// up to 25 s at high load; bucket up to 25 s so the P99 tail is
-/// resolvable without saturating the right-most bucket.
-const LLM_VERIFIER_MS_BUCKETS: &[f64] = &[
-    10.0, 50.0, 100.0, 250.0, 500.0, 1000.0, 2500.0, 5000.0, 10000.0, 25000.0,
-];
-
 /// All custom metric instruments for the retrieval pipeline.
 ///
 /// Cheaply cloneable — the underlying OTel instruments are `Arc`-backed.
@@ -211,36 +189,18 @@ pub struct RetrievalMetrics {
     retrieval_results: metrics::Counter<u64>,
     /// Invocation count per retrieval strategy.
     strategy_usage: metrics::Counter<u64>,
-    /// Distribution of verifier confidence scores.
-    verification_confidence: metrics::Histogram<f64>,
-    /// Count of queries that passed the grounding gate.
-    grounding_pass: metrics::Counter<u64>,
-    /// Count of queries that failed the grounding gate.
-    grounding_fail: metrics::Counter<u64>,
     /// Count of pipeline runs that produced zero evidence after retrieval.
     zero_evidence: metrics::Counter<u64>,
     /// Count of web budget exhaustion events by resource kind (search/news/fetch).
     web_budget_exhausted: metrics::Counter<u64>,
-    /// Count of grounding-gate retry attempts, labelled by strategy.
-    grounding_retry: metrics::Counter<u64>,
-    /// Count of queries that exhausted all retries without passing grounding.
-    grounding_retries_exhausted: metrics::Counter<u64>,
-    /// Count of queries where the grounding gate short-circuited further
-    /// retries because the query's subject tokens were absent from the
-    /// first-pass evidence — strong signal the topic is out-of-corpus.
-    grounding_subject_absent: metrics::Counter<u64>,
-    /// Count of claim-directed retry iterations performed by the
-    /// grounding gate. Each iteration may dispatch one search per
-    /// flagged claim before re-verifying.
-    grounding_claim_directed_retry: metrics::Counter<u64>,
-    /// Distribution of "new evidence items surfaced" per claim-directed
-    /// search. A value of `0` means the search produced no novel
-    /// evidence and the gate fell back to a full agent rerun.
-    grounding_claim_directed_new_evidence: metrics::Histogram<u64>,
+    /// Count of pre-synth subject-absent short-circuit events,
+    /// labelled by retrieval strategy. Increments when none of the
+    /// agent's rewritten queries share any content tokens with the
+    /// fused evidence — strong signal the topic is out-of-corpus and
+    /// synthesis is being skipped to save the LLM round-trip.
+    subject_check_short_circuit: metrics::Counter<u64>,
     /// End-to-end query pipeline duration in milliseconds.
     query_duration_ms: metrics::Histogram<f64>,
-    /// Count of verifier invocations by method (llm/heuristic/heuristic_fallback/none).
-    verifier_method: metrics::Counter<u64>,
     /// Count of cross-encoder reranker fallbacks, labelled by strategy.
     reranker_fallback: metrics::Counter<u64>,
     /// Count of graph extraction failures (both primary and fallback failed).
@@ -336,11 +296,6 @@ pub struct RetrievalMetrics {
     /// the router-level wrap of `CrossEncoderReranker::rerank` so the
     /// measurement covers HTTP round-trip and back-off-driven retries.
     reranker_duration_ms: metrics::Histogram<f64>,
-    /// Latency of a single LLM grounding-verifier call, in
-    /// milliseconds. Recorded by passing this metric handle into
-    /// `GroundingVerifier`; covers the rig-core/OpenAI prompt
-    /// round-trip end-to-end.
-    llm_verifier_duration_ms: metrics::Histogram<f64>,
 
     /// Count of Qdrant→Postgres-FTS fallback events triggered by the
     /// circuit breaker, labelled by retrieval strategy. Increments when
@@ -384,24 +339,6 @@ impl RetrievalMetrics {
             .with_unit("calls")
             .build();
 
-        let verification_confidence = meter
-            .f64_histogram(VERIFICATION_CONFIDENCE)
-            .with_description("Distribution of verifier confidence scores for grounded responses.")
-            .with_boundaries(CONFIDENCE_BUCKETS.to_vec())
-            .build();
-
-        let grounding_pass = meter
-            .u64_counter(GROUNDING_PASS_TOTAL)
-            .with_description("Number of queries that passed the faithfulness grounding check.")
-            .with_unit("queries")
-            .build();
-
-        let grounding_fail = meter
-            .u64_counter(GROUNDING_FAIL_TOTAL)
-            .with_description("Number of queries that failed the faithfulness grounding check.")
-            .with_unit("queries")
-            .build();
-
         let zero_evidence = meter
             .u64_counter(ZERO_EVIDENCE_TOTAL)
             .with_description(
@@ -419,51 +356,14 @@ impl RetrievalMetrics {
             .with_unit("events")
             .build();
 
-        let grounding_retry = meter
-            .u64_counter(GROUNDING_RETRY_TOTAL)
+        let subject_check_short_circuit = meter
+            .u64_counter(SUBJECT_CHECK_SHORT_CIRCUIT_TOTAL)
             .with_description(
-                "Number of grounding-gate retry attempts, labelled by retrieval strategy.",
-            )
-            .with_unit("retries")
-            .build();
-
-        let grounding_retries_exhausted = meter
-            .u64_counter(GROUNDING_RETRIES_EXHAUSTED_TOTAL)
-            .with_description(
-                "Number of queries that exhausted all grounding retries without passing \
-                 the faithfulness check.",
+                "Number of queries where the pre-synth subject-presence gate fired and \
+                 synthesis was short-circuited because no rewritten retrieval query shared \
+                 any content tokens with the fused evidence.",
             )
             .with_unit("queries")
-            .build();
-
-        let grounding_subject_absent = meter
-            .u64_counter(GROUNDING_SUBJECT_ABSENT_TOTAL)
-            .with_description(
-                "Number of queries where grounding-gate retries were skipped because \
-                 the subject of the query was absent from the first-pass evidence.",
-            )
-            .with_unit("queries")
-            .build();
-
-        let grounding_claim_directed_retry = meter
-            .u64_counter(GROUNDING_CLAIM_DIRECTED_RETRY_TOTAL)
-            .with_description(
-                "Number of claim-directed retry iterations performed by the grounding gate. \
-                 Each iteration runs one focused retrieval per ungrounded claim before \
-                 re-verifying the answer.",
-            )
-            .with_unit("iterations")
-            .build();
-
-        let grounding_claim_directed_new_evidence = meter
-            .u64_histogram(GROUNDING_CLAIM_DIRECTED_NEW_EVIDENCE_COUNT)
-            .with_description(
-                "Number of new evidence items surfaced by a single claim-directed search. \
-                 A value of zero means no novel evidence was found and the gate fell back \
-                 to a full agent rerun.",
-            )
-            .with_unit("documents")
-            .with_boundaries(CLAIM_DIRECTED_NEW_EVIDENCE_BUCKETS.to_vec())
             .build();
 
         let query_duration_ms = meter
@@ -471,15 +371,6 @@ impl RetrievalMetrics {
             .with_description("End-to-end query pipeline wall-clock duration in milliseconds.")
             .with_unit("ms")
             .with_boundaries(DURATION_MS_BUCKETS.to_vec())
-            .build();
-
-        let verifier_method = meter
-            .u64_counter(VERIFIER_METHOD_TOTAL)
-            .with_description(
-                "Number of verifier invocations by method: llm, heuristic, heuristic_fallback, \
-                 or none.",
-            )
-            .with_unit("calls")
             .build();
 
         let reranker_fallback = meter
@@ -730,16 +621,6 @@ impl RetrievalMetrics {
             .with_boundaries(BACKEND_LATENCY_MS_BUCKETS.to_vec())
             .build();
 
-        let llm_verifier_duration_ms = meter
-            .f64_histogram(LLM_VERIFIER_DURATION_MS)
-            .with_description(
-                "Latency of a single LLM grounding-verifier call end-to-end, in \
-                 milliseconds.",
-            )
-            .with_unit("ms")
-            .with_boundaries(LLM_VERIFIER_MS_BUCKETS.to_vec())
-            .build();
-
         let qdrant_circuit_breaker_fallback = meter
             .u64_counter(QDRANT_CIRCUIT_BREAKER_FALLBACK_TOTAL)
             .with_description(
@@ -753,18 +634,10 @@ impl RetrievalMetrics {
             retrieval_latency,
             retrieval_results,
             strategy_usage,
-            verification_confidence,
-            grounding_pass,
-            grounding_fail,
             zero_evidence,
             web_budget_exhausted,
-            grounding_retry,
-            grounding_retries_exhausted,
-            grounding_subject_absent,
-            grounding_claim_directed_retry,
-            grounding_claim_directed_new_evidence,
+            subject_check_short_circuit,
             query_duration_ms,
-            verifier_method,
             reranker_fallback,
             graph_extraction_failure,
             llm_calls,
@@ -793,7 +666,6 @@ impl RetrievalMetrics {
             embedder_duration_ms,
             rrf_fusion_duration_ms,
             reranker_duration_ms,
-            llm_verifier_duration_ms,
             qdrant_circuit_breaker_fallback,
         }
     }
@@ -821,25 +693,6 @@ impl RetrievalMetrics {
         self.strategy_usage.add(1, &[strategy_attr(strategy)]);
     }
 
-    /// Record a verifier confidence score for a completed response.
-    ///
-    /// `confidence` must be in `[0.0, 1.0]`. Values outside this range are
-    /// clamped silently to avoid corrupting histogram state.
-    pub fn record_verification_confidence(&self, confidence: f64) {
-        let clamped = confidence.clamp(0.0, 1.0);
-        self.verification_confidence.record(clamped, &[]);
-    }
-
-    /// Increment the counter for queries that passed the grounding gate.
-    pub fn record_grounding_pass(&self) {
-        self.grounding_pass.add(1, &[]);
-    }
-
-    /// Increment the counter for queries that failed the grounding gate.
-    pub fn record_grounding_fail(&self) {
-        self.grounding_fail.add(1, &[]);
-    }
-
     /// Increment the zero-evidence counter, labelled by strategy.
     ///
     /// Call when the evidence fuser produces an empty result set after
@@ -856,56 +709,16 @@ impl RetrievalMetrics {
             .add(1, &[KeyValue::new("resource.kind", kind.to_owned())]);
     }
 
-    /// Increment the grounding retry counter, labelled by strategy.
+    /// Increment the pre-synth subject-absent short-circuit counter,
+    /// labelled by retrieval strategy.
     ///
-    /// Call each time the grounding gate triggers a retry attempt.
-    pub fn record_grounding_retry(&self, strategy: RetrievalStrategy) {
-        self.grounding_retry.add(1, &[strategy_attr(strategy)]);
-    }
-
-    /// Increment the retries-exhausted counter, labelled by strategy.
-    ///
-    /// Call when the grounding gate loop exits because all retries were
-    /// consumed without the answer passing the faithfulness check.
-    pub fn record_grounding_retries_exhausted(&self, strategy: RetrievalStrategy) {
-        self.grounding_retries_exhausted
+    /// Call when none of the agent's rewritten retrieval queries share
+    /// any content tokens with the fused evidence pack — strong
+    /// signal the topic is out-of-corpus, and synthesis is being
+    /// skipped to save the wasted LLM round-trip.
+    pub fn record_subject_check_short_circuit(&self, strategy: RetrievalStrategy) {
+        self.subject_check_short_circuit
             .add(1, &[strategy_attr(strategy)]);
-    }
-
-    /// Increment the subject-absent short-circuit counter, labelled by strategy.
-    ///
-    /// Call when the grounding gate skipped retries because the query's
-    /// subject tokens were absent from the first-pass evidence — a strong
-    /// signal that additional retries will not produce grounded output and
-    /// would only waste latency and LLM budget.
-    pub fn record_grounding_subject_absent(&self, strategy: RetrievalStrategy) {
-        self.grounding_subject_absent
-            .add(1, &[strategy_attr(strategy)]);
-    }
-
-    /// Increment the claim-directed retry iteration counter, labelled
-    /// by strategy.
-    ///
-    /// Call once per claim-directed retry iteration — typically before
-    /// the gate dispatches per-claim searches and re-verifies. Distinct
-    /// from [`Self::record_grounding_retry`] (which counts every retry
-    /// iteration regardless of mode); claim-directed iterations are a
-    /// strict subset.
-    pub fn record_grounding_claim_directed_retry(&self, strategy: RetrievalStrategy) {
-        self.grounding_claim_directed_retry
-            .add(1, &[strategy_attr(strategy)]);
-    }
-
-    /// Record the count of new evidence items surfaced by one
-    /// claim-directed search batch.
-    ///
-    /// `count` is the number of documents that were not already present
-    /// in the evidence pack. A value of `0` indicates the
-    /// claim-directed search produced no novel support and the gate
-    /// fell through to a full agent rerun.
-    pub fn record_grounding_claim_directed_new_evidence(&self, count: u64) {
-        self.grounding_claim_directed_new_evidence
-            .record(count, &[]);
     }
 
     /// Record the end-to-end query pipeline duration in milliseconds.
@@ -915,20 +728,6 @@ impl RetrievalMetrics {
     pub fn record_query_duration_ms(&self, elapsed_ms: f64, strategy: RetrievalStrategy) {
         self.query_duration_ms
             .record(elapsed_ms, &[strategy_attr(strategy)]);
-    }
-
-    /// Increment the verifier method counter.
-    ///
-    /// `method` matches the `VerificationResult::method` field:
-    /// `"llm"`, `"heuristic"`, `"heuristic_fallback"`, or `"none"`.
-    pub fn record_verifier_method(&self, method: &str, is_grounded: bool) {
-        self.verifier_method.add(
-            1,
-            &[
-                KeyValue::new("verifier.method", method.to_owned()),
-                KeyValue::new("verifier.grounded", is_grounded),
-            ],
-        );
     }
 
     /// Increment the reranker fallback counter, labelled by strategy.
@@ -1150,15 +949,6 @@ impl RetrievalMetrics {
     /// back-off-driven retries.
     pub fn record_reranker_duration(&self, elapsed_ms: f64) {
         self.reranker_duration_ms.record(elapsed_ms, &[]);
-    }
-
-    /// Record the latency of a single LLM grounding-verifier call.
-    ///
-    /// Wraps `GroundingVerifier::verify_with_llm` end-to-end so the
-    /// measurement reflects the rig-core / OpenAI prompt round-trip
-    /// users actually wait for.
-    pub fn record_llm_verifier_duration(&self, elapsed_ms: f64) {
-        self.llm_verifier_duration_ms.record(elapsed_ms, &[]);
     }
 
     /// Record one Qdrant→Postgres-FTS circuit-breaker fallback event,

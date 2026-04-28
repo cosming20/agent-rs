@@ -19,8 +19,6 @@ use agent_rs_retrieval::EvidencePack;
 use agent_rs_stores::types::{ChatTurn, SearchResult};
 use uuid::Uuid;
 
-use crate::verifier::VerificationResult;
-
 /// Mutable state accumulating through the orchestrator pipeline.
 ///
 /// Immutable request fields are set at construction. Mutable fields
@@ -82,12 +80,6 @@ pub struct QueryContext {
     pub(crate) evidence: Vec<SearchResult>,
     /// The full evidence pack with provenance metadata.
     pub(crate) fused_pack: Option<EvidencePack>,
-
-    // ---- Accumulated by GroundingGate ----
-    /// Verification result from the grounding check.
-    pub(crate) verification: Option<VerificationResult>,
-    /// Number of retry attempts performed.
-    pub(crate) retries: usize,
 
     // ---- Coverage-aware RAG fields ----
     pub coverage_plan: Option<crate::coverage::CoveragePlan>,
@@ -157,8 +149,6 @@ impl QueryContext {
             agent_latency_ms: 0,
             evidence: Vec::new(),
             fused_pack: None,
-            verification: None,
-            retries: 0,
             coverage_plan: None,
             coverage_evidence: Vec::new(),
             coverage_report: None,

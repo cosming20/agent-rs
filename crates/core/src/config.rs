@@ -295,7 +295,6 @@ impl Default for CircuitBreakerConfig {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct AgentConfig {
     pub max_steps: usize,
-    pub max_retries: usize,
     pub system_prompt_file: String,
     /// Reasoning-effort hint forwarded to OpenAI Chat Completions for
     /// gpt-5.x / o-series models. Valid values as of
@@ -431,118 +430,41 @@ impl fmt::Debug for RerankerConfig {
     }
 }
 
-/// Faithfulness verifier configuration.
+/// Subject-presence pre-filter configuration.
+///
+/// Controls the language-agnostic check that runs **before** the
+/// synthesis LLM call: when none of the agent's rewritten retrieval
+/// queries share any content tokens with the fused evidence, the topic
+/// is treated as out-of-corpus and synthesis is short-circuited with a
+/// polite "not in evidence" response. This saves the wasted LLM call
+/// on queries that fundamentally cannot be answered from the corpus.
+///
+/// Centralised here so corpus operators can tune the heuristic per
+/// dataset (e.g. a corpus of short-form Q&A may want
+/// `subject_min_token_len = 3`) without a recompile.
 #[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct VerifierConfig {
-    /// Minimum confidence threshold for the heuristic fallback verifier
-    /// to return `is_grounded = true`. The LLM-based verifier ignores
-    /// this field; its verdict is derived from typed claims.
-    pub confidence_threshold: f64,
-    /// Optional model override for the grounding verifier. When `None`
-    /// (default), the verifier uses the global `llm.model`. Set this to
-    /// a stronger model (e.g. `gpt-5.4-mini`) to improve claim
-    /// classification quality without upgrading the primary retrieval
-    /// LLM. Reads from `AGENT_RS__VERIFIER__MODEL`.
-    #[serde(default)]
-    pub model: Option<String>,
-    /// Optional `seed` override for the grounding verifier's LLM call.
-    ///
-    /// `None` (default) means "inherit from `agent.seed`" — the verifier
-    /// runs with the same determinism as the main agent, so a verdict
-    /// flip can be reproduced by re-running the same query.
-    /// `Some(x)` overrides — useful when running an A/B comparison
-    /// between verifier prompts and wanting the verifier to converge
-    /// on a different seed than the main agent (rare).
-    ///
-    /// Override via `AGENT_RS__VERIFIER__SEED`.
-    #[serde(default)]
-    pub seed: Option<u64>,
-}
-
-/// Strategy used by the grounding gate when the verifier reports the
-/// answer as ungrounded.
-///
-/// `ClaimDirected` (default) extracts each claim flagged as
-/// `supported = false` and runs a focused retrieval per claim, hoping
-/// to surface evidence the agent missed. Only on zero-new-evidence does
-/// it fall through to a full agent rerun.
-///
-/// `AgentRerun` skips claim search entirely and re-runs the agent with
-/// a diagnostic prompt — the legacy behaviour, kept for A/B comparison
-/// and as an escape hatch.
-///
-/// Override via `AGENT_RS__GROUNDING__RETRY_STRATEGY` (`claim_directed`
-/// or `agent_rerun`).
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum RetryStrategy {
-    /// Run a focused retrieval per ungrounded claim before re-running the
-    /// agent. Falls through to [`Self::AgentRerun`] only when no new
-    /// evidence is surfaced.
-    #[default]
-    ClaimDirected,
-    /// Re-run the full agent with a diagnostic prompt — the legacy retry
-    /// path. Kept for A/B comparison and as an escape hatch when the
-    /// claim-directed path regresses.
-    AgentRerun,
-}
-
-/// Grounding gate heuristic configuration.
-///
-/// Controls the language-agnostic subject-presence check that runs before
-/// the LLM verifier as a cheap pre-filter. Centralised here so corpus
-/// operators can tune the heuristic per dataset (e.g. a corpus of
-/// short-form Q&A may want `subject_min_token_len = 3`) without a
-/// recompile.
-#[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct GroundingConfig {
+pub struct SubjectCheckConfig {
     /// Minimum character length for a query token to be considered a
     /// content-bearing word. Tokens shorter than this are treated as
     /// function words / particles regardless of language.
     ///
-    /// `4` is the empirical sweet spot across EN, RO, ES, DE — it drops
-    /// pronouns and short conjunctions while preserving real nouns. Bump
-    /// to `5` for noisier corpora; lower only with care.
+    /// `4` is the empirical sweet spot across EN, RO, ES, DE — it
+    /// drops pronouns and short conjunctions while preserving real
+    /// nouns. Bump to `5` for noisier corpora; lower only with care.
     ///
-    /// Override via `AGENT_RS__GROUNDING__SUBJECT_MIN_TOKEN_LEN`.
+    /// Override via `AGENT_RS__SUBJECT_CHECK__SUBJECT_MIN_TOKEN_LEN`.
     #[serde(default = "default_subject_min_token_len")]
     pub subject_min_token_len: usize,
-
-    /// Retry strategy used when the verifier flags the answer as
-    /// ungrounded. See [`RetryStrategy`] for semantics.
-    ///
-    /// Override via `AGENT_RS__GROUNDING__RETRY_STRATEGY`.
-    #[serde(default)]
-    pub retry_strategy: RetryStrategy,
-
-    /// Maximum number of evidence items returned per claim-directed
-    /// search.
-    ///
-    /// Tunable to balance retrieval breadth against token pressure on
-    /// the re-verifier. Tighter values keep the evidence pack focused;
-    /// broader values surface more candidate support at the cost of LLM
-    /// context. Only consulted when
-    /// [`Self::retry_strategy`] is [`RetryStrategy::ClaimDirected`].
-    ///
-    /// Override via `AGENT_RS__GROUNDING__CLAIM_SEARCH_TOP_K`.
-    #[serde(default = "default_claim_search_top_k")]
-    pub claim_search_top_k: usize,
 }
 
 fn default_subject_min_token_len() -> usize {
     4
 }
 
-fn default_claim_search_top_k() -> usize {
-    3
-}
-
-impl Default for GroundingConfig {
+impl Default for SubjectCheckConfig {
     fn default() -> Self {
         Self {
             subject_min_token_len: default_subject_min_token_len(),
-            retry_strategy: RetryStrategy::default(),
-            claim_search_top_k: default_claim_search_top_k(),
         }
     }
 }
@@ -919,9 +841,14 @@ pub struct Settings {
     pub ranker: RankerConfig,
     #[serde(default)]
     pub reranker: RerankerConfig,
-    pub verifier: VerifierConfig,
+    /// Subject-presence pre-filter configuration. See
+    /// [`SubjectCheckConfig`] for semantics. The configuration was
+    /// previously named `grounding` and lived under
+    /// `Settings.grounding`; the rename reflects its new role as a
+    /// deterministic pre-synth gate rather than a knob on the (now
+    /// removed) LLM grounding verifier.
     #[serde(default)]
-    pub grounding: GroundingConfig,
+    pub subject_check: SubjectCheckConfig,
     pub web_budget: WebBudgetConfig,
     pub brave: BraveConfig,
     pub fetch: FetchConfig,
@@ -995,7 +922,6 @@ impl Default for Settings {
                 // planner partially missed. Non-exhaustive flows still
                 // finish in <=2 turns.
                 max_steps: 5,
-                max_retries: 1,
                 system_prompt_file: String::new(),
                 reasoning_effort: DEFAULT_REASONING_EFFORT.to_owned(),
                 seed: DEFAULT_AGENT_SEED,
@@ -1018,12 +944,7 @@ impl Default for Settings {
                 max_concurrency: 8,
                 disabled: false,
             },
-            verifier: VerifierConfig {
-                confidence_threshold: 0.5,
-                model: None,
-                seed: None,
-            },
-            grounding: GroundingConfig::default(),
+            subject_check: SubjectCheckConfig::default(),
             web_budget: WebBudgetConfig {
                 max_searches: 3,
                 max_news: 2,

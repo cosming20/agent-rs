@@ -5,6 +5,19 @@
 //!
 //! After the 2026-04-21 stateless pivot this no longer stores assistant
 //! chat messages — that's the web app's job now.
+//!
+//! The previous LLM-based grounding verifier was deleted in the
+//! synthesizer-streams refactor. Persisted `query_run` rows still
+//! carry an `is_grounded` column for backwards-compatibility with
+//! existing dashboards / migrations; we derive it deterministically
+//! from the heuristic confidence:
+//!
+//! ```text
+//! is_grounded = response.confidence >= GROUNDED_CONFIDENCE_THRESHOLD
+//! ```
+//!
+//! No LLM call, no retries, no [`crate::context::QueryContext::verification`]
+//! field on the context.
 
 use std::sync::Arc;
 
@@ -18,6 +31,18 @@ use uuid::Uuid;
 
 use crate::context::QueryContext;
 use crate::synthesis::{ResponseSynthesizer, SynthesizedResponse};
+
+/// Heuristic-confidence threshold above which a persisted `query_run`
+/// row is flagged as `is_grounded = true`.
+///
+/// The DB column predates the verifier deletion and is consumed by
+/// existing dashboards / replay tooling, so the persister keeps
+/// emitting it. The value mirrors the previous `synthesis::
+/// LOW_CONFIDENCE_HEDGE_THRESHOLD` (0.15) — answers that already
+/// trigger the synthesizer's "please verify independently" wrapper
+/// are simultaneously marked ungrounded in the audit log, which keeps
+/// the two surfaces consistent.
+const GROUNDED_CONFIDENCE_THRESHOLD: f64 = 0.15;
 
 /// Synthesizes response, persists telemetry rows.
 pub struct ResultPersister {
@@ -46,12 +71,6 @@ impl ResultPersister {
         strategy = %ctx.strategy,
     ))]
     pub async fn persist(&self, ctx: &QueryContext) -> Result<SynthesizedResponse, AgentError> {
-        let verification = ctx.verification.as_ref().ok_or_else(|| {
-            AgentError::Orchestrator("verification result missing before persist".into())
-        })?;
-
-        self.metrics
-            .record_verifier_method(&verification.method, verification.is_grounded);
         self.metrics
             .record_query_duration_ms(ctx.elapsed_ms() as f64, ctx.strategy);
 
@@ -59,15 +78,16 @@ impl ResultPersister {
             &ctx.answer,
             &ctx.evidence,
             &ctx.query,
-            verification,
             ctx.strategy,
             ctx.coverage_report.as_ref(),
         )?;
 
+        let is_grounded = response.confidence.value() >= GROUNDED_CONFIDENCE_THRESHOLD;
+
         info!(
             citations = response.citations.len(),
             confidence = response.confidence.value(),
-            is_grounded = response.is_grounded,
+            is_grounded,
             "response synthesized"
         );
 
@@ -81,7 +101,7 @@ impl ResultPersister {
             answer: response.answer.clone(),
             strategy: ctx.strategy,
             confidence: response.confidence,
-            is_grounded: response.is_grounded,
+            is_grounded,
             created_at: Utc::now().naive_utc(),
         };
 
